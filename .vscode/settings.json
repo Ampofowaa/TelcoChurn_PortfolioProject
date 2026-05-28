@@ -1,4 +1,14 @@
 {
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
-  "python.packageManager.alwaysUseUv": true
+  "python.packageManager.alwaysUseUv": true,
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.fixAll.ruff": "explicit",
+      "source.organizeImports.ruff": "explicit"
+    }
+  },
+  "mypy-type-checker.args": ["--config-file=pyproject.toml"],
+  "ruff.configuration": "pyproject.toml"
 }
