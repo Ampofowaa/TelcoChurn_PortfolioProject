@@ -222,5 +222,6 @@ datasets/
 mlruns/
 reports/
 .dvc/cache/
+PROJECT_PLAN.md
 project_thoughts.md
 prompts.txt
