@@ -1,0 +1,12 @@
+# Normalize all text files to LF in the repo
+* text=auto eol=lf
+
+# Explicitly binary — never touch line endings
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pkl binary
+*.parquet binary
+*.csv binary
