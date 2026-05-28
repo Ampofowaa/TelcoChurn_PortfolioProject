@@ -99,7 +99,7 @@ monitoring/             # Prometheus config + Grafana dashboard JSON
 Copy `.env.example` to `.env` for local development. Never commit `.env`. Required vars (set up per phase):
 
 ```
-POSTGRES_URL=postgresql://user:pass@localhost:5432/telco_churn
+POSTGRES_URL=postgresql://user:pass@localhost:5432/telco_churn  # pragma: allowlist secret
 MLFLOW_TRACKING_URI=http://localhost:5000
 PREFECT_API_URL=http://localhost:4200/api
 AWS_REGION=us-east-1
