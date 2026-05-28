@@ -1,0 +1,23 @@
+# defaults list — sub-configs are added as each phase is completed
+# defaults:
+#   - data: telco          # Phase 1
+#   - model: lightgbm      # Phase 5
+#   - training: optuna     # Phase 5
+#   - serving: api         # Phase 9
+#   - _self_
+
+random_seed: 42
+
+mlflow:
+  tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,http://localhost:5000}
+  experiment_name: telco-churn
+  registered_model_name: telco-churn-pipeline
+
+paths:
+  raw_data: datasets/raw/Telco-Customer-Churn.csv
+  interim_data: datasets/interim/
+  processed_data: datasets/processed/
+  reports: reports/
+
+database:
+  url: ${oc.env:POSTGRES_URL,postgresql://user:pass@localhost:5432/telco_churn}  # pragma: allowlist secret
