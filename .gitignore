@@ -217,9 +217,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Folders in this project
+# Project-specific
 datasets/
-notebooks/EDA.ipynb
-PROJECT_PLAN.md
+mlruns/
+reports/
+.dvc/cache/
 project_thoughts.md
 prompts.txt
