@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Folders in this project
+datasets/
+notebooks/EDA.ipynb
+PROJECT_PLAN.md
+project_thoughts.MD
+prompts.TXT
