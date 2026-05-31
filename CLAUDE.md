@@ -69,7 +69,7 @@ monitoring/             # Prometheus config + Grafana dashboard JSON
 
 ## Git Conventions
 
-- **Branch prefix:** `feat/`, `fix/`, `chore/`, `docs/` — e.g. `feat/phase-0-tooling`, `fix/schema-null-handling`.
+- **Branch prefix:** `feat/`, `fix/`, `chore/`, `docs/`, `test/`, `refactor/`, `data/`, `model/` — e.g. `feat/phase-0-tooling`, `fix/schema-null-handling`, `data/phase-1-ingest`.
 - **Commit style:** Conventional Commits — `feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`, `data:`, `model:`.
   - `data:` — dataset changes, schema updates, DVC pipeline edits, SQL changes.
   - `model:` — hyperparameter tuning, training logic, calibration, threshold changes.

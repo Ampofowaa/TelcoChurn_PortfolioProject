@@ -761,51 +761,66 @@ The $68/intervention and $575/LTV figures used to derive the production threshol
 
 ## 17. Quick Start
 
-**Prerequisites:** Python 3.9+, Jupyter, and the project dependencies installed (`pip install -r requirements.txt`).
+**Prerequisites:** Python 3.11+, [uv](https://docs.astral.sh/uv/), [Docker Desktop](https://www.docker.com/products/docker-desktop/), and a [Kaggle API token](https://www.kaggle.com/settings/api). Kaggle supports two credential formats — use whichever your account generates:
+- **New format (KGAT_ token):** paste the token string into `~/.kaggle/access_token` (plain text, no JSON).
+- **Legacy format:** download `kaggle.json` from Settings → API → *Create Legacy API Key* and place it at `~/.kaggle/kaggle.json`.
 
-**Step 1 — Clone the repository and navigate into it**
+**Step 1 — Clone and install**
 
 ```bash
 git clone <repo-url>
-cd telco-customer-churn
+cd TelcoChurn_PortfolioProject
+uv sync
 ```
 
-**Step 2 — Add the dataset**
-
-Download the [IBM Telco Customer Churn dataset](https://www.kaggle.com/datasets/blastchar/telco-customer-churn) from Kaggle and place `Telco-Customer-Churn.csv` in `data/raw/`. This folder is gitignored and must be created manually.
-
-**Step 3 — Open the notebook**
+**Step 2 — Download the dataset**
 
 ```bash
-jupyter notebook notebooks/EDA.ipynb
+make data
 ```
 
-This opens Jupyter in your browser. Run cells top to bottom — all analysis, modelling, and results are self-contained in `EDA.ipynb`.
+This runs `uv run kaggle datasets download -d blastchar/telco-customer-churn` (via the project's virtual environment) and places the raw CSV at `datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv`. The `datasets/` directory is gitignored — DVC (Phase 8) handles data version control.
 
-**Step 4 — Browse experiment runs (optional)**
+**Step 3 — Start Postgres and load the data**
 
-> **Note:** This step requires the notebook (Step 2) to have been run at least once. Running the notebook generates the `mlruns/` tracking store locally — a fresh clone will have no experiments to show until then.
+```bash
+cp .env.example .env      # defaults work with Docker out of the box
+make db-up                # start postgres:16 in Docker
+make ingest               # load 7,043 rows → customers_raw
+```
+
+Verify: `SELECT COUNT(*) FROM customers_raw` should return 7043.
+
+**Step 4 — Run the tests**
+
+```bash
+uv run pytest                  # unit tests (no Docker required)
+make test-integration          # integration tests (requires Docker)
+```
+
+**Step 5 — Browse experiment runs (Phase 5+)**
 
 ```bash
 mlflow ui --backend-store-uri file:./mlruns
 ```
 
-Then open [http://localhost:5000](http://localhost:5000) in your browser to explore logged metrics, parameters, and model artifacts across all experiments.
+Open [http://localhost:5000](http://localhost:5000) to explore logged experiments.
 
 ---
 
 ## 18. Project Structure
 
 ```
-├── notebooks/
-│   └── EDA.ipynb             # Full EDA + modelling notebook (§§1–17)
-├── requirements.txt
-└── README.md
+src/telco_churn/        # importable Python package
+configs/                # Hydra YAML configs
+sql/                    # Postgres schema + feature SQL views
+tests/unit/             # pytest unit tests
+tests/integration/      # integration tests (Postgres, API, pipeline)
+pipelines/              # Prefect flows
+monitoring/             # Prometheus + Grafana config
+datasets/               # gitignored; tracked by DVC (Phase 8)
+mlruns/                 # gitignored; MLflow local tracking store
 ```
-
-> **Locally generated (gitignored — not committed):**
-> - `data/raw/` — download the [IBM Telco Customer Churn dataset](https://www.kaggle.com/datasets/blastchar/telco-customer-churn) and place `Telco-Customer-Churn.csv` here before running the notebook.
-> - `mlruns/` — created automatically when the notebook runs and logs experiments to MLflow.
 
 ### Notebook section map
 
