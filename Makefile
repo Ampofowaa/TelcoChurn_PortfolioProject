@@ -1,4 +1,4 @@
-.PHONY: lint format test train
+.PHONY: lint format test test-integration data db-up db-down ingest train
 
 lint:
 	uv run ruff check src/
@@ -9,7 +9,22 @@ format:
 	uv run black src/
 
 test:
-	uv run pytest --cov=src --cov-report=term-missing
+	uv run pytest
+
+test-integration:
+	uv run pytest -m integration
+
+data:
+	uv run kaggle datasets download -d blastchar/telco-customer-churn -p datasets/raw/ --unzip
+
+db-up:
+	docker compose --profile infra up -d
+
+db-down:
+	docker compose --profile infra down
+
+ingest:
+	uv run python -m telco_churn.data.ingest
 
 train:
 	dvc repro
