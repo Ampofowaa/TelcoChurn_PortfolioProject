@@ -1,4 +1,4 @@
-.PHONY: lint format test test-integration data db-up db-down ingest train
+.PHONY: lint format test test-integration data db-up db-down ingest validate train
 
 lint:
 	uv run ruff check src/
@@ -25,6 +25,9 @@ db-down:
 
 ingest:
 	uv run python -m telco_churn.data.ingest
+
+validate:
+	uv run python -m telco_churn.data.validate
 
 train:
 	dvc repro

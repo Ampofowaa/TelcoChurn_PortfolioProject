@@ -6,7 +6,7 @@ End-to-end ML portfolio project on the IBM Telco Customer Churn dataset. The goa
 
 ## Source of Truth
 
-- **Modelling science:** `notebooks/EDA.ipynb` is the authoritative reference for all data validation gates, preprocessing logic, feature engineering decisions, Optuna hyperparameters, calibration, cost-sensitive threshold derivation, and evaluation metrics. When migrating logic to `src/`, preserve the math exactly — do not silently simplify or alter it.
+- **Modelling science:** `notebooks/_archive/EDA-original.ipynb` is the authoritative reference for all data validation gates, preprocessing logic, feature engineering decisions, Optuna hyperparameters, calibration, cost-sensitive threshold derivation, and evaluation metrics. When migrating logic to `src/`, preserve the math exactly — do not silently simplify or alter it.
 - **Architecture decisions:** `README.md` documents the rationale behind every modelling choice, known limitations, and business cost parameters. Do not contradict it.
 - **Build roadmap:** `PROJECT_PLAN.md` defines the 15-phase lifecycle-ordered execution plan. Do not implement features that belong to a later phase.
 
@@ -30,6 +30,7 @@ mlflow ui                        # open experiment tracking UI (localhost:5000)
 
 make lint                        # shortcut: ruff check + mypy
 make test                        # shortcut: pytest --cov=src
+make validate                    # shortcut: uv run python -m telco_churn.data.validate
 make train                       # shortcut: dvc repro (train + evaluate stages)
 
 docker compose --profile infra up -d    # start Postgres + MLflow (Phase 1+ / Phase 5+)
