@@ -61,7 +61,7 @@ target-version = ["py313"]
 python_version = "3.13"
 strict = true
 ignore_missing_imports = true
-exclude = ["notebooks/", "pipelines/", "scripts/"]
+exclude = ["notebooks/", "pipelines/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

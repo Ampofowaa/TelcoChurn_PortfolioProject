@@ -23,7 +23,7 @@ repos:
     hooks:
       - id: mypy
         args: [--config-file=pyproject.toml]
-        additional_dependencies: [pytest]
+        additional_dependencies: [pytest, nbformat]
 
   - repo: https://github.com/kynan/nbstripout
     rev: 0.9.1

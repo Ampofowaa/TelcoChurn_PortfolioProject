@@ -15,7 +15,7 @@ import nbformat
 
 def upgrade(path: str) -> bool:
     """Return True if the file was modified."""
-    nb = nbformat.read(path, as_version=4)
+    nb = nbformat.read(path, as_version=4)  # type: ignore[no-untyped-call]
 
     needs_minor_bump = nb.nbformat_minor < 5
     needs_id_fix = any(len(cell.get("id", "")) < 8 for cell in nb.cells)
@@ -26,7 +26,7 @@ def upgrade(path: str) -> bool:
         if len(cell.get("id", "")) < 8:
             cell["id"] = secrets.token_hex(4)
     nb.nbformat_minor = 5
-    nbformat.write(nb, path)
+    nbformat.write(nb, path)  # type: ignore[no-untyped-call]
     return True
 
 
