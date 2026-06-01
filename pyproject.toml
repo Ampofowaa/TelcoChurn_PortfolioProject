@@ -24,6 +24,7 @@ dependencies = [
     "seaborn>=0.13.2",
     "sqlalchemy>=2.0",
     "structlog>=25.5.0",
+    "pandera>=0.18",
 ]
 
 [dependency-groups]
@@ -31,10 +32,12 @@ dev = [
     "black>=26.5.1",
     "mypy>=2.1.0",
     "pre-commit>=4.6.0",
+    "hypothesis>=6.0",
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
     "ruff>=0.15.15",
     "testcontainers[postgres]>=4.0",
+    "nbstripout>=0.9.1",
 ]
 
 [tool.ruff]
@@ -61,6 +64,7 @@ exclude = ["notebooks/", "pipelines/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests/unit"]
 addopts = "--cov=src --cov-report=term-missing -m 'not integration'"
 markers = [
     "integration: integration tests that require Docker (deselected by default)",
