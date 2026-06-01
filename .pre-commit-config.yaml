@@ -30,6 +30,15 @@ repos:
     hooks:
       - id: nbstripout
 
+  - repo: local
+    hooks:
+      - id: upgrade-notebooks
+        name: upgrade notebooks to nbformat 4.5
+        entry: python scripts/upgrade_notebooks.py
+        language: python
+        types: [jupyter]
+        additional_dependencies: [nbformat]
+
   - repo: https://github.com/Yelp/detect-secrets
     rev: v1.5.0
     hooks:
