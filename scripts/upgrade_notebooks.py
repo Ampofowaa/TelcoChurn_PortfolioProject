@@ -7,7 +7,6 @@ to 4.4 and lack cell IDs, causing a render error on GitHub.
 
 from __future__ import annotations
 
-import json
 import secrets
 import sys
 
@@ -16,15 +15,13 @@ import nbformat
 
 def upgrade(path: str) -> bool:
     """Return True if the file was modified."""
-    with open(path, encoding="utf-8") as f:
-        raw = json.load(f)
+    nb = nbformat.read(path, as_version=4)
 
-    needs_minor_bump = raw.get("nbformat_minor", 0) < 5
-    needs_id_fix = any(len(c.get("id", "")) < 8 for c in raw.get("cells", []))
+    needs_minor_bump = nb.nbformat_minor < 5
+    needs_id_fix = any(len(cell.get("id", "")) < 8 for cell in nb.cells)
     if not needs_minor_bump and not needs_id_fix:
         return False
 
-    nb = nbformat.read(path, as_version=4)
     for cell in nb.cells:
         if len(cell.get("id", "")) < 8:
             cell["id"] = secrets.token_hex(4)

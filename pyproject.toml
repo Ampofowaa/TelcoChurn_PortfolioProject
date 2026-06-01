@@ -38,6 +38,7 @@ dev = [
     "ruff>=0.15.15",
     "testcontainers[postgres]>=4.0",
     "nbstripout>=0.9.1",
+    "nbconvert>=7.17.1",
 ]
 
 [tool.ruff]
@@ -60,7 +61,7 @@ target-version = ["py313"]
 python_version = "3.13"
 strict = true
 ignore_missing_imports = true
-exclude = ["notebooks/", "pipelines/"]
+exclude = ["notebooks/", "pipelines/", "scripts/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
