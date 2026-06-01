@@ -18,12 +18,15 @@ def upgrade(path: str) -> bool:
     """Return True if the file was modified."""
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
-    if raw.get("nbformat_minor", 0) >= 5:
+
+    needs_minor_bump = raw.get("nbformat_minor", 0) < 5
+    needs_id_fix = any(len(c.get("id", "")) < 8 for c in raw.get("cells", []))
+    if not needs_minor_bump and not needs_id_fix:
         return False
 
     nb = nbformat.read(path, as_version=4)
     for cell in nb.cells:
-        if "id" not in cell or not cell["id"]:
+        if len(cell.get("id", "")) < 8:
             cell["id"] = secrets.token_hex(4)
     nb.nbformat_minor = 5
     nbformat.write(nb, path)
