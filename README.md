@@ -82,7 +82,7 @@ Raw CSV
 
 ## Quick Start
 
-**Prerequisites:** Python 3.11+, [uv](https://docs.astral.sh/uv/), [Docker Desktop](https://www.docker.com/products/docker-desktop/), and a [Kaggle API token](https://www.kaggle.com/settings/api).
+**Prerequisites:** Python 3.13+, [uv](https://docs.astral.sh/uv/), [Docker Desktop](https://www.docker.com/products/docker-desktop/), and a [Kaggle API token](https://www.kaggle.com/settings/api).
 
 **1 — Clone and install**
 

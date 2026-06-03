@@ -7,7 +7,8 @@ End-to-end ML portfolio project on the IBM Telco Customer Churn dataset. The goa
 ## Source of Truth
 
 - **Modelling science:** `notebooks/_archive/EDA-original.ipynb` is the authoritative reference for all data validation gates, preprocessing logic, feature engineering decisions, Optuna hyperparameters, calibration, cost-sensitive threshold derivation, and evaluation metrics. When migrating logic to `src/`, preserve the math exactly — do not silently simplify or alter it.
-- **Architecture decisions:** `README.md` documents the rationale behind every modelling choice, known limitations, and business cost parameters. Do not contradict it.
+- **Modelling rationale:** `ANALYSIS.md` documents every modelling decision, known limitations, and business cost parameters. Do not contradict it.
+- **Project landing page:** `README.md` is the recruiter-facing overview (headline metrics, pipeline diagram, quick start, project status). It does not contain modelling rationale.
 - **Build roadmap:** `PROJECT_PLAN.md` defines the 15-phase lifecycle-ordered execution plan. Do not implement features that belong to a later phase.
 
 ## Key Commands
@@ -89,7 +90,7 @@ monitoring/             # Prometheus config + Grafana dashboard JSON
 ## Testing
 
 - Target ≥80% coverage on `src/`. Do not chase 100%.
-- Run a single test: `uv run pytest -k "test_name"` or `uv run pytest tests/unit/test_schema.py`.
+- Run a single test: `uv run pytest -k "test_name"` or `uv run pytest tests/unit/test_checks.py`.
 - Integration tests require Docker services to be running (`docker compose --profile infra up -d`).
 - The integration smoke test trains on a 500-row stratified sample and asserts ROC-AUC ≥ 0.75.
 - When writing data, schema, or validation tests, cover: normal case, missing values, wrong dtypes, and empty dataframe.
@@ -114,12 +115,12 @@ Lifecycle-ordered. Tests are written alongside each module — there is no dedic
 |---|---|---|
 | 0 | Project foundation | `pyproject.toml`, `uv.lock`, `.pre-commit-config.yaml`, skeleton dirs, Hydra root, structlog |
 | 1 | Data ingestion (CSV → Postgres) | `docker-compose.yml` w/ Postgres + `sql/schema/001_create_raw.sql` + `data/ingest.py` |
-| 2 | Data validation (Pandera + 5 gates) | `data/schema.py` + `data/validate.py` + `tests/unit/test_schema.py` |
+| 2 | Data validation (Pandera + 5 gates) | `data/schema.py` + `data/checks.py` + `data/validate.py` + `tests/unit/test_checks.py` + `tests/unit/test_validate.py` |
 | 3 | EDA notebook (slim rewrite) | `notebooks/01-eda.ipynb` importing from `src/`; original archived |
 | 4 | Feature engineering (SQL + Python) | `sql/features/*.sql` + `features/sql_features.py` + `features/build.py` |
 | 5 | Model training (LightGBM + Optuna + MLflow) | `models/train.py` + `configs/{model,training}/*.yaml`; challenger registered |
 | 6 | Calibration + cost-sensitive threshold | `models/calibrate.py` + `models/threshold.py` |
-| 7 | Evaluation + error analysis + registry promotion | `models/evaluate.py` + `models/register.py` + `notebooks/03-error-analysis.ipynb` |
+| 7 | Evaluation + error analysis + registry promotion | `models/evaluate.py` + `models/register.py` + `notebooks/05-error-analysis.ipynb` |
 | 8 | DVC pipeline wrap | `dvc.yaml` with 5 stages; reproducible end-to-end |
 | 9 | Serving + UI | FastAPI (`/predict`, `/health`, `/metrics`) + Streamlit + Dockerfiles |
 | 10 | Orchestration | Prefect retrain flow (weekly) + drift check flow (daily) |

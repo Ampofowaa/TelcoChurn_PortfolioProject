@@ -61,7 +61,7 @@ target-version = ["py313"]
 python_version = "3.13"
 strict = true
 ignore_missing_imports = true
-exclude = ["notebooks/", "pipelines/"]
+exclude = ["notebooks/", "pipelines/", "tests/"]
 
 [[tool.mypy.overrides]]
 module = "pandera.*"
