@@ -63,6 +63,10 @@ strict = true
 ignore_missing_imports = true
 exclude = ["notebooks/", "pipelines/"]
 
+[[tool.mypy.overrides]]
+module = "pandera.*"
+follow_imports = "skip"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests/unit"]
