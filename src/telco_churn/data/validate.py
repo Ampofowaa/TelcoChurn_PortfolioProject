@@ -150,6 +150,8 @@ def validate_raw(
     df: pd.DataFrame,
     strict: bool = True,
     reports_dir: Path = _REPORTS_DIR,
+    min_rows: int = 1_000,
+    max_null_rate: float = 0.05,
 ) -> ValidationResult:
     """Run the five EDA data-quality gates against raw telco data.
 
@@ -159,6 +161,8 @@ def validate_raw(
         strict: Raise ValidationError when any ERROR-severity gate fails.
         reports_dir: Directory for validation report artifacts. Override in
             tests to avoid writing to the real filesystem (pass tmp_path).
+        min_rows: Gate 5 minimum row count threshold (config: validation.min_rows).
+        max_null_rate: Gate 5 per-column null rate ceiling (config: validation.max_null_rate).
 
     Returns:
         ValidationResult with all gate outcomes categorised by severity.
@@ -171,7 +175,7 @@ def validate_raw(
         check_duplicate_ids(df),
         check_churn_labels(df),
         check_totalcharges_nulls(df),
-        *check_distribution_sanity(df),
+        *check_distribution_sanity(df, min_rows=min_rows, max_null_rate=max_null_rate),
     ]
     result = ValidationResult(checks=checks)
     _log_result(result)
@@ -185,6 +189,8 @@ def validate_clean(
     df: pd.DataFrame,
     strict: bool = True,
     reports_dir: Path = _REPORTS_DIR,
+    min_rows: int = 1_000,
+    max_null_rate: float = 0.05,
 ) -> ValidationResult:
     """Run the five EDA data-quality gates after totalcharges imputation.
 
@@ -198,6 +204,8 @@ def validate_clean(
         strict: Raise ValidationError when any ERROR-severity gate fails.
         reports_dir: Directory for validation report artifacts. Override in
             tests to avoid writing to the real filesystem (pass tmp_path).
+        min_rows: Gate 5 minimum row count threshold (config: validation.min_rows).
+        max_null_rate: Gate 5 per-column null rate ceiling (config: validation.max_null_rate).
 
     Returns:
         ValidationResult with all gate outcomes categorised by severity.
@@ -210,7 +218,7 @@ def validate_clean(
         check_duplicate_ids(df),
         check_churn_labels(df),
         check_totalcharges_nulls(df),
-        *check_distribution_sanity(df),
+        *check_distribution_sanity(df, min_rows=min_rows, max_null_rate=max_null_rate),
     ]
     result = ValidationResult(checks=checks)
     _log_result(result)
@@ -224,6 +232,7 @@ if __name__ == "__main__":
     import sys
 
     from dotenv import load_dotenv
+    from omegaconf import OmegaConf
 
     from telco_churn.utils.db import get_engine
     from telco_churn.utils.logging import configure_logging
@@ -231,9 +240,15 @@ if __name__ == "__main__":
     load_dotenv()
     configure_logging()
 
+    cfg = OmegaConf.load("configs/config.yaml")
+    min_rows = int(cfg.validation.min_rows)
+    max_null_rate = float(cfg.validation.max_null_rate)
+
     engine = get_engine()
     df = pd.read_sql("SELECT * FROM customers_raw", engine)
-    result = validate_raw(df, strict=False)
+    result = validate_raw(
+        df, strict=False, min_rows=min_rows, max_null_rate=max_null_rate
+    )
 
     if result.can_proceed:
         logger.info("validation_passed", warnings=len(result.warnings))

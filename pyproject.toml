@@ -8,7 +8,7 @@ where = ["src"]
 [project]
 name = "telcochurn-portfolioproject"
 version = "0.1.0"
-description = "Add your description here"
+description = "Production-grade churn prediction system: Pandera validation, LightGBM + Optuna, MLflow registry, FastAPI serving, Prefect orchestration, AWS deployment"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -66,7 +66,11 @@ exclude = ["notebooks/", "pipelines/"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests/unit"]
-addopts = "--cov=src --cov-report=term-missing -m 'not integration'"
+addopts = "--cov=src --cov-report=term-missing"
 markers = [
-    "integration: integration tests that require Docker (deselected by default)",
+    "integration: integration tests that require Docker (pass --run-integration to run)",
 ]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true

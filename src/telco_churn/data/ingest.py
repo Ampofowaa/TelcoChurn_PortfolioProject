@@ -14,8 +14,6 @@ from telco_churn.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-RAW_CSV = Path("datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv")
-
 # Explicit column types keep the DB schema aligned with 001_create_raw.sql.
 _DTYPE_MAP: dict[str, types.TypeEngine[Any]] = {
     "customerid": types.VARCHAR(20),
@@ -42,7 +40,7 @@ _DTYPE_MAP: dict[str, types.TypeEngine[Any]] = {
 }
 
 
-def load_raw_csv(path: Path = RAW_CSV) -> pd.DataFrame:
+def load_raw_csv(path: Path) -> pd.DataFrame:
     """Load and type-coerce the raw Telco CSV.
 
     Coerces TotalCharges to numeric (whitespace in source → NaN for the 11
@@ -61,7 +59,7 @@ def load_raw_csv(path: Path = RAW_CSV) -> pd.DataFrame:
     return df.rename(columns={"partner": "has_partner", "contract": "contract_type"})
 
 
-def ingest(path: Path = RAW_CSV, engine: Engine | None = None) -> int:
+def ingest(path: Path, engine: Engine | None = None) -> int:
     """Load the raw Telco CSV into the customers_raw Postgres table.
 
     The table is replaced on each call, making the operation idempotent.
@@ -85,16 +83,31 @@ def ingest(path: Path = RAW_CSV, engine: Engine | None = None) -> int:
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
 
     from dotenv import load_dotenv
+    from omegaconf import OmegaConf
 
     from telco_churn.utils.logging import configure_logging
 
     load_dotenv()
     configure_logging()
+
+    cfg = OmegaConf.load("configs/config.yaml")
+    default_csv = Path(cfg.paths.raw_data)
+
+    parser = argparse.ArgumentParser(description="Ingest raw Telco CSV into Postgres.")
+    parser.add_argument(
+        "--csv-path",
+        type=Path,
+        default=default_csv,
+        help=f"Path to the raw CSV file (default: {default_csv})",
+    )
+    args = parser.parse_args()
+
     try:
-        ingest()
+        ingest(path=args.csv_path)
     except Exception as e:
         logger.error("ingest failed", error=str(e))
         sys.exit(1)
