@@ -82,6 +82,24 @@ def test_schema_check_pass_has_no_detail(valid_raw_df: pd.DataFrame) -> None:
     assert result.detail is None
 
 
+def test_invalid_contract_type_fails_schema_check(valid_raw_df: pd.DataFrame) -> None:
+    """A contract_type value outside the allowed set triggers a blocking schema error."""
+    df = valid_raw_df.copy()
+    df.loc[0, "contract_type"] = "Weekly"
+    result = check_schema(df)
+    assert result.passed is False
+    assert result.failure_severity == Severity.ERROR
+
+
+def test_unexpected_column_fails_schema_check(valid_raw_df: pd.DataFrame) -> None:
+    """An extra column not in RawSchema fails Gate 1 — strict=True is enforced."""
+    df = valid_raw_df.copy()
+    df["unexpected_column"] = 0
+    result = check_schema(df)
+    assert result.passed is False
+    assert result.failure_severity == Severity.ERROR
+
+
 # ---------------------------------------------------------------------------
 # Gate 2 — duplicate IDs
 # ---------------------------------------------------------------------------

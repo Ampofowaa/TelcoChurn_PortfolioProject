@@ -614,6 +614,18 @@ These are reasonable "future work" items for the README, not omissions:
 
 ---
 
+## Pre-Phase 3 To-Do
+
+Items identified in a post-QA audit (June 2026). All must be resolved before Phase 3 begins. Ordered by priority.
+
+| Priority | Status | Item | Detail |
+|---|---|---|---|
+| High | [x] | Fix 4 stale references in `CLAUDE.md` | (1) Source of Truth: `README.md` → `ANALYSIS.md` for modelling rationale; (2) Testing section example: `test_schema.py` → `test_checks.py`; (3) Phase 2 deliverable: `test_schema.py` → `test_checks.py` + `test_validate.py`; (4) Phase 7 notebook: `03-error-analysis.ipynb` → `05-error-analysis.ipynb` |
+| High | [x] | Bump pre-commit mypy to match project requirement | `.pre-commit-config.yaml` pins `mirrors-mypy` at `v1.13.0`; `pyproject.toml` requires `mypy>=2.1.0`. Hook and project are running different mypy versions — they can diverge on what they catch. Update `rev` to the latest `mirrors-mypy` release that corresponds to mypy v2.x |
+| Medium | [x] | Add direct Pandera schema constraint tests | Added `test_invalid_contract_type_fails_schema_check` and `test_unexpected_column_fails_schema_check` to `tests/unit/test_checks.py`. Other cases (`gender`, `churn`, NULL `totalcharges`) were already covered — no duplicate test file needed |
+
+---
+
 ## Completed: QA & Standards Hardening (June 2026)
 
 All items below were identified in a review against industry DS standards and completed before the repo was shared publicly. Full details are in `CHANGELOG.md`.

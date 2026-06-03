@@ -6,6 +6,33 @@ Versions map to project phases; see [PROJECT_PLAN.md](PROJECT_PLAN.md) for the f
 
 ---
 
+## [0.2.2] - 2026-06-03 — Pre-Phase 3 Cleanup
+
+*Fixes identified in a post-QA audit. No modelling logic changed.*
+
+### Tooling
+- `mirrors-mypy` in `.pre-commit-config.yaml` bumped from `v1.13.0` → `v2.1.0` to match
+  the project's `mypy>=2.1.0` requirement — pre-commit hook and CI now run the same mypy
+  version, eliminating the class of "passes locally, fails in CI" type errors we experienced
+- Pre-commit mypy hook now runs `mypy src/` explicitly (`pass_filenames: false`) rather than
+  receiving staged filenames — matches the CI command exactly and avoids duplicate-module
+  errors from the two `conftest.py` files in `tests/`
+- `tests/` added to the mypy `exclude` list in `pyproject.toml` — type-checking is scoped
+  to `src/` only, consistent with CLAUDE.md and the CI step
+
+### Documentation
+- `CLAUDE.md` corrected: Source of Truth updated (`README.md` → `ANALYSIS.md` for
+  modelling rationale); test file references fixed (`test_schema.py` → `test_checks.py` +
+  `test_validate.py`); Phase 7 notebook corrected (`03-error-analysis.ipynb` →
+  `05-error-analysis.ipynb`)
+
+### Tests
+- Two missing schema constraint cases added to `tests/unit/test_checks.py`:
+  invalid `contract_type` value and unexpected extra column (enforces `strict=True`)
+- Test count: 49 → 51 passed; overall coverage holds at 80.73 %
+
+---
+
 ## [0.2.1] - 2026-06-03 — QA & Standards Hardening
 
 *Addresses code quality and documentation gaps identified in a review against industry DS

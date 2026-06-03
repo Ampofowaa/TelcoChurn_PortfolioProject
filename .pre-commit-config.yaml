@@ -19,10 +19,11 @@ repos:
       - id: black
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.13.0
+    rev: v2.1.0
     hooks:
       - id: mypy
-        args: [--config-file=pyproject.toml]
+        args: [--config-file=pyproject.toml, src/]
+        pass_filenames: false
         additional_dependencies: [pytest, nbformat]
 
   - repo: https://github.com/kynan/nbstripout
