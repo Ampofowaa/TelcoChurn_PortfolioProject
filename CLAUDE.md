@@ -7,7 +7,8 @@ End-to-end ML portfolio project on the IBM Telco Customer Churn dataset. The goa
 ## Source of Truth
 
 - **Modelling science:** `notebooks/_archive/EDA-original.ipynb` is the authoritative reference for all data validation gates, preprocessing logic, feature engineering decisions, Optuna hyperparameters, calibration, cost-sensitive threshold derivation, and evaluation metrics. When migrating logic to `src/`, preserve the math exactly — do not silently simplify or alter it.
-- **Modelling rationale:** `ANALYSIS.md` documents every modelling decision, known limitations, and business cost parameters. Do not contradict it.
+- **Modelling rationale:** `ANALYSIS.md` documents every modelling decision, known limitations, and business cost parameters. **§0 (Problem Framing & Cost Definition)** is the entry point — it defines the prediction unit, label definition, cost structure, success criteria, and the two modelling invariants (test set touched once; one metric drives selection) that govern all phases. Do not contradict it.
+- **System & workflow diagrams:** `docs/architecture.md` — system architecture diagram (infrastructure flow) and ML workflow diagram (modelling lifecycle with the two feedback loops).
 - **Project landing page:** `README.md` is the recruiter-facing overview (headline metrics, pipeline diagram, quick start, project status). It does not contain modelling rationale.
 - **Build roadmap:** `PROJECT_PLAN.md` defines the 15-phase lifecycle-ordered execution plan. Do not implement features that belong to a later phase.
 
@@ -55,6 +56,13 @@ docker compose up -d                    # start full local stack (Phase 9+)
 - **Target column** is always named `churn` (binary: 0/1).
 - **Class imbalance handling is required** — never train a model without it.
 - **Random state is always 42** for reproducibility across all splits, samplers, and models.
+
+## Modelling Invariants
+
+These are written policy — not notebook conventions — and must be preserved in all `src/` code:
+
+- **Test set touched once.** `X_test` / `y_test` are imported and used in exactly one place: `models/evaluate.py`. No other module may access the test split. Under continuous retraining (Phase 10), the sealed test set is **not** reused for challenger-vs-champion comparisons — that erodes it; use a rolling holdout instead.
+- **One metric drives selection.** PR-AUC (average precision) is the sole criterion for model selection, Optuna tuning, and champion promotion. All other metrics (recall, precision, F1, ROC-AUC) are reported as diagnostics only. If two metrics point in different directions, PR-AUC wins — mixing selection signals introduces cherry-picking risk.
 
 ## Project Structure (target — being built phase by phase)
 

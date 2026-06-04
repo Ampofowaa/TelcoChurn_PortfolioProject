@@ -287,6 +287,8 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 
 ### Phase 3 — Exploratory Data Analysis Notebook *(1 day)*
 
+> **Why Phase 2 (Validation) comes before Phase 3 (EDA):** This ordering looks backwards — you would normally explore data before writing validation rules. The explanation is that this project migrates a *completed* notebook (`EDA-original.ipynb`), not a greenfield build. The five validation gates were *discovered* during the original EDA session and are already documented in `ANALYSIS.md`. Phase 2 *enforces* those already-known rules as automated Pandera checks; Phase 3 *re-presents* the EDA as a clean, importable-function-backed notebook. In the original science timeline the order was: explore → discover quality issues → define gates. In the migration timeline, enforcement (Phase 2) is built first because downstream phases (features, training) depend on the validation pipeline being in place before they run. These two orderings serve different purposes: discover-vs-enforce.
+
 **What this achieves:** The original 148-cell monolith is archived and replaced by a clean, importable-function-backed notebook. A reviewer can read it as a narrative — not as a research scratch-pad — and verify that the modelling decisions are grounded in the data.
 
 **Deliverables:**
@@ -308,6 +310,20 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 
 **What this achieves:** Features are built in two layers — SQL views in Postgres (tenure bucketing, charge-per-service ratios) and a scikit-learn `ColumnTransformer` (scaling, encoding, imputation). This mirrors how features are built in a real warehouse-backed ML system. The ColumnTransformer definition is lifted verbatim from the original notebook to preserve the science exactly.
 
+> **Ordering note (where the error-feature loop lives):** the *generative* error-driven feature loop (notebook §10.5 — scan false negatives, hypothesise features, re-measure) already ran during the original modelling; its surviving engineered features are part of the feature set lifted here. Phase 4 transcribes that converged feature set — it does **not** re-run the loop. The *confirmatory* error analysis on the final model is a separate, later step (Phase 7). This is why feature engineering (Phase 4) correctly precedes training (Phase 5) even though "errors drive features" — the loop was closed in the notebook, not re-opened in the migration.
+
+> **Feature-selection note (diagnose, don't reflexively drop):** the engineered features above are **carried forward in full** at this phase. LightGBM is immune to multicollinearity and tolerates irrelevant inputs, and the post-encoding width (~30–45 columns) is not high-dimensional, so filter/wrapper selection buys little accuracy here. The notebook already does the industry-correct thing — it *measures* redundancy (VIF, §8) and relevance (Cramér's V, effect sizes) and drops nothing. The *decision* about which features to keep is made against the model in **Phase 5** (`notebooks/04-feature-selection.ipynb`), where a null-importance experiment selects inside CV, refits LightGBM on the survivors, and compares to the full set with a bootstrap CI — adopting a reduced set only if there is no significant PR-AUC loss. Feature selection is the *drop*-half of the feature loop (Phase 7 error analysis is the *add*-half) — see `summary.md` §4.4.
+
+> **Where feature work happens across this project (generation vs. selection vs. confirmatory analysis).** These are three *distinct* activities, not three rounds of the same one — the project does **not** engineer features twice:
+>
+> | Activity | What it does | Phase | Iterated here? |
+> |---|---|---|---|
+> | Feature **engineering** (generate) | *creates* features | Phase 4 — transcribe the converged set | **No** — the generative loop already closed in `EDA-original.ipynb`; Phase 4 lifts the result |
+> | Feature **selection** (prune) | *drops* weak features | Phase 5, step 3 | Once; set frozen before tuning |
+> | Error analysis (diagnose) | *finds* where the model fails | Phase 7 | **Confirmatory** — validates the shipped model; does **not** reopen engineering |
+>
+> In a greenfield build, engineering is a *loop* (error analysis → new feature → re-model, 2–5× — "data-centric" iteration); the linear phase list shows only the first pass. This project migrates a loop that **already converged**, so it engineers once. The loop genuinely reopens only for the **next model version**, driven by post-deployment monitoring and drift (Phases 10 & 13) on the retrain cadence — not within this build.
+
 **Deliverables:**
 - `sql/features/tenure_buckets.sql` — `CASE`-based tenure cohorts (e.g., 0–12, 13–24, 25–48, 49+ months)
 - `sql/features/charge_per_service.sql` — `MonthlyCharges` divided by the count of active services; NULL-safe
@@ -326,25 +342,41 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 
 ---
 
-### Phase 5 — Model Training (LightGBM + Optuna + MLflow) *(2–3 days)*
+### Phase 5 — Model Training (LightGBM + Optuna + MLflow) *(3–4 days)*
 
 **What this achieves:** A reproducible, experiment-tracked training run that searches hyperparameters with Bayesian optimisation and logs every trial to MLflow. The best model is registered in the MLflow Model Registry as `challenger`, ready for evaluation and promotion.
 
+**Order of operations within this phase (the modelling loop — do not reorder):**
+1. **Build candidates** — the two reference baselines (`DummyClassifier`, `LogisticRegression`) *and* the tree models, all through the *identical* Phase 4 pipeline and CV splits. (Baselines must run through the same pipeline to be a fair measuring instrument — that is why they live here, after features exist, not earlier.)
+2. **Compare on PR-AUC** → confirm LightGBM beats the baselines; document the margin (expect a near-tie with `LogisticRegression`).
+3. **Select features (freeze the input space)** — run null-importance / target-permutation selection (inside CV, on train + val only) against a *default-config* LightGBM, refit on the survivors, and confirm the reduced model's CV PR-AUC sits within the bootstrap CI of the full-feature model. This is what *freezes* the feature set before tuning (§4.3: tune late, on a frozen input space). The expected, fully acceptable outcome on this dataset is "keep most/all" — documented honestly either way. Detail in `notebooks/04-feature-selection.ipynb`.
+4. **Tune only the confirmed family** (LightGBM) with Optuna — *late*, after the feature set is frozen by step 3.
+5. **Register the tuned model** as `challenger`. Calibration + thresholding (Phase 6) and sealed-test evaluation (Phase 7) are deliberately separate, later phases.
+
 **Deliverables:**
 - `configs/model/lightgbm.yaml` — LightGBM parameter ranges (lifted from the original notebook's Optuna study as warm-start defaults): `num_leaves`, `learning_rate`, `n_estimators`, `min_child_samples`, `subsample`, `colsample_bytree`, `reg_alpha`, `reg_lambda`
-- `configs/training/optuna.yaml` — Optuna config: `n_trials: 50`, `sampler: tpe`, `direction: maximize`, `metric: roc_auc`, `cv_folds: 5`, `random_state: 42`
+- `configs/training/optuna.yaml` — Optuna config: `n_trials: 50`, `sampler: tpe`, `direction: maximize`, `metric: average_precision` (PR-AUC — see the flagged deviation below), `cv_folds: 5`, `random_state: 42`
+- **Reference baselines (floor + linear control)** — `DummyClassifier(strategy="most_frequent")` and `LogisticRegression(class_weight="balanced", max_iter=1000)`, run through the *identical* pipeline, CV splits, and metric as the tree models. The notebook's existing "baselines" (RandomForest / LightGBM / XGBoost) are all non-linear candidates — there is currently no no-information floor and no linear reference. These two establish: (a) the prior-only floor (~73 % accuracy → exposes the accuracy trap), and (b) how much signal is *linear*. Report both as rows in the §10.3 / `03-model-selection.ipynb` comparison table on **PR-AUC (primary) and recall @ 0.35 (diagnostic)**; they are reference rows, not selection candidates.
+  > **Expected finding to document:** Telco churn is near-linear — logistic regression typically reaches AUC ≈ 0.83, within the test-set CI of the tuned LightGBM. If so, state explicitly that LightGBM is chosen for calibration quality / SHAP interaction structure / error-analysis-driven features, **not** because it materially out-predicts the linear model. This is the honest justification for downstream complexity and ties to the significance discipline (Phase 7 bootstrap CIs).
+- **Model-selection metric = PR-AUC (average precision).** Cross-family model selection and the §10.3 / `03-model-selection.ipynb` comparison rank on **PR-AUC**, not recall@0.35 — PR-AUC is threshold-free and imbalance-appropriate (ROC-AUC is optimistic at a ~27 % positive rate). Recall / precision / F1 at the operating threshold are **reported as diagnostics, not used to decide**. Sanity check: plot the candidate PR curves together and confirm they do not cross near the operating region (if the PR-AUC ranking agrees with recall@0.35, the old conclusion stands, now properly justified). Rationale: ranking quality and operating point are separate decisions; the threshold is set later (Phase 6) and is a business-owned knob — see `summary.md` §4.2 and §4.5.
+  > **⚠ Flagged deviation from the archived notebook (per CLAUDE.md):** the notebook *selects and tunes* on CV recall@0.35 (`recall_scorer` is the Optuna objective; PR-AUC / ROC-AUC / average precision are logged there only as diagnostics). Standardising selection *and* the Optuna objective to PR-AUC is a deliberate methodological change (ranking-vs-operating-point separation), **not** a transcription — and note the plan's prior `metric: roc_auc` was itself an unflagged deviation. The notebook's preprocessing, hyperparameter ranges, calibration, threshold logic and evaluation math are otherwise preserved verbatim. Decision approved in design discussion (June 2026); record in `ANALYSIS.md` when Phase 5 lands.
 - `src/telco_churn/models/train.py`:
   - Reads config via Hydra
   - Loads the feature matrix from `datasets/processed/`
-  - Stratified 5-fold cross-validation; optimisation metric is ROC-AUC (validation set)
+  - Stratified 5-fold cross-validation; **optimisation objective is PR-AUC (average precision)** — imbalance-appropriate and consistent with the cross-family selection metric; ROC-AUC, recall, precision and F1 are also logged for diagnosis (see flagged deviation above)
   - Class imbalance: `scale_pos_weight` set to negative/positive ratio (~2.77)
   - Each Optuna trial is a nested MLflow child run; the study itself is the parent run
   - Best model logged as `pyfunc` artifact with `feature_columns.txt` and `preprocessing.pkl`
   - Best model registered in MLflow Model Registry as `telco-churn-pipeline` with alias `challenger`
+- **Structural test-set isolation (no leakage by construction):** the train/val/test split lives in a dedicated module; `train.py` imports only the train + val splits, never test. The test split is importable *only* by `evaluate.py` (Phase 7). This makes the "test set touched once" invariant a structural guarantee, not a convention (former Group B item — see `summary.md` §4.6 for the sealed-test rationale and §4.4 for the profiling-holdout discipline).
+- **Feature selection (`src/telco_churn/features/select.py`) — null-importance / target-permutation:** ranks features by comparing each feature's *real* gain importance against its importance distribution under repeated target shuffles; a feature is a drop candidate when its real importance is not meaningfully above its null distribution. Fit **inside CV on train + val only**, against a *default-config* LightGBM (not the tuned model — selection precedes HPO so the input space is frozen first). Returns the surviving feature list plus the importance/null table, and reports **selection stability** (how consistently each feature survives across folds). Mechanically, the selector is wrapped in an sklearn `Pipeline` with the model so `cross_val_score` re-fits selection on each fold's training portion only (leak-free — the standard safeguard); the single deployed feature set comes from one run on all training data. **Industry default, not nested CV:** the honest performance number is the Phase 7 sealed test reported with a bootstrap CI (`evaluate.py`) — the selection loop is deliberately *not* nested, matching production practice (a frozen feature set is required for serving/monitoring, and the CI already states the small-sample noise).
+  > **⚠ Flagged deviation from the archived notebook (per CLAUDE.md):** the notebook performs **no** feature selection — it measures VIF / Cramér's V / permutation importance as *diagnostics* and deliberately keeps every feature. Adding an explicit selection step is a deliberate methodological addition for learning and portfolio completeness, **not** a transcription. It is constructed to be *honest*: the reduced set is adopted **only if** its CV PR-AUC is within the full set's bootstrap CI (no significant loss) *and* there is a parsimony / operational reason to prefer it; otherwise the full set stands. Record the actual keep/drop decision and its rationale in `ANALYSIS.md`. The notebook's preprocessing, hyperparameters, calibration, threshold and evaluation math are otherwise preserved verbatim.
+- `notebooks/04-feature-selection.ipynb` — the experiment end to end: (1) full-set CV PR-AUC + bootstrap CI as the reference; (2) null-importance ranking; (3) drop features that do not beat noise; (4) **refit** LightGBM on the reduced set; (5) reduced-vs-full CV PR-AUC with an overlapping-CI check → documented decision. Imports from `select.py`; heavy logic stays out of the notebook.
+- `tests/unit/test_select.py` — synthetic data with planted noise columns and known-informative columns; assert the selector drops the noise and keeps the signal; assert selection is fit inside the fold (no access to held-out rows); cover the empty-dataframe and all-noise edge cases.
 - `tests/unit/test_train.py` — config loading, metric logging contract (mock MLflow client)
 - `notebooks/03-model-selection.ipynb` — loads the Optuna study from MLflow; renders parallel-coordinates plot, hyperparameter importance, and validation AUC distribution across trials
 
-**Verification:** `uv run python -m telco_churn.models.train` completes 50 trials and produces an MLflow run whose cross-validation AUC falls within the bootstrap CI reported in `README.md`.
+**Verification:** `uv run python -m telco_churn.models.train` completes 50 trials and produces an MLflow run whose cross-validation **PR-AUC** falls within the bootstrap CI reported in `README.md`; the two reference baselines appear as rows in the comparison and LightGBM's PR-AUC is ≥ both. `notebooks/04-feature-selection.ipynb` runs end to end and records a keep/drop decision in `ANALYSIS.md` (a reduced set is adopted only if its CV PR-AUC stays within the full set's CI).
 
 ---
 
@@ -354,6 +386,7 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 
 **Deliverables:**
 - `src/telco_churn/models/calibrate.py` — `CalibratedClassifierCV` wrapping the best LightGBM model; tests both sigmoid and isotonic methods; keeps whichever achieves the lower Brier score; logs calibrated model as a new MLflow artifact
+  > **⚠ Flagged deviation from the archived notebook (per CLAUDE.md):** the notebook uses a *fixed* `method='sigmoid'` (Platt) calibrator (§14.1). Selecting sigmoid-vs-isotonic by Brier is a deliberate, small methodological change — not a transcription. Caveat to apply: isotonic can over-fit on a small calibration set (~1,400 val rows), so sigmoid may legitimately win; **document the method actually chosen** and its Brier in `ANALYSIS.md` rather than assuming isotonic. If the result is sigmoid, the outcome matches the notebook and the deviation is moot. The notebook's threshold logic and evaluation math are otherwise preserved verbatim.
 - `src/telco_churn/models/threshold.py` — cost-sensitive threshold search over the OOF probability distribution; three scenarios from `notebooks/_archive/EDA-original.ipynb`:
   - **Conservative** (high cost of a missed churner): threshold ~0.22
   - **Base** (balanced): threshold ~0.30
@@ -368,7 +401,7 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 
 ### Phase 7 — Evaluation + Error Analysis + Registry Promotion *(2 days)*
 
-**What this achieves:** A sealed test-set evaluation (the test set has never been touched until this point) produces bootstrap-confidence-interval-bounded metrics that are honest estimates of production performance. A structured promotion decision replaces the `challenger` alias with `champion` only when the new model improves on both recall and calibration.
+**What this achieves:** A sealed test-set evaluation (the test set has never been touched until this point) produces bootstrap-confidence-interval-bounded metrics that are honest estimates of production performance. A structured promotion decision replaces the `challenger` alias with `champion` only when the new model improves on both **ranking (PR-AUC)** and **calibration (Brier)**; recall at the operating threshold is reported but does not gate the decision.
 
 **Deliverables:**
 - `src/telco_churn/models/evaluate.py`:
@@ -376,11 +409,13 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
   - 1,000-iteration bootstrap 95 % CIs (routine lifted verbatim from the original notebook)
   - Writes `reports/metrics.json`
   - Logs all metrics and the report to the MLflow run
-- `src/telco_churn/models/register.py` — promotes `challenger` → `champion` if and only if it beats the current `champion` on both recall (≥ 0) and Brier score (lower is better); no promotion otherwise; logs the decision with structured event `model_promoted` or `model_rejected`
+- `src/telco_churn/models/register.py` — promotes `challenger` → `champion` if and only if it beats the current `champion` on both **PR-AUC** (ranking quality; threshold-free) and **Brier score** (calibration; lower is better); no promotion otherwise; logs the decision with structured event `model_promoted` or `model_rejected`. **The operating threshold is shipped as a separate versioned config artifact** alongside the model — *not* folded into the promotion comparison — so "is the new model better at ranking?" and "where do we cut?" stay independent, separately-auditable decisions. (Recall@threshold remains a *reported* metric; it does not gate promotion, because it inherits the fixed-threshold fragility discussed in `summary.md` §4.2.)
 - `tests/unit/test_evaluate.py` — bootstrap CI math verified on a synthetic dataset with known population AUC
 - `notebooks/05-error-analysis.ipynb` — SHAP global feature importance, SHAP local explanations for representative FN/FP cases, confusion matrix at each cost scenario threshold
 
-**Verification:** `uv run python -m telco_churn.models.evaluate` produces `reports/metrics.json` whose AUC CI overlaps the CI reported in `README.md`.
+> **Ordering & test-set discipline:** the error analysis here is *confirmatory* (notebook §12 / §16.4 — SHAP + FN/FP profiling of the final model), distinct from the *generative* error-feature loop already baked into Phase 4. The sealed test set is touched exactly **once**, here — `evaluate.py` is the *only* module permitted to import the test split (the structural isolation set up in Phase 5). Under continuous retraining (Phase 10) do **not** re-use this same sealed test set for every challenger-vs-champion comparison — that erodes it; promote on a rolling/time-based holdout instead. This preserves the "test set touched once" invariant (Lifecycle & Framing Gaps, Group A). Turning the *generative* loop into reproducible production code (so the repo demonstrates the full lifecycle in code, not just the migration) is a **deliberately deferred v2** — see "What This Plan Deliberately Does Not Include" — sequenced after Phase 14 so the production spine ships first.
+
+**Verification:** `uv run python -m telco_churn.models.evaluate` produces `reports/metrics.json` whose PR-AUC and ROC-AUC CIs overlap the CIs reported in `README.md`.
 
 ---
 
@@ -401,6 +436,10 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
   | `evaluate` | `models/evaluate.py` | `reports/metrics.json` |
 
 - DVC local remote configured for now; swapped to S3 in Phase 12
+
+> **Deliberate scope — why the DAG stops at `evaluate`:** the five DVC stages cover the *data-transform* pipeline (raw → reproducible metrics). Calibration + thresholding (Phase 6) and registry promotion (Phase 7) are intentionally **not** DVC stages. They are *decision* steps, not deterministic data transforms: calibration depends on a held-out fold, the threshold encodes a business cost choice (owned outside the pipeline — see `summary.md` §4.5), and promotion compares against the live `champion` in the MLflow registry, which is mutable state DVC cannot content-hash. Folding them in would make `dvc repro` non-deterministic (its output would depend on whatever `champion` currently exists). Instead, those steps are driven by the Phase 10 Prefect `retrain` flow, which calls `train → evaluate` (reproducible, DVC-tracked) and then `calibrate → threshold → register` (decision layer) as explicit flow tasks. If full champion reproducibility is ever required, the fix is to pin the comparison baseline to a specific run ID rather than the `champion` alias — not to add these as DVC stages.
+
+- **No manual retraining flags (replaces the notebook's `RETRAIN_BEST` / `LOG_ARTIFACTS` booleans):** the hand-set flags that decided what to recompute do **not** migrate into `src/`. DVC's content-hashed DAG determines staleness — changing a dep reruns exactly the affected stages and nothing else. This is the engineering replacement for the manual flags (former Group B item).
 - **Phase 2 cleanup:** Remove `clean_dataframe()` from `validate.py` — imputation now belongs to the `features` stage's fitted `SimpleImputer`. Update `validate_clean()` to expect the features stage output directly. Remove the associated tests.
 - **Phase 2 cleanup:** In the DVC `validate` stage entry point, catch `ValidationError`, emit a `pipeline_blocked` structured log event, and call `sys.exit(1)`.
 
@@ -415,13 +454,17 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 **Deliverables:**
 - `src/telco_churn/serving/schemas.py` — Pydantic v2 request/response models; field constraints aligned with the Pandera schema (single source of truth)
 - `src/telco_churn/serving/predict.py` — loads the `champion` model and preprocessor from MLflow at startup; exposes `predict_single` and `predict_batch`
+- **Threshold as policy, not model state:** `/predict` returns the **calibrated `P(churn)`**; the decision rule (operating threshold, any per-segment cuts, EV formula) lives in a **separate versioned config / policy layer** loaded at startup, changeable without redeploying the model artifact. This keeps the business-owned operating point decoupled from the model — see `summary.md` §4.5. The response includes both the probability and the decision so callers can apply their own threshold if they prefer.
 - `src/telco_churn/serving/app.py` — FastAPI app:
   - `POST /predict` — single customer prediction
-  - `POST /predict/batch` — batch scoring (array of customers)
+  - `POST /predict/batch` — batch scoring (array of `CustomerFeatures` objects); same model and preprocessor as the single endpoint — batch is a delivery mode, not a model change; the prediction unit (one customer per score) is identical in both modes
   - `GET /health` — liveness probe
   - `GET /ready` — readiness probe (model loaded)
   - `GET /metrics` — Prometheus metrics via `prometheus_fastapi_instrumentator`
   - Structured log per prediction: request ID, features, probability, threshold, decision
+
+> **Note — batch as the operational backbone:** In production, batch is typically the primary delivery mode. A nightly/weekly job scores the entire active customer base, writes results to a `churn_scores` table, and the CRM reads from there. Real-time (`/predict`) is the supplement — used for event-triggered interventions (e.g., a customer calls to cancel). The `pipelines/batch_predict.py` flow in Phase 10 is the scheduled incarnation of this pattern. The prediction unit (`a single customer per score`) is identical in both modes.
+
 - `src/telco_churn/ui/streamlit_app.py` — 19-feature form → `POST /predict` → probability gauge + top-5 SHAP contributions
 - `Dockerfile` (multi-stage, FastAPI) + `Dockerfile.ui` (Streamlit); both added to `docker-compose.yml`
 - `tests/integration/test_api.py` — FastAPI test client: `/predict` returns valid schema; `/health` returns 200; batch endpoint accepts arrays
@@ -436,7 +479,7 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 
 **Deliverables:**
 - Prefect 3 server added to `docker-compose.yml` (UI at `:4200`)
-- `pipelines/retrain.py` — weekly Sunday 02:00 schedule; runs `ingest → validate → features → train → evaluate → register`; promotes `challenger` to `champion` on recall AND Brier improvement
+- `pipelines/retrain.py` — weekly Sunday 02:00 schedule; runs `ingest → validate → features → train → evaluate → register`; promotes `challenger` to `champion` on PR-AUC AND Brier improvement (same gate as `register.py`)
 - `pipelines/drift_check.py` — daily 06:00; pulls the last 24 hours of predictions from the API structured logs; runs an Evidently data drift report; alerts (Prefect notification) when PSI > 0.2 on any top-5 feature
 - `pipelines/batch_predict.py` (optional) — nightly scoring of all customers; writes results to a `predictions` table in Postgres
 
@@ -611,36 +654,35 @@ These are reasonable "future work" items for the README, not omissions:
 - **API authentication** — fine for a portfolio demo; a production system would add OAuth/JWT
 - **Multi-region / HA deployment** — single App Runner region is sufficient
 - **Cost dashboards** — AWS Cost Explorer's free view covers the free-tier project
+- **A live generative error-analysis → feature loop (v2)** — this project's story is *"productionised validated science"*: it ships the **converged** feature set from `EDA-original.ipynb` (which stays the source of truth), and Phase 7's error analysis is *confirmatory*. A natural **v2**, built *after* the production spine ships (post-Phase 14), turns the generative loop into reproducible code — error analysis on a profiling holdout proposes a **new** feature, the `select.py` + training harness re-measure it, and it is adopted only if it beats the frozen set on PR-AUC within CI. That would let the repo *also* claim "full DS lifecycle in code" without re-deriving work already done well. Deferred deliberately so the finishable migration artifact exists first; the v2 loop **extends**, not replaces, the notebook — see `summary.md` §4.4.
 
 ---
 
-## Pre-Phase 3 To-Do
+## Lifecycle & Framing Gaps (June 2026)
 
-Items identified in a post-QA audit (June 2026). All must be resolved before Phase 3 begins. Ordered by priority.
+Items surfaced in a review of the project's workflow against the industry-standard data-science lifecycle (CRISP-DM and its MLOps descendants). The *modelling science* is already at or above standard — these are **documentation, framing, and engineering-discipline** gaps, not science gaps. Full reasoning is in `summary.md` → "The Industry Data Science Lifecycle".
+
+**Group A — Documentation & framing (do before Phase 3):**
+
+These four are pure documentation (no code) and lock the rules that govern Phases 5–7. Do them before starting the EDA notebook.
 
 | Priority | Status | Item | Detail |
 |---|---|---|---|
-| High | [x] | Fix 4 stale references in `CLAUDE.md` | (1) Source of Truth: `README.md` → `ANALYSIS.md` for modelling rationale; (2) Testing section example: `test_schema.py` → `test_checks.py`; (3) Phase 2 deliverable: `test_schema.py` → `test_checks.py` + `test_validate.py`; (4) Phase 7 notebook: `03-error-analysis.ipynb` → `05-error-analysis.ipynb` |
-| High | [x] | Bump pre-commit mypy to match project requirement | `.pre-commit-config.yaml` pins `mirrors-mypy` at `v1.13.0`; `pyproject.toml` requires `mypy>=2.1.0`. Hook and project are running different mypy versions — they can diverge on what they catch. Update `rev` to the latest `mirrors-mypy` release that corresponds to mypy v2.x |
-| Medium | [x] | Add direct Pandera schema constraint tests | Added `test_invalid_contract_type_fails_schema_check` and `test_unexpected_column_fails_schema_check` to `tests/unit/test_checks.py`. Other cases (`gender`, `churn`, NULL `totalcharges`) were already covered — no duplicate test file needed |
+| High | [x] | Add "Step 0: Problem Framing & Cost Definition" as an explicit lifecycle step | Exists in `ANALYSIS.md` but is not a named step. Document: prediction unit (a customer), label definition + horizon, the decision the score feeds, FN-vs-FP cost structure, baseline-to-beat, and success criterion. This is the phase that makes the cost-sensitive threshold meaningful; reviewers look for it. |
+| High | [x] | Reframe the workflow string as a loop, not a straight line | The linear `validation → EDA → … → registration` string hides the two feedback arrows. Show **error analysis in two places** (error-driven FE *before* tuning, deep error analysis *after*) and the Evaluation→Business / Modeling→Data-Prep loops. |
+| Medium | [x] | Document the EDA-vs-validation ordering rationale | Phase 2 (validation) before Phase 3 (EDA) looks backwards without a note. Clarify: validation gates are *discovered* during EDA (notebook) and then *enforced* as automated checks (Phase 2) — the two orderings serve discover-vs-enforce purposes. Fold the note into the Phase 3 intro. |
+| Medium | [x] | State the "test set touched once" and "one metric drives selection" invariants as written policy | Currently enforced by notebook convention only. Record in `CLAUDE.md` / `ANALYSIS.md` so they survive the migration to `src/` as explicit rules. |
 
----
+**Former Groups B & C — now embedded in their phases (this is a completion index only; the phase deliverables are the source of truth):**
 
-## Completed: QA & Standards Hardening (June 2026)
+The engineering-discipline and metric/threshold items have been folded into the relevant phase deliverables so each spec lives in exactly one place and cannot drift. Use this table only to tick off completion as each phase lands.
 
-All items below were identified in a review against industry DS standards and completed before the repo was shared publicly. Full details are in `CHANGELOG.md`.
-
-| Priority | Item | Resolution |
-|---|---|---|
-| Critical | GitHub Actions CI pipeline | Added `.github/workflows/ci.yml` (lint, type-check, unit tests + coverage) |
-| Critical | README recruiter-facing rewrite | Slimmed to elevator pitch + results + pipeline overview + tech stack |
-| Critical | Coverage threshold enforced locally | `fail_under = 80` in `[tool.coverage.report]` |
-| High | PEP 561 typed-package marker | Added `src/telco_churn/py.typed` |
-| High | `customerid` index in SQL schema | Covered by `PRIMARY KEY` constraint (implicit B-tree index) |
-| High | `CHANGELOG.md` | Generated from Conventional Commits history |
-| High | `clean_dataframe()` placeholder documented | Docstring explains Phase 8 removal and why |
-| Medium | Gate 5 thresholds config-driven | `validation.min_rows` and `validation.max_null_rate` in `configs/config.yaml` |
-| Medium | `__version__` exposed | `importlib.metadata.version()` in `src/telco_churn/__init__.py` |
-| Medium | Integration test skip guard | `--run-integration` flag + `pytest.mark.integration` in root `conftest.py` |
-| Low | `argparse` in `ingest.py` CLI | `--csv-path` argument replaces hardcoded path |
-| Low | `CONTRIBUTING.md` | Setup, make commands, pre-commit hooks, PR conventions |
+| Status | Phase | Item | Specified in |
+|---|---|---|---|
+| [ ] | 5 | Reference baselines (floor + linear control) | Phase 5 deliverables; `summary.md` §4.1 |
+| [ ] | 5 | PR-AUC for selection + Optuna objective (⚠ flagged deviation) | Phase 5 deliverables; `summary.md` §4.2 |
+| [ ] | 5 & 7 | Test-set leakage structurally impossible | Phase 5 (split isolation bullet) + Phase 7 ordering note |
+| [ ] | 7 | Promotion gate = PR-AUC + Brier; threshold as versioned artifact | Phase 7 `register.py` deliverable; `summary.md` §4.2 |
+| [ ] | 8 | Drop notebook retraining flags (DVC DAG replaces them) | Phase 8 deliverables |
+| [ ] | 9 | Threshold as a versioned policy layer | Phase 9 deliverables; `summary.md` §4.5 |
+| [ ] | 3, 5–7 | Split the 7,600-line notebook into its three jobs | Phase 3 intro + roadmap |
