@@ -17,6 +17,31 @@ flowchart TD
     K -->|re-runs| D
 ```
 
+## ML Workflow — a loop, not a straight line
+
+The system diagram above shows the infrastructure flow. The diagram below shows the **modelling lifecycle**, including the two feedback loops that a linear summary hides.
+
+```mermaid
+flowchart TD
+    A[Data Ingestion] --> B[Data Validation]
+    B --> C[EDA]
+    C --> D[Feature Engineering]
+    D --> E[Baseline Models]
+    E --> F["Error Analysis 1 — generative\nblind-spot profiling on baseline FNs"]
+    F -.->|"hypothesis-driven\nfeatures back to FE"| D
+    F --> G[Hyperparameter Tuning — Optuna]
+    G --> H[Calibration + Threshold]
+    H --> I[Sealed Test Evaluation]
+    I --> J["Error Analysis 2 — confirmatory\nSHAP + FN/FP profiling of final model"]
+    J --> K[Business Review]
+    K -.->|"cost assumptions\nrevised"| H
+    K -.->|"drift or\nnew data"| D
+```
+
+**Solid arrows** — main linear flow. **Dashed arrows** — feedback loops. Full rationale for both loops is in `ANALYSIS.md` §0.
+
+---
+
 ## Components
 
 | Component | Tool | Phase |

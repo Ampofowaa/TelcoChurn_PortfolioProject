@@ -1,8 +1,8 @@
 # Analysis & Modelling Decisions
 
 Full modelling rationale for the [Telco Customer Churn](README.md) portfolio project.
-Covers EDA, feature engineering, model selection, hyperparameter tuning, error analysis,
-SHAP explainability, calibration, threshold optimisation, and business impact.
+Covers problem framing, EDA, feature engineering, model selection, hyperparameter tuning,
+error analysis, SHAP explainability, calibration, threshold optimisation, and business impact.
 
 All analysis is reproducible from `notebooks/_archive/EDA-original.ipynb`.
 The `src/` package implements the production-ready version of the same logic.
@@ -11,6 +11,7 @@ The `src/` package implements the production-ready version of the same logic.
 
 ## Table of Contents
 
+0. [Problem Framing & Cost Definition](#0-problem-framing--cost-definition)
 1. [EDA & Statistical Testing](#1-eda--statistical-testing)
 2. [Data Quality & Missing Values](#2-data-quality--missing-values)
 3. [Feature Engineering](#3-feature-engineering)
@@ -24,6 +25,66 @@ The `src/` package implements the production-ready version of the same logic.
 11. [Production Refit & Model Registration](#11-production-refit--model-registration)
 12. [Known Limitations](#12-known-limitations)
 13. [Recommendations & Next Steps](#13-recommendations--next-steps)
+
+---
+
+## 0. Problem Framing & Cost Definition
+
+This step locks the rules that govern every modelling decision in §§1–11. It is documented here — before any EDA or model results — so that the cost-sensitive threshold, the choice of recall as the primary metric, and the class imbalance handling all have a traceable origin.
+
+### Prediction unit
+
+A **single customer at a scoring cycle** (default: monthly). The model produces one churn-probability score per customer per run. All metrics (Recall, Precision, P&L) are computed per customer, not per account or household.
+
+### Label definition and horizon
+
+`Churn = 1` if the customer cancelled service **within the current billing cycle** (approximately 30 days). The label is derived directly from the IBM Telco dataset's `Churn` column (Yes/No, recoded to 1/0). It is a **binary, point-in-time label** — there is no survival horizon to tune and no soft-churn intermediate class in this dataset.
+
+The label captures *revealed* churn (cancellation has occurred), not *predicted intent*. This means the model is trained to identify customers who have the same profile as those who eventually cancelled — not customers who are currently dissatisfied but have not yet acted.
+
+### Decision the score feeds
+
+The score feeds a **proactive retention intervention decision**: whether to include a customer in the upcoming outreach cycle (discount offer, contract upgrade, service credit). The decision is binary per customer per cycle. A contacted customer either receives an offer or does not; there is no tiered response modelled at this stage (tiered outreach is a §13 recommendation).
+
+This framing makes the cost structure asymmetric and well-defined (see below). It has two metric consequences: **PR-AUC is the primary model selection and promotion metric** — it summarises precision-recall performance across all thresholds and is the promotion gate used in §§5 and 7. **Recall at the production threshold is the primary business metric** — once the model is deployed at the optimised production threshold (§9), the question the business asks is "how many churners did we catch this cycle?", and missed churners receive no offer and are lost.
+
+### FN vs FP cost structure
+
+| Error type | Business consequence | Base-scenario cost |
+|---|---|---|
+| **False Negative (FN)** | Churner not contacted — no retention offer issued. Customer cancels; LTV is lost. | ~$172 opportunity cost (30 % retention success × $575 LTV − $0 spend) |
+| **False Positive (FP)** | Non-churner contacted unnecessarily. Retention offer issued at cost; customer was going to stay anyway. | ~$68 direct spend per intervention |
+
+**FN/FP cost ratio ≈ 2.5:1** under the base scenario. Missing a churner costs approximately 2.5× more than a wasted offer. This ratio has two concrete consequences:
+
+1. The optimal decision threshold is **shifted left of 0.5** — accepting more FPs to recover more churners is cost-rational.
+2. **Recall is prioritised over Precision** as the primary metric. A model that catches fewer churners is not compensated by being more precise, because the asymmetry means false negatives are the more expensive error.
+
+The cost parameters ($68/intervention, $575 LTV, 30 % success rate) are illustrative and derived from plausible telecom industry benchmarks. They are not Finance-validated; see §12 Known Limitation #8. The three-scenario bracket (Conservative / Base / Optimistic) in §9 exists specifically to stress-test decisions against this uncertainty.
+
+### Baseline to beat
+
+Two reference points bound the performance target:
+
+| Baseline | Recall | Precision | Notes |
+|---|---|---|---|
+| Stratified random (population rate) | 26.5 % | 26.5 % | Floor — any useful model must beat this |
+| Heuristic: flag all month-to-month customers | ~88 % | ~43 % | Cheap, non-ML rule; captures the dominant risk profile. Values are EDA-derived approximations (§1), not fitted model results. |
+
+The month-to-month heuristic sets a high recall bar. A model that achieves 88 % recall at 43 % precision by flagging a single feature is not worth the engineering cost. The LightGBM pipeline must beat this on **both recall and precision** and must demonstrate value on the segments the heuristic ignores (annual-contract, long-tenure churners).
+
+### Success criterion
+
+The model is considered fit for production if, at the cost-optimised threshold on the **sealed test set**:
+
+| Criterion | Gate | Rationale |
+|---|---|---|
+| PR-AUC | ≥ 0.60 | Primary ranking metric — threshold-free and imbalance-appropriate at a 27 % positive rate; ROC-AUC is optimistic under class imbalance and is not used as a gate |
+| Recall at the optimised production threshold | ≥ 0.75 | Primary business metric — proportion of churners caught at the deployed operating point |
+| P&L vs random (base scenario) | Positive — model P&L > random-targeting P&L | Confirms the model adds economic value over an unguided contact budget |
+| No test-set information used before final evaluation | Structural requirement — threshold derived from OOF predictions only | Preserves the "test set touched once" invariant (§9) |
+
+These gates were set before the test set was opened. The final test-set results in §10 are evaluated against them exactly once.
 
 ---
 
