@@ -11,5 +11,6 @@
   },
   "mypy-type-checker.args": ["--config-file=pyproject.toml"],
   "ruff.configuration": "pyproject.toml",
-  "python.terminal.useEnvFile": true
+  "python.terminal.useEnvFile": true,
+  "python.analysis.typeCheckingMode": "off"
 }

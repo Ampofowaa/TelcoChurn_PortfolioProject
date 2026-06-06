@@ -31,9 +31,9 @@ repos:
     hooks:
       - id: nbstripout
         args: [--keep-id]
-        # _archive/ holds the authoritative original notebook whose outputs are
-        # kept on purpose as a results baseline for comparison.
-        exclude: ^notebooks/_archive/
+        # _archive/ and numbered presentation notebooks (00-, 01-, …) keep their
+        # outputs for GitHub browsing. Unnumbered scratch notebooks are stripped.
+        exclude: ^notebooks/(_archive/|0[0-9]-)
 
   - repo: local
     hooks:
