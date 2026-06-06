@@ -7,7 +7,7 @@ End-to-end ML portfolio project on the IBM Telco Customer Churn dataset. The goa
 ## Source of Truth
 
 - **Modelling science:** `notebooks/_archive/EDA-original.ipynb` is the authoritative reference for all data validation gates, preprocessing logic, feature engineering decisions, Optuna hyperparameters, calibration, cost-sensitive threshold derivation, and evaluation metrics. When migrating logic to `src/`, preserve the math exactly — do not silently simplify or alter it.
-- **Modelling rationale:** `ANALYSIS.md` documents every modelling decision, known limitations, and business cost parameters. **§0 (Problem Framing & Cost Definition)** is the entry point — it defines the prediction unit, label definition, cost structure, success criteria, and the two modelling invariants (test set touched once; one metric drives selection) that govern all phases. Do not contradict it.
+- **Modelling rationale:** `ANALYSIS.md` documents every modelling decision, analytical results and findings, and known limitations — the full narrative from data insights through to model results. **§0 (Problem Framing & Cost Definition)** is the entry point — it defines the prediction unit, label definition, cost structure, success criteria, and the two modelling invariants (test set touched once; one metric drives selection) that govern all phases. Do not contradict it.
 - **System & workflow diagrams:** `docs/architecture.md` — system architecture diagram (infrastructure flow) and ML workflow diagram (modelling lifecycle with the two feedback loops).
 - **Project landing page:** `README.md` is the recruiter-facing overview (headline metrics, pipeline diagram, quick start, project status). It does not contain modelling rationale.
 - **Build roadmap:** `PROJECT_PLAN.md` defines the 15-phase lifecycle-ordered execution plan. Do not implement features that belong to a later phase.
@@ -103,6 +103,7 @@ monitoring/             # Prometheus config + Grafana dashboard JSON
 - The integration smoke test trains on a 500-row stratified sample and asserts ROC-AUC ≥ 0.75.
 - When writing data, schema, or validation tests, cover: normal case, missing values, wrong dtypes, and empty dataframe.
 - Run `pytest` before marking any task complete; if the phase has no tests yet, note it explicitly instead of skipping.
+- When closing a QA backlog item (`[x]`), verify the fix is present in the code — read the relevant file or run the relevant test. Never mark `[x]` based on intent; only mark it after the change is confirmed in the working tree.
 
 ## Environment Variables
 

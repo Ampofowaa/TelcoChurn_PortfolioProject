@@ -124,6 +124,17 @@ def test_validate_clean_fails_when_nulls_remain(
     assert result.can_proceed is False
 
 
+def test_validate_clean_strict_raises_on_blocking_error(
+    valid_raw_df: pd.DataFrame, tmp_path: Path
+) -> None:
+    """validate_clean with strict=True raises ValidationError when errors exist."""
+    df = valid_raw_df.copy()
+    df.loc[0, "totalcharges"] = float("nan")
+    with pytest.raises(ValidationError) as exc_info:
+        validate_clean(df, strict=True, reports_dir=tmp_path)
+    assert len(exc_info.value.result.errors) >= 1
+
+
 # ---------------------------------------------------------------------------
 # clean_dataframe
 # ---------------------------------------------------------------------------

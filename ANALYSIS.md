@@ -71,7 +71,9 @@ Two reference points bound the performance target:
 | Stratified random (population rate) | 26.5 % | 26.5 % | Floor — any useful model must beat this |
 | Heuristic: flag all month-to-month customers | ~88 % | ~43 % | Cheap, non-ML rule; captures the dominant risk profile. Values are EDA-derived approximations (§1), not fitted model results. |
 
-The month-to-month heuristic sets a high recall bar. A model that achieves 88 % recall at 43 % precision by flagging a single feature is not worth the engineering cost. The LightGBM pipeline must beat this on **both recall and precision** and must demonstrate value on the segments the heuristic ignores (annual-contract, long-tenure churners).
+**Heuristic derivation:** month-to-month customers = 3,875; total churners = 1,869; month-to-month churn rate ≈ 43 % (§1 bivariate analysis) → ~1,666 churners captured. Recall = 1,666 / 1,869 ≈ **88 %**. Precision = 1,666 / 3,875 ≈ **43 %** (equals the segment churn rate by definition — flagging an entire group sets precision equal to that group's base rate).
+
+The month-to-month heuristic sets a high recall bar but has two structural weaknesses. First, the ~12 % of churners it misses (~203 customers on annual or two-year contracts) are disproportionately long-tenure, higher-LTV customers — each FN in this segment costs more than the $172 average above, so the apparent 88 % recall understates the business cost of the misses. Second, the heuristic assigns equal weight to all 3,875 flagged customers; it cannot distinguish near-certain churners from borderline cases, making cost-efficient prioritisation of the outreach budget impossible. The ML model must therefore do more than match aggregate recall and precision — it must recover high-value churners the heuristic ignores and produce calibrated probability scores that enable threshold-optimised, cost-rational triage. This is also why the recall at the cost-optimised production threshold (§9) is set below 88 %: chasing the heuristic's recall ceiling requires flagging an ever-larger share of the customer base, flooding the outreach budget with low-confidence contacts. The economically rational operating point accepts a lower recall in exchange for materially higher precision and a better overall cost outcome.
 
 ### Success criterion
 
@@ -90,43 +92,92 @@ These gates were set before the test set was opened. The final test-set results 
 
 ## 1. EDA & Statistical Testing
 
-Statistical significance and effect sizes validated with **Chi-square + Cramér's V** (categorical) and **Mann–Whitney U + rank-biserial r** (numeric) on the full 7,043 rows. With n = 7,043, effect size magnitude is the primary lens — p-values are all < 0.001 and are informative only as a filter.
+### Key findings
 
-### Top predictors by effect size
+- **Churn signal follows a clear hierarchy.** Contract type and tenure dominate; a cluster of service-related features (internet service, security/support add-ons, payment method, charges) contribute moderate signal; gender and phone service contribute nothing. A few features dominate, many contribute moderately, and a handful contribute nothing — but the distribution is not sparse enough to call concentrated.
+- **The three leading signals share variance.** Contract type, tenure, and fiber optic internet service are correlated — month-to-month customers inherently have shorter tenure; fiber optic customers pay more and churn at a higher rate. In bivariate analysis each appears strong in isolation; in a fitted model they compete for the same variance.
+- **The add-on service cluster signals disengagement, not causation.** All six add-on services are structurally tied to internet service — no-internet customers are coded "No internet service" across all six simultaneously. Their elevated churn correlation is partly structural and partly a disengagement signal: customers planning to leave do not invest in add-on services. Causality cannot be resolved from cross-sectional data alone.
+- **Charge features move in opposite directions and must both be retained.** Higher monthly charges predict higher churn (fiber optic concentration); higher total charges predict lower churn (only long-tenure customers accumulate large totals). They carry independent information despite their correlation — only ~8.7 % of customers have `TotalCharges ≈ MonthlyCharges × tenure` exactly.
+- **Class imbalance is moderate but consequential.** The dataset is 73.5 % No-churn / 26.5 % Churn (5,174 / 1,869; 2.77:1 ratio). A naive accuracy-maximising model achieves 73.5 % accuracy while identifying zero churners. **PR-AUC is the primary model selection and promotion metric** — more informative than ROC-AUC at this imbalance ratio; Recall at the deployed threshold is the primary business metric (see §0).
+
+### Univariate distributions
+
+**Numeric features:**
+- `tenure` is bimodal (U-shaped): a spike at 0–5 months (new customers at highest inherent risk), a broad plateau from ~10–65 months (the stable retained cohort), and a second concentration at 65–72 months (long-term loyals) — consistent with a survival distribution. The 0–12 month cohort churns at ~48 %; by 49+ months that falls below 10 %.
+- `monthlycharges` shows a two-tier structure: a sharp spike at $18–20 (basic phone-only plans), then a broad spread to $120 with density skewed toward $75–120 (bundled internet + add-on packages).
+- `totalcharges` is right-skewed, with a long tail of high-value, long-tenure customers. Billing amounts shift over time for ~91 % of customers, so `totalcharges` carries signal independent of the other two numeric features.
+
+**Categorical features:**
+- **Demographics:** gender is near-balanced (~51 % male); senior citizens represent ~16 % of the base; customers with a partner or dependents are ~41 % and ~30 % respectively — the base skews toward younger, independent adults.
+- **Services:** ~90 % have phone service; internet service splits across fiber optic (~44 %), DSL (~34 %), and no internet (~22 %). Security and support add-ons skew heavily toward "No" — the ~22 % without internet cannot subscribe, and month-to-month customers show lower uptake. Streaming add-ons are more evenly split.
+- **Contract and billing:** month-to-month contracts dominate (~55 %); paperless billing is the majority preference (~59 %); electronic check is the most common payment method (~34 %).
+
+**Outliers:**
+All three numeric features have zero IQR-flagged outliers. The bounds are wide because the features span their full natural ranges — tenure 0–72 months (by contract design), monthlycharges ~$18–$119, totalcharges $0–$8,684. The right-skew in `totalcharges` reflects a genuine business pattern, not contamination. All values are retained.
+
+**Categorical cardinality:**
+All categorical features have 2–4 distinct values — no high-cardinality columns. One-hot encoding is safe with no dimensionality or sparsity concern.
+
+### Bivariate analysis & effect sizes
+
+Chi-squared + Cramér's V for categorical features (V > 0.30 = strong, 0.10–0.30 = moderate, < 0.10 = weak); Mann-Whitney U + rank-biserial r for numeric features. With n = 7,043, p-values are near zero for any real effect — **effect size magnitude, not p-value, drives the ordering below.**
 
 | Feature | Method | Effect size | Key finding |
 |---|---|---|---|
 | Contract type | Cramér's V | **0.41** (strong) | Month-to-month: ~43 % churn; One year: ~11 %; Two year: < 3 % |
-| tenure | Rank-biserial r | **0.48** | Churners leave at median ~10 months; non-churners average 38 months |
+| tenure | Rank-biserial r | **−0.48** | Churners average 18 months; non-churners 38 months |
 | OnlineSecurity | Cramér's V | 0.35 (strong) | Churn ~2× higher without the service |
 | TechSupport | Cramér's V | 0.34 (strong) | Churn ~2× higher without the service |
 | InternetService | Cramér's V | 0.32 (strong) | Fiber optic carries disproportionately high churn |
 | PaymentMethod | Cramér's V | 0.30 (strong) | Electronic check is the highest-churn payment method |
-| TotalCharges | Rank-biserial r | 0.30 | Churners accumulate less ($1,532 vs $2,555) before leaving |
-| MonthlyCharges | Rank-biserial r | −0.24 | Churners pay *more* per month ($74 vs $61) — fiber optic concentration |
-| OnlineBackup | Cramér's V | 0.29 | Near-strong predictor |
-| DeviceProtection | Cramér's V | 0.28 | Near-strong predictor |
+| TotalCharges | Rank-biserial r | −0.30 | Churners accumulate less ($1,532 vs $2,555) before leaving |
+| MonthlyCharges | Rank-biserial r | +0.24 | Churners pay *more* per month ($74 vs $61) — fiber optic concentration |
+| OnlineBackup | Cramér's V | 0.29 | Non-subscribers churn more; partly structural (internet cluster), partly disengagement |
+| DeviceProtection | Cramér's V | 0.28 | Same pattern as OnlineBackup |
+| PaperlessBilling | Cramér's V | 0.19 | Elevated churn — proxy for month-to-month and fiber optic mix, not a direct effect |
+| Dependents | Cramér's V | 0.16 | Without dependents: above-average churn |
+| SeniorCitizen | Cramér's V | 0.15 | ~42 % churn vs ~24 % — likely mediated by contract type and internet service |
+| Partner | Cramér's V | 0.15 | Without a partner: above-average churn |
+| MultipleLines | Cramér's V | 0.04 | Statistically significant but practically negligible |
+| **PhoneService** | Cramér's V | **0.01** (p = 0.34) | **Non-predictor** |
+| **Gender** | Cramér's V | **0.008** (p = 0.49) | **Non-predictor** |
 
-### Non-predictors
+**Interpretive notes:**
 
-- **PhoneService** (V = 0.01, p = 0.34) and **gender** (V = 0.008, p = 0.49) are statistically non-significant.
-- `PhoneService_Yes` has the highest finite VIF (~1,774) yet is not predictive of churn — a clean illustration of why multicollinearity screening does **not** replace significance testing. VIF measures collinearity between features, not relevance to the target.
+- **Fiber optic churn** operates through two overlapping channels: a cost channel (average $91.50/month vs $58.10 for DSL — a 57 % premium) and a potential service quality channel. The data cannot separate the two; feature importance in the modelling phase will clarify each channel's contribution.
+- **Payment method and paperless billing reflect commitment depth, not direct drivers.** Automated payment methods (bank transfer, credit card) are associated with lower churn — consistent with greater friction to cancel. Paperless billing's elevated churn is a proxy for the month-to-month and fiber optic mix.
+- **Senior citizen churn** (~42 % vs ~24 %) is likely mediated by contract type and internet service; the EDA cannot decompose the independent age contribution. No systematic age-based under-service is evident in the error analysis (§6).
+- **`PhoneService_Yes`** has VIF = ∞ (perfectly collinear with `MultipleLines_No phone service`) yet V = 0.01 — the clearest illustration that VIF measures collinearity between features, not relevance to the target.
 
-### Key interaction effects
+### Interaction effects
 
-- **Senior citizens** show higher churn not as an independent age effect but because 70.7 % of seniors are on month-to-month contracts (vs 52.0 % for non-seniors) and 72.8 % are on fiber optic (vs 38.4 %). The age signal is entirely mediated by contract type and internet service. `SeniorCitizen` does not appear in the top 15 SHAP features.
-- **Fiber optic churn** operates through two overlapping channels: a cost channel (average $91.50/month vs $58.10 for DSL, a 57 % monthly premium) and a potential service quality channel. Both `InternetService_Fiber optic` and `MonthlyCharges` retain independent gain and SHAP signal, confirming compounding rather than additive risk.
-- **TotalCharges** remains independently informative despite high VIF (10.8). Only 8.7 % of customers have TotalCharges = MonthlyCharges × tenure exactly; mean billing deviation is $45.09, confirming TotalCharges captures genuine plan history beyond simple arithmetic.
+- **Contract type shows an asymmetric correlation with churn.** `contract_type_Month-to-month` correlates positively at r ≈ +0.40, while `contract_type_Two year` correlates negatively at only r ≈ −0.30 — lack of commitment pushes harder toward churn than long-term commitment protects against it.
+- **Contract type × internet service compound interaction.** Within each internet tier, contract type dominates — fiber optic churn falls from 54.6 % (month-to-month) to 7.2 % (two-year), a 47 pp drop. Within each contract tier, fiber optic customers always churn more than DSL. The gap between fiber optic and DSL *narrows* as contracts lengthen (22 pp on month-to-month, 10 pp on one-year, 5 pp on two-year), confirming that contract lock-in partially suppresses the fiber optic risk premium. The highest-risk cohort is specifically *fiber optic + month-to-month*:
 
-### Charge feature directionality (important)
+| Contract type | Fiber optic | DSL | No internet |
+|---|---|---|---|
+| Month-to-month | 54.6 % | 32.2 % | 18.9 % |
+| One year | 19.3 % | 9.3 % | 2.5 % |
+| Two year | 7.2 % | 1.9 % | 0.8 % |
 
-- High `MonthlyCharges` → **higher churn risk** (fiber optic concentration)
-- High `TotalCharges` → **lower churn risk** (only long-tenure customers accumulate high totals)
-- These move in opposite directions because they measure different things. Both are retained.
+### Feature correlations
+
+Three key patterns emerge from the full encoded correlation matrix:
+
+- **`TotalCharges` is the hub of the numeric feature cluster.** It correlates strongly with both `tenure` (longer-tenured customers accumulate more total charges) and `monthlycharges` (higher monthly spend compounds over time). As noted in Key findings, billing amounts shift over time for ~91 % of customers, so `totalcharges` retains independent predictive signal despite this correlation.
+- **Add-on service features form a tight structural cluster.** OnlineSecurity, OnlineBackup, TechSupport, DeviceProtection, StreamingTV, and StreamingMovies correlate strongly with one another and with InternetService — no-internet customers receive "No internet service" across all six add-on columns simultaneously, making the cluster identification-equivalent rather than independently informative.
+- **Most other feature pairs carry weak-to-moderate correlations**, indicating the remaining features contribute relatively independent signal.
 
 ### Multicollinearity (VIF)
 
-Several features have infinite or very high VIF due to structural dependencies (all add-on `_No internet service` dummies are linearly dependent on `InternetService_No`). This is a linear model problem only. **Tree-based ensembles split one feature at a time and are immune to collinearity.** No columns were dropped on this basis.
+VIF > 10 flags severe multicollinearity. **14 of 30 encoded features** exceed this threshold:
+
+- **9 features return VIF = ∞:** `internetservice_No` and the six `_No internet service` add-on dummies are perfectly collinear — the same customers carry all seven simultaneously. `phoneservice_Yes` and `multiplelines_No phone service` form the second infinite cluster — customers without phone service are always coded "No phone service" across MultipleLines.
+- **5 features return high finite VIF:** `monthlycharges` (≈ 866, driven by internet service tier and `totalcharges` accumulation), `internetservice_Fiber optic` (≈ 149), `streamingtv_Yes` and `streamingmovies_Yes` (≈ 24 each), and `totalcharges` (≈ 11).
+
+The remaining 16 features all have VIF ≤ 10, with `seniorcitizen` (≈ 1.15) and `gender_Male` (1.00) effectively orthogonal to all other features.
+
+**All 30 features are carried forward into feature engineering.** The practical impact of multicollinearity is model-family-dependent: tree-based methods (LightGBM, XGBoost, RandomForest) are immune — each split is evaluated independently and collinearity does not distort estimates. Linear models are materially affected and would require feature consolidation or regularisation. The null-importance experiment during model training (§5) is the explicit gate for any feature pruning.
 
 ---
 
@@ -143,9 +194,8 @@ Several features have infinite or very high VIF due to structural dependencies (
 | Churn values in {Yes, No} | PASS | Exactly two unique values |
 
 **Missing value treatment:**
-- 11 `TotalCharges` NaN rows (0.16 %) belong to customers with `tenure = 0` — first bill not yet issued.
+- 11 `TotalCharges` NaN rows (0.16 %) belong to customers with `tenure = 0` — first bill not yet issued. This is structurally determined missingness, not random.
 - **Decision: rows retained**; imputed via `SimpleImputer(strategy='median')` inside the preprocessing pipeline.
-- No outliers removed: IQR bounds encompass the full range for all three numeric features. Tree-based ensembles are robust to extreme values.
 
 ---
 

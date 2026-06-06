@@ -201,7 +201,7 @@ TelcoChurn_PortfolioProject/
 | 0 | Project foundation | `pyproject.toml`, pre-commit, skeleton dirs, Hydra root, structlog | ✅ Done |
 | 1 | Data ingestion (CSV → Postgres) | `docker-compose.yml`, `sql/schema/`, `data/ingest.py` | ✅ Done |
 | 2 | Data validation (Pandera + 5 gates) | `data/schema.py`, `data/checks.py`, `data/validate.py`, 40 tests | ✅ Done |
-| 3 | EDA notebook | `notebooks/01-eda.ipynb` importing from `src/` | Not started |
+| 3 | EDA notebook | `notebooks/01-eda.ipynb` importing from `src/` | ✅ Done |
 | 4 | Feature engineering (SQL + Python) | `sql/features/*.sql`, `features/sql_features.py`, `features/build.py` | Not started |
 | 5 | Model training (LightGBM + Optuna + MLflow) | `models/train.py`, `configs/model/`, `configs/training/` | Not started |
 | 6 | Calibration + cost-sensitive threshold | `models/calibrate.py`, `models/threshold.py` | Not started |
@@ -302,7 +302,7 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 
 > The original `notebooks/_archive/EDA-original.ipynb` remains frozen. It is the authoritative reference for all modelling decisions; it is not retroactively split or edited.
 
-**Verification:** Notebook executes end-to-end without errors (`jupyter nbconvert --execute notebooks/01-eda.ipynb`).
+**Verification:** Notebook executes end-to-end without errors (`uv run jupyter nbconvert --to notebook --execute --inplace notebooks/01-eda.ipynb`).
 
 ---
 
@@ -323,6 +323,11 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 > | Error analysis (diagnose) | *finds* where the model fails | Phase 7 | **Confirmatory** — validates the shipped model; does **not** reopen engineering |
 >
 > In a greenfield build, engineering is a *loop* (error analysis → new feature → re-model, 2–5× — "data-centric" iteration); the linear phase list shows only the first pass. This project migrates a loop that **already converged**, so it engineers once. The loop genuinely reopens only for the **next model version**, driven by post-deployment monitoring and drift (Phases 10 & 13) on the retrain cadence — not within this build.
+
+> **Interaction checks (open `notebooks/02-feature-experiments.ipynb`):** before building any interaction feature, verify the interaction exists in the data. Two checks are required at the top of the notebook — each is a pivot of churn rate over two features, identical in structure to the `contract_type × internetservice` table in `01-eda.ipynb §8d`:
+> 1. **`tenure_cohort × contract_type`** — is the churn-rate drop across contract tiers steeper for short-tenure customers than for long-tenure ones? If yes, the combination carries more signal than either feature alone and a `tenure_cohort × contract_type` interaction column is justified.
+> 2. **`tenure_cohort × internetservice`** — is the fiber optic churn premium concentrated in the first year, or does it persist across all tenure bands? If the premium shrinks with tenure, a `tenure_cohort × internetservice` interaction column is justified.
+> Build the interaction feature only if the cross-tab confirms the interaction; document the decision (keep or skip) and the supporting numbers as a markdown cell immediately below each pivot.
 
 **Deliverables:**
 - `sql/features/tenure_buckets.sql` — `CASE`-based tenure cohorts (e.g., 0–12, 13–24, 25–48, 49+ months)
@@ -396,6 +401,8 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 - `notebooks/04-calibration-and-threshold.ipynb` — reliability diagrams before and after calibration; cost curve annotated with each scenario threshold
 
 **Verification:** Calibrated Brier score ≤ uncalibrated Brier score; base-scenario threshold matches the value documented in `README.md`.
+
+> **⚠ Layout flag (from Phase 3):** Add `reports/figures/` to the repository layout in the "Repository Layout (target)" section when this phase lands. `reports/` is already used implicitly (Phase 2 writes `reports/validation/`, Phase 7 writes `reports/metrics.json`) but was omitted from the top-level layout. Phase 6 is the first phase to save evaluation charts (reliability diagrams, cost curves) to disk, making the omission visible. Update the layout table and add `reports/figures/` as the destination for saved charts.
 
 ---
 
