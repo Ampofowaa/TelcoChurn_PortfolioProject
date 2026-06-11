@@ -7,6 +7,8 @@ error analysis, SHAP explainability, calibration, threshold optimisation, and bu
 All analysis is reproducible from `notebooks/_archive/EDA-original.ipynb`.
 The `src/` package implements the production-ready version of the same logic.
 
+> *Section numbers follow the analytical lifecycle and do not correspond to implementation phase numbers in `PROJECT_PLAN.md`.*
+
 ---
 
 ## Table of Contents
@@ -103,7 +105,7 @@ These gates were set before the test set was opened. The final test-set results 
 ### Univariate distributions
 
 **Numeric features:**
-- `tenure` is bimodal (U-shaped): a spike at 0–5 months (new customers at highest inherent risk), a broad plateau from ~10–65 months (the stable retained cohort), and a second concentration at 65–72 months (long-term loyals) — consistent with a survival distribution. The 0–12 month cohort churns at ~48 %; by 49+ months that falls below 10 %.
+- `tenure` is bimodal (U-shaped): a spike at 0–5 months (new customers at highest inherent risk), a broad plateau from ~10–65 months (the stable retained cohort), and a second concentration at 65–72 months (long-term loyals) — consistent with a survival distribution. The 0–12 month cohort churns at ~47 %; by 49+ months that falls below 10 %.
 - `monthlycharges` shows a two-tier structure: a sharp spike at $18–20 (basic phone-only plans), then a broad spread to $120 with density skewed toward $75–120 (bundled internet + add-on packages).
 - `totalcharges` is right-skewed, with a long tail of high-value, long-tenure customers. Billing amounts shift over time for ~91 % of customers, so `totalcharges` carries signal independent of the other two numeric features.
 
@@ -177,7 +179,7 @@ VIF > 10 flags severe multicollinearity. **14 of 30 encoded features** exceed th
 
 The remaining 16 features all have VIF ≤ 10, with `seniorcitizen` (≈ 1.15) and `gender_Male` (1.00) effectively orthogonal to all other features.
 
-**All 30 features are carried forward into feature engineering.** The practical impact of multicollinearity is model-family-dependent: tree-based methods (LightGBM, XGBoost, RandomForest) are immune — each split is evaluated independently and collinearity does not distort estimates. Linear models are materially affected and would require feature consolidation or regularisation. The null-importance experiment during model training (§5) is the explicit gate for any feature pruning.
+**All features are retained — none are dropped on VIF grounds.** The practical impact of multicollinearity is model-family-dependent: tree-based methods (LightGBM, XGBoost, RandomForest) are immune — each split is evaluated independently and collinearity does not distort estimates. Linear models are materially affected and would require feature consolidation or regularisation. The null-importance experiment during model training (§5) is the explicit gate for any feature pruning.
 
 ---
 
@@ -201,39 +203,117 @@ The remaining 16 features all have VIF ≤ 10, with `seniorcitizen` (≈ 1.15) a
 
 ## 3. Feature Engineering
 
-Feature engineering was driven by **FN profiling** on the baseline model (error-driven iteration) rather than domain intuition alone.
+Features are built in two layers: **SQL views in Postgres** (tenure bucketing, charge-per-service ratio) and **Python-engineered features** (four hypothesis-driven columns). The SQL layer handles transformations that are efficient in a relational database and reusable across any downstream query; the Python layer adds signals that require conditional logic or ratios across multiple raw columns. Together they produce a 25-column feature DataFrame passed to the training pipeline.
 
-### Identified blind spots (val set, baseline LightGBM)
+All features are derived from current account attributes available at CRM serving time — no historical aggregates, future data, or target-adjacent signals.
 
-| Subgroup | FN rate | n (val) | Reliability |
-|---|---|---|---|
-| Contract = One year | 0.538 | 13 | Most reliable problem area |
-| DSL + tenure ≥ 25 months | 0.333 | 6 | Directional, small n |
-| Month-to-month | 0.037 | — | Best-caught segment |
-| Fiber optic | 0.019 | — | Best-caught segment |
+---
 
-The model thoroughly learns the high-risk profile (short tenure + fiber optic + month-to-month) but applies a strong "loyal customer" prior to customers who churn after years of moderate-cost service.
+### SQL-engineered features
 
-### Three hypothesis-driven features tested
+#### `tenure_cohort` — tenure bucketing
 
-| Feature | Construction | Hypothesis |
+**What it is:** Each customer is assigned to one of four tenure bands — 0–12 mo, 13–24 mo, 25–48 mo, 49+ mo — based on how long they have been a customer.
+
+**Why it matters:** Churn risk does not decline uniformly with each additional month of tenure — it drops in meaningful jumps at cohort boundaries. A customer who has just crossed into a later cohort behaves noticeably differently from one still in the previous group.
+
+| Cohort | Customers | Churn rate |
 |---|---|---|
-| `is_long_month_to_month` | tenure > 24 AND month-to-month | Long-tenured month-to-month customers have low tenure signal but still lack exit barriers |
-| `charge_per_service` | MonthlyCharges ÷ count of active services | Over-charged, under-served customers — high cost relative to value received |
-| `monthly_to_total_ratio` | MonthlyCharges ÷ TotalCharges | Isolates newly-expensive customers with insufficient billing history |
+| 0–12 mo | 2,186 | **47.4 %** |
+| 13–24 mo | 1,024 | 28.7 % |
+| 25–48 mo | 1,594 | 20.4 % |
+| 49+ mo | 2,239 | **9.5 %** |
 
-### Adoption decision
+The 0–12 mo cohort churns at roughly **5× the rate** of the 49+ mo cohort.
 
-| Metric | Baseline | With engineered features | Gate |
+**Design decision:** Both `tenure` (exact month count) and `tenure_cohort` (risk tier) are kept. Exact tenure tells the model *where* a customer sits within a group; the cohort label tells it *which risk tier* they belong to. The two carry complementary information and neither subsumes the other.
+
+---
+
+#### `charge_per_service` — monthly charge per active subscription
+
+**What it is:** Each customer's monthly charges divided by the number of active service subscriptions they hold (phone, multiple lines, internet, and six add-on services — nine binary flags in total).
+
+**Why it matters:** A raw monthly bill can be misleading. A customer paying $80/month across eight subscriptions is getting reasonable value per service; one paying the same for two is paying a steep price per subscription. `charge_per_service` puts all customers on a like-for-like basis.
+
+The distribution splits into four natural clusters with a sharp churn step at the $24 threshold:
+
+| Band | Avg services | Median monthly ($) | Churn rate |
 |---|---|---|---|
-| Overall CV recall | 0.8431 | 0.8394 | PASS (Δ < 0.005 tolerance) |
-| Subgroup recall (benchmark FN group) | 0.3333 | 0.1667 | **FAIL (direction reversed)** |
+| $10–16 | 5.6 | 69.80 | 15 % |
+| $16–24 | 3.1 | 50.65 | 31 % |
+| **$24–30** | **2.7** | **75.05** | **57 %** |
+| $30+ | 2.0 | 70.05 | 59 % |
 
-**Decision: all three engineered features discarded.** Both gates must pass; subgroup gate failed.
+The step from 31 % to 57 % at the $24 mark is the sharpest in the distribution. Churners have a median of $18.94 per service versus $15.53 for non-churners — a signal that is not visible in raw `monthlycharges` alone because a high bill could simply mean the customer has many services rather than that they are overpaying for each one.
 
-**Root cause:** LightGBM constructs interaction splits internally. H1/H2/H3 interactions are already approximated via tree splits on the raw features; explicit engineering added redundant signal and marginal multicollinearity without improving the target blind spot.
+---
 
-**Limitation acknowledged:** The DSL + long-tenure blind spot is real but the val subgroup is too small (n = 6) for reliable measurement. This is a first-pass finding, not a closed issue.
+### Python-engineered features
+
+Three hypothesis-driven features (H1–H3) derived from the EDA's identified blind spots, producing four engineered columns — H3 contributes two (`fiber_contract` and `dsl_contract`, one per internet tier). Each targets a segment where raw features send a misleading signal to the model.
+
+---
+
+#### H1: `is_long_month_to_month` — exit-barrier blind spot
+
+**Hypothesis:** Customers on a month-to-month contract who have stayed past 24 months look loyal by tenure alone, but they have never committed to a longer term — raw tenure underestimates their churn risk.
+
+**Evidence:** Month-to-month churn falls steadily across cohorts (51.4 % → 37.7 % → 32.9 % → 26.0 %) but never fully settles — even at 49+ months, MTM customers still churn at roughly the dataset average. By contrast, two-year contract customers show near-zero churn in the first two cohorts and remain below 4 % throughout.
+
+| Cohort | MTM churn | Two-year churn | Gap (pp) |
+|---|---|---|---|
+| 0–12 mo | 51.4 % | 0.0 % | 51.4 |
+| 13–24 mo | 37.7 % | 0.0 % | 37.7 |
+| 25–48 mo | 32.9 % | 2.2 % | 30.7 |
+| 49+ mo | 26.0 % | 3.3 % | 22.7 |
+
+The gap narrows but never closes — confirming the interaction is real.
+
+**Result:** 1,144 customers flagged (16.2 % of the dataset). Of those, **30.9 % churn** versus **25.7 %** for the rest — a **5.2 pp gap**. Roughly 1 in 3 customers who have been on a monthly contract for over two years will leave, a rate higher than the dataset average despite their long tenure.
+
+---
+
+#### H2: `monthly_to_total_ratio` — thin billing history
+
+**Hypothesis:** `TotalCharges` grows automatically with tenure and is mainly a proxy for seniority. A low total could mean a loyal new customer or someone about to leave after a short stay — the two are indistinguishable from `TotalCharges` alone. Dividing `MonthlyCharges` by `TotalCharges` produces a ratio close to 1 for someone who just started (total ≈ one month's bill) and falling toward 0 as billing history accumulates. This separates the ambiguous low-`TotalCharges` group into customers who are simply new versus those whose account history is too thin to assess.
+
+**Result:** Churners have a median ratio of **0.103** versus **0.027** for non-churners — roughly **4× higher**. Translating to approximate tenure (ratio ≈ 1/tenure): the median churner has been a customer for ~10 months; the median non-churner for ~37 months.
+
+The churner population is a genuine mix: a large cluster of new customers at early-exit risk (>0.2 ratio), plus a meaningful long-tenure tail (<0.05 ratio) — customers who eventually leave after years of service. Non-churners concentrate heavily at the low end.
+
+*Note: 11 zero-tenure rows have `TotalCharges = NULL` and therefore `monthly_to_total_ratio = NaN`. These are preserved in the feature DataFrame and imputed by `SimpleImputer(strategy='median')` in the training pipeline.*
+
+---
+
+#### H3: `fiber_contract` / `dsl_contract` — internet × contract interaction
+
+**Hypothesis:** Fiber optic customers churn at the highest rate of any internet tier; month-to-month customers churn at the highest rate of any contract type. These two risk factors do not combine additively. A fiber optic customer on a two-year contract has made a commitment that partially offsets the fiber churn tendency; a fiber optic customer on a month-to-month plan has both risk factors at once with nothing to offset either. The individual `contract_type` and `internetservice` columns each carry this information separately but cannot represent when the two coincide.
+
+**Evidence:** Churn rates vary substantially *within* each internet tier depending on contract type:
+
+| Contract type | Fiber optic | DSL | No internet |
+|---|---|---|---|
+| Month-to-month | 54.6 % | 32.2 % | 18.9 % |
+| One year | 19.3 % | 9.3 % | 2.5 % |
+| Two year | 7.2 % | 1.9 % | 0.8 % |
+
+Fiber optic spans **47 pp** across contract types; DSL spans **30 pp**. This within-tier variation cannot be recovered from the individual encoded columns alone.
+
+**Design decision:** Two 4-level categoricals rather than binary MTM flags or a full 9-level crossing. Binary MTM flags would capture only the highest-risk cell in each tier and discard the remaining variation. The full 9-level crossing would encode all combinations, including the seven sitting at or below average, adding noise without signal. The chosen design creates one categorical per high-risk internet tier — `fiber_contract` takes values `Month-to-month_Fiber optic`, `One year_Fiber optic`, `Two year_Fiber optic`, and `Not Fiber optic`; `dsl_contract` mirrors this for DSL. Customers on no internet service are handled by the individual encoded columns; their churn rates vary by contract type (18.9 % month-to-month, 2.5 % one-year, 0.8 % two-year) but all fall below the dataset average, and the contract_type encoding already captures this variation.
+
+---
+
+### Feature inventory
+
+| Group | Count | Examples |
+|---|---|---|
+| Binary (OHE drop-if-binary) | 7 | `gender`, `seniorcitizen`, `is_long_month_to_month` |
+| Multi-category (OHE) | 13 | `contract_type`, `tenure_cohort`, `fiber_contract`, `dsl_contract` |
+| Numeric (impute → scale) | 5 | `tenure`, `monthlycharges`, `charge_per_service`, `monthly_to_total_ratio` |
+| **Total** | **25** | |
+
+The `ColumnTransformer` definition and fitting are model training responsibilities, applied to the training split only to prevent test-set statistics from leaking into preprocessing parameters.
 
 ---
 

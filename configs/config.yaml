@@ -16,7 +16,8 @@ mlflow:
 paths:
   raw_data: datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv
   interim_data: datasets/interim/
-  processed_data: datasets/processed/
+  processed_data: ${oc.env:PROCESSED_DATA_DIR,datasets/processed/}
+  sql_features: sql/features
   reports: reports/
 
 validation:

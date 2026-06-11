@@ -11,7 +11,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--run-integration",
         action="store_true",
         default=False,
-        help="Run integration tests (requires Docker services via `make db-up`).",
+        help="Run integration tests — testcontainers tests are self-contained; Compose-backed tests additionally require `make db-up`.",
     )
 
 
@@ -21,7 +21,9 @@ def pytest_collection_modifyitems(
     """Skip integration-marked tests unless --run-integration is passed."""
     if config.getoption("--run-integration"):
         return
-    skip = pytest.mark.skip(reason="requires Docker — pass --run-integration to run")
+    skip = pytest.mark.skip(
+        reason="integration test skipped — pass --run-integration to run"
+    )
     for item in items:
         if item.get_closest_marker("integration"):
             item.add_marker(skip)

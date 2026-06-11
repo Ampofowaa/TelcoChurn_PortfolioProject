@@ -10,6 +10,8 @@
     }
   },
   "mypy-type-checker.args": ["--config-file=pyproject.toml"],
+  "mypy-type-checker.preferDaemon": false,
+  "mypy-type-checker.importStrategy": "fromEnvironment",
   "ruff.configuration": "pyproject.toml",
   "python.terminal.useEnvFile": true,
   "python.analysis.typeCheckingMode": "off"
