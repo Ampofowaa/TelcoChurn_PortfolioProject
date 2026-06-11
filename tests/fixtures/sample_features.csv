@@ -1,0 +1,14 @@
+customerID,gender,SeniorCitizen,Partner,Dependents,tenure,PhoneService,MultipleLines,InternetService,OnlineSecurity,OnlineBackup,DeviceProtection,TechSupport,StreamingTV,StreamingMovies,Contract,PaperlessBilling,PaymentMethod,MonthlyCharges,TotalCharges,Churn
+7590-VHVEG,Female,0,Yes,No,1,No,No phone service,DSL,No,Yes,No,No,No,No,Month-to-month,Yes,Electronic check,29.85,29.85,No
+5575-GNVDE,Male,0,No,No,34,Yes,No,DSL,Yes,No,Yes,No,No,No,One year,No,Mailed check,56.95,1889.50,No
+3668-QPYBK,Male,0,No,No,2,Yes,No,DSL,Yes,Yes,No,No,No,No,Month-to-month,Yes,Mailed check,53.85,108.15,Yes
+7795-CFOCW,Male,0,No,No,45,No,No phone service,DSL,Yes,No,Yes,Yes,No,No,One year,No,Bank transfer (automatic),42.30,1840.75,No
+zero-tenure,Female,0,No,No,0,No,No phone service,DSL,No,No,No,No,No,No,Month-to-month,Yes,Electronic check,20.00, ,No
+boundary-12,Female,0,No,No,12,Yes,No,DSL,No,No,No,No,No,No,Month-to-month,No,Mailed check,50.00,600.00,No
+boundary-13,Female,0,No,No,13,Yes,No,DSL,No,No,No,No,No,No,Month-to-month,No,Mailed check,50.00,650.00,No
+boundary-24,Female,0,No,No,24,Yes,No,DSL,No,No,No,No,No,No,Month-to-month,No,Mailed check,50.00,1200.00,No
+boundary-25,Female,0,No,No,25,Yes,No,DSL,No,No,No,No,No,No,Month-to-month,No,Mailed check,50.00,1250.00,No
+boundary-48,Female,0,No,No,48,Yes,No,DSL,No,No,No,No,No,No,Month-to-month,No,Mailed check,50.00,2400.00,No
+boundary-49,Female,0,No,No,49,Yes,No,DSL,No,No,No,No,No,No,Month-to-month,No,Mailed check,50.00,2450.00,No
+fiber-optic-1,Female,0,Yes,No,36,Yes,Yes,Fiber optic,No,No,No,No,No,No,Two year,No,Bank transfer (automatic),90.00,3240.00,No
+no-internet-1,Male,1,No,No,8,Yes,No,No,No internet service,No internet service,No internet service,No internet service,No internet service,No internet service,Month-to-month,Yes,Electronic check,19.90,159.20,No

@@ -1,0 +1,394 @@
+"""Integration tests: SQL feature views via testcontainers Postgres."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+
+import pandas as pd
+import pytest
+from omegaconf import OmegaConf
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from testcontainers.postgres import PostgresContainer
+
+from telco_churn.data.ingest import ingest
+from telco_churn.features import (
+    BINARY_INT_COLS,
+    BINARY_STR_COLS,
+    MULTI_CAT_COLS,
+    NUMERIC_COLS,
+    PYTHON_ENGINEERED_COLS,
+    SQL_FEATURE_COLS,
+    build_feature_df,
+    build_sql_features,
+)
+
+pytestmark = pytest.mark.integration
+
+_FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
+_RAW_COUNT = 13
+
+
+@pytest.fixture(scope="module")
+def sql_dir() -> Path:
+    """Resolve the SQL features directory from config at execution time, not collection time."""
+    return Path(OmegaConf.load("configs/config.yaml").paths.sql_features)
+
+
+@pytest.fixture(scope="module")
+def pg_engine() -> Iterator[Engine]:
+    """Ephemeral Postgres 16 container seeded with sample data and feature views."""
+    with PostgresContainer("postgres:16") as pg:
+        engine = create_engine(pg.get_connection_url())
+        yield engine
+        engine.dispose()
+
+
+@pytest.fixture(scope="module")
+def pg_url(pg_engine: Engine) -> str:
+    """Full connection URL for the testcontainers Postgres instance."""
+    return pg_engine.url.render_as_string(hide_password=False)
+
+
+@pytest.fixture(scope="module")
+def seeded_engine(pg_engine: Engine, sql_dir: Path) -> Engine:
+    """Ingest sample CSV and build SQL feature views once for the module."""
+    ingest(_FIXTURES_DIR / "sample_features.csv", pg_engine)
+    build_sql_features(pg_engine, sql_dir)
+    return pg_engine
+
+
+# ---------------------------------------------------------------------------
+# tenure_buckets view
+# ---------------------------------------------------------------------------
+
+
+def test_tenure_buckets_row_count_matches_raw(seeded_engine: Engine) -> None:
+    """tenure_buckets view has the same row count as customers_raw."""
+    with seeded_engine.connect() as conn:
+        raw = conn.execute(text("SELECT COUNT(*) FROM customers_raw")).scalar()
+        view = conn.execute(text("SELECT COUNT(*) FROM tenure_buckets")).scalar()
+    assert view == raw == _RAW_COUNT
+
+
+def test_tenure_buckets_no_null_cohort(seeded_engine: Engine) -> None:
+    """Every row in tenure_buckets has a non-NULL tenure_cohort."""
+    with seeded_engine.connect() as conn:
+        nulls = conn.execute(
+            text("SELECT COUNT(*) FROM tenure_buckets WHERE tenure_cohort IS NULL")
+        ).scalar()
+    assert nulls == 0
+
+
+def test_tenure_buckets_correct_label_for_short_tenure(seeded_engine: Engine) -> None:
+    """tenure=1 maps to '0–12 mo'."""
+    with seeded_engine.connect() as conn:
+        cohort = conn.execute(
+            text(
+                "SELECT tenure_cohort FROM tenure_buckets " "WHERE customerid = :id"
+            ).bindparams(id="7590-VHVEG")
+        ).scalar()
+    assert cohort == "0–12 mo"
+
+
+def test_tenure_buckets_correct_label_for_long_tenure(seeded_engine: Engine) -> None:
+    """tenure=45 maps to '25–48 mo'."""
+    with seeded_engine.connect() as conn:
+        cohort = conn.execute(
+            text(
+                "SELECT tenure_cohort FROM tenure_buckets " "WHERE customerid = :id"
+            ).bindparams(id="7795-CFOCW")
+        ).scalar()
+    assert cohort == "25–48 mo"
+
+
+def test_tenure_buckets_zero_tenure_bucket(seeded_engine: Engine) -> None:
+    """tenure=0 maps to '0–12 mo' (include_lowest boundary)."""
+    with seeded_engine.connect() as conn:
+        cohort = conn.execute(
+            text(
+                "SELECT tenure_cohort FROM tenure_buckets " "WHERE customerid = :id"
+            ).bindparams(id="zero-tenure")
+        ).scalar()
+    assert cohort == "0–12 mo"
+
+
+@pytest.mark.parametrize(
+    ("customerid", "expected_cohort"),
+    [
+        ("boundary-12", "0–12 mo"),  # upper edge of first band
+        ("boundary-13", "13–24 mo"),  # lower edge of second band
+        ("boundary-24", "13–24 mo"),  # upper edge of second band
+        ("boundary-25", "25–48 mo"),  # lower edge of third band
+        ("boundary-48", "25–48 mo"),  # upper edge of third band
+        ("boundary-49", "49+ mo"),  # lower edge of final band
+    ],
+)
+def test_tenure_buckets_fencepost_values(
+    seeded_engine: Engine, customerid: str, expected_cohort: str
+) -> None:
+    """Each bucket boundary value maps to the correct cohort label."""
+    with seeded_engine.connect() as conn:
+        cohort = conn.execute(
+            text(
+                "SELECT tenure_cohort FROM tenure_buckets " "WHERE customerid = :id"
+            ).bindparams(id=customerid)
+        ).scalar()
+    assert cohort == expected_cohort
+
+
+# ---------------------------------------------------------------------------
+# charge_per_service view
+# ---------------------------------------------------------------------------
+
+
+def test_charge_per_service_row_count_matches_raw(seeded_engine: Engine) -> None:
+    """charge_per_service view has the same row count as customers_raw."""
+    with seeded_engine.connect() as conn:
+        raw = conn.execute(text("SELECT COUNT(*) FROM customers_raw")).scalar()
+        view = conn.execute(text("SELECT COUNT(*) FROM charge_per_service")).scalar()
+    assert view == raw == _RAW_COUNT
+
+
+def test_charge_per_service_no_null(seeded_engine: Engine) -> None:
+    """charge_per_service is never NULL (GREATEST prevents divide-by-zero)."""
+    with seeded_engine.connect() as conn:
+        nulls = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM charge_per_service "
+                "WHERE charge_per_service IS NULL"
+            )
+        ).scalar()
+    assert nulls == 0
+
+
+def test_charge_per_service_positive(seeded_engine: Engine) -> None:
+    """charge_per_service is positive for all rows."""
+    with seeded_engine.connect() as conn:
+        non_pos = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM charge_per_service "
+                "WHERE charge_per_service <= 0"
+            )
+        ).scalar()
+    # No zero-monthlycharges row in the sample; 0.0 / N = 0.0 would be flagged by this assertion.
+    assert non_pos == 0
+
+
+def test_charge_per_service_lte_monthly_charges(seeded_engine: Engine) -> None:
+    """charge_per_service <= monthlycharges for all rows (at least one service)."""
+    with seeded_engine.connect() as conn:
+        violators = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM charge_per_service cps "
+                "JOIN customers_raw r ON cps.customerid = r.customerid "
+                "WHERE cps.charge_per_service > r.monthlycharges + 0.001"
+            )
+        ).scalar()
+    assert violators == 0
+
+
+def test_charge_per_service_fiber_optic_counts_as_internet(
+    seeded_engine: Engine,
+) -> None:
+    """Fiber optic triggers internetservice <> 'No': phone(1)+multilines(1)+internet(1)=3; 90/3=30."""
+    with seeded_engine.connect() as conn:
+        val = conn.execute(
+            text(
+                "SELECT charge_per_service FROM charge_per_service "
+                "WHERE customerid = :id"
+            ).bindparams(id="fiber-optic-1")
+        ).scalar()
+    assert float(val) == pytest.approx(30.00)
+
+
+def test_charge_per_service_no_internet_excluded_from_flag(
+    seeded_engine: Engine,
+) -> None:
+    """InternetService='No' contributes 0 to service_count: phone(1) only; 19.90/1=19.90."""
+    with seeded_engine.connect() as conn:
+        val = conn.execute(
+            text(
+                "SELECT charge_per_service FROM charge_per_service "
+                "WHERE customerid = :id"
+            ).bindparams(id="no-internet-1")
+        ).scalar()
+    assert float(val) == pytest.approx(19.90)
+
+
+@pytest.mark.parametrize(
+    ("customerid", "expected"),
+    [
+        # phone=No(0), multilines='No phone service'(0), internet=DSL(1),
+        # onlinebackup=Yes(1) → service_count=2; 29.85/2=14.925
+        ("7590-VHVEG", 14.925),
+    ],
+)
+def test_charge_per_service_value_correctness(
+    seeded_engine: Engine, customerid: str, expected: float
+) -> None:
+    """charge_per_service equals monthlycharges / service_count for a known row."""
+    with seeded_engine.connect() as conn:
+        val = conn.execute(
+            text(
+                "SELECT charge_per_service FROM charge_per_service "
+                "WHERE customerid = :id"
+            ).bindparams(id=customerid)
+        ).scalar()
+    assert float(val) == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# customer_features view
+# ---------------------------------------------------------------------------
+
+
+def test_customer_features_row_count_matches_raw(seeded_engine: Engine) -> None:
+    """customer_features view preserves all rows from customers_raw."""
+    with seeded_engine.connect() as conn:
+        raw = conn.execute(text("SELECT COUNT(*) FROM customers_raw")).scalar()
+        view = conn.execute(text("SELECT COUNT(*) FROM customer_features")).scalar()
+    assert view == raw == _RAW_COUNT
+
+
+def test_customer_features_tenure_cohort_no_null(seeded_engine: Engine) -> None:
+    """tenure_cohort is non-NULL for every row in customer_features."""
+    with seeded_engine.connect() as conn:
+        nulls = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM customer_features " "WHERE tenure_cohort IS NULL"
+            )
+        ).scalar()
+    assert nulls == 0
+
+
+def test_customer_features_charge_per_service_no_null(seeded_engine: Engine) -> None:
+    """charge_per_service is non-NULL for every row in customer_features."""
+    with seeded_engine.connect() as conn:
+        nulls = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM customer_features "
+                "WHERE charge_per_service IS NULL"
+            )
+        ).scalar()
+    assert nulls == 0
+
+
+def test_customer_features_contains_expected_columns(seeded_engine: Engine) -> None:
+    """customer_features exposes tenure_cohort and charge_per_service alongside raw cols."""
+    with seeded_engine.connect() as conn:
+        row = (
+            conn.execute(text("SELECT * FROM customer_features LIMIT 1"))
+            .mappings()
+            .fetchone()
+        )
+    assert row is not None
+    cols = set(row.keys())
+    assert "tenure_cohort" in cols
+    assert "charge_per_service" in cols
+    assert "churn" in cols
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline: customer_features view → build_feature_df
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def feature_df(seeded_engine: Engine) -> pd.DataFrame:
+    """DataFrame produced by the full SQL → build_feature_df pipeline."""
+    df_raw = pd.read_sql_table(
+        "customer_features", seeded_engine, columns=SQL_FEATURE_COLS
+    )
+    return build_feature_df(df_raw)
+
+
+def test_pipeline_row_count(feature_df: pd.DataFrame) -> None:
+    """Pipeline preserves all rows from customers_raw."""
+    assert feature_df.shape[0] == _RAW_COUNT
+
+
+def test_pipeline_all_feature_columns_present(feature_df: pd.DataFrame) -> None:
+    """All declared feature columns are present after the SQL → Python pipeline."""
+    for col in BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS:
+        assert col in feature_df.columns
+
+
+def test_pipeline_python_engineered_columns_added(feature_df: pd.DataFrame) -> None:
+    """Python-engineered columns are absent from the view but present after build_feature_df."""
+    for col in PYTHON_ENGINEERED_COLS:
+        assert col in feature_df.columns
+
+
+def test_pipeline_no_unexpected_nulls(feature_df: pd.DataFrame) -> None:
+    """Only totalcharges and monthly_to_total_ratio may be null in pipeline output."""
+    nullable = {"totalcharges", "monthly_to_total_ratio"}
+    non_nullable = [
+        c
+        for c in BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS
+        if c not in nullable
+    ]
+    assert not feature_df[non_nullable].isnull().any().any()
+
+
+def test_pipeline_csv_write_shape(
+    seeded_engine: Engine, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Pipeline output written to CSV has the expected shape."""
+    df_raw = pd.read_sql_table(
+        "customer_features", seeded_engine, columns=SQL_FEATURE_COLS
+    )
+    df_out = build_feature_df(df_raw)
+    out_path = tmp_path_factory.mktemp("out") / "processed.csv"
+    df_out.to_csv(out_path, index=False)
+
+    df_loaded = pd.read_csv(out_path)
+    expected_cols = (
+        len(BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS) + 2
+    )  # + customerid + churn
+    assert df_loaded.shape == (_RAW_COUNT, expected_cols)
+
+
+# ---------------------------------------------------------------------------
+# __main__ CLI composition: load_dotenv → OmegaConf.load → get_engine →
+#   read_sql_table → build_feature_df → CSV write
+# ---------------------------------------------------------------------------
+
+
+def test_build_main_cli_composition(
+    seeded_engine: Engine,
+    pg_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Full build.py __main__ composition runs end-to-end and produces the expected CSV.
+
+    CLAUDE.md: every __main__ entry point requires an integration test exercising the
+    full composition path (DB read → transform → file write). seeded_engine ensures
+    customers_raw is populated before the subprocess connects.
+    """
+    out_dir = tmp_path_factory.mktemp("build_cli")
+    _project_root = Path(__file__).parents[2]
+
+    env = {**os.environ, "POSTGRES_URL": pg_url, "PROCESSED_DATA_DIR": str(out_dir)}
+    result = subprocess.run(
+        [sys.executable, "-m", "telco_churn.features.build"],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=str(_project_root),
+    )
+    assert (
+        result.returncode == 0
+    ), f"build CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+
+    out_path = out_dir / "telco_churn_processed.csv"
+    assert out_path.exists(), "processed CSV was not written by the CLI"
+    df = pd.read_csv(out_path)
+    expected_cols = (
+        len(BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS) + 2
+    )  # + customerid + churn
+    assert df.shape == (_RAW_COUNT, expected_cols)
