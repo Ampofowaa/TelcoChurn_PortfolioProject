@@ -57,6 +57,27 @@ def test_cleaned_schema_rejects_null_totalcharges(valid_raw_df: pd.DataFrame) ->
     assert result.passed is False
 
 
+def test_cleaned_schema_rejects_totalcharges_below_monthlycharges(
+    valid_raw_df: pd.DataFrame,
+) -> None:
+    """CleanedSchema rejects totalcharges < monthlycharges for a billed customer (tenure >= 1)."""
+    df = valid_raw_df.copy()
+    # Row 0 has tenure=12; setting totalcharges below monthlycharges violates the invariant.
+    df.loc[0, "totalcharges"] = df.loc[0, "monthlycharges"] * 0.5
+    result = check_schema(df, cleaned=True)
+    assert result.passed is False
+
+
+def test_cleaned_schema_allows_totalcharges_equal_monthlycharges(
+    valid_raw_df: pd.DataFrame,
+) -> None:
+    """CleanedSchema accepts totalcharges == monthlycharges (first billing cycle)."""
+    df = valid_raw_df.copy()
+    df.loc[0, "totalcharges"] = df.loc[0, "monthlycharges"]
+    result = check_schema(df, cleaned=True)
+    assert result.passed is True
+
+
 def test_raw_schema_accepts_null_totalcharges(
     zero_tenure_df: pd.DataFrame,
 ) -> None:
@@ -95,6 +116,17 @@ def test_unexpected_column_fails_schema_check(valid_raw_df: pd.DataFrame) -> Non
     """An extra column not in RawSchema fails Gate 1 — strict=True is enforced."""
     df = valid_raw_df.copy()
     df["unexpected_column"] = 0
+    result = check_schema(df)
+    assert result.passed is False
+    assert result.failure_severity == Severity.ERROR
+
+
+def test_zero_totalcharges_with_nonzero_monthly_fails_schema_check(
+    valid_raw_df: pd.DataFrame,
+) -> None:
+    """totalcharges=0.0 with monthlycharges>0 is a pipeline integrity violation caught by Gate 1."""
+    df = valid_raw_df.copy()
+    df.loc[0, "totalcharges"] = 0.0
     result = check_schema(df)
     assert result.passed is False
     assert result.failure_severity == Severity.ERROR

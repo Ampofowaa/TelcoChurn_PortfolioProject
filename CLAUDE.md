@@ -45,7 +45,10 @@ docker compose up -d                    # start full local stack (Phase 9+)
 - **Registered model name:** `telco-churn-pipeline`
 - **Production alias:** `champion` — the FastAPI service loads whichever run carries this alias at startup.
 - **Challenger alias:** `challenger` — used during evaluation before promotion.
-- **Logged artifacts per run:** model (pyfunc), `feature_columns.txt`, `preprocessing.pkl`, `model_card.json`.
+- **Logged artifacts per run:** model (pyfunc), `feature_space.txt`, `feature_columns.txt`, `preprocessing.pkl`, `model_card.json`.
+  - `feature_space.txt` — full **feature space**: every column `build_feature_df` produced before selection (the complete output of the Phase 4 feature pipeline).
+  - `feature_columns.txt` — **model input space**: the subset that survived `select.py` and entered the `ColumnTransformer`. The diff between `feature_space.txt` and `feature_columns.txt` is what selection dropped for that run — a per-run audit trail that requires no git lookup.
+  - `preprocessing.pkl` — fitted `ColumnTransformer`; encodes the exact transformations applied to the model input space at training time.
 
 ## Data Handling
 
@@ -86,6 +89,25 @@ monitoring/             # Prometheus config + Grafana dashboard JSON
 - **Base branch:** `main`. Open a PR for each phase or significant feature; do not commit directly to `main`.
 - **Flag any schema-breaking changes** before implementing them — raise it explicitly rather than proceeding silently.
 
+## Changelog Conventions
+
+Update `CHANGELOG.md` at the end of every phase or significant fix. Follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+**Audience:** engineers consuming the project. Recruiters are a secondary audience — the italic summary per version handles them; the bullets do not need to.
+
+**Structure per version:**
+- Version header: `## [X.Y.Z] - YYYY-MM-DD — Phase N: Short Title`
+- Italic summary (1–3 sentences): what the phase accomplishes and any key architectural boundary. Keep it concise.
+- `### Added / ### Changed / ### Fixed` sections as needed.
+
+**Bullet rules:**
+- 1–2 lines max per bullet. State what changed; add a short *why* clause only if non-obvious.
+- Include file paths and function names so the entry is navigable (`src/telco_churn/features/build.py`).
+- Keep test counts and coverage numbers — they are concrete signals worth preserving.
+- **Do not embed data statistics** (churn rates, median values, percentage gaps) — those belong in `ANALYSIS.md`.
+- **Do not explain implementation rationale** in depth — that belongs in commit messages or PR descriptions.
+- Fixed items: one clause on what was wrong, one clause on what was done. Stop there.
+
 ## Code Style
 
 - **Formatter:** `black` (line length 88). `ruff` for linting (replaces flake8/isort).
@@ -102,6 +124,8 @@ monitoring/             # Prometheus config + Grafana dashboard JSON
 - Integration tests require Docker services to be running (`docker compose --profile infra up -d`).
 - The integration smoke test trains on a 500-row stratified sample and asserts ROC-AUC ≥ 0.75.
 - When writing data, schema, or validation tests, cover: normal case, missing values, wrong dtypes, and empty dataframe.
+- Every module with a `__main__` CLI entry point requires an integration test that exercises the full pipeline path (e.g., DB read → transform → file write). Unit tests on pure functions do not cover the CLI composition — a broken join between two individually-tested modules only surfaces at the entry point. Exception: waived when the `__main__` path is a strict subset of an already-tested CLI entry point (e.g., a helper whose full composition is exercised as a subroutine inside another module's subprocess test).
+- Every new package added under `src/telco_churn/` must have a scoped `make test-<package>` Makefile target using `--override-ini="addopts=" --cov=src/telco_churn/<package>`. The global `make test` remains the CI gate; the scoped target lets phase tests run in isolation without a false `fail_under=80` failure from other packages.
 - Run `pytest` before marking any task complete; if the phase has no tests yet, note it explicitly instead of skipping.
 - When closing a QA backlog item (`[x]`), verify the fix is present in the code — read the relevant file or run the relevant test. Never mark `[x]` based on intent; only mark it after the change is confirmed in the working tree.
 

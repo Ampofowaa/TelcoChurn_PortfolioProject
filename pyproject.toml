@@ -76,6 +76,11 @@ markers = [
     "integration: integration tests that require Docker (pass --run-integration to run)",
 ]
 
+[tool.coverage.run]
+
 [tool.coverage.report]
 fail_under = 80
 show_missing = true
+exclude_lines = [
+    "if __name__ == .__main__.:",
+]
