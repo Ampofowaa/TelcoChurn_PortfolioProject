@@ -16,6 +16,11 @@ from pandera.typing import Series
 
 from telco_churn.data.schema import YES_NO, YES_NO_NO_INTERNET, YES_NO_NO_PHONE
 
+__all__ = [
+    "CustomerFeaturesSchema",
+    "FeatureOutputSchema",
+]
+
 _TENURE_COHORTS: Final[frozenset[str]] = frozenset(
     {"0–12 mo", "13–24 mo", "25–48 mo", "49+ mo"}
 )
@@ -41,7 +46,7 @@ class CustomerFeaturesSchema(DataFrameModel):  # type: ignore[misc]
     """Input schema for build_feature_df — validates the customer_features SQL view output.
 
     Declares the 21 SQL-sourced feature columns. customerid and churn are expected
-    pass-throughs: validated by the data layer (Phase 2) and preserved here for
+    pass-throughs: validated by the data validation layer and preserved here for
     downstream traceability. strict=False allows them without triggering a schema error.
     coerce=True handles Postgres NUMERIC → float and SMALLINT → int coercion on read.
     """
@@ -98,7 +103,7 @@ class FeatureOutputSchema(CustomerFeaturesSchema):
     Inherits the 21 SQL-sourced column constraints from CustomerFeaturesSchema and
     adds the 4 Python-engineered columns produced by _add_python_features (H1–H3).
     strict=False: customerid and churn pass through unchanged — y extraction and
-    feature selection are the caller's responsibility (Phase 5 train.py).
+    feature selection are the caller's responsibility (train.py).
     coerce=False: feature column types must be correct by construction; a mismatch
     is a bug, not a cast.
     """

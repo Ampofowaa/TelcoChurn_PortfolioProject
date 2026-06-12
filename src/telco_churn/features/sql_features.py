@@ -48,17 +48,12 @@ if __name__ == "__main__":
 
     from telco_churn.utils.db import get_engine
     from telco_churn.utils.logging import configure_logging
-
-    def _project_root() -> Path:
-        for parent in Path(__file__).resolve().parents:
-            if (parent / "pyproject.toml").exists():
-                return parent
-        raise FileNotFoundError("project root not found — pyproject.toml missing")
+    from telco_churn.utils.paths import get_project_root
 
     load_dotenv()
     configure_logging()
 
-    cfg = OmegaConf.load(_project_root() / "configs" / "config.yaml")
+    cfg = OmegaConf.load(get_project_root() / "configs" / "config.yaml")
 
     try:
         build_sql_features(get_engine(), sql_dir=Path(cfg.paths.sql_features))

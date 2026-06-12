@@ -26,6 +26,7 @@ from telco_churn.features import (
     build_feature_df,
     build_sql_features,
 )
+from telco_churn.utils.paths import get_project_root
 
 pytestmark = pytest.mark.integration
 
@@ -371,7 +372,6 @@ def test_build_main_cli_composition(
     customers_raw is populated before the subprocess connects.
     """
     out_dir = tmp_path_factory.mktemp("build_cli")
-    _project_root = Path(__file__).parents[2]
 
     env = {**os.environ, "POSTGRES_URL": pg_url, "PROCESSED_DATA_DIR": str(out_dir)}
     result = subprocess.run(
@@ -379,7 +379,7 @@ def test_build_main_cli_composition(
         env=env,
         capture_output=True,
         text=True,
-        cwd=str(_project_root),
+        cwd=str(get_project_root()),
     )
     assert (
         result.returncode == 0

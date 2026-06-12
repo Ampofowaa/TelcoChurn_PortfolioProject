@@ -1,5 +1,4 @@
--- Right-closed bands matching pd.cut(bins=[0,12,24,48,72], right=True, include_lowest=True):
--- tenure=12 → '0–12 mo', tenure=13 → '13–24 mo'.
+-- Right-closed bands: tenure ≤ 12 → '0–12 mo', 13–24 → '13–24 mo', 25–48 → '25–48 mo', 49+ → '49+ mo'.
 CREATE OR REPLACE VIEW tenure_buckets AS
 SELECT
     customerid,

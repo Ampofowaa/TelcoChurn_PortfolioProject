@@ -11,6 +11,17 @@ import pandera as pa
 from telco_churn.features.schema import CustomerFeaturesSchema, FeatureOutputSchema
 from telco_churn.utils.logging import get_logger
 
+__all__ = [
+    "BINARY_STR_COLS",
+    "BINARY_INT_COLS",
+    "MULTI_CAT_COLS",
+    "NUMERIC_COLS",
+    "PYTHON_ENGINEERED_COLS",
+    "TARGET_COL",
+    "SQL_FEATURE_COLS",
+    "build_feature_df",
+]
+
 logger = get_logger(__name__)
 
 BINARY_STR_COLS: list[str] = [
@@ -74,6 +85,17 @@ SQL_FEATURE_COLS: list[str] = ["customerid"] + [
     if c not in PYTHON_ENGINEERED_COLS
 ]
 
+# Phase 5 replaces PYTHON_ENGINEERED_COLS with provenance-based source sets, making
+# this filter unnecessary. Until then, guard that PYTHON_ENGINEERED_COLS stays in sync:
+# a column removed from the typed lists without being removed here would silently keep
+# being excluded from SQL_FEATURE_COLS, causing a missing-column bug at DB read time.
+assert PYTHON_ENGINEERED_COLS <= set(
+    BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS
+), (
+    "PYTHON_ENGINEERED_COLS references columns absent from typed feature lists — "
+    "update the typed lists or remove the stale entry"
+)
+
 
 def _add_python_features(df: pd.DataFrame) -> pd.DataFrame:
     """Compute H1, H2, H3a, and H3b engineered features on a copy of df.
@@ -113,8 +135,8 @@ def build_feature_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df must contain all columns produced by the customer_features SQL view plus a
     churn column. customerid and churn pass through unchanged. Extracting y and
-    selecting feature columns before training is the caller's responsibility (Phase 5
-    train.py).
+    selecting feature columns before training is the caller's responsibility
+    (train.py).
     """
     return _add_python_features(df)
 
@@ -124,21 +146,17 @@ if __name__ == "__main__":
 
     from dotenv import load_dotenv
     from omegaconf import OmegaConf
+    from sqlalchemy.exc import SQLAlchemyError
 
     from telco_churn.features.sql_features import build_sql_features
     from telco_churn.utils.db import get_engine
     from telco_churn.utils.logging import configure_logging
-
-    def _project_root() -> Path:
-        for parent in Path(__file__).resolve().parents:
-            if (parent / "pyproject.toml").exists():
-                return parent
-        raise FileNotFoundError("project root not found — pyproject.toml missing")
+    from telco_churn.utils.paths import get_project_root
 
     load_dotenv()
     configure_logging()
 
-    cfg = OmegaConf.load(_project_root() / "configs" / "config.yaml")
+    cfg = OmegaConf.load(get_project_root() / "configs" / "config.yaml")
     processed_dir = Path(cfg.paths.processed_data)
     sql_dir = Path(cfg.paths.sql_features)
 
@@ -162,6 +180,12 @@ if __name__ == "__main__":
             rows=int(df_out.shape[0]),
             feature_cols=len(feature_cols),
         )
+    except pa.errors.SchemaError as e:
+        logger.error("feature_build_schema_invalid", error=str(e), exc_info=True)
+        sys.exit(1)
+    except SQLAlchemyError as e:
+        logger.error("feature_build_db_error", error=str(e), exc_info=True)
+        sys.exit(1)
     except Exception as e:
-        logger.error("feature engineering failed", error=str(e), exc_info=True)
+        logger.error("feature_build_failed", error=str(e), exc_info=True)
         sys.exit(1)
