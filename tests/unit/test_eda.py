@@ -17,6 +17,7 @@ from telco_churn.data.eda import (
     correlation_with_target,
     detect_outliers,
     encoded_correlation_matrix,
+    inspect_missing,
 )
 
 # ---------------------------------------------------------------------------
@@ -26,9 +27,36 @@ from telco_churn.data.eda import (
 
 @pytest.fixture
 def eda_df() -> pd.DataFrame:
-    """200-row DataFrame with normalized Telco column names and both churn classes."""
+    """200-row DataFrame with normalized Telco column names and both churn classes.
+
+    Respects IBM Telco structural constraints:
+    - multiplelines = "No phone service" iff phoneservice = "No"
+    - all internet add-on columns = "No internet service" iff internetservice = "No"
+    """
     rng = np.random.default_rng(42)
     n = 200
+
+    phoneservice = rng.choice(["Yes", "No"], n)
+    multiplelines = np.where(
+        phoneservice == "No",
+        "No phone service",
+        rng.choice(["Yes", "No"], n),
+    )
+
+    internetservice = rng.choice(["DSL", "Fiber optic", "No"], n)
+    no_internet = internetservice == "No"
+
+    def internet_addon(
+        rng: np.random.Generator, no_internet: np.ndarray, n: int
+    ) -> list[str]:
+        values = np.where(
+            no_internet, "No internet service", rng.choice(["Yes", "No"], n)
+        )
+        return values.tolist()
+
+    tenure = rng.integers(1, 72, n)
+    monthlycharges = rng.uniform(20, 100, n)
+
     return pd.DataFrame(
         {
             "customerid": [f"C{i:04d}" for i in range(n)],
@@ -36,24 +64,16 @@ def eda_df() -> pd.DataFrame:
             "seniorcitizen": rng.choice([0, 1], n).tolist(),
             "has_partner": rng.choice(["Yes", "No"], n).tolist(),
             "dependents": rng.choice(["Yes", "No"], n).tolist(),
-            "tenure": rng.integers(0, 72, n).tolist(),
-            "phoneservice": rng.choice(["Yes", "No"], n).tolist(),
-            "multiplelines": rng.choice(["Yes", "No", "No phone service"], n).tolist(),
-            "internetservice": rng.choice(["DSL", "Fiber optic", "No"], n).tolist(),
-            "onlinesecurity": rng.choice(
-                ["Yes", "No", "No internet service"], n
-            ).tolist(),
-            "onlinebackup": rng.choice(
-                ["Yes", "No", "No internet service"], n
-            ).tolist(),
-            "deviceprotection": rng.choice(
-                ["Yes", "No", "No internet service"], n
-            ).tolist(),
-            "techsupport": rng.choice(["Yes", "No", "No internet service"], n).tolist(),
-            "streamingtv": rng.choice(["Yes", "No", "No internet service"], n).tolist(),
-            "streamingmovies": rng.choice(
-                ["Yes", "No", "No internet service"], n
-            ).tolist(),
+            "tenure": tenure.tolist(),
+            "phoneservice": phoneservice.tolist(),
+            "multiplelines": multiplelines.tolist(),
+            "internetservice": internetservice.tolist(),
+            "onlinesecurity": internet_addon(rng, no_internet, n),
+            "onlinebackup": internet_addon(rng, no_internet, n),
+            "deviceprotection": internet_addon(rng, no_internet, n),
+            "techsupport": internet_addon(rng, no_internet, n),
+            "streamingtv": internet_addon(rng, no_internet, n),
+            "streamingmovies": internet_addon(rng, no_internet, n),
             "contract_type": rng.choice(
                 ["Month-to-month", "One year", "Two year"], n
             ).tolist(),
@@ -67,11 +87,69 @@ def eda_df() -> pd.DataFrame:
                 ],
                 n,
             ).tolist(),
-            "monthlycharges": rng.uniform(20, 100, n).tolist(),
-            "totalcharges": rng.uniform(0, 7000, n).tolist(),
+            "monthlycharges": monthlycharges.tolist(),
+            "totalcharges": (tenure * monthlycharges).tolist(),
             "churn": rng.choice([0, 1], n, p=[0.73, 0.27]).tolist(),
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# inspect_missing
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_missing_returns_dict_keyed_by_null_col(eda_df: pd.DataFrame) -> None:
+    df = eda_df.copy()
+    df.loc[0, "totalcharges"] = float("nan")
+    result = inspect_missing(df)
+    assert isinstance(result, dict)
+    assert "totalcharges" in result
+
+
+def test_inspect_missing_no_nulls_returns_empty_dict(eda_df: pd.DataFrame) -> None:
+    result = inspect_missing(eda_df)
+    assert result == {}
+
+
+def test_inspect_missing_rows_are_all_null_for_col(eda_df: pd.DataFrame) -> None:
+    df = eda_df.copy()
+    df.loc[[0, 1], "totalcharges"] = float("nan")
+    result = inspect_missing(df)
+    assert result["totalcharges"]["totalcharges"].isna().all()
+    assert len(result["totalcharges"]) == 2
+
+
+def test_inspect_missing_default_context_cols_present(eda_df: pd.DataFrame) -> None:
+    df = eda_df.copy()
+    df.loc[0, "totalcharges"] = float("nan")
+    result = inspect_missing(df)
+    cols = set(result["totalcharges"].columns)
+    assert "customerid" in cols
+    assert "churn" in cols
+    assert "totalcharges" in cols
+
+
+def test_inspect_missing_custom_missing_cols(eda_df: pd.DataFrame) -> None:
+    df = eda_df.copy()
+    df.loc[0, "totalcharges"] = float("nan")
+    df.loc[1, "tenure"] = float("nan")
+    result = inspect_missing(df, missing_cols=["totalcharges"])
+    assert set(result.keys()) == {"totalcharges"}
+
+
+def test_inspect_missing_custom_context_cols(eda_df: pd.DataFrame) -> None:
+    df = eda_df.copy()
+    df.loc[0, "totalcharges"] = float("nan")
+    result = inspect_missing(df, context_cols=["tenure"])
+    assert set(result["totalcharges"].columns) == {"tenure", "totalcharges"}
+
+
+def test_inspect_missing_empty_dataframe_returns_empty_dict(
+    eda_df: pd.DataFrame,
+) -> None:
+    result = inspect_missing(eda_df.iloc[0:0])
+    assert result == {}
 
 
 # ---------------------------------------------------------------------------

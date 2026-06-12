@@ -9,17 +9,32 @@ a thin rendering wrapper with no duplicated logic.
 from __future__ import annotations
 
 import warnings
+from typing import Final
 
 import numpy as np
 import pandas as pd
 from scipy.stats import chi2_contingency, mannwhitneyu
-from sklearn.linear_model import LinearRegression
+
+__all__ = [
+    "CAT_FEATURES",
+    "NUM_FEATURES",
+    "BINARY_INT_FEATURES",
+    "TARGET",
+    "inspect_missing",
+    "detect_outliers",
+    "churn_rate_by_group",
+    "compute_chi2_tests",
+    "compute_mann_whitney",
+    "compute_vif",
+    "encoded_correlation_matrix",
+    "correlation_with_target",
+]
 
 # ---------------------------------------------------------------------------
 # Column-name constants (single source of truth for notebook callers)
 # ---------------------------------------------------------------------------
 
-CAT_FEATURES: list[str] = [
+CAT_FEATURES: Final[tuple[str, ...]] = (
     "gender",
     "has_partner",
     "dependents",
@@ -35,16 +50,16 @@ CAT_FEATURES: list[str] = [
     "contract_type",
     "paperlessbilling",
     "paymentmethod",
-]
+)
 
-NUM_FEATURES: list[str] = ["tenure", "monthlycharges", "totalcharges"]
+NUM_FEATURES: Final[tuple[str, ...]] = ("tenure", "monthlycharges", "totalcharges")
 
 # Binary integer columns (0/1 SMALLINT in the DB) that are categorically meaningful
 # but must NOT be passed to pd.get_dummies — they are already numeric and need no encoding.
 # Chi-squared tests (pd.crosstab) handle integer values correctly.
-BINARY_INT_FEATURES: list[str] = ["seniorcitizen"]
+BINARY_INT_FEATURES: Final[tuple[str, ...]] = ("seniorcitizen",)
 
-TARGET: str = "churn"
+TARGET: Final[str] = "churn"
 
 
 # ---------------------------------------------------------------------------
@@ -52,9 +67,52 @@ TARGET: str = "churn"
 # ---------------------------------------------------------------------------
 
 
+def inspect_missing(
+    df: pd.DataFrame,
+    missing_cols: list[str] | None = None,
+    context_cols: list[str] | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Return missing-value rows for each column that has nulls.
+
+    For each column with at least one null, extracts the subset of rows
+    where that column is missing, retaining *context_cols* alongside it
+    to support missingness-mechanism analysis (MCAR / MAR / MNAR).
+
+    Args:
+        df: Input DataFrame.
+        missing_cols: Columns to inspect. Defaults to all columns in *df*
+            that contain at least one null. Pass a pre-computed list (e.g.
+            ``missing_summary.index.tolist()``) to avoid re-scanning.
+        context_cols: Columns to display alongside the missing column.
+            Defaults to ``customerid``, ``NUM_FEATURES``, and ``churn``
+            when present — the same context used in the EDA notebook.
+
+    Returns:
+        Dict mapping column name → DataFrame of rows where that column is
+        null.  Empty dict if no nulls are found.
+    """
+    cols_to_inspect = (
+        missing_cols
+        if missing_cols is not None
+        else df.columns[df.isnull().any()].tolist()
+    )
+    if not cols_to_inspect:
+        return {}
+
+    if context_cols is None:
+        defaults = ["customerid"] + list(NUM_FEATURES) + [TARGET]
+        context_cols = [c for c in defaults if c in df.columns]
+
+    result: dict[str, pd.DataFrame] = {}
+    for col in cols_to_inspect:
+        display_cols = [c for c in context_cols if c != col] + [col]
+        result[col] = df.loc[df[col].isnull(), display_cols].reset_index(drop=True)
+    return result
+
+
 def detect_outliers(
     df: pd.DataFrame,
-    num_features: list[str] = NUM_FEATURES,
+    num_features: list[str] | None = None,
 ) -> pd.DataFrame:
     """IQR-based outlier summary for numeric features.
 
@@ -70,6 +128,8 @@ def detect_outliers(
         ``pct_outliers`` is the percentage (0–100) of non-null observations
         that fall outside the IQR bounds (denominator excludes NaNs).
     """
+    if num_features is None:
+        num_features = list(NUM_FEATURES)
     rows = []
     for col in num_features:
         series = df[col].dropna()
@@ -137,7 +197,7 @@ def churn_rate_by_group(df: pd.DataFrame, col: str) -> pd.Series[float]:
 
 def compute_chi2_tests(
     df: pd.DataFrame,
-    cat_features: list[str] = CAT_FEATURES + BINARY_INT_FEATURES,
+    cat_features: list[str] | None = None,
     target: str = TARGET,
 ) -> pd.DataFrame:
     """Chi-squared test + Cramér's V for categorical features vs *target*.
@@ -155,6 +215,8 @@ def compute_chi2_tests(
         DataFrame with columns: feature, cramers_v, chi2, p_value, dof.
         Sorted descending by Cramér's V.
     """
+    if cat_features is None:
+        cat_features = list(CAT_FEATURES + BINARY_INT_FEATURES)
     rows = []
     for col in cat_features:
         n_null = int(df[col].isna().sum())
@@ -209,7 +271,7 @@ def compute_chi2_tests(
 
 def compute_mann_whitney(
     df: pd.DataFrame,
-    num_features: list[str] = NUM_FEATURES,
+    num_features: list[str] | None = None,
     target: str = TARGET,
 ) -> pd.DataFrame:
     """Mann-Whitney U test + rank-biserial r for numeric features vs *target*.
@@ -227,6 +289,8 @@ def compute_mann_whitney(
         DataFrame with columns: feature, rank_biserial_r, U_stat, p_value,
         mean_churners, mean_non_churners.  Sorted by |rank_biserial_r| desc.
     """
+    if num_features is None:
+        num_features = list(NUM_FEATURES)
     rows = []
     for col in num_features:
         g1 = df.loc[df[target] == 1, col].dropna()
@@ -271,16 +335,16 @@ def compute_mann_whitney(
 
 def compute_vif(
     df: pd.DataFrame,
-    num_cols: list[str] = NUM_FEATURES + BINARY_INT_FEATURES,
-    cat_cols: list[str] = CAT_FEATURES,
+    num_cols: list[str] | None = None,
+    cat_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     """Variance Inflation Factor table for multicollinearity detection.
 
     Uses ``drop_first=True`` one-hot
     encoding to avoid the dummy-variable trap (perfect multicollinearity
     that would make VIF undefined).  VIF is computed as ``1 / (1 − R²)``
-    where R² comes from regressing each feature on all others via sklearn
-    ``LinearRegression`` (avoids a statsmodels dependency).
+    where R² comes from regressing each feature on all others via numpy
+    ``lstsq`` (avoids statsmodels and sklearn dependencies).
 
     Args:
         df: DataFrame with numeric and categorical columns (no target column).
@@ -295,6 +359,10 @@ def compute_vif(
     Returns:
         DataFrame with columns: feature, VIF. Sorted descending by VIF.
     """
+    if num_cols is None:
+        num_cols = list(NUM_FEATURES + BINARY_INT_FEATURES)
+    if cat_cols is None:
+        cat_cols = list(CAT_FEATURES)
     present_num = [c for c in num_cols if c in df.columns]
     present_cat = [c for c in cat_cols if c in df.columns]
 
@@ -322,8 +390,23 @@ def compute_vif(
     for i in range(X.shape[1]):
         y = X[:, i]
         x_rest = np.delete(X, i, axis=1)
-        r2 = float(LinearRegression().fit(x_rest, y).score(x_rest, y))
+        # Centre both X and y to match OLS-with-intercept (same as LinearRegression default).
+        y_c = y - y.mean()
+        x_c = x_rest - x_rest.mean(axis=0)
+        coeffs, *_ = np.linalg.lstsq(x_c, y_c, rcond=None)
+        ss_res = float(np.sum((y_c - x_c @ coeffs) ** 2))
+        ss_tot = float(np.sum(y_c**2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 1.0
         vif_vals.append(round(1.0 / (1.0 - r2) if r2 < 1.0 else float("inf"), 2))
+
+    if any(v == float("inf") for v in vif_vals):
+        warnings.warn(
+            "VIF is inf for one or more features — perfect multicollinearity detected. "
+            "Common causes: structural dependencies in the data (e.g. add-on service columns "
+            "that are fully determined by a parent column), or a high-cardinality column "
+            "passed to cat_cols that makes the design matrix rank-deficient.",
+            stacklevel=2,
+        )
 
     return (
         pd.DataFrame({"feature": df_vif.columns.tolist(), "VIF": vif_vals})
@@ -345,7 +428,7 @@ def encoded_correlation_matrix(
         cat_cols: Columns to one-hot encode; defaults to ``CAT_FEATURES``.
 
     Returns:
-        Square correlation DataFrame over all encoded features.
+        Square correlation DataFrame over all encoded features and the target column.
     """
     cats = cat_cols if cat_cols is not None else CAT_FEATURES
     present_cat = [c for c in cats if c in df.columns]
