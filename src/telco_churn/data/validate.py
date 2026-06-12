@@ -17,6 +17,15 @@ from telco_churn.data.checks import (
     check_totalcharges_nulls,
 )
 from telco_churn.utils.logging import get_logger
+from telco_churn.utils.paths import get_project_root
+
+__all__ = [
+    "ValidationResult",
+    "ValidationError",
+    "save_validation_report",
+    "validate_raw",
+    "validate_clean",
+]
 
 logger = get_logger(__name__)
 
@@ -60,26 +69,7 @@ class ValidationError(Exception):
         super().__init__(f"{len(result.errors)} blocking validation error(s): {msgs}")
 
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Impute NULL totalcharges with the column median.
-
-    The 11 zero-tenure customers in the IBM Telco dataset have whitespace
-    TotalCharges in the source CSV, which ingest.py coerces to NaN. Imputing
-    with the median preserves these rows rather than dropping them.
-
-    Phase 2 placeholder — used to make validate_clean() testable before the
-    Phase 4 feature engineering stage exists. In the DVC pipeline, imputation
-    is performed by a fitted sklearn SimpleImputer in the features stage, which
-    stores the training-set median and applies it consistently to future batches.
-    """
-    out = df.copy()
-    if out["totalcharges"].notna().any():
-        median_tc = float(out["totalcharges"].median())
-        out["totalcharges"] = out["totalcharges"].fillna(median_tc)
-    return out
-
-
-_REPORTS_DIR = Path("reports/validation")
+_REPORTS_DIR = get_project_root() / "reports" / "validation"
 
 
 def save_validation_report(
@@ -146,6 +136,36 @@ def _log_result(result: ValidationResult) -> None:
         )
 
 
+def _run_gates(
+    df: pd.DataFrame,
+    *,
+    cleaned: bool,
+    strict: bool,
+    reports_dir: Path,
+    min_rows: int,
+    max_null_rate: float,
+) -> ValidationResult:
+    """Assemble and run all five data-quality gates, log results, and persist a report.
+
+    Single implementation shared by validate_raw and validate_clean — the only
+    behavioural difference between the two public functions is the cleaned= flag
+    passed to check_schema. All future gate additions belong here.
+    """
+    checks: list[CheckResult] = [
+        check_schema(df, cleaned=cleaned),
+        check_duplicate_ids(df),
+        check_churn_labels(df),
+        check_totalcharges_nulls(df),
+        *check_distribution_sanity(df, min_rows=min_rows, max_null_rate=max_null_rate),
+    ]
+    result = ValidationResult(checks=checks)
+    _log_result(result)
+    save_validation_report(result, base_dir=reports_dir)
+    if strict and not result.can_proceed:
+        raise ValidationError(result)
+    return result
+
+
 def validate_raw(
     df: pd.DataFrame,
     strict: bool = True,
@@ -170,19 +190,14 @@ def validate_raw(
     Raises:
         ValidationError: When strict=True and at least one ERROR gate fails.
     """
-    checks: list[CheckResult] = [
-        check_schema(df, cleaned=False),
-        check_duplicate_ids(df),
-        check_churn_labels(df),
-        check_totalcharges_nulls(df),
-        *check_distribution_sanity(df, min_rows=min_rows, max_null_rate=max_null_rate),
-    ]
-    result = ValidationResult(checks=checks)
-    _log_result(result)
-    save_validation_report(result, base_dir=reports_dir)
-    if strict and not result.can_proceed:
-        raise ValidationError(result)
-    return result
+    return _run_gates(
+        df,
+        cleaned=False,
+        strict=strict,
+        reports_dir=reports_dir,
+        min_rows=min_rows,
+        max_null_rate=max_null_rate,
+    )
 
 
 def validate_clean(
@@ -194,7 +209,7 @@ def validate_clean(
 ) -> ValidationResult:
     """Run the five EDA data-quality gates after totalcharges imputation.
 
-    Called after the Phase 4 features stage has imputed totalcharges with
+    Called after the feature engineering stage has imputed totalcharges with
     the training-set median. Validates that no NULL totalcharges remain
     before the rest of feature engineering proceeds.
 
@@ -213,22 +228,17 @@ def validate_clean(
     Raises:
         ValidationError: When strict=True and at least one ERROR gate fails.
     """
-    checks: list[CheckResult] = [
-        check_schema(df, cleaned=True),
-        check_duplicate_ids(df),
-        check_churn_labels(df),
-        check_totalcharges_nulls(df),
-        *check_distribution_sanity(df, min_rows=min_rows, max_null_rate=max_null_rate),
-    ]
-    result = ValidationResult(checks=checks)
-    _log_result(result)
-    save_validation_report(result, base_dir=reports_dir)
-    if strict and not result.can_proceed:
-        raise ValidationError(result)
-    return result
+    return _run_gates(
+        df,
+        cleaned=True,
+        strict=strict,
+        reports_dir=reports_dir,
+        min_rows=min_rows,
+        max_null_rate=max_null_rate,
+    )
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     import sys
 
     from dotenv import load_dotenv
@@ -240,23 +250,26 @@ if __name__ == "__main__":  # pragma: no cover
     load_dotenv()
     configure_logging()
 
-    cfg = OmegaConf.load("configs/config.yaml")
+    cfg = OmegaConf.load(get_project_root() / "configs" / "config.yaml")
     min_rows = int(cfg.validation.min_rows)
     max_null_rate = float(cfg.validation.max_null_rate)
 
     engine = get_engine()
     df = pd.read_sql("SELECT * FROM customers_raw", engine)
-    result = validate_raw(
-        df, strict=False, min_rows=min_rows, max_null_rate=max_null_rate
-    )
-
-    if result.can_proceed:
+    try:
+        result = validate_raw(
+            df, strict=True, min_rows=min_rows, max_null_rate=max_null_rate
+        )
         logger.info("validation_passed", warnings=len(result.warnings))
         sys.exit(0)
-    else:
+    except ValidationError as e:
         logger.error(
             "validation_failed",
-            errors=len(result.errors),
-            warnings=len(result.warnings),
+            errors=len(e.result.errors),
+            warnings=len(e.result.warnings),
+            exc_info=True,
         )
+        sys.exit(1)
+    except Exception as e:
+        logger.error("validation_unexpected_error", error=str(e), exc_info=True)
         sys.exit(1)

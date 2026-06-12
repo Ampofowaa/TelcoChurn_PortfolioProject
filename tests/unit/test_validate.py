@@ -6,15 +6,11 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from helpers import make_row
-from hypothesis import given, settings
-from hypothesis import strategies as st
 
 from telco_churn.data.checks import CheckResult, Severity
 from telco_churn.data.validate import (
     ValidationError,
     ValidationResult,
-    clean_dataframe,
     save_validation_report,
     validate_clean,
     validate_raw,
@@ -136,54 +132,6 @@ def test_validate_clean_strict_raises_on_blocking_error(
 
 
 # ---------------------------------------------------------------------------
-# clean_dataframe
-# ---------------------------------------------------------------------------
-
-
-def test_clean_dataframe_imputes_null_totalcharges(valid_raw_df: pd.DataFrame) -> None:
-    """clean_dataframe fills NULL totalcharges with the median of remaining non-null values."""
-    df = valid_raw_df.copy()
-    df.loc[0, "totalcharges"] = float("nan")
-    expected = float(
-        df["totalcharges"].median()
-    )  # median of non-null values in the input
-    cleaned = clean_dataframe(df)
-    assert cleaned["totalcharges"].isna().sum() == 0
-    assert cleaned.loc[0, "totalcharges"] == pytest.approx(expected)
-
-
-def test_clean_dataframe_preserves_row_count(zero_tenure_df: pd.DataFrame) -> None:
-    """clean_dataframe never drops rows."""
-    cleaned = clean_dataframe(zero_tenure_df)
-    assert len(cleaned) == len(zero_tenure_df)
-
-
-def test_clean_dataframe_does_not_modify_non_null_totalcharges(
-    valid_raw_df: pd.DataFrame,
-) -> None:
-    """clean_dataframe leaves already-non-null totalcharges values unchanged."""
-    expected = valid_raw_df["totalcharges"].tolist()
-    cleaned = clean_dataframe(valid_raw_df)
-    assert cleaned["totalcharges"].tolist() == pytest.approx(expected)
-
-
-def test_clean_dataframe_all_null_totalcharges_stays_null() -> None:
-    """When every totalcharges value is NULL, clean_dataframe leaves them as-is.
-
-    The median of an all-NaN Series is NaN, and fillna(NaN) is a no-op. The
-    resulting NULLs will then be caught by validate_clean.
-    """
-    df = pd.DataFrame(
-        {
-            **{k: [v] for k, v in make_row().items()},
-            "totalcharges": [float("nan")],
-        }
-    )
-    cleaned = clean_dataframe(df)
-    assert pd.isna(cleaned.loc[0, "totalcharges"])
-
-
-# ---------------------------------------------------------------------------
 # save_validation_report
 # ---------------------------------------------------------------------------
 
@@ -226,56 +174,3 @@ def test_save_validation_report_returns_none_when_all_pass(
     result = validate_raw(large_valid_df, strict=False, reports_dir=tmp_path)
     report_dir = save_validation_report(result, base_dir=tmp_path)
     assert report_dir is None
-
-
-# ---------------------------------------------------------------------------
-# Hypothesis property tests
-# ---------------------------------------------------------------------------
-
-
-_TOTALCHARGES_STRATEGY = st.lists(
-    st.one_of(
-        st.floats(
-            min_value=0.01,
-            max_value=10_000.0,
-            allow_nan=False,
-            allow_infinity=False,
-        ),
-        st.none(),
-    ),
-    min_size=1,
-    max_size=20,
-).filter(lambda vals: any(v is not None for v in vals))
-
-
-def _make_minimal_df(totalcharges: list[float | None]) -> pd.DataFrame:
-    """Build a minimal DataFrame with the given totalcharges values."""
-    n = len(totalcharges)
-    base = make_row()
-    return pd.DataFrame(
-        {k: [v] * n for k, v in base.items()} | {"totalcharges": totalcharges}
-    )
-
-
-@given(values=_TOTALCHARGES_STRATEGY)  # type: ignore[misc]
-@settings(max_examples=40)  # type: ignore[misc]
-def test_clean_dataframe_leaves_no_null_totalcharges(
-    values: list[float | None],
-) -> None:
-    """clean_dataframe imputes every NULL totalcharges regardless of their count."""
-    df = _make_minimal_df(values)
-    cleaned = clean_dataframe(df)
-    assert cleaned["totalcharges"].isna().sum() == 0
-
-
-@given(values=_TOTALCHARGES_STRATEGY)  # type: ignore[misc]
-@settings(max_examples=40)  # type: ignore[misc]
-def test_clean_dataframe_does_not_modify_other_columns(
-    values: list[float | None],
-) -> None:
-    """clean_dataframe never modifies columns other than totalcharges."""
-    df = _make_minimal_df(values)
-    cleaned = clean_dataframe(df)
-    other_cols = [c for c in df.columns if c != "totalcharges"]
-    for col in other_cols:
-        pd.testing.assert_series_equal(df[col], cleaned[col])
