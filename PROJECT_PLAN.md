@@ -453,6 +453,7 @@ In a greenfield build, feature engineering is a *loop* (error analysis → new f
 - **No manual retraining flags (replaces the notebook's `RETRAIN_BEST` / `LOG_ARTIFACTS` booleans):** the hand-set flags that decided what to recompute do **not** migrate into `src/`. DVC's content-hashed DAG determines staleness — changing a dep reruns exactly the affected stages and nothing else. This is the engineering replacement for the manual flags (former Group B item).
 - **Phase 2 cleanup:** Remove `clean_dataframe()` from `validate.py` — imputation now belongs to the `features` stage's fitted `SimpleImputer`. Update `validate_clean()` to expect the features stage output directly. Remove the associated tests.
 - **Phase 2 cleanup:** In the DVC `validate` stage entry point, catch `ValidationError`, emit a `pipeline_blocked` structured log event, and call `sys.exit(1)`.
+- **SQL migration strategy:** `CREATE TABLE IF NOT EXISTS` is idempotent for creation but blind to changes — adding a column, renaming one, or tightening a constraint will be silently skipped on re-run. Adopt Alembic (the natural fit for a SQLAlchemy-backed project) before Phase 8 ships so that schema changes are applied reproducibly across local, CI, and AWS environments. Existing DDL in `sql/schema/001_create_raw.sql` becomes the initial migration version.
 
 **Verification:** Change a hyperparameter in `configs/model/lightgbm.yaml`; `dvc repro` re-runs `train` and `evaluate` only, not `ingest`, `validate`, or `features`.
 
@@ -666,34 +667,3 @@ These are reasonable "future work" items for the README, not omissions:
 - **Multi-region / HA deployment** — single App Runner region is sufficient
 - **Cost dashboards** — AWS Cost Explorer's free view covers the free-tier project
 - **A live generative error-analysis → feature loop (v2)** — this project's story is *"productionised validated science"*: it ships the **converged** feature set from `EDA-original.ipynb` (which stays the source of truth), and Phase 7's error analysis is *confirmatory*. A natural **v2**, built *after* the production spine ships (post-Phase 14), turns the generative loop into reproducible code — error analysis on a profiling holdout proposes a **new** feature, the `select.py` + training harness re-measure it, and it is adopted only if it beats the frozen set on PR-AUC within CI. That would let the repo *also* claim "full DS lifecycle in code" without re-deriving work already done well. Deferred deliberately so the finishable migration artifact exists first; the v2 loop **extends**, not replaces, the notebook — see `summary.md` §4.4.
-
----
-
-## Lifecycle & Framing Gaps (June 2026)
-
-Items surfaced in a review of the project's workflow against the industry-standard data-science lifecycle (CRISP-DM and its MLOps descendants). The *modelling science* is already at or above standard — these are **documentation, framing, and engineering-discipline** gaps, not science gaps. Full reasoning is in `summary.md` → "The Industry Data Science Lifecycle".
-
-**Group A — Documentation & framing (do before Phase 3):**
-
-These four are pure documentation (no code) and lock the rules that govern Phases 5–7. Do them before starting the EDA notebook.
-
-| Priority | Status | Item | Detail |
-|---|---|---|---|
-| High | [x] | Add "Step 0: Problem Framing & Cost Definition" as an explicit lifecycle step | Exists in `ANALYSIS.md` but is not a named step. Document: prediction unit (a customer), label definition + horizon, the decision the score feeds, FN-vs-FP cost structure, baseline-to-beat, and success criterion. This is the phase that makes the cost-sensitive threshold meaningful; reviewers look for it. |
-| High | [x] | Reframe the workflow string as a loop, not a straight line | The linear `validation → EDA → … → registration` string hides the two feedback arrows. Show **error analysis in two places** (error-driven FE *before* tuning, deep error analysis *after*) and the Evaluation→Business / Modeling→Data-Prep loops. |
-| Medium | [x] | Document the EDA-vs-validation ordering rationale | Phase 2 (validation) before Phase 3 (EDA) looks backwards without a note. Clarify: validation gates are *discovered* during EDA (notebook) and then *enforced* as automated checks (Phase 2) — the two orderings serve discover-vs-enforce purposes. Fold the note into the Phase 3 intro. |
-| Medium | [x] | State the "test set touched once" and "one metric drives selection" invariants as written policy | Currently enforced by notebook convention only. Record in `CLAUDE.md` / `ANALYSIS.md` so they survive the migration to `src/` as explicit rules. |
-
-**Former Groups B & C — now embedded in their phases (this is a completion index only; the phase deliverables are the source of truth):**
-
-The engineering-discipline and metric/threshold items have been folded into the relevant phase deliverables so each spec lives in exactly one place and cannot drift. Use this table only to tick off completion as each phase lands.
-
-| Status | Phase | Item | Specified in |
-|---|---|---|---|
-| [ ] | 5 | Reference baselines (floor + linear control) | Phase 5 deliverables; `summary.md` §4.1 |
-| [ ] | 5 | PR-AUC for selection + Optuna objective (⚠ flagged deviation) | Phase 5 deliverables; `summary.md` §4.2 |
-| [ ] | 5 & 7 | Test-set leakage structurally impossible | Phase 5 (split isolation bullet) + Phase 7 ordering note |
-| [ ] | 7 | Promotion gate = PR-AUC + Brier; threshold as versioned artifact | Phase 7 `register.py` deliverable; `summary.md` §4.2 |
-| [ ] | 8 | Drop notebook retraining flags (DVC DAG replaces them) | Phase 8 deliverables |
-| [ ] | 9 | Threshold as a versioned policy layer | Phase 9 deliverables; `summary.md` §4.5 |
-| [ ] | 3, 5–7 | Split the 7,600-line notebook into its three jobs | Phase 3 intro + roadmap |

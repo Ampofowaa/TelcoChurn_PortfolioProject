@@ -14,8 +14,8 @@ The `src/` package implements the production-ready version of the same logic.
 ## Table of Contents
 
 0. [Problem Framing & Cost Definition](#0-problem-framing--cost-definition)
-1. [EDA & Statistical Testing](#1-eda--statistical-testing)
-2. [Data Quality & Missing Values](#2-data-quality--missing-values)
+1. [Data Ingestion & Quality Checks](#1-data-ingestion--quality-checks)
+2. [EDA & Statistical Testing](#2-eda--statistical-testing)
 3. [Feature Engineering](#3-feature-engineering)
 4. [Baseline Models](#4-baseline-models)
 5. [Hyperparameter Tuning (Optuna)](#5-hyperparameter-tuning-optuna)
@@ -73,7 +73,7 @@ Two reference points bound the performance target:
 | Stratified random (population rate) | 26.5 % | 26.5 % | Floor — any useful model must beat this |
 | Heuristic: flag all month-to-month customers | ~88 % | ~43 % | Cheap, non-ML rule; captures the dominant risk profile. Values are EDA-derived approximations (§1), not fitted model results. |
 
-**Heuristic derivation:** month-to-month customers = 3,875; total churners = 1,869; month-to-month churn rate ≈ 43 % (§1 bivariate analysis) → ~1,666 churners captured. Recall = 1,666 / 1,869 ≈ **88 %**. Precision = 1,666 / 3,875 ≈ **43 %** (equals the segment churn rate by definition — flagging an entire group sets precision equal to that group's base rate).
+**Heuristic derivation:** month-to-month customers = 3,875; total churners = 1,869; month-to-month churn rate ≈ 43 % (§2 bivariate analysis) → ~1,666 churners captured. Recall = 1,666 / 1,869 ≈ **88 %**. Precision = 1,666 / 3,875 ≈ **43 %** (equals the segment churn rate by definition — flagging an entire group sets precision equal to that group's base rate).
 
 The month-to-month heuristic sets a high recall bar but has two structural weaknesses. First, the ~12 % of churners it misses (~203 customers on annual or two-year contracts) are disproportionately long-tenure, higher-LTV customers — each FN in this segment costs more than the $172 average above, so the apparent 88 % recall understates the business cost of the misses. Second, the heuristic assigns equal weight to all 3,875 flagged customers; it cannot distinguish near-certain churners from borderline cases, making cost-efficient prioritisation of the outreach budget impossible. The ML model must therefore do more than match aggregate recall and precision — it must recover high-value churners the heuristic ignores and produce calibrated probability scores that enable threshold-optimised, cost-rational triage. This is also why the recall at the cost-optimised production threshold (§9) is set below 88 %: chasing the heuristic's recall ceiling requires flagging an ever-larger share of the customer base, flooding the outreach budget with low-confidence contacts. The economically rational operating point accepts a lower recall in exchange for materially higher precision and a better overall cost outcome.
 
@@ -92,7 +92,29 @@ These gates were set before the test set was opened. The final test-set results 
 
 ---
 
-## 1. EDA & Statistical Testing
+## 1. Data Ingestion & Quality Checks
+
+**Dataset:** 7,043 rows × 20 columns. Ingested from `datasets/raw/Telco-Customer-Churn.csv` into the `customers_raw` Postgres table via `ingest()`.
+
+**Five automated gates — all PASS:**
+
+| Gate | Severity | Check | Result |
+|---|---|---|---|
+| 1 | ERROR | Schema — column presence, types, value ranges, categoricals | PASS |
+| 2 | ERROR | Duplicate `customerid` values | PASS — 0 duplicates |
+| 3 | ERROR | Binary `churn` labels, no missing values | PASS |
+| 4 | WARNING | Unexpected NULL `totalcharges` (non-zero tenure) | PASS — 0 unexpected NULLs |
+| 5 | ERROR/WARNING | Row count ≥ 1,000; critical-column null rates ≤ 5 % | PASS — 7,043 rows; all rates 0.0 % |
+
+ERROR gates block the Postgres load; WARNING gates emit a diagnostic but allow the pipeline to proceed.
+
+**11 NULL `totalcharges` rows (0.16 %):** All have `tenure = 0` — brand-new customers whose first bill has not yet been generated. Gate 4 passes because all nulls are on zero-tenure rows (the expected structural case). Missing value treatment and the decision to retain these rows are discussed in §2.
+
+The full gate walkthrough — rendered results and failure detail tables — is in [`notebooks/00-data-ingestion.ipynb`](notebooks/00-data-ingestion.ipynb).
+
+---
+
+## 2. EDA & Statistical Testing
 
 ### Key findings
 
@@ -118,7 +140,11 @@ These gates were set before the test set was opened. The final test-set results 
 All three numeric features have zero IQR-flagged outliers. The bounds are wide because the features span their full natural ranges — tenure 0–72 months (by contract design), monthlycharges ~$18–$119, totalcharges $0–$8,684. The right-skew in `totalcharges` reflects a genuine business pattern, not contamination. All values are retained.
 
 **Categorical cardinality:**
-All categorical features have 2–4 distinct values — no high-cardinality columns. One-hot encoding is safe with no dimensionality or sparsity concern.
+Excluding `customerid` (7,043 unique values — one per customer), all 15 modelling features have 2–4 distinct values — low cardinality throughout, so one-hot encoding is safe with no dimensionality or sparsity concern.
+
+### Missing values
+
+Only `totalcharges` has nulls — 11 rows (0.16 %), all with `tenure = 0` (brand-new customers whose first bill had not yet been generated). All 11 are **non-churners**: a missingness indicator would carry no predictive signal because there are no churners in this group to separate from non-churners. The missingness is purely structural — determined by the billing cycle, not by customer behaviour or intent. **Decision: rows retained**; imputed via `SimpleImputer(strategy='median')` inside the training pipeline.
 
 ### Bivariate analysis & effect sizes
 
@@ -180,24 +206,6 @@ VIF > 10 flags severe multicollinearity. **14 of 30 encoded features** exceed th
 The remaining 16 features all have VIF ≤ 10, with `seniorcitizen` (≈ 1.15) and `gender_Male` (1.00) effectively orthogonal to all other features.
 
 **All features are retained — none are dropped on VIF grounds.** The practical impact of multicollinearity is model-family-dependent: tree-based methods (LightGBM, XGBoost, RandomForest) are immune — each split is evaluated independently and collinearity does not distort estimates. Linear models are materially affected and would require feature consolidation or regularisation. The null-importance experiment during model training (§5) is the explicit gate for any feature pruning.
-
----
-
-## 2. Data Quality & Missing Values
-
-**Five automated pass/fail gates — all PASS:**
-
-| Check | Status | Detail |
-|---|---|---|
-| No duplicate customerIDs | PASS | 0 duplicates |
-| Missing values < 1% per column | PASS | Max 0.16 % in `TotalCharges` |
-| tenure ≥ 0 | PASS | 0 negative values |
-| MonthlyCharges > 0 | PASS | 0 non-positive values |
-| Churn values in {Yes, No} | PASS | Exactly two unique values |
-
-**Missing value treatment:**
-- 11 `TotalCharges` NaN rows (0.16 %) belong to customers with `tenure = 0` — first bill not yet issued. This is structurally determined missingness, not random.
-- **Decision: rows retained**; imputed via `SimpleImputer(strategy='median')` inside the preprocessing pipeline.
 
 ---
 

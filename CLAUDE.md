@@ -112,9 +112,12 @@ Update `CHANGELOG.md` at the end of every phase or significant fix. Follow [Keep
 
 - **Formatter:** `black` (line length 88). `ruff` for linting (replaces flake8/isort).
 - **Type hints:** required on all public functions in `src/`. `mypy --strict` on `src/` only.
+- **`__all__` required in every public module under `src/`.** List every public function, class, and constant. Omit underscore-prefixed internals. Place it after the imports block, before the first definition.
 - **All functions must have docstrings.**
 - **No comments explaining what the code does** — use clear names instead. Only comment the non-obvious *why* (hidden constraints, workarounds, subtle invariants).
 - **No error handling inside pure functions.** Handle errors at system boundaries only: file I/O, DB calls, model load, external API calls.
+- **Never use bare relative paths for file I/O in `src/`.** `"configs/config.yaml"` resolves from the shell's CWD and breaks in DVC stages, Prefect workers, CI, and Docker containers. Always anchor to `get_project_root() / "configs" / "config.yaml"` (`utils/paths.py`). This applies everywhere in `src/` — `__main__` blocks, module-level constants, and function bodies.
+- **All `logger.error(...)` calls inside `except` blocks must include `exc_info=True`.** `str(e)` logs only the message; `exc_info=True` attaches the full traceback so failures are diagnosable in CI and pipeline logs.
 - **Notebooks** are thin wrappers: import from `src/`, call functions, render outputs. Heavy logic lives in `src/`.
 
 ## Testing
@@ -124,7 +127,8 @@ Update `CHANGELOG.md` at the end of every phase or significant fix. Follow [Keep
 - Integration tests require Docker services to be running (`docker compose --profile infra up -d`).
 - The integration smoke test trains on a 500-row stratified sample and asserts ROC-AUC ≥ 0.75.
 - When writing data, schema, or validation tests, cover: normal case, missing values, wrong dtypes, and empty dataframe.
-- Every module with a `__main__` CLI entry point requires an integration test that exercises the full pipeline path (e.g., DB read → transform → file write). Unit tests on pure functions do not cover the CLI composition — a broken join between two individually-tested modules only surfaces at the entry point. Exception: waived when the `__main__` path is a strict subset of an already-tested CLI entry point (e.g., a helper whose full composition is exercised as a subroutine inside another module's subprocess test).
+- Every module with a `__main__` CLI entry point requires a **subprocess** integration test — invoked via `subprocess.run([sys.executable, "-m", "<module>"], env={...}, capture_output=True)` — covering the full composition path (argparse/config load → I/O → exit code). Direct function calls do not qualify: they miss argparse, OmegaConf resolution, dotenv loading, and env-var-to-engine joints that only surface at the subprocess boundary. Cover both the exit 0 (success) and exit 1 (error) paths. Exception: waived only when the module's entire `__main__` body is exercised as a named subroutine call inside another module's subprocess integration test — direct calls to shared helper functions do not satisfy the exception.
+- Running integration tests in isolation will fail the `fail_under=80` gate because coverage is measured across all `src/` modules. Append `--no-cov` for standalone integration runs: `uv run pytest tests/integration/ --run-integration --no-cov`.
 - Every new package added under `src/telco_churn/` must have a scoped `make test-<package>` Makefile target using `--override-ini="addopts=" --cov=src/telco_churn/<package>`. The global `make test` remains the CI gate; the scoped target lets phase tests run in isolation without a false `fail_under=80` failure from other packages.
 - Run `pytest` before marking any task complete; if the phase has no tests yet, note it explicitly instead of skipping.
 - When closing a QA backlog item (`[x]`), verify the fix is present in the code — read the relevant file or run the relevant test. Never mark `[x]` based on intent; only mark it after the change is confirmed in the working tree.

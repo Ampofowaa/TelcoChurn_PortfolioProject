@@ -73,3 +73,35 @@ def test_missing_file_raises(tmp_path: Path) -> None:
     """load_raw_csv raises FileNotFoundError with an actionable message."""
     with pytest.raises(FileNotFoundError, match="make data"):
         load_raw_csv(tmp_path / "does_not_exist.csv")
+
+
+def _drop_column(csv: str, col: str) -> str:
+    """Return csv with the named column (header + values) removed."""
+    lines = csv.strip().split("\n")
+    headers = lines[0].split(",")
+    idx = headers.index(col)
+    return "\n".join(
+        ",".join(parts[:idx] + parts[idx + 1 :])
+        for parts in (line.split(",") for line in lines)
+    )
+
+
+def test_missing_column_raises(tmp_path: Path) -> None:
+    """load_raw_csv raises ValueError when a required column is absent."""
+    path = tmp_path / "missing_col.csv"
+    path.write_text(_drop_column(_MINIMAL_CSV, "TechSupport"))
+    with pytest.raises(ValueError, match="missing.*techsupport"):
+        load_raw_csv(path)
+
+
+def test_extra_column_raises(tmp_path: Path) -> None:
+    """load_raw_csv raises ValueError when the CSV contains an unexpected column."""
+    lines = _MINIMAL_CSV.strip().split("\n")
+    augmented = "\n".join(
+        line + (",ExtraCol" if i == 0 else ",extra_value")
+        for i, line in enumerate(lines)
+    )
+    path = tmp_path / "extra_col.csv"
+    path.write_text(augmented)
+    with pytest.raises(ValueError, match="unexpected.*extracol"):
+        load_raw_csv(path)

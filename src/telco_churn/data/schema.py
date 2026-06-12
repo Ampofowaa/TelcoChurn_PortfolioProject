@@ -9,6 +9,14 @@ import pandera as pa
 from pandera.pandas import DataFrameModel, Field
 from pandera.typing import Series
 
+__all__ = [
+    "YES_NO",
+    "YES_NO_NO_PHONE",
+    "YES_NO_NO_INTERNET",
+    "RawSchema",
+    "CleanedSchema",
+]
+
 # ---------------------------------------------------------------------------
 # Allowed categorical values (source of truth: notebooks/_archive/EDA-original.ipynb)
 # ---------------------------------------------------------------------------
@@ -18,33 +26,6 @@ YES_NO_NO_PHONE: Final[frozenset[str]] = frozenset({"Yes", "No", "No phone servi
 YES_NO_NO_INTERNET: Final[frozenset[str]] = frozenset(
     {"Yes", "No", "No internet service"}
 )
-
-REQUIRED_COLUMNS: Final[frozenset[str]] = frozenset(
-    {
-        "customerid",
-        "gender",
-        "seniorcitizen",
-        "has_partner",
-        "dependents",
-        "tenure",
-        "phoneservice",
-        "multiplelines",
-        "internetservice",
-        "onlinesecurity",
-        "onlinebackup",
-        "deviceprotection",
-        "techsupport",
-        "streamingtv",
-        "streamingmovies",
-        "contract_type",
-        "paperlessbilling",
-        "paymentmethod",
-        "monthlycharges",
-        "totalcharges",
-        "churn",
-    }
-)
-
 
 # ---------------------------------------------------------------------------
 # Pandera SchemaModel definitions
@@ -59,26 +40,26 @@ class RawSchema(DataFrameModel):  # type: ignore[misc]
     """
 
     customerid: Series[str] = Field(nullable=False)
-    gender: Series[str] = Field(isin={"Male", "Female"}, nullable=True)
-    seniorcitizen: Series[int] = Field(isin=[0, 1], nullable=True)
-    has_partner: Series[str] = Field(isin=YES_NO, nullable=True)
-    dependents: Series[str] = Field(isin=YES_NO, nullable=True)
-    tenure: Series[int] = Field(ge=0, nullable=True)
-    phoneservice: Series[str] = Field(isin=YES_NO, nullable=True)
-    multiplelines: Series[str] = Field(isin=YES_NO_NO_PHONE, nullable=True)
+    gender: Series[str] = Field(isin={"Male", "Female"}, nullable=False)
+    seniorcitizen: Series[int] = Field(isin=[0, 1], nullable=False)
+    has_partner: Series[str] = Field(isin=YES_NO, nullable=False)
+    dependents: Series[str] = Field(isin=YES_NO, nullable=False)
+    tenure: Series[int] = Field(ge=0, nullable=False)
+    phoneservice: Series[str] = Field(isin=YES_NO, nullable=False)
+    multiplelines: Series[str] = Field(isin=YES_NO_NO_PHONE, nullable=False)
     internetservice: Series[str] = Field(
-        isin={"DSL", "Fiber optic", "No"}, nullable=True
+        isin={"DSL", "Fiber optic", "No"}, nullable=False
     )
-    onlinesecurity: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=True)
-    onlinebackup: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=True)
-    deviceprotection: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=True)
-    techsupport: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=True)
-    streamingtv: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=True)
-    streamingmovies: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=True)
+    onlinesecurity: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=False)
+    onlinebackup: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=False)
+    deviceprotection: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=False)
+    techsupport: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=False)
+    streamingtv: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=False)
+    streamingmovies: Series[str] = Field(isin=YES_NO_NO_INTERNET, nullable=False)
     contract_type: Series[str] = Field(
-        isin={"Month-to-month", "One year", "Two year"}, nullable=True
+        isin={"Month-to-month", "One year", "Two year"}, nullable=False
     )
-    paperlessbilling: Series[str] = Field(isin=YES_NO, nullable=True)
+    paperlessbilling: Series[str] = Field(isin=YES_NO, nullable=False)
     paymentmethod: Series[str] = Field(
         isin={
             "Electronic check",
@@ -86,9 +67,9 @@ class RawSchema(DataFrameModel):  # type: ignore[misc]
             "Bank transfer (automatic)",
             "Credit card (automatic)",
         },
-        nullable=True,
+        nullable=False,
     )
-    monthlycharges: Series[float] = Field(ge=0.0, nullable=True)
+    monthlycharges: Series[float] = Field(ge=0.0, nullable=False)
     totalcharges: Series[float] = Field(ge=0.0, nullable=True)
     churn: Series[int] = Field(isin=[0, 1], nullable=False)
 
@@ -112,8 +93,8 @@ class RawSchema(DataFrameModel):  # type: ignore[misc]
 class CleanedSchema(RawSchema):
     """RawSchema with totalcharges required to be non-null.
 
-    Imputation via clean_dataframe() is a prerequisite before validating
-    against this schema.
+    The model training sklearn ColumnTransformer (SimpleImputer) is a prerequisite —
+    validate_clean() should be called after imputation, not before.
     """
 
     totalcharges: Series[float] = Field(ge=0.0, nullable=False)

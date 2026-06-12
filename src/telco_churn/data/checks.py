@@ -11,6 +11,16 @@ from pandera.errors import SchemaErrors
 
 from telco_churn.data.schema import CleanedSchema, RawSchema
 
+__all__ = [
+    "Severity",
+    "CheckResult",
+    "check_schema",
+    "check_duplicate_ids",
+    "check_churn_labels",
+    "check_totalcharges_nulls",
+    "check_distribution_sanity",
+]
+
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
@@ -41,9 +51,16 @@ class CheckResult:
 # Gate constants
 # ---------------------------------------------------------------------------
 
-# Columns checked for high null rates in Gate 5. totalcharges is excluded because
-# the 11 zero-tenure NULLs in the raw dataset are expected and handled by imputation.
-_NULL_CHECKED_COLS: Final[frozenset[str]] = frozenset({"customerid", "tenure", "churn"})
+# Columns checked for high null rates in Gate 5.
+# Derived from RawSchema so the set stays in sync with schema changes automatically.
+# totalcharges excluded: nullable=True in RawSchema (11 zero-tenure NULLs expected).
+# customerid excluded: Gate 1 (schema) and Gate 2 (duplicate IDs) already cover it;
+# including it here would triple-report the same problem in the validation report.
+_NULL_CHECKED_COLS: Final[frozenset[str]] = frozenset(
+    col_name
+    for col_name, col_schema in RawSchema.to_schema().columns.items()
+    if not col_schema.nullable and col_name != "customerid"
+)
 
 _MIN_ROWS: Final[int] = 1_000
 _MAX_NULL_RATE: Final[float] = 0.05
@@ -170,8 +187,9 @@ def check_totalcharges_nulls(df: pd.DataFrame) -> CheckResult:
     therefore expected only where tenure == 0. Any NULL with tenure > 0 is
     unexpected and worth flagging.
 
-    Severity: WARNING — clean_dataframe() will impute these with the median,
-    so the pipeline can continue, but the anomaly should be investigated.
+    Severity: WARNING — the model training ColumnTransformer will impute these
+    with the training-set median, so the pipeline can continue, but the anomaly
+    should be investigated.
 
     Non-negativity for tenure, monthlycharges, and totalcharges is enforced
     by Gate 1 (RawSchema Field(ge=0)) and is not duplicated here.

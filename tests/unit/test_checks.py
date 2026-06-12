@@ -283,3 +283,26 @@ def test_high_null_rate_in_critical_column_is_warning(
     assert tenure_check.failure_severity == Severity.WARNING
     assert tenure_check.detail is not None
     assert len(tenure_check.detail) == len(df)
+
+
+def test_null_rate_check_covers_all_non_nullable_schema_columns(
+    valid_raw_df: pd.DataFrame,
+) -> None:
+    """Gate 5 null-rate checks cover every non-nullable RawSchema column.
+
+    Previously _NULL_CHECKED_COLS was hardcoded to 3 columns (customerid, tenure,
+    churn). It is now derived from RawSchema, so all 19 non-nullable columns are
+    monitored. This test verifies that a column outside the original 3 — monthlycharges
+    — triggers a warning when its null rate exceeds the threshold.
+    """
+    df = valid_raw_df.copy()
+    df["monthlycharges"] = float("nan")
+    results = check_distribution_sanity(df, min_rows=1, max_null_rate=0.05)
+    monthly_check = next(
+        (r for r in results if r.name == "null_rate_monthlycharges"), None
+    )
+    assert (
+        monthly_check is not None
+    ), "monthlycharges must be covered by Gate 5 null-rate checks"
+    assert monthly_check.passed is False
+    assert monthly_check.failure_severity == Severity.WARNING
