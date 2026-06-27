@@ -31,9 +31,9 @@ repos:
     hooks:
       - id: nbstripout
         args: [--keep-id]
-        # _archive/ and numbered presentation notebooks (00-, 01-, …) keep their
-        # outputs for GitHub browsing. Unnumbered scratch notebooks are stripped.
-        exclude: ^notebooks/(_archive/|0[0-9]-)
+        # _archive/ and numbered presentation notebooks (00-, 01-, 02a-, …) keep
+        # their outputs for GitHub browsing. Unnumbered scratch notebooks are stripped.
+        exclude: ^notebooks/(_archive/|0[0-9][a-z]?-)
 
   - repo: local
     hooks:
