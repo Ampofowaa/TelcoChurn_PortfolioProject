@@ -7,7 +7,7 @@ uv sync
 pre-commit install
 ```
 
-Copy `.env.example` to `.env` and fill in the required values. For Phases 0–2 only `POSTGRES_URL` (and the `POSTGRES_*` vars) are needed; the MLflow, Prefect, and AWS vars are filled in as those phases are completed.
+Copy `.env.example` to `.env` and fill in the required values. For Phases 0–4 only `POSTGRES_URL` (and the `POSTGRES_*` vars) are needed; the MLflow, Prefect, and AWS vars are filled in as those phases are completed.
 
 ## Available make commands
 
@@ -22,6 +22,8 @@ Copy `.env.example` to `.env` and fill in the required values. For Phases 0–2 
 | `make db-down` | Stop and remove the Postgres container |
 | `make ingest` | Load raw CSV into Postgres (`python -m telco_churn.data.ingest`) |
 | `make validate` | Run the 5 Pandera validation gates (`python -m telco_churn.data.validate`) |
+| `make features` | Build SQL feature views and write processed dataset (`python -m telco_churn.features.build`) |
+| `make test-features` | Run feature-package unit tests with scoped coverage (`src/telco_churn/features`) |
 | `make train` | Re-run the DVC pipeline (`dvc repro`) |
 
 ## Pre-commit hooks

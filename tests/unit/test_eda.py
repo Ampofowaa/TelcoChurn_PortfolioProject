@@ -495,15 +495,15 @@ def test_compute_vif_warns_on_dropped_nulls(eda_df: pd.DataFrame) -> None:
     assert set(result.columns) == {"feature", "VIF"}
 
 
-def test_compute_vif_high_cardinality_cat_col_silently_returns_inf(
+def test_compute_vif_high_cardinality_cat_col_silently_returns_one(
     eda_df: pd.DataFrame,
 ) -> None:
-    # customerid has n unique values — one-hot expansion produces more columns than
-    # rows, making every regression R²=1 and every VIF=inf with no error raised.
+    # customerid OHE produces more columns than rows so vif_single's "too small
+    # to fit reliably" guard (len(y) < max(10, p+2)) triggers and returns 1.0.
     # The caller is responsible for not passing high-cardinality columns in cat_cols.
     df_pred = eda_df.drop(columns=["churn"])
     result = compute_vif(df_pred, cat_cols=["customerid"])
-    assert (result["VIF"] == float("inf")).all()
+    assert (result["VIF"] == 1.0).all()
 
 
 # ---------------------------------------------------------------------------

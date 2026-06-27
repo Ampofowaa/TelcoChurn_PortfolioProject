@@ -12,7 +12,7 @@ test:
 	uv run pytest
 
 test-features:
-	uv run pytest tests/unit/test_build.py tests/unit/test_sql_features.py \
+	uv run pytest tests/unit/test_build.py tests/unit/test_sql_features.py tests/unit/test_generate.py tests/unit/test_preprocessing.py \
 		--override-ini="addopts=" \
 		--cov=src/telco_churn/features --cov-report=term-missing
 

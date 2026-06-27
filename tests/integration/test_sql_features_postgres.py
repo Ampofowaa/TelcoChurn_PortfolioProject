@@ -21,7 +21,6 @@ from telco_churn.features import (
     BINARY_STR_COLS,
     MULTI_CAT_COLS,
     NUMERIC_COLS,
-    PYTHON_ENGINEERED_COLS,
     SQL_FEATURE_COLS,
     build_feature_df,
     build_sql_features,
@@ -61,85 +60,6 @@ def seeded_engine(pg_engine: Engine, sql_dir: Path) -> Engine:
     ingest(_FIXTURES_DIR / "sample_features.csv", pg_engine)
     build_sql_features(pg_engine, sql_dir)
     return pg_engine
-
-
-# ---------------------------------------------------------------------------
-# tenure_buckets view
-# ---------------------------------------------------------------------------
-
-
-def test_tenure_buckets_row_count_matches_raw(seeded_engine: Engine) -> None:
-    """tenure_buckets view has the same row count as customers_raw."""
-    with seeded_engine.connect() as conn:
-        raw = conn.execute(text("SELECT COUNT(*) FROM customers_raw")).scalar()
-        view = conn.execute(text("SELECT COUNT(*) FROM tenure_buckets")).scalar()
-    assert view == raw == _RAW_COUNT
-
-
-def test_tenure_buckets_no_null_cohort(seeded_engine: Engine) -> None:
-    """Every row in tenure_buckets has a non-NULL tenure_cohort."""
-    with seeded_engine.connect() as conn:
-        nulls = conn.execute(
-            text("SELECT COUNT(*) FROM tenure_buckets WHERE tenure_cohort IS NULL")
-        ).scalar()
-    assert nulls == 0
-
-
-def test_tenure_buckets_correct_label_for_short_tenure(seeded_engine: Engine) -> None:
-    """tenure=1 maps to '0–12 mo'."""
-    with seeded_engine.connect() as conn:
-        cohort = conn.execute(
-            text(
-                "SELECT tenure_cohort FROM tenure_buckets " "WHERE customerid = :id"
-            ).bindparams(id="7590-VHVEG")
-        ).scalar()
-    assert cohort == "0–12 mo"
-
-
-def test_tenure_buckets_correct_label_for_long_tenure(seeded_engine: Engine) -> None:
-    """tenure=45 maps to '25–48 mo'."""
-    with seeded_engine.connect() as conn:
-        cohort = conn.execute(
-            text(
-                "SELECT tenure_cohort FROM tenure_buckets " "WHERE customerid = :id"
-            ).bindparams(id="7795-CFOCW")
-        ).scalar()
-    assert cohort == "25–48 mo"
-
-
-def test_tenure_buckets_zero_tenure_bucket(seeded_engine: Engine) -> None:
-    """tenure=0 maps to '0–12 mo' (include_lowest boundary)."""
-    with seeded_engine.connect() as conn:
-        cohort = conn.execute(
-            text(
-                "SELECT tenure_cohort FROM tenure_buckets " "WHERE customerid = :id"
-            ).bindparams(id="zero-tenure")
-        ).scalar()
-    assert cohort == "0–12 mo"
-
-
-@pytest.mark.parametrize(
-    ("customerid", "expected_cohort"),
-    [
-        ("boundary-12", "0–12 mo"),  # upper edge of first band
-        ("boundary-13", "13–24 mo"),  # lower edge of second band
-        ("boundary-24", "13–24 mo"),  # upper edge of second band
-        ("boundary-25", "25–48 mo"),  # lower edge of third band
-        ("boundary-48", "25–48 mo"),  # upper edge of third band
-        ("boundary-49", "49+ mo"),  # lower edge of final band
-    ],
-)
-def test_tenure_buckets_fencepost_values(
-    seeded_engine: Engine, customerid: str, expected_cohort: str
-) -> None:
-    """Each bucket boundary value maps to the correct cohort label."""
-    with seeded_engine.connect() as conn:
-        cohort = conn.execute(
-            text(
-                "SELECT tenure_cohort FROM tenure_buckets " "WHERE customerid = :id"
-            ).bindparams(id=customerid)
-        ).scalar()
-    assert cohort == expected_cohort
 
 
 # ---------------------------------------------------------------------------
@@ -256,17 +176,6 @@ def test_customer_features_row_count_matches_raw(seeded_engine: Engine) -> None:
     assert view == raw == _RAW_COUNT
 
 
-def test_customer_features_tenure_cohort_no_null(seeded_engine: Engine) -> None:
-    """tenure_cohort is non-NULL for every row in customer_features."""
-    with seeded_engine.connect() as conn:
-        nulls = conn.execute(
-            text(
-                "SELECT COUNT(*) FROM customer_features " "WHERE tenure_cohort IS NULL"
-            )
-        ).scalar()
-    assert nulls == 0
-
-
 def test_customer_features_charge_per_service_no_null(seeded_engine: Engine) -> None:
     """charge_per_service is non-NULL for every row in customer_features."""
     with seeded_engine.connect() as conn:
@@ -280,7 +189,7 @@ def test_customer_features_charge_per_service_no_null(seeded_engine: Engine) -> 
 
 
 def test_customer_features_contains_expected_columns(seeded_engine: Engine) -> None:
-    """customer_features exposes tenure_cohort and charge_per_service alongside raw cols."""
+    """customer_features exposes charge_per_service and churn alongside the raw cols."""
     with seeded_engine.connect() as conn:
         row = (
             conn.execute(text("SELECT * FROM customer_features LIMIT 1"))
@@ -289,7 +198,6 @@ def test_customer_features_contains_expected_columns(seeded_engine: Engine) -> N
         )
     assert row is not None
     cols = set(row.keys())
-    assert "tenure_cohort" in cols
     assert "charge_per_service" in cols
     assert "churn" in cols
 
@@ -319,19 +227,12 @@ def test_pipeline_all_feature_columns_present(feature_df: pd.DataFrame) -> None:
         assert col in feature_df.columns
 
 
-def test_pipeline_python_engineered_columns_added(feature_df: pd.DataFrame) -> None:
-    """Python-engineered columns are absent from the view but present after build_feature_df."""
-    for col in PYTHON_ENGINEERED_COLS:
-        assert col in feature_df.columns
-
-
 def test_pipeline_no_unexpected_nulls(feature_df: pd.DataFrame) -> None:
-    """Only totalcharges and monthly_to_total_ratio may be null in pipeline output."""
-    nullable = {"totalcharges", "monthly_to_total_ratio"}
+    """Only totalcharges may be null in pipeline output (11 zero-tenure rows)."""
     non_nullable = [
         c
         for c in BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS
-        if c not in nullable
+        if c != "totalcharges"
     ]
     assert not feature_df[non_nullable].isnull().any().any()
 

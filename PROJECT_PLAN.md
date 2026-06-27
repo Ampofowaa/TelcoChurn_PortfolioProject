@@ -112,7 +112,6 @@ TelcoChurn_PortfolioProject/
 ├── sql/
 │   ├── schema/001_create_raw.sql
 │   └── features/
-│       ├── tenure_buckets.sql
 │       ├── charge_per_service.sql
 │       └── customer_features.sql   # final feature view
 │
@@ -125,7 +124,9 @@ TelcoChurn_PortfolioProject/
 │   │   └── validate.py         # orchestrates gates; structured logging; report writer
 │   ├── features/
 │   │   ├── sql_features.py     # runs sql/features/*.sql via SQLAlchemy
-│   │   └── build.py            # Python feature engineering (H1–H3) + column group exports
+│   │   ├── build.py            # column group exports (raw IBM columns + charge_per_service)
+│   │   ├── preprocessing.py    # shared ColumnTransformer builder (Phase 4a; reused by train.py)
+│   │   └── generate.py         # error-driven discovery machinery: OOF profiler, gate, bootstrap CI (Phase 4a)
 │   ├── models/
 │   │   ├── train.py            # Optuna + LightGBM + MLflow
 │   │   ├── calibrate.py        # CalibratedClassifierCV
@@ -174,10 +175,12 @@ TelcoChurn_PortfolioProject/
 │
 ├── notebooks/
 │   ├── _archive/EDA-original.ipynb  # original 148-cell monolith; frozen reference
-│   ├── 00-data-quality.ipynb        # Phase 2 — 5 gates on live Postgres data
+│   ├── 00-data-ingestion.ipynb      # Phase 2 — raw CSV → 5 Pandera gates → Postgres ingest
 │   ├── 01-eda.ipynb                 # Phase 3 — statistical tests, distributions
-│   ├── 02-feature-engineering.ipynb # Phase 4 — SQL view + ColumnTransformer output
+│   ├── 02a-feature-discovery.ipynb  # Phase 4a — structured feature search: domain hypotheses + OOF blind-spot profiling → adoption gate
+│   ├── 02b-feature-engineering.ipynb # Phase 4b — distribution/justification view of the adopted set
 │   ├── 03-model-selection.ipynb     # Phase 5 — Optuna study + baseline comparison
+│   ├── 03b-feature-selection.ipynb  # Phase 5 — null-importance selection experiment
 │   ├── 04-calibration-and-threshold.ipynb  # Phase 6 — reliability diagrams + cost curves
 │   └── 05-error-analysis.ipynb      # Phase 7 — SHAP + FN/FP analysis
 │
@@ -202,7 +205,8 @@ TelcoChurn_PortfolioProject/
 | 1 | Data ingestion (CSV → Postgres) | `docker-compose.yml`, `sql/schema/`, `data/ingest.py` | ✅ Done |
 | 2 | Data validation (Pandera + 5 gates) | `data/schema.py`, `data/checks.py`, `data/validate.py`, 40 tests | ✅ Done |
 | 3 | EDA notebook | `notebooks/01-eda.ipynb` importing from `src/` | ✅ Done |
-| 4 | Feature engineering (SQL + Python) | `sql/features/*.sql`, `features/sql_features.py`, `features/build.py` | ✅ Done |
+| 4a | Feature discovery: structured feature search (domain hypotheses + OOF profiling → adoption gate) | `features/generate.py`, `features/preprocessing.py`, `notebooks/02a-feature-discovery.ipynb`, provenance log | ✅ Done |
+| 4b | Feature engineering — encode the 4a-adopted set | `sql/features/*.sql`, `features/sql_features.py`, `features/build.py`, `features/schema.py` | ✅ Done |
 | 5 | Model training (LightGBM + Optuna + MLflow) | `models/train.py`, `configs/model/`, `configs/training/` | Not started |
 | 6 | Calibration + cost-sensitive threshold | `models/calibrate.py`, `models/threshold.py` | Not started |
 | 7 | Evaluation + error analysis + registry promotion | `models/evaluate.py`, `models/register.py`, `notebooks/05-error-analysis.ipynb` | Not started |
@@ -275,10 +279,10 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 - `tests/unit/conftest.py` — shared fixtures: `valid_raw_df`, `zero_tenure_df`, `empty_telco_df`, `large_valid_df`
 - `tests/unit/test_checks.py` — 26 tests: `ValidationResult` properties; Gates 1–5 pass/fail/severity/detail assertions
 - `tests/unit/test_validate.py` — 14 tests: `validate_raw` strict/non-strict; `validate_clean`; `clean_dataframe` imputation; `save_validation_report` artifacts; `hypothesis` property tests for NaN propagation and column isolation
-- `notebooks/00-data-quality.ipynb` — runs the 5 gates against the live Postgres table; renders `summary.csv` and `schema_failures.csv` for inspection
+- `notebooks/00-data-ingestion.ipynb` — demonstrates the raw CSV → 5 Pandera gates → Postgres ingest journey; renders `summary.csv` and `schema_failures.csv` for inspection
 
 **Phase 8 cleanup required:**
-- Remove `clean_dataframe()` once the Phase 4 `features` stage owns imputation via a fitted `sklearn SimpleImputer` that stores the training-set median
+- Remove `clean_dataframe()` once imputation is owned by the **Phase 5 training `ColumnTransformer`** (`SimpleImputer(strategy='median')` fit on `X_train` only); the Phase 4b `features` stage deliberately preserves the 11 NaNs so no training-set statistic leaks into feature engineering
 - In the DVC stage entry point, catch `ValidationError`, emit a `pipeline_blocked` structured log event listing which gates failed, then call `sys.exit(1)` — do not let Python's default traceback handler produce the exit, which is noisy and unsearchable in pipeline logs
 
 **Verification:** `uv run python -m telco_churn.data.validate` against the loaded Postgres data exits 0; an injected violation exits 1 and writes a timestamped report to `reports/validation/`.
@@ -306,23 +310,47 @@ Phases follow the data scientist's natural workflow: environment → ingest → 
 
 ---
 
-### Phase 4 — Feature Engineering (SQL + Python) *(2 days)*
+### Phase 4a — Feature Discovery: Structured Feature Search *(2–3 days)*
 
-**What this achieves:** Features are built in two layers — SQL views in Postgres (tenure bucketing, charge-per-service ratio) and four hypothesis-driven Python columns (H1–H3). This mirrors how features are built in a real warehouse-backed ML system. The feature set is lifted from the original notebook's converged engineering loop.
+**What this achieves:** Establishes which engineered features earn a place in the model through a narrated, audited discovery loop. Candidates originate from two sources: EDA-anchored domain hypotheses (e.g., tenure survival-curve segmentation, service-normalised pricing, the fiber × contract interaction) and OOF false-negative profiling that surfaces systematic blind spots the baseline cannot recover. Every candidate — regardless of origin — passes through a four-screen adoption gate: leakage pre-gate → redundancy screen → OOF PR-AUC + subgroup recall → importance vs. noise floor. The loop is human-in-the-loop: the analyst writes each candidate in the notebook; `generate.py` supplies the mechanical scaffolding. Starts from raw IBM columns only. At least one decoy must be introduced and rejected.
 
-In a greenfield build, feature engineering is a *loop* (error analysis → new feature → re-model, 2–5× — "data-centric" iteration); the linear phase list shows only the first pass. This project migrates a loop that **already converged**, so it engineers once. The loop genuinely reopens only for the **next model version**, driven by post-deployment monitoring and drift (Phases 10 & 13) on the retrain cadence — not within this build.
+**Not a DVC stage:** run-once R&D, seeded (`random_state=42`). Commits its provenance and adopted-set list; the production pipeline ships the frozen result via Phase 4b `build.py`.
 
 **Deliverables:**
-- `sql/features/tenure_buckets.sql` — `CASE`-based tenure cohorts (0–12, 13–24, 25–48, 49+ months)
-- `sql/features/charge_per_service.sql` — `monthlycharges` divided by the count of active services; NULL-safe
-- `sql/features/customer_features.sql` — final feature view joining `customers_raw` with both SQL-derived features; this is the table the Python feature builder reads
-- `src/telco_churn/features/sql_features.py` — `build_sql_features(engine)` runs the three SQL files in dependency order via SQLAlchemy; idempotent (`CREATE OR REPLACE VIEW`)
-- `src/telco_churn/features/build.py` — `build_feature_df(df)` applies Python-engineered features (H1–H3) on top of the SQL-engineered columns and returns a raw (untransformed) feature DataFrame alongside the target array; exports `BINARY_COLS`, `MULTI_CAT_COLS`, `NUMERIC_COLS` for the training pipeline to consume. **Does not fit or apply the `ColumnTransformer`** — that belongs in Phase 5 where the train/val/test split is performed, so transformer statistics are never leaked from held-out rows.
-- `tests/unit/test_build.py` — dtype invariants (`hypothesis`), NaN propagation, column count stability
-- `tests/integration/test_sql_features_postgres.py` — `testcontainers` Postgres; assert view row count matches `customers_raw`; assert no NULL in derived columns where not expected
-- `notebooks/02-feature-engineering.ipynb` — SQL feature distributions and Python-engineered feature validation outputs
 
-**Verification:** `uv run python -m telco_churn.features.build` reads from the SQL feature view, applies Python feature engineering, and writes `datasets/processed/telco_churn_processed.csv` (7,043 rows × 25 feature columns + `customerid` + `churn`, raw and untransformed). `customerid` is the first column — present for error analysis and prediction tracing in later phases, excluded from model inputs by the `ColumnTransformer` in Phase 5.
+*Source:*
+- `src/telco_churn/features/preprocessing.py` — `build_preprocessor(binary, multi_cat, numeric)` returning a `ColumnTransformer` (median-impute + scale numerics; OHE categoricals; `FunctionTransformer(astype str)` on the mixed-dtype binary group); reused verbatim by Phase 5 `train.py`
+- `src/telco_churn/features/generate.py` — discovery machinery: `oof_predictions`, `profile_false_negatives` (single-feature scan + cross-tab → ranked blind spots), `serving_available` (leakage pre-gate), `redundancy_screen` (|corr| + VIF / Cramér's V), `candidate_importance` (permutation importance vs. decoy noise floor), `adoption_gate` (composes the four screens; PR-AUC is the sole selector, the others are guardrails), `bootstrap_pr_auc_ci`, `backward_elimination` (post-loop pruning pass over the adopted set), `LapRecord` + provenance writer. Pure, typed, testable — no feature logic.
+
+*Tests:*
+- `tests/unit/test_generate.py` — planted recoverable blind spot: profiler surfaces it; gate adopts a known-good feature, rejects a decoy, rejects a leaked candidate at the pre-gate (before any metric is computed), flags and rejects a collinear duplicate with no marginal recall gain, rejects a noise-floor-importance candidate despite a fold-noise recall blip; the flat-global-PR-AUC-but-recall-up case is adopted; OOF predictions are leak-free; bootstrap-CI math on a known-population case; empty-frame / all-noise edge cases.
+
+*Notebook:*
+- `notebooks/02a-feature-discovery.ipynb` — narrated discovery session: lap-by-lap from the raw base, error profile → analyst hypothesis → redundancy screen → re-measure → gate decision, including ≥1 rejected decoy. Candidate feature logic lives here during the loop, then migrates to `build.py` in Phase 4b.
+
+*Artifact:*
+- `reports/feature_discovery/provenance.json` — run-level header (random state, gate-threshold constants) + per-lap record (blind spot, hypothesis, EDA anchor, serving-availability verdict, redundancy stats, ΔPR-AUC, Δsubgroup recall, importance vs. noise floor, decision). The auditable trail proving the feature set was discovered, not asserted.
+
+**Verification:** `notebooks/02a-feature-discovery.ipynb` runs end-to-end from the raw base, discovers candidates lap-by-lap from the error profile (expected to converge near the six features in `build.py`), rejects ≥1 decoy through the gate, and emits the adopted-set list + `reports/feature_discovery/provenance.json`. `uv run pytest tests/unit/test_generate.py` passes.
+
+---
+
+### Phase 4b — Feature Engineering *(1–2 days)*
+
+**What this achieves:** Takes the single Phase 4a adoption — `charge_per_service` — builds it in a SQL view, and folds it into the feature set alongside the 19 raw IBM columns. The training pipeline inherits a clean, Pandera-validated column interface: nothing provisional, no dead feature code.
+
+**Deliverables:**
+- `sql/features/charge_per_service.sql` — `monthlycharges ÷ GREATEST(service_count, 1)`; nine binary `CASE WHEN` flags summed in a subquery; `GREATEST` guards divide-by-zero; `internetservice <> 'No'` catches both DSL and Fiber optic
+- `sql/features/customer_features.sql` — final feature view; LEFT JOIN over `customers_raw` so any row filtered by a dependent view surfaces as NULL (caught by Pandera) rather than being silently dropped
+- `src/telco_churn/features/sql_features.py` — `build_sql_features(engine, sql_dir)`: runs the two SQL files in dependency order inside one `engine.begin()` transaction; idempotent (`CREATE OR REPLACE VIEW`)
+- `src/telco_churn/features/build.py` — `BINARY_STR_COLS` (5), `BINARY_INT_COLS` (1), `MULTI_CAT_COLS` (10), `NUMERIC_COLS` (3 raw + `charge_per_service`); `build_feature_df()` is a Pandera-decorated pass-through; `__main__` CLI retained until Phase 8
+- `src/telco_churn/features/schema.py` — `CustomerFeaturesSchema` (20 columns; `strict=False` so `customerid`/`churn` pass through; `coerce=True` for Postgres type coercion on read); `FeatureOutputSchema` inherits and overrides `coerce=False`
+- `tests/unit/test_build.py` — shape, NaN passthrough, immutability, schema rejection, `hypothesis` property tests, provenance cross-check against `adopted_features.json`
+- `tests/unit/test_sql_features.py` — execution count, dependency order, single-transaction contract, error propagation with filename, idempotency, file existence
+- `tests/integration/test_sql_features_postgres.py` — `testcontainers` Postgres covering both views and the full SQL → `build_feature_df` pipeline; `__main__` CLI subprocess test
+- `notebooks/02b-feature-engineering.ipynb` — loads the feature view, renders the 20-column inventory, confirms output shape; Phase 4a outcome in the opening cell; full narrative in `ANALYSIS.md §3b`
+
+**Verification:** `uv run python -m telco_churn.features.build` exits 0 and writes `datasets/processed/telco_churn_processed.csv` (7,043 rows × 20 feature columns + `customerid` + `churn`). `uv run pytest tests/unit/test_build.py tests/unit/test_sql_features.py` passes. Integration tests require the stale `tenure_buckets` cleanup before running.
 
 ---
 
@@ -351,7 +379,7 @@ In a greenfield build, feature engineering is a *loop* (error analysis → new f
 >
 > | Stage | `customerid` treatment |
 > |---|---|
-> | `build_feature_df` | Present in the input DataFrame; absent from the returned `feature_df` because it is not in `BINARY_COLS`, `MULTI_CAT_COLS`, or `NUMERIC_COLS` |
+> | `build_feature_df` | Present in the input DataFrame; absent from the returned `feature_df` because it is not in `BINARY_STR_COLS`, `BINARY_INT_COLS`, `MULTI_CAT_COLS`, or `NUMERIC_COLS` |
 > | `train.py` train/val/test split | Split `customerid` out as a separate `pd.Series` alongside `X_train`, `X_val`, `X_test` — do not drop it |
 > | `ColumnTransformer` | `remainder='drop'` passively excludes any column not listed in a transformer — `customerid` never reaches the model even if accidentally present in `X` |
 > | Error analysis (Phase 7) | Re-attach `customerid` Series to `y_pred` for joins back to raw customer records |
@@ -363,10 +391,12 @@ In a greenfield build, feature engineering is a *loop* (error analysis → new f
 - `configs/training/optuna.yaml` — `n_trials: 50`, `sampler: tpe`, `direction: maximize`, `metric: average_precision`, `cv_folds: 5`, `random_state: 42`
 
 *Source:*
-- `src/telco_churn/models/train.py` — reads config via Hydra; loads feature DataFrame from `datasets/processed/` via `build_feature_df`; performs the stratified train/val/test split (`random_state=42`, **the only place the split is defined**); fits the `ColumnTransformer` on the training split only and wraps it with the model in a single sklearn `Pipeline` (OHE over native encoding — all categoricals ≤ 4 unique values; `StandardScaler` included for linear baseline fairness); stratified 5-fold CV with `scale_pos_weight ≈ 2.77`; best model logged as `pyfunc` with `feature_space.txt`, `feature_columns.txt`, and `preprocessing.pkl` and registered as `telco-churn-pipeline` / alias `challenger`. **Two-layer artifact logging (feature space vs model input space):** `feature_space.txt` is logged at the start of the MLflow run by reading `BINARY_COLS + MULTI_CAT_COLS + NUMERIC_COLS` from `build.py` — it records the full *feature space* (every column `build_feature_df` produced, owned by `FeatureSchema`). It is generated here, not in `build.py`, because it is an MLflow artifact — Phase 4 has no MLflow context. `feature_columns.txt` records the *model input space* — the subset that survived `select.py` and entered the `ColumnTransformer`. The diff between these two files is what selection dropped for that specific run; any MLflow run is self-describing without a git lookup. `feature_space.txt` is identical across most runs (it only changes when `build.py` changes); `feature_columns.txt` can differ on every run where selection experiments change. `preprocessing.pkl` is the fitted `ColumnTransformer` encoding the exact transformations applied to the model input space at training time. The test split is importable **only** by `evaluate.py` (Phase 7) — the "test set touched once" invariant is structural, not conventional. **Binary dtype note:** `BINARY_COLS` contains a mixed-dtype group — `gender`, `has_partner`, `dependents`, `phoneservice`, `paperlessbilling` are `'Yes'`/`'No'` strings, while `seniorcitizen` and `is_long_month_to_month` are `0`/`1` integers. Add a `FunctionTransformer(lambda X: X.astype(str))` as the first step in the binary branch of the `ColumnTransformer` to normalise all binary inputs to strings before OHE. **Imputation note:** `totalcharges` and `monthly_to_total_ratio` are NaN for 11 zero-tenure rows (`tenure = 0`, `monthlycharges > 0` — first bill not yet issued); both must be imputed via `SimpleImputer(strategy='median')` inside the numeric branch of the `ColumnTransformer` — fit on `X_train` only, never on the full dataset. This is the only place imputation is applied; `build_feature_df` deliberately preserves the NaN values so no training-set statistics leak into the feature-engineering step. Median imputation is appropriate here for three reasons: (1) all 11 rows are non-churners, so they are not in the minority class the model is tuned to identify; (2) 11 rows is 0.15 % of the dataset — negligible impact on any split; (3) LightGBM splits on individual thresholds, not linear combinations, so inter-column consistency between the imputed `totalcharges` and `monthly_to_total_ratio` values does not affect model behaviour.
+- `src/telco_churn/models/train.py` — reads config via Hydra; loads feature DataFrame from `datasets/processed/` via `build_feature_df`; performs the stratified train/val/test split (`random_state=42`, **the only place the split is defined**); fits the `ColumnTransformer` on the training split only and wraps it with the model in a single sklearn `Pipeline` (OHE over native encoding — all categoricals ≤ 4 unique values; `StandardScaler` included for linear baseline fairness); stratified 5-fold CV with `scale_pos_weight ≈ 2.77`; best model logged as `pyfunc` with `feature_space.txt`, `feature_columns.txt`, and `preprocessing.pkl` and registered as `telco-churn-pipeline` / alias `challenger`. **Two-layer artifact logging (feature space vs model input space):** `feature_space.txt` is logged at the start of the MLflow run by reading `BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS` from `build.py` — it records the full *feature space* (every column `build_feature_df` produced, owned by `FeatureSchema`). It is generated here, not in `build.py`, because it is an MLflow artifact — Phase 4 has no MLflow context. `feature_columns.txt` records the *model input space* — the subset that survived `select.py` and entered the `ColumnTransformer`. The diff between these two files is what selection dropped for that specific run; any MLflow run is self-describing without a git lookup. `feature_space.txt` is identical across most runs (it only changes when `build.py` changes); `feature_columns.txt` can differ on every run where selection experiments change. `preprocessing.pkl` is the fitted `ColumnTransformer` encoding the exact transformations applied to the model input space at training time. The test split is importable **only** by `evaluate.py` (Phase 7) — the "test set touched once" invariant is structural, not conventional. **Binary dtype note:** the binary group is split by dtype across two lists — `BINARY_STR_COLS` (`gender`, `has_partner`, `dependents`, `phoneservice`, `paperlessbilling`; `'Yes'`/`'No'` strings) and `BINARY_INT_COLS` (`seniorcitizen`, `is_long_month_to_month`; `0`/`1` integers). The binary branch of the `ColumnTransformer` is fed their union (`BINARY_STR_COLS + BINARY_INT_COLS`) with a `FunctionTransformer(lambda X: X.astype(str))` as its first step, normalising all binary inputs to strings before OHE. **Imputation note:** `totalcharges` and `monthly_to_total_ratio` are NaN for 11 zero-tenure rows (`tenure = 0`, `monthlycharges > 0` — first bill not yet issued); both must be imputed via `SimpleImputer(strategy='median')` inside the numeric branch of the `ColumnTransformer` — fit on `X_train` only, never on the full dataset. This is the only place imputation is applied; `build_feature_df` deliberately preserves the NaN values so no training-set statistics leak into the feature-engineering step. Median imputation is appropriate here for three reasons: (1) all 11 rows are non-churners, so they are not in the minority class the model is tuned to identify; (2) 11 rows is 0.15 % of the dataset — negligible impact on any split; (3) LightGBM splits on individual thresholds, not linear combinations, so inter-column consistency between the imputed `totalcharges` and `monthly_to_total_ratio` values does not affect model behaviour.
 > **📌 Discussion (revisit at Phase 5 implementation) — model-specific preprocessors:** The current design uses a single shared `ColumnTransformer` with `StandardScaler` included for linear baseline fairness. However, full OHE without `drop='first'` on multi-categorical features reintroduces perfect multicollinearity for linear models (the dummy variable trap), inflating coefficient variance and making estimates unstable — tree models are immune since each split is evaluated independently. The principled fix is two named preprocessors: `linear_preprocessor` (OHE `drop='first'` on all categoricals + `StandardScaler`) paired with `DummyClassifier` and `LogisticRegression`, and `tree_preprocessor` (OHE `drop='if_binary'` on binary cols, no drop on multi-cat, scaling optional) paired with LightGBM, XGBoost, and RandomForest. This costs two `ColumnTransformer` definitions and one extra line per `Pipeline` but makes the baseline comparison genuinely apples-to-apples — each family's pipeline is tuned to that family's assumptions. Adopt this pattern if the linear baseline is being taken seriously as a potential champion; the single-transformer shortcut is acceptable if trees dominate by a clear margin and the linear model is a floor only.
+   >
+   > **`tenure_cohort` vs `tenure` for the linear preprocessor (Phase 4a finding):** Phase 4a rejected `tenure_cohort` for LightGBM — continuous `tenure` already encodes all cohort signal and the tree learns the same non-linear boundaries through its own splits. For logistic regression, `tenure_cohort` (OHE’d with `drop='first'`) is the correct substitution: a single linear slope on continuous `tenure` cannot represent the survival-distribution shape (steep drop in the first 12 months, then gradual flattening), whereas OHE’d cohorts give the model a separate coefficient per risk tier. When building the `linear_preprocessor`, move `tenure` from the numeric group and replace it with `tenure_cohort` in the categorical group.
 
-- `src/telco_churn/features/schema.py` — `FeatureSchema` frozen dataclass (or Pydantic `BaseModel` with `model_config = ConfigDict(frozen=True)`) that owns `binary`, `multi_cat`, and `numeric` as `tuple[str, ...]` fields. This replaces the three bare `list[str]` module-level constants in `build.py` (`BINARY_COLS`, `MULTI_CAT_COLS`, `NUMERIC_COLS`) with a single typed, immutable object. `train.py` imports one `FeatureSchema` instance and feeds its fields directly to the `ColumnTransformer` column lists; `build_feature_df` imports the same instance to select columns — one source of truth, no mutation risk. Rationale: `Final[list[str]]` prevents rebinding but not `.append()`; `tuple` prevents mutation but not misuse; a `frozen=True` schema prevents both and adds field-level validation (non-empty, no duplicates) at no extra cost. Phase 4's bare lists remain in `build.py` until this phase lands; they are removed in the same PR that introduces `schema.py`.
+- `src/telco_churn/features/schema.py` (**extended, not created — the file already exists from Phase 4b, holding the Pandera `CustomerFeaturesSchema` / `FeatureOutputSchema` contracts**) — Phase 5 adds a `FeatureSchema` frozen dataclass (or Pydantic `BaseModel` with `model_config = ConfigDict(frozen=True)`) *alongside* those contracts, owning `binary`, `multi_cat`, and `numeric` as `tuple[str, ...]` fields. This replaces the bare `list[str]` column-group constants in `build.py` with a single typed, immutable object (the Pandera schemas validate row *values*; `FeatureSchema` owns the column *grouping* — two complementary roles in one module). `train.py` imports one `FeatureSchema` instance and feeds its fields directly to the `ColumnTransformer` column lists; `build_feature_df` imports the same instance to select columns — one source of truth, no mutation risk. Rationale: `Final[list[str]]` prevents rebinding but not `.append()`; `tuple` prevents mutation but not misuse; a `frozen=True` schema prevents both and adds field-level validation (non-empty, no duplicates) at no extra cost. `build.py`'s bare column-group lists remain until this phase lands; they are removed in the same PR that adds `FeatureSchema` to the existing `schema.py`.
   **Feature space vs model input space — two distinct concepts:** `FeatureSchema` owns the *feature space*: all engineered columns that `build_feature_df` can produce (the full Phase 4 output). The *model input space* is a separate, narrower concept — it is what actually enters the `ColumnTransformer` after `select.py` narrows the feature space down to survivors. `FeatureSchema` does not define the model input space; `select.py`'s output does. These must be kept conceptually separate: the feature space is stable across many model versions (adding a new engineered column updates it once), while the model input space changes every time selection runs a different experiment. **`frozen=True` semantics:** `frozen=True` means the `FeatureSchema` *instance* is immutable at runtime — no `.append()` or mutation by a caller. It does **not** mean the feature set is version-locked. Evolving the feature set (e.g., adding a new engineered column) requires explicit code changes in `build.py`, `FeatureSchema`, and the relevant SQL/Python feature builder — the frozen instance just enforces that those changes are deliberate rather than accidental runtime side-effects.
 
 - `src/telco_churn/features/select.py` — null-importance / target-permutation selector; fits inside CV on train + val only against a default-config LightGBM; returns surviving feature list, importance/null table, and per-fold stability scores; wrapped in an sklearn `Pipeline` so `cross_val_score` re-fits selection on each fold's training portion (leak-free by construction).
@@ -377,9 +407,28 @@ In a greenfield build, feature engineering is a *loop* (error analysis → new f
 
 *Notebooks:*
 - `notebooks/03-model-selection.ipynb` — loads the Optuna study from MLflow; renders parallel-coordinates plot, hyperparameter importance, CV PR-AUC distribution across trials, and comparison table with reference baselines
-- `notebooks/04-feature-selection.ipynb` — full selection experiment: full-set CV PR-AUC + bootstrap CI → null-importance ranking → reduced-set refit → overlapping-CI check → documented keep/drop decision; imports from `select.py`
+- `notebooks/03b-feature-selection.ipynb` — full selection experiment: full-set CV PR-AUC + bootstrap CI → null-importance ranking → reduced-set refit → overlapping-CI check → documented keep/drop decision; imports from `select.py`
 
-**Verification:** `uv run python -m telco_churn.models.train` completes 50 trials and produces an MLflow run whose cross-validation PR-AUC falls within the bootstrap CI reported in `README.md`; reference baselines appear as rows in the comparison and LightGBM's PR-AUC is ≥ both. `notebooks/04-feature-selection.ipynb` runs end to end and records a keep/drop decision in `ANALYSIS.md`.
+**Verification:** `uv run python -m telco_churn.models.train` completes 50 trials and produces an MLflow run whose cross-validation PR-AUC falls within the bootstrap CI reported in `README.md`; reference baselines appear as rows in the comparison and LightGBM's PR-AUC is ≥ both. `notebooks/03b-feature-selection.ipynb` runs end to end and records a keep/drop decision in `ANALYSIS.md`.
+
+**Prep checklist (task → deliverable):** the five ordered steps form the spine; two foundation tasks precede them because Step 1 cannot run without the schema and configs.
+
+| # | Task | Deliverable |
+|---|---|---|
+| 1 | **Foundation:** `FeatureSchema` (frozen, typed; replaces the bare `list[str]` constants in `build.py`) | `src/telco_churn/features/schema.py` + `build.py` edits |
+| 2 | **Foundation:** model + training Hydra configs | `configs/model/lightgbm.yaml`, `configs/training/optuna.yaml` |
+| 3 | **Step 1** — build candidates (Dummy + LogReg + LightGBM/XGBoost/RandomForest) through the *identical* pipeline + CV; split defined once (`random_state=42`); `customerid` split out as a Series; `ColumnTransformer` fit on train only | `src/telco_churn/models/train.py` (split + `ColumnTransformer`/`Pipeline` + candidates) |
+| 4 | **Step 2** — compare on PR-AUC (sole selection metric); confirm LightGBM ≥ baselines; ROC-AUC/recall/precision/F1 as diagnostics only | comparison logic in `train.py` + `ANALYSIS.md` note (recall@0.35→PR-AUC deviation + baseline margin) |
+| 5 | **Step 3** — null-importance/target-permutation selection inside CV on train+val vs default LightGBM; refit on survivors; adopt reduced set only if within full-set bootstrap CI; **freezes the input space** | `src/telco_churn/features/select.py` + keep/drop decision in `ANALYSIS.md` |
+| 6 | **Step 4** — tune LightGBM with Optuna (50 TPE trials, `average_precision`) *after* the freeze; trials as nested MLflow child runs | Optuna tuning logic in `train.py` |
+| 7 | **Step 5** — register tuned model as `telco-churn-pipeline` / `challenger`; two-layer artifact logging | registration + `feature_space.txt`, `feature_columns.txt`, `preprocessing.pkl` in `train.py` |
+| 8 | Tests — config loading + metric-logging contract (mock MLflow); split reproducibility | `tests/unit/test_train.py` |
+| 9 | Tests — planted-noise synthetic data; selector drops noise/keeps signal; leak-free; edge cases | `tests/unit/test_select.py` |
+| 10 | Notebook — Optuna study + baseline comparison loaded from MLflow | `notebooks/03-model-selection.ipynb` |
+| 11 | Notebook — full selection experiment (full-set CI → null-importance → reduced refit → overlap check → decision) | `notebooks/03b-feature-selection.ipynb` |
+| 12 | Verification — 50-trial run within README CI; LightGBM ≥ baselines; green `pytest` | passing verification + green test suite |
+
+> **Order is load-bearing:** selection (Step 3) freezes the input space *before* tuning (Step 4) — changing features invalidates tuning. The test split is defined once in `train.py` and stays importable only by `evaluate.py` (Phase 7). Calibration/thresholding (Phase 6) and sealed-test evaluation + promotion to `champion` (Phase 7) are out of scope here.
 
 ---
 
@@ -399,6 +448,8 @@ In a greenfield build, feature engineering is a *loop* (error analysis → new f
 - `notebooks/04-calibration-and-threshold.ipynb` — reliability diagrams before and after calibration; cost curve annotated with each scenario threshold
 
 **Verification:** Calibrated Brier score ≤ uncalibrated Brier score; base-scenario threshold matches the value documented in `README.md`.
+
+> **📌 Cross-reference with Phase 4a (`notebooks/02a-feature-discovery.ipynb`):** The discovery notebook explicitly names `models/calibrate.py` and `models/threshold.py` as the home of the production decision threshold — telling readers that `DISCOVERY_THRESHOLD` (the prevalence-based reference used for lap-to-lap delta comparisons) is *not* the production threshold. When this phase lands: (1) confirm both modules exist at the paths named in the notebook (`src/telco_churn/models/calibrate.py` and `src/telco_churn/models/threshold.py`); (2) verify the notebook's cross-reference text is still accurate (function names, file paths); (3) update the notebook's threshold documentation block if the calibration/threshold API has changed from what was described.
 
 > **⚠ Layout flag (from Phase 3):** Add `reports/figures/` to the repository layout in the "Repository Layout (target)" section when this phase lands. `reports/` is already used implicitly (Phase 2 writes `reports/validation/`, Phase 7 writes `reports/metrics.json`) but was omitted from the top-level layout. Phase 6 is the first phase to save evaluation charts (reliability diagrams, cost curves) to disk, making the omission visible. Update the layout table and add `reports/figures/` as the destination for saved charts.
 
@@ -567,10 +618,12 @@ In a greenfield build, feature engineering is a *loop* (error analysis → new f
 Phase 0 is the only hard prerequisite. Phases 1–8 are sequential — each phase's output is the next phase's input. After Phase 8, the engineering wrapper is largely independent:
 
 ```
-0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
-                                    ↓
-                              9 → 10 → 11 → 12 → 13 → 14
+0 → 1 → 2 → 3 → 4a → 4b → 5 → 6 → 7 → 8
+                                        ↓
+                                  9 → 10 → 11 → 12 → 13 → 14
 ```
+
+Phase 4a (structured feature search) is the authoritative gate that **decides** the feature set; Phase 4b **engineers** the survivors into SQL + `build.py` + schema. 4a sits at the feature ↔ model boundary because it needs a baseline model to profile errors against — it reuses `features/preprocessing.py` (built in 4a, shared with Phase 5 `train.py`).
 
 Conservative estimate: **5–7 weeks** part-time; **~3 weeks** full-time.
 
@@ -601,9 +654,10 @@ Notebooks are for exploration and narrative, not for owning logic:
 
 | Notebook | Phase | What It Demonstrates |
 |---|---|---|
-| `00-data-quality.ipynb` | 2 | 5 Pandera gates on the live Postgres table; example violations |
+| `00-data-ingestion.ipynb` | 2 | Raw CSV → 5 Pandera gates → Postgres ingest; example violations |
 | `01-eda.ipynb` | 3 | Statistical tests, distributions, churn-rate breakdowns |
-| `02-feature-engineering.ipynb` | 4 | SQL feature distributions and Python-engineered feature validation outputs |
+| `02a-feature-discovery.ipynb` | 4a | Structured feature search: domain hypotheses + OOF blind-spot profiling → adoption gate, incl. a rejected decoy |
+| `02b-feature-engineering.ipynb` | 4b | Distribution / justification view of the 4a-adopted feature set |
 | `03-model-selection.ipynb` | 5 | Optuna study summary + baseline comparison loaded from MLflow |
 | `04-calibration-and-threshold.ipynb` | 6 | Reliability diagrams + 3-scenario cost curves |
 | `05-error-analysis.ipynb` | 7 | SHAP global/local plots + FN/FP analysis |
@@ -666,4 +720,4 @@ These are reasonable "future work" items for the README, not omissions:
 - **API authentication** — fine for a portfolio demo; a production system would add OAuth/JWT
 - **Multi-region / HA deployment** — single App Runner region is sufficient
 - **Cost dashboards** — AWS Cost Explorer's free view covers the free-tier project
-- **A live generative error-analysis → feature loop (v2)** — this project's story is *"productionised validated science"*: it ships the **converged** feature set from `EDA-original.ipynb` (which stays the source of truth), and Phase 7's error analysis is *confirmatory*. A natural **v2**, built *after* the production spine ships (post-Phase 14), turns the generative loop into reproducible code — error analysis on a profiling holdout proposes a **new** feature, the `select.py` + training harness re-measure it, and it is adopted only if it beats the frozen set on PR-AUC within CI. That would let the repo *also* claim "full DS lifecycle in code" without re-deriving work already done well. Deferred deliberately so the finishable migration artifact exists first; the v2 loop **extends**, not replaces, the notebook — see `summary.md` §4.4.
+- **An *automated / online* generative feature loop (v2)** — the *human-in-the-loop, reproducible* generative loop is now **in scope as Phase 4a**: the analyst profiles errors on an OOF substrate, hypothesises features, and the adoption gate keeps/rejects them (`features/generate.py` + `notebooks/02a-feature-discovery.ipynb`), reproducing the convergence of `EDA-original.ipynb` §10.5 as runnable, audited code. What remains deferred to **v2** is the *automated* version — a drift-triggered loop that re-opens discovery on new data post-deployment without an analyst in the seat (Phases 10 & 13 supply the triggers). The automated engine is deliberately out of MVP scope: unattended feature invention is a governance and reproducibility hazard and is **not** standard practice for classical tabular ML — the human-in-the-loop loop (Phase 4b) is the industry-correct form. See `summary.md` §4.4.

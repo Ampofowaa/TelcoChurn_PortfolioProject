@@ -6,6 +6,51 @@ Versions map to project phases; see [PROJECT_PLAN.md](PROJECT_PLAN.md) for the f
 
 ---
 
+## [0.4.2] - 2026-06-27 — Phase 4a/4b: Feature Discovery & Engineering
+
+*Phase 4a ran a nine-lap structured feature search; `charge_per_service` was the sole adoption.
+Phase 4b pruned all rejected candidates from the feature pipeline. Feature set: 20 columns
+(19 raw IBM + `charge_per_service`). 206 unit tests; 94.97% coverage.*
+
+### Added
+- **`notebooks/02a-feature-discovery.ipynb`** — nine-lap search: OOF error profile → hypothesis
+  → four-screen gate (leakage, redundancy, ΔPR-AUC, permutation importance).
+- **`src/telco_churn/features/generate.py`** — discovery machinery: OOF predictor,
+  blind-spot profiler (`profile_false_negatives`), four-screen adoption gate
+  (`serving_available`, `redundancy_screen`, `candidate_importance`, `adoption_gate`),
+  bootstrap PR-AUC CI, and provenance writer; typed result dataclasses (`LapRecord`,
+  `AdoptionDecision`, `RedundancyResult`, `ImportanceResult`).
+- **`src/telco_churn/utils/stats.py`** — `abs_corr()` (absolute Spearman), `cramers_v()`,
+  and `vif_single()`; shared statistical helpers across `data.eda` and `features.generate`.
+- **`reports/feature_discovery/provenance.json`** — per-lap gate outputs (screen results, ΔPR-AUC,
+  CI, importance, decision); machine-readable audit trail.
+- **`reports/feature_discovery/adopted_features.json`** — frozen adopted-feature list
+  (`["charge_per_service"]`).
+- **Provenance cross-check** (`tests/unit/test_build.py`) — reads `adopted_features.json`; asserts
+  every adopted feature appears in the column groups; tripwire if Phase 4a reruns.
+
+### Changed
+- **`notebooks/02b-feature-engineering.ipynb`** — renamed from `02-feature-engineering.ipynb`;
+  rewritten as a verification wrapper: loads the feature view, renders the 20-column inventory,
+  confirms output shape; Phase 4a outcome summary in the opening cell.
+- **`src/telco_churn/features/build.py`** — `PYTHON_ENGINEERED_COLS`, module-load assertion guard,
+  and `_add_python_features()` removed; `build_feature_df()` is now a schema-validated pass-through.
+- **`src/telco_churn/features/schema.py`** — `tenure_cohort` field and three constant sets removed;
+  `FeatureOutputSchema` collapsed to a `coerce=False` subclass with no additional columns.
+- **`sql/features/customer_features.sql`** — `tenure_buckets` JOIN and `tenure_cohort` column removed.
+- **`src/telco_churn/features/sql_features.py`** — `_SQL_FILES` updated to two entries;
+  `tenure_buckets.sql` reference removed.
+- **`tests/unit/test_build.py`** — complete rewrite; H1/H2/H3 tests (~15) removed; 14 tests remain
+  covering dtype invariants, null propagation, column-count stability, and provenance cross-check.
+
+### Removed
+- **`sql/features/tenure_buckets.sql`** — `tenure_cohort` rejected at Phase 4a gate (screen 4).
+- **`PYTHON_ENGINEERED_COLS`** from `features/build.py` and `features/__init__.py`.
+- **Cross-schema invariant tests** (`tests/unit/test_schema.py`) — removed with the
+  `FeatureOutputSchema` columns that depended on Python-engineered features.
+
+---
+
 ## [0.4.1] - 2026-06-12 — Post-Phase 4 QA Hardening
 
 *Addresses correctness and code-quality gaps identified across Phases 1–4. Highlights: ingest
@@ -115,7 +160,7 @@ split are Phase 5 responsibilities.*
   public API for Phase 5.
 - **SQL feature runner** (`src/telco_churn/features/sql_features.py`) — executes the three SQL
   files in dependency order via SQLAlchemy; idempotent (`CREATE OR REPLACE VIEW`).
-- **Feature engineering notebook** (`notebooks/02-feature-engineering.ipynb`) — thin wrapper
+- **Feature engineering notebook** (`notebooks/02b-feature-engineering.ipynb`) — thin wrapper
   rendering SQL feature distributions and Python feature validation outputs.
 - **Unit tests** (`tests/unit/test_build.py`) — 37 tests covering H1, H2, H3a, H3b correctness,
   NaN propagation, column count invariant, target/ID exclusion, and no input mutation. Includes

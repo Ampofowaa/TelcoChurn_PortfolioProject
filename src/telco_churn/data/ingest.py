@@ -152,14 +152,14 @@ if __name__ == "__main__":
     import sys
 
     from dotenv import load_dotenv
-    from omegaconf import OmegaConf
 
     from telco_churn.utils.logging import configure_logging
+    from telco_churn.utils.paths import load_config
 
     load_dotenv()
     configure_logging()
 
-    cfg = OmegaConf.load(get_project_root() / "configs" / "config.yaml")
+    cfg = load_config()
     default_csv = Path(cfg.paths.raw_data)
 
     parser = argparse.ArgumentParser(description="Ingest raw Telco CSV into Postgres.")

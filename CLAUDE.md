@@ -120,6 +120,33 @@ Update `CHANGELOG.md` at the end of every phase or significant fix. Follow [Keep
 - **All `logger.error(...)` calls inside `except` blocks must include `exc_info=True`.** `str(e)` logs only the message; `exc_info=True` attaches the full traceback so failures are diagnosable in CI and pipeline logs.
 - **Notebooks** are thin wrappers: import from `src/`, call functions, render outputs. Heavy logic lives in `src/`.
 
+## Notebook Conventions
+
+### Heading hierarchy
+
+Four levels, strictly nested — never skip a level:
+
+| Level | Markdown | Usage |
+|---|---|---|
+| `#` | `# Title` | Notebook title — one per notebook |
+| `##` | `## N. Section name` | Top-level numbered sections; unnumbered only for closing structural sections (e.g. `## Summary`, `## Provenance Output`) |
+| `###` | `### Topic name` | Named topics within a section — LAPs, deep-dives, structural conclusions, analysis sub-groups |
+| `####` | `#### Sub-step name` | Protocol or analysis sub-steps — `#### Construct`, `#### Evaluate`, `#### Record`, `#### Demographics` |
+
+**No alphanumeric sub-labels on `###` in workflow/protocol notebooks** (e.g. `02a`, `02b`, future modelling notebooks). Topic headers are named descriptively; numbering adds no information and rots when sections are restructured.
+
+**Exception — EDA and reference notebooks** (`01-eda.ipynb` and similar): `###` sections may carry alphanumeric labels (e.g. `### 6d. Numeric features vs churn`) when those labels serve as stable cross-reference addresses cited by downstream notebooks. Do not strip them.
+
+### Cross-references between notebooks
+
+Use `§N` notation when referring to a section in another notebook:
+
+- Top-level section: `§6 \`01-eda.ipynb\`` → `## 6. Bivariate analysis`
+- Subsection: `§6d \`01-eda.ipynb\`` → `### 6d. Numeric features vs churn`
+- `ANALYSIS.md` sections: `§2` or a Markdown link `[§2 EDA](../ANALYSIS.md#2-eda--statistical-testing)`
+
+Always use the `§N` format consistently — not "Section N", not "chapter N", not bare numbers.
+
 ## Testing
 
 - Target ≥80% coverage on `src/`. Do not chase 100%.
