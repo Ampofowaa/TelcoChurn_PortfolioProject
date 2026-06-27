@@ -1,4 +1,4 @@
--- Final feature view: all raw columns plus the two SQL-derived features.
+-- Final feature view: all raw columns plus the one SQL-derived feature.
 -- has_partner and contract_type keep the ingest.py names (partner/contract were renamed
 -- on load); build.py uses these names in its column lists.
 -- LEFT JOIN: customers_raw is the authoritative row source. If a dependent view ever
@@ -27,8 +27,6 @@ SELECT
     r.monthlycharges,
     r.totalcharges,
     r.churn,  -- NULL for new customers in serving; training queries only.
-    tb.tenure_cohort,
     cps.charge_per_service
-FROM customers_raw            AS r
-LEFT JOIN tenure_buckets      AS tb  ON tb.customerid  = r.customerid
-LEFT JOIN charge_per_service  AS cps ON cps.customerid = r.customerid;
+FROM customers_raw           AS r
+LEFT JOIN charge_per_service AS cps ON cps.customerid = r.customerid;

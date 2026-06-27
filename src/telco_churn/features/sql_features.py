@@ -12,18 +12,17 @@ from telco_churn.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Execution order matters: customer_features joins the two preceding views.
+# Execution order matters: customer_features joins the preceding view.
 _SQL_FILES = [
-    "tenure_buckets.sql",
     "charge_per_service.sql",
     "customer_features.sql",
 ]
 
 
 def build_sql_features(engine: Engine, sql_dir: Path) -> None:
-    """Create or replace the three feature views in dependency order.
+    """Create or replace the two feature views in dependency order.
 
-    Runs tenure_buckets → charge_per_service → customer_features via SQLAlchemy.
+    Runs charge_per_service → customer_features via SQLAlchemy.
     Each file uses CREATE OR REPLACE VIEW, so the operation is idempotent.
     sql_dir must be supplied by the caller — resolve from configs/config.yaml
     (cfg.paths.sql_features) so the location is environment-overridable.
@@ -44,16 +43,15 @@ if __name__ == "__main__":
     import sys
 
     from dotenv import load_dotenv
-    from omegaconf import OmegaConf
 
     from telco_churn.utils.db import get_engine
     from telco_churn.utils.logging import configure_logging
-    from telco_churn.utils.paths import get_project_root
+    from telco_churn.utils.paths import load_config
 
     load_dotenv()
     configure_logging()
 
-    cfg = OmegaConf.load(get_project_root() / "configs" / "config.yaml")
+    cfg = load_config()
 
     try:
         build_sql_features(get_engine(), sql_dir=Path(cfg.paths.sql_features))

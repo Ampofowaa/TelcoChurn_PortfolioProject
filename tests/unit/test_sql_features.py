@@ -34,11 +34,11 @@ def mock_engine() -> tuple[MagicMock, MagicMock]:
 # ---------------------------------------------------------------------------
 
 
-def test_build_sql_features_executes_all_three_files(
+def test_build_sql_features_executes_all_files(
     mock_engine: tuple[MagicMock, MagicMock],
     sql_dir: Path,
 ) -> None:
-    """build_sql_features calls conn.execute once per SQL file (3 total)."""
+    """build_sql_features calls conn.execute once per SQL file."""
     engine, conn = mock_engine
     build_sql_features(engine, sql_dir)
     assert conn.execute.call_count == len(_EXPECTED_SQL_FILES)
@@ -48,12 +48,12 @@ def test_build_sql_features_execution_order(
     mock_engine: tuple[MagicMock, MagicMock],
     sql_dir: Path,
 ) -> None:
-    """SQL files are executed in dependency order: tenure_buckets → charge_per_service → customer_features."""
+    """SQL files are executed in dependency order: charge_per_service → customer_features."""
     engine, conn = mock_engine
     build_sql_features(engine, sql_dir)
 
     executed_sql = [str(call.args[0]) for call in conn.execute.call_args_list]
-    expected_order = ["tenure_buckets", "charge_per_service", "customer_features"]
+    expected_order = ["charge_per_service", "customer_features"]
     for i, view_name in enumerate(expected_order):
         assert (
             view_name in executed_sql[i]
@@ -77,7 +77,7 @@ def test_build_sql_features_propagates_filename_on_error(
     """RuntimeError message includes the failing SQL filename."""
     engine, conn = mock_engine
     conn.execute.side_effect = Exception("syntax error at or near SELECT")
-    with pytest.raises(RuntimeError, match="tenure_buckets.sql"):
+    with pytest.raises(RuntimeError, match="charge_per_service.sql"):
         build_sql_features(engine, sql_dir)
 
 
@@ -95,5 +95,5 @@ def test_sql_files_are_idempotent(filename: str, sql_dir: Path) -> None:
 
 @pytest.mark.parametrize("filename", _EXPECTED_SQL_FILES)
 def test_sql_files_exist(filename: str, sql_dir: Path) -> None:
-    """All three SQL files are present on disk at the expected path."""
+    """All SQL files are present on disk at the expected path."""
     assert (sql_dir / filename).exists()
