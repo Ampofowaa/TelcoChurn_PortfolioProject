@@ -106,12 +106,11 @@ class CleanedSchema(RawSchema):
     ) -> pd.Series:
         """totalcharges >= monthlycharges for customers with tenure >= 1.
 
-        The le=1.0 constraint on monthly_to_total_ratio in FeatureOutputSchema
-        depends on this invariant — if totalcharges < monthlycharges, the ratio
-        exceeds 1.0 and the downstream Pandera output check fires instead of this
-        data-layer guard. Zero-tenure customers (tenure=0) are exempt: their
-        totalcharges is the imputed median, not an accrued billing total.
-        NaN tenure rows return False from >= 1 in pandas and pass the check.
+        A customer billed for at least one month must have accrued at least one
+        month's charges — totalcharges below monthlycharges indicates a data
+        corruption or ingestion error. Zero-tenure customers (tenure=0) are
+        exempt: their totalcharges is the imputed median, not an accrued billing
+        total. NaN tenure rows return False from >= 1 in pandas and pass the check.
         """
         billed_mask = df["tenure"] >= 1
         return ~(billed_mask & (df["totalcharges"] < df["monthlycharges"]))

@@ -17,7 +17,7 @@ from telco_churn.data.checks import (
     check_totalcharges_nulls,
 )
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.paths import get_project_root
+from telco_churn.utils.paths import get_project_root, load_config
 
 __all__ = [
     "ValidationResult",
@@ -242,7 +242,6 @@ if __name__ == "__main__":
     import sys
 
     from dotenv import load_dotenv
-    from omegaconf import OmegaConf
 
     from telco_churn.utils.db import get_engine
     from telco_churn.utils.logging import configure_logging
@@ -250,15 +249,20 @@ if __name__ == "__main__":
     load_dotenv()
     configure_logging()
 
-    cfg = OmegaConf.load(get_project_root() / "configs" / "config.yaml")
+    cfg = load_config()
     min_rows = int(cfg.validation.min_rows)
     max_null_rate = float(cfg.validation.max_null_rate)
+    reports_dir = get_project_root() / cfg.paths.validation_reports
 
     engine = get_engine()
     df = pd.read_sql("SELECT * FROM customers_raw", engine)
     try:
         result = validate_raw(
-            df, strict=True, min_rows=min_rows, max_null_rate=max_null_rate
+            df,
+            strict=True,
+            min_rows=min_rows,
+            max_null_rate=max_null_rate,
+            reports_dir=reports_dir,
         )
         logger.info("validation_passed", warnings=len(result.warnings))
         sys.exit(0)

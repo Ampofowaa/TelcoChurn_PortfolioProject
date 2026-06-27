@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import chi2_contingency, mannwhitneyu
 
+from telco_churn.utils.stats import vif_single
+
 __all__ = [
     "CAT_FEATURES",
     "NUM_FEATURES",
@@ -232,7 +234,7 @@ def compute_chi2_tests(
                 stacklevel=2,
             )
             continue
-        chi2_raw, p_raw, dof_raw, expected = chi2_contingency(ct)
+        chi2_raw, p_raw, dof_raw, expected = chi2_contingency(ct, correction=False)
         chi2_stat = float(chi2_raw)
         p_val = float(p_raw)
         dof_val = int(dof_raw)
@@ -243,14 +245,14 @@ def compute_chi2_tests(
                 "chi-squared results may be unreliable.",
                 stacklevel=2,
             )
-        n = int(ct.values.sum())
-        k = int(min(ct.shape)) - 1
-        if k == 0:
+        if int(min(ct.shape)) - 1 == 0:
             warnings.warn(
                 f"'{col}' is constant — chi-squared undefined, skipping.", stacklevel=2
             )
             continue
-        v = float(np.sqrt(chi2_stat / (n * k)))
+        n = int(ct.values.sum())
+        min_dim = min(ct.shape[0] - 1, ct.shape[1] - 1)
+        v = float(np.sqrt(chi2_stat / (n * min_dim)))
         rows.append(
             {
                 "feature": col,
@@ -340,11 +342,9 @@ def compute_vif(
 ) -> pd.DataFrame:
     """Variance Inflation Factor table for multicollinearity detection.
 
-    Uses ``drop_first=True`` one-hot
-    encoding to avoid the dummy-variable trap (perfect multicollinearity
-    that would make VIF undefined).  VIF is computed as ``1 / (1 − R²)``
-    where R² comes from regressing each feature on all others via numpy
-    ``lstsq`` (avoids statsmodels and sklearn dependencies).
+    Uses ``drop_first=True`` one-hot encoding to avoid the dummy-variable
+    trap (perfect multicollinearity that would make VIF undefined). VIF is
+    delegated to :func:`telco_churn.utils.stats.vif_single`.
 
     Args:
         df: DataFrame with numeric and categorical columns (no target column).
@@ -385,19 +385,10 @@ def compute_vif(
         )
         return pd.DataFrame(columns=["feature", "VIF"])
 
-    X = df_vif.to_numpy(dtype=np.float64)
     vif_vals: list[float] = []
-    for i in range(X.shape[1]):
-        y = X[:, i]
-        x_rest = np.delete(X, i, axis=1)
-        # Centre both X and y to match OLS-with-intercept (same as LinearRegression default).
-        y_c = y - y.mean()
-        x_c = x_rest - x_rest.mean(axis=0)
-        coeffs, *_ = np.linalg.lstsq(x_c, y_c, rcond=None)
-        ss_res = float(np.sum((y_c - x_c @ coeffs) ** 2))
-        ss_tot = float(np.sum(y_c**2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 1.0
-        vif_vals.append(round(1.0 / (1.0 - r2) if r2 < 1.0 else float("inf"), 2))
+    for col in df_vif.columns:
+        vif = vif_single(df_vif[col], df_vif.drop(columns=[col]))
+        vif_vals.append(round(vif, 2))
 
     if any(v == float("inf") for v in vif_vals):
         warnings.warn(
