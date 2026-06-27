@@ -18,7 +18,9 @@ paths:
   interim_data: datasets/interim/
   processed_data: ${oc.env:PROCESSED_DATA_DIR,datasets/processed/}
   sql_features: sql/features
-  reports: reports/
+  reports: reports
+  feature_discovery_reports: ${paths.reports}/feature_discovery
+  validation_reports: ${paths.reports}/validation
 
 validation:
   min_rows: 1000

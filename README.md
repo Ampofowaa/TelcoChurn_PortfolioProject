@@ -42,7 +42,7 @@ Engineering build plan (15 phases, current status) → **[PROJECT_PLAN.md](PROJE
 ```
 Raw CSV
   └─ Pandera validation (5 quality gates)
-       └─ Feature engineering (error-driven; 3 candidates tested, all discarded)
+       └─ Feature engineering (9-lap OOF discovery; charge_per_service adopted)
             └─ LightGBM baseline → Optuna tuning (50 trials, TPE)
                  └─ Sigmoid calibration (CalibratedClassifierCV, cv=5)
                       └─ OOF cost-optimised threshold (no leakage)
@@ -117,7 +117,13 @@ uv run pytest          # unit tests (no Docker required)
 make test-integration  # integration tests (requires Docker)
 ```
 
-**5 — Browse experiment runs (Phase 5+)**
+**5 — Build features**
+
+```bash
+make features          # build SQL views → write datasets/processed/telco_churn_processed.csv
+```
+
+**6 — Browse experiment runs (Phase 5+)**
 
 ```bash
 mlflow ui --backend-store-uri file:./mlruns
@@ -153,6 +159,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, make commands, and
 | 0 | Project foundation (tooling, pre-commit, configs) | ✅ Done |
 | 1 | Data ingestion — CSV → Postgres | ✅ Done |
 | 2 | Data validation — Pandera + 5 quality gates | ✅ Done |
-| 3–14 | EDA → features → training → serving → cloud → monitoring | Planned |
+| 3 | EDA notebook | ✅ Done |
+| 4a | Feature discovery — 9-lap OOF search → adoption gate | ✅ Done |
+| 4b | Feature engineering — SQL views + Pandera-validated feature interface | ✅ Done |
+| 5–14 | Model training → serving → cloud → monitoring | Planned |
 
 See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full phase-by-phase roadmap.

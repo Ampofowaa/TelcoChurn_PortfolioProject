@@ -16,7 +16,7 @@ The `src/` package implements the production-ready version of the same logic.
 0. [Problem Framing & Cost Definition](#0-problem-framing--cost-definition)
 1. [Data Ingestion & Quality Checks](#1-data-ingestion--quality-checks)
 2. [EDA & Statistical Testing](#2-eda--statistical-testing)
-3. [Feature Engineering](#3-feature-engineering)
+3. [Feature Discovery & Engineering](#3-feature-discovery--engineering)
 4. [Baseline Models](#4-baseline-models)
 5. [Hyperparameter Tuning (Optuna)](#5-hyperparameter-tuning-optuna)
 6. [Error Analysis](#6-error-analysis)
@@ -71,7 +71,7 @@ Two reference points bound the performance target:
 | Baseline | Recall | Precision | Notes |
 |---|---|---|---|
 | Stratified random (population rate) | 26.5 % | 26.5 % | Floor — any useful model must beat this |
-| Heuristic: flag all month-to-month customers | ~88 % | ~43 % | Cheap, non-ML rule; captures the dominant risk profile. Values are EDA-derived approximations (§1), not fitted model results. |
+| Heuristic: flag all month-to-month customers | ~88 % | ~43 % | Cheap, non-ML rule; captures the dominant risk profile. Values are EDA-derived approximations (§2), not fitted model results. |
 
 **Heuristic derivation:** month-to-month customers = 3,875; total churners = 1,869; month-to-month churn rate ≈ 43 % (§2 bivariate analysis) → ~1,666 churners captured. Recall = 1,666 / 1,869 ≈ **88 %**. Precision = 1,666 / 3,875 ≈ **43 %** (equals the segment churn rate by definition — flagging an entire group sets precision equal to that group's base rate).
 
@@ -168,7 +168,7 @@ Chi-squared + Cramér's V for categorical features (V > 0.30 = strong, 0.10–0.
 | Partner | Cramér's V | 0.15 | Without a partner: above-average churn |
 | MultipleLines | Cramér's V | 0.04 | Statistically significant but practically negligible |
 | **PhoneService** | Cramér's V | **0.01** (p = 0.34) | **Non-predictor** |
-| **Gender** | Cramér's V | **0.008** (p = 0.49) | **Non-predictor** |
+| **Gender** | Cramér's V | **0.0086** (p = 0.49) | **Non-predictor** |
 
 **Interpretive notes:**
 
@@ -207,121 +207,84 @@ The remaining 16 features all have VIF ≤ 10, with `seniorcitizen` (≈ 1.15) a
 
 **All features are retained — none are dropped on VIF grounds.** The practical impact of multicollinearity is model-family-dependent: tree-based methods (LightGBM, XGBoost, RandomForest) are immune — each split is evaluated independently and collinearity does not distort estimates. Linear models are materially affected and would require feature consolidation or regularisation. The null-importance experiment during model training (§5) is the explicit gate for any feature pruning.
 
----
-
-## 3. Feature Engineering
-
-Features are built in two layers: **SQL views in Postgres** (tenure bucketing, charge-per-service ratio) and **Python-engineered features** (four hypothesis-driven columns). The SQL layer handles transformations that are efficient in a relational database and reusable across any downstream query; the Python layer adds signals that require conditional logic or ratios across multiple raw columns. Together they produce a 25-column feature DataFrame passed to the training pipeline.
-
-All features are derived from current account attributes available at CRM serving time — no historical aggregates, future data, or target-adjacent signals.
+The full EDA — rendered distributions, bivariate charts, interaction heatmaps, and VIF tables — is in [`notebooks/01-eda.ipynb`](notebooks/01-eda.ipynb).
 
 ---
 
-### SQL-engineered features
+## 3. Feature Discovery & Engineering
 
-#### `tenure_cohort` — tenure bucketing
+### 3a. Feature Discovery
 
-**What it is:** Each customer is assigned to one of four tenure bands — 0–12 mo, 13–24 mo, 25–48 mo, 49+ mo — based on how long they have been a customer.
+Feature discovery precedes feature engineering to identify which new columns are worth building. The search follows two strategies: **error-driven** — profiling the base model's false negatives to find subgroups it systematically misses, then hypothesising a feature that targets each blind spot directly — and **domain-derived** — using knowledge of telecom pricing and service structure to construct row-level ratios and counts that no single tree split can replicate on its own. Both strategies feed the same evaluation pipeline: a baseline LightGBM trained on the 19 raw IBM columns (using 5-fold out-of-fold predictions — each row scored by a fold that never saw it during training — PR-AUC = **0.6432**, 95 % bootstrap CI: [0.6195, 0.6677]) sets the performance floor, and every candidate is assessed through a four-screen adoption gate, cheapest-first.
 
-**Why it matters:** Churn risk does not decline uniformly with each additional month of tenure — it drops in meaningful jumps at cohort boundaries. A customer who has just crossed into a later cohort behaves noticeably differently from one still in the previous group.
+**Four-screen gate:**
 
-| Cohort | Customers | Churn rate |
+The four gates assess each candidate in sequence:
+
+- **Serving availability** — can this column be computed at prediction time from raw data alone?
+- **Redundancy** — is it too similar to a column already in the adopted set?
+- **Performance** — does adding it improve the model's ranking score (PR-AUC) by at least 0.0015?
+- **Importance** — does the model actually use it, or is the signal already captured elsewhere?
+
+| Screen | Name | Rejection trigger |
 |---|---|---|
-| 0–12 mo | 2,186 | **47.4 %** |
-| 13–24 mo | 1,024 | 28.7 % |
-| 25–48 mo | 1,594 | 20.4 % |
-| 49+ mo | 2,239 | **9.5 %** |
+| 1 | Serving availability | Column not computable from raw CSV at inference time |
+| 2 | Redundancy (soft gate) | Spearman \|r\| ≥ 0.85 (numeric) or Cramér's V ≥ 0.70 (categorical); flags but does not auto-reject |
+| 3 | Performance | Global OOF PR-AUC delta < 0.0015 |
+| 4 | Importance | Permutation importance ≤ `max(noise_decoy, 0) + 0.005` |
 
-The 0–12 mo cohort churns at roughly **5× the rate** of the 49+ mo cohort.
+Screen 4 is the empirical backstop for collective or cross-type redundancy that Screen 2's pairwise check cannot catch.
 
-**Design decision:** Both `tenure` (exact month count) and `tenure_cohort` (risk tier) are kept. Exact tenure tells the model *where* a customer sits within a group; the cohort label tells it *which risk tier* they belong to. The two carry complementary information and neither subsumes the other.
+**Error-driven laps (1–6).** The base FN error profile surfaces three blind spots:
 
----
-
-#### `charge_per_service` — monthly charge per active subscription
-
-**What it is:** Each customer's monthly charges divided by the number of active service subscriptions they hold (phone, multiple lines, internet, and six add-on services — nine binary flags in total).
-
-**Why it matters:** A raw monthly bill can be misleading. A customer paying $80/month across eight subscriptions is getting reasonable value per service; one paying the same for two is paying a steep price per subscription. `charge_per_service` puts all customers on a like-for-like basis.
-
-The distribution splits into four natural clusters with a sharp churn step at the $24 threshold:
-
-| Band | Avg services | Median monthly ($) | Churn rate |
-|---|---|---|---|
-| $10–16 | 5.6 | 69.80 | 15 % |
-| $16–24 | 3.1 | 50.65 | 31 % |
-| **$24–30** | **2.7** | **75.05** | **57 %** |
-| $30+ | 2.0 | 70.05 | 59 % |
-
-The step from 31 % to 57 % at the $24 mark is the sharpest in the distribution. Churners have a median of $18.94 per service versus $15.53 for non-churners — a signal that is not visible in raw `monthlycharges` alone because a high bill could simply mean the customer has many services rather than that they are overpaying for each one.
-
----
-
-### Python-engineered features
-
-Three hypothesis-driven features (H1–H3) derived from the EDA's identified blind spots, producing four engineered columns — H3 contributes two (`fiber_contract` and `dsl_contract`, one per internet tier). Each targets a segment where raw features send a misleading signal to the model.
-
----
-
-#### H1: `is_long_month_to_month` — exit-barrier blind spot
-
-**Hypothesis:** Customers on a month-to-month contract who have stayed past 24 months look loyal by tenure alone, but they have never committed to a longer term — raw tenure underestimates their churn risk.
-
-**Evidence:** Month-to-month churn falls steadily across cohorts (51.4 % → 37.7 % → 32.9 % → 26.0 %) but never fully settles — even at 49+ months, MTM customers still churn at roughly the dataset average. By contrast, two-year contract customers show near-zero churn in the first two cohorts and remain below 4 % throughout.
-
-| Cohort | MTM churn | Two-year churn | Gap (pp) |
-|---|---|---|---|
-| 0–12 mo | 51.4 % | 0.0 % | 51.4 |
-| 13–24 mo | 37.7 % | 0.0 % | 37.7 |
-| 25–48 mo | 32.9 % | 2.2 % | 30.7 |
-| 49+ mo | 26.0 % | 3.3 % | 22.7 |
-
-The gap narrows but never closes — confirming the interaction is real.
-
-**Result:** 1,144 customers flagged (16.2 % of the dataset). Of those, **30.9 % churn** versus **25.7 %** for the rest — a **5.2 pp gap**. Roughly 1 in 3 customers who have been on a monthly contract for over two years will leave, a rate higher than the dataset average despite their long tenure.
-
----
-
-#### H2: `monthly_to_total_ratio` — thin billing history
-
-**Hypothesis:** `TotalCharges` grows automatically with tenure and is mainly a proxy for seniority. A low total could mean a loyal new customer or someone about to leave after a short stay — the two are indistinguishable from `TotalCharges` alone. Dividing `MonthlyCharges` by `TotalCharges` produces a ratio close to 1 for someone who just started (total ≈ one month's bill) and falling toward 0 as billing history accumulates. This separates the ambiguous low-`TotalCharges` group into customers who are simply new versus those whose account history is too thin to assess.
-
-**Result:** Churners have a median ratio of **0.103** versus **0.027** for non-churners — roughly **4× higher**. Translating to approximate tenure (ratio ≈ 1/tenure): the median churner has been a customer for ~10 months; the median non-churner for ~37 months.
-
-The churner population is a genuine mix: a large cluster of new customers at early-exit risk (>0.2 ratio), plus a meaningful long-tenure tail (<0.05 ratio) — customers who eventually leave after years of service. Non-churners concentrate heavily at the low end.
-
-*Note: 11 zero-tenure rows have `TotalCharges = NULL` and therefore `monthly_to_total_ratio = NaN`. These are preserved in the feature DataFrame and imputed by `SimpleImputer(strategy='median')` in the training pipeline.*
-
----
-
-#### H3: `fiber_contract` / `dsl_contract` — internet × contract interaction
-
-**Hypothesis:** Fiber optic customers churn at the highest rate of any internet tier; month-to-month customers churn at the highest rate of any contract type. These two risk factors do not combine additively. A fiber optic customer on a two-year contract has made a commitment that partially offsets the fiber churn tendency; a fiber optic customer on a month-to-month plan has both risk factors at once with nothing to offset either. The individual `contract_type` and `internetservice` columns each carry this information separately but cannot represent when the two coincide.
-
-**Evidence:** Churn rates vary substantially *within* each internet tier depending on contract type:
-
-| Contract type | Fiber optic | DSL | No internet |
-|---|---|---|---|
-| Month-to-month | 54.6 % | 32.2 % | 18.9 % |
-| One year | 19.3 % | 9.3 % | 2.5 % |
-| Two year | 7.2 % | 1.9 % | 0.8 % |
-
-Fiber optic spans **47 pp** across contract types; DSL spans **30 pp**. This within-tier variation cannot be recovered from the individual encoded columns alone.
-
-**Design decision:** Two 4-level categoricals rather than binary MTM flags or a full 9-level crossing. Binary MTM flags would capture only the highest-risk cell in each tier and discard the remaining variation. The full 9-level crossing would encode all combinations, including the seven sitting at or below average, adding noise without signal. The chosen design creates one categorical per high-risk internet tier — `fiber_contract` takes values `Month-to-month_Fiber optic`, `One year_Fiber optic`, `Two year_Fiber optic`, and `Not Fiber optic`; `dsl_contract` mirrors this for DSL. Customers on no internet service are handled by the individual encoded columns; their churn rates vary by contract type (18.9 % month-to-month, 2.5 % one-year, 0.8 % two-year) but all fall below the dataset average, and the contract_type encoding already captures this variation.
-
----
-
-### Feature inventory
-
-| Group | Count | Examples |
+| Blind spot | FN rate | Missed churners |
 |---|---|---|
-| Binary (OHE drop-if-binary) | 7 | `gender`, `seniorcitizen`, `is_long_month_to_month` |
-| Multi-category (OHE) | 13 | `contract_type`, `tenure_cohort`, `fiber_contract`, `dsl_contract` |
-| Numeric (impute → scale) | 5 | `tenure`, `monthlycharges`, `charge_per_service`, `monthly_to_total_ratio` |
-| **Total** | **25** | |
+| Two-year contract | 85.4 % | 48 |
+| One-year contract | 54.2 % | 166 |
+| Tenure 55–72 months | 53.7 % | 73 |
 
-The `ColumnTransformer` definition and fitting are model training responsibilities, applied to the training split only to prevent test-set statistics from leaking into preprocessing parameters.
+*Rationale.* **One-year and two-year contract blind spots (Laps 1–4):** these groups churn at ~11 % and ~3 % respectively versus 43 % for month-to-month, so the model assigns nearly everyone in them a low churn score — even customers who show clear warning signs like fiber optic internet or high monthly charges. Each lap tests whether explicitly flagging a specific high-risk combination within that segment (e.g. "one-year contract AND fiber optic," "two-year contract AND above-median charge") could give the model a dedicated signal for those customers, rather than treating the whole contract group the same way. **Tenure blind spot (Laps 5–6):** the model reads tenure as a smooth number, but churn risk drops steeply at specific thresholds rather than declining gradually. Lap 5 tests whether bucketing tenure into lifecycle cohorts (0–12 mo, 13–24 mo, etc.) makes those risk tiers explicit enough to improve predictions; Lap 6 tests a flag for customers who have remained on a month-to-month contract for over 55 months — a "never upgraded despite years of opportunity" signal.
+
+All six error-driven candidates are pairwise conjunctions of existing columns. All six are rejected.
+
+| Lap | Feature | Description | Outcome | Reason |
+|---|---|---|---|---|
+| 1 | `two_year_fiber` | `contract_type = Two year` AND `internetservice = Fiber optic` | REJECTED (Screen 4) | The model already sees both columns as separate inputs and finds their combination on its own — the flag adds nothing (importance 0.0000) |
+| 2 | `two_year_high_charge` | `contract_type = Two year` AND `monthlycharges` > dataset median | REJECTED (Screen 3) | A yes/no charge threshold is less informative than the raw `monthlycharges` value the model already has — PR-AUC fell (−0.0008) |
+| 3 | `one_year_streaming` | `contract_type = One year` AND at least one streaming service subscribed | REJECTED (Screen 4) | The model already sees `streamingtv` and `streamingmovies` as separate inputs and finds their combination on its own — 166 one-year churners confirm data sparsity is not the cause (importance 0.0009) |
+| 4 | `one_year_high_charge` | `contract_type = One year` AND `monthlycharges` > dataset median | REJECTED (Screen 3) | A yes/no charge threshold adds nothing above the continuous `monthlycharges` column the model already has — PR-AUC barely moved (+0.0012, below 0.0015 minimum) |
+| 5 | `tenure_cohort` | `tenure` bucketed into 5 lifecycle cohorts (0–12, 13–24, 25–48, 49–65, 65+ months) | REJECTED (Screen 4) | The model finds the same risk thresholds directly from raw `tenure` — the cohort buckets add nothing on top (importance 0.0024) |
+| 6 | `long_tenure_mtm` | `tenure` > 55 months AND `contract_type = Month-to-month` | REJECTED (Screen 4) | The model already identifies this group through its own decisions on `tenure` and `contract_type` (importance 0.0002) |
+
+*Structural conclusion:* LightGBM's depth-2 split-finding discovers pairwise conjunctions independently; pre-computed binary flags add nothing the model cannot recover itself. Useful features must require operations no single tree split can replicate — row-level division or within-row summation.
+
+**Domain-derived laps (7–9).**
+
+*Rationale.* Laps 1–6 showed that recombining columns the model already has never helps. The next question is whether features requiring operations the model genuinely cannot perform on its own — row-level division and within-row summation — can add signal. **`charge_per_service`** tests whether normalising monthly spend by number of active services reveals a per-unit cost signal invisible in raw charges alone. **`num_add_on_services`** tests whether collapsing all optional subscriptions into a single count captures a "switching cost depth" signal the individual add-on flags carry only in aggregate. **`monthly_to_total_ratio`** is included as a deliberate decoy to verify the gate correctly rejects a ratio that looks like new information but reduces to a near-perfect transformation of a column the model already has.
+
+| Lap | Feature | Description | Outcome | Reason |
+|---|---|---|---|---|
+| 7 | `charge_per_service` | monthlycharges ÷ num_active_services | **ADOPTED** | Per-unit cost is genuinely new information not recoverable from raw charges alone — all four screens passed (importance 0.0056, PR-AUC +0.0018) |
+| 8 | `num_add_on_services` | Count of 7 optional add-on subscriptions | REJECTED (Screen 3) | The seven individual add-on flags are already in the model; their sum adds nothing collectively that they do not cover separately (PR-AUC −0.0011) |
+| 9 | `monthly_to_total_ratio` | monthlycharges ÷ totalcharges | REJECTED (Screen 3) | Reduces to ≈ 1/`tenure` (Spearman \|r\| = 0.999) — confirmed decoy; the model already has `tenure` directly (PR-AUC −0.0005) |
+
+The domain-derived search confirmed the core insight from Laps 1–6: a feature must require operations the model cannot perform through its own splits. `charge_per_service` met that bar — dividing monthly charges by service count is a relationship no single split on either column can replicate. The other two did not: the add-on count was collectively redundant with its seven source flags despite passing Screen 2's pairwise check, and the charges ratio reduced to approximately `1/tenure` (Spearman |r| = 0.999), making it mathematically equivalent to a column the model already holds regardless of how it was framed.
+
+**Backward elimination.** Removing `charge_per_service` costs −0.0018 PR-AUC — it clears the 0.0015 threshold, though the margin is slim and consistent with the modest forward-pass delta. The feature holds its place in the full adopted set.
+
+**Result:** 1 feature adopted from 9 candidates. OOF PR-AUC: 0.6432 → **0.6450**. Adopted set: `charge_per_service`, frozen to `reports/feature_discovery/adopted_features.json`.
+
+The full lap-by-lap trail — per-screen outputs, provenance records, and diagnostic plots — is in [`notebooks/02a-feature-discovery.ipynb`](notebooks/02a-feature-discovery.ipynb).
+
+---
+
+### 3b. Feature Engineering
+
+One feature survived the feature discovery process: `charge_per_service`. Feature engineering builds it into the production pipeline alongside the 19 raw IBM columns, producing a 20-column feature set for model training.
+
+`charge_per_service` is a SQL-engineered feature that normalises each customer's monthly bill by the number of active service subscriptions they hold — nine binary flags in total (`phoneservice`, `multiplelines`, `internetservice`, and six add-on services).
+
+The full 20-column inventory — grouped by type and always in sync with the codebase — is in [`notebooks/02b-feature-engineering.ipynb`](notebooks/02b-feature-engineering.ipynb).
 
 ---
 
@@ -762,6 +725,8 @@ mlflow.sklearn.load_model("models:/telco-churn-pipeline@champion")
 7. **Feature set cannot reduce FPs for loyal high-risk-profile customers.** ~50 % of non-churners who share the fiber optic + month-to-month + no add-on profile are incorrectly flagged. No loyalty, satisfaction, or recency-of-service-change signals are available.
 
 8. **Business cost parameters are illustrative.** The $68/intervention and $575/LTV figures are reasonable but not Finance-validated.
+
+9. **Feature discovery redundancy screen has a mixed-type gap.** Screen 2 in the lap framework checks numeric-vs-numeric relationships (Pearson) and categorical-vs-categorical (Cramér's V) but has no branch for categorical-derived-from-numeric (e.g. `tenure_cohort` vs `tenure`). Screen 4 — permutation importance given all adopted features — is the empirical backstop: a feature that adds no marginal signal because the model already has the underlying numeric column is identified and rejected regardless of type. Confirmed with `tenure_cohort` in Lap 5: Screen 2 passed (Cramér's V found no adopted categorical equivalent), but Screen 4 correctly rejected it (importance = 0.0024, below noise floor) because continuous `tenure` was already in the adopted set.
 
 ---
 
