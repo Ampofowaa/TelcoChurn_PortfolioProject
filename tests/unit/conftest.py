@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 from helpers import make_row
+
+from telco_churn.features.build import TARGET_COL
+from telco_churn.models.train.common import _FEATURE_COLS
 
 
 @pytest.fixture
@@ -39,3 +43,62 @@ def large_valid_df() -> pd.DataFrame:
     """1 001-row DataFrame to clear the Gate 5 row-count threshold."""
     rows = [make_row(f"cust-{i:04d}") for i in range(1_001)]
     return pd.DataFrame(rows)
+
+
+_TRAIN_N = 120  # enough rows to stratify comfortably at 20% test size
+
+
+@pytest.fixture
+def feature_df() -> pd.DataFrame:
+    """Synthetic feature DataFrame matching _FEATURE_COLS + customerid + churn.
+
+    Shared across the models/train/* unit test modules (candidates, comparison,
+    tuning, registration) — one synthetic frame shape for the whole training
+    pipeline test suite.
+    """
+    rng = np.random.default_rng(0)
+    n = _TRAIN_N
+    return pd.DataFrame(
+        {
+            "customerid": [f"cust-{i:04d}" for i in range(n)],
+            "gender": rng.choice(["Male", "Female"], size=n),
+            "has_partner": rng.choice(["Yes", "No"], size=n),
+            "dependents": rng.choice(["Yes", "No"], size=n),
+            "phoneservice": rng.choice(["Yes", "No"], size=n),
+            "paperlessbilling": rng.choice(["Yes", "No"], size=n),
+            "seniorcitizen": rng.integers(0, 2, size=n).tolist(),
+            "multiplelines": rng.choice(["Yes", "No", "No phone service"], size=n),
+            "internetservice": rng.choice(["DSL", "Fiber optic", "No"], size=n),
+            "onlinesecurity": rng.choice(["Yes", "No", "No internet service"], size=n),
+            "onlinebackup": rng.choice(["Yes", "No", "No internet service"], size=n),
+            "deviceprotection": rng.choice(
+                ["Yes", "No", "No internet service"], size=n
+            ),
+            "techsupport": rng.choice(["Yes", "No", "No internet service"], size=n),
+            "streamingtv": rng.choice(["Yes", "No", "No internet service"], size=n),
+            "streamingmovies": rng.choice(["Yes", "No", "No internet service"], size=n),
+            "contract_type": rng.choice(
+                ["Month-to-month", "One year", "Two year"], size=n
+            ),
+            "paymentmethod": rng.choice(
+                [
+                    "Electronic check",
+                    "Mailed check",
+                    "Bank transfer (automatic)",
+                    "Credit card (automatic)",
+                ],
+                size=n,
+            ),
+            "tenure": rng.integers(0, 73, size=n).tolist(),
+            "monthlycharges": rng.uniform(18.25, 118.75, size=n).tolist(),
+            "totalcharges": rng.uniform(18.25, 8684.8, size=n).tolist(),
+            "charge_per_service": rng.uniform(0.5, 50.0, size=n).tolist(),
+            "churn": rng.integers(0, 2, size=n).tolist(),
+        }
+    )
+
+
+@pytest.fixture
+def dev_split(feature_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """X, y built directly from the synthetic fixture — no split needed for CV tests."""
+    return feature_df[_FEATURE_COLS], feature_df[TARGET_COL]

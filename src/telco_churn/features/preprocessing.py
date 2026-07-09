@@ -1,27 +1,55 @@
-"""Tree-family ColumnTransformer builder for the discovery loop and training pipeline."""
+"""Tree-family and linear-family ColumnTransformer builders for the training pipeline."""
 
 from __future__ import annotations
 
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import FunctionTransformer, OneHotEncoder
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
-__all__ = ["build_preprocessor"]
+__all__ = [
+    "build_preprocessor",
+    "build_linear_preprocessor",
+    "TENURE_COHORT_EDGES",
+    "TENURE_COHORT_LABELS",
+]
+
+# Fixed cohort edges from the tenure survival shape documented in ANALYSIS.md §2.
+# Five cohorts: 0–12 m (new, highest risk), 13–24 m, 25–48 m, 49–65 m, 65+ m (loyal).
+# Edges are domain constants, not data-derived quantiles — no fit step needed and no
+# train-set statistics leak through the binning branch.
+TENURE_COHORT_EDGES: list[int] = [0, 12, 24, 48, 65, 72]
+TENURE_COHORT_LABELS: list[str] = ["0-12m", "13-24m", "25-48m", "49-65m", "65+m"]
 
 
 def _cast_to_str(X: Any) -> Any:
     """Normalise mixed-dtype binary group to str so OHE receives a uniform type.
 
-    Converts both int 0/1 columns (BINARY_INT_COLS) and Yes/No string columns
-    (BINARY_STR_COLS) to numpy str before encoding — required because sklearn's
-    OHE sees whichever dtype arrives and would treat '0'/'1' and 0/1 as separate
-    categories if the two groups are not normalised first.
+    Used only by build_linear_preprocessor's binary branch. The tree path uses
+    OHE(drop='if_binary') directly, which handles heterogeneous dtypes per-column.
     """
     return np.array(X, dtype=str)
+
+
+def _bin_tenure(X: Any) -> Any:
+    """Stateless cohort binning for tenure using fixed TENURE_COHORT_EDGES.
+
+    Receives a 2-D input of shape (n, 1) from ColumnTransformer — either a numpy
+    array or a DataFrame depending on the caller — and returns a (n, 1) object
+    array of string cohort labels for the downstream OHE step.
+    Stateless by construction — fixed edges need no fit and leak nothing.
+    """
+    binned = pd.cut(
+        pd.Series(np.asarray(X)[:, 0]),
+        bins=TENURE_COHORT_EDGES,
+        labels=TENURE_COHORT_LABELS,
+        include_lowest=True,
+    ).astype(str)
+    return np.array(binned).reshape(-1, 1)
 
 
 def build_preprocessor(
@@ -31,43 +59,31 @@ def build_preprocessor(
 ) -> ColumnTransformer:
     """Return an unfitted tree-family ColumnTransformer for binary, multi-cat, and numeric columns.
 
-    Designed for tree-based models (GBDT, RandomForest, XGBoost): trees are invariant
-    to monotone feature transformations, so StandardScaler is deliberately omitted —
-    scaling adds no information to split decisions and belongs only in a linear-family
-    preprocessor. Must be fitted on the training split only so held-out statistics
-    never leak into the preprocessing step.
+    Designed for tree-based models (GBDT): trees are invariant to monotone feature
+    transformations, so StandardScaler is deliberately omitted — scaling adds no
+    information to split decisions and belongs only in the linear-family preprocessor.
 
-    binary    — union of BINARY_STR_COLS and BINARY_INT_COLS; _cast_to_str normalises
-                mixed dtypes to str before OHE so int 0/1 and Yes/No columns encode
-                identically.
+    binary    — union of str and int binary columns. OHE(drop='if_binary') handles
+                heterogeneous dtypes per-column and produces exactly 1 column per
+                binary feature (cleaner feature names in feature_columns.txt and SHAP).
     multi_cat — multi-level categoricals; OHE without drop='first' — correct for trees
                 (immune to the dummy-variable trap) and keeps all levels visible in
-                importance/redundancy screens.
+                importance screens.
     numeric   — numeric columns; SimpleImputer(median) handles the 11 NaN zero-tenure
                 rows (fit on X_train only). No scaling — trees don't need it.
 
-    Model training note: if the linear baseline proves a genuine champion candidate, add a
-    separate build_linear_preprocessor (drop='first' + StandardScaler) alongside this
-    function — do not parameterise this one.
-
-    Model training note: switch binary OHE to drop='if_binary' (remove _cast_to_str + Pipeline).
-    Each binary column then produces 1 column instead of 2, yielding cleaner feature names
-    in feature_columns.txt and SHAP plots. Deferred from Phase 4a: zero impact on tree
-    model quality during discovery, and the test updates are most natural at the point
-    the preprocessor is first serialized and logged.
+    Must be fitted on the training split only so held-out statistics never leak into
+    the preprocessing step.
     """
-    binary_pipeline = Pipeline(
-        steps=[
-            (
-                "to_str",
-                FunctionTransformer(_cast_to_str, feature_names_out="one-to-one"),
-            ),
-            ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-        ]
-    )
     return ColumnTransformer(
         transformers=[
-            ("binary", binary_pipeline, binary),
+            (
+                "binary",
+                OneHotEncoder(
+                    drop="if_binary", handle_unknown="ignore", sparse_output=False
+                ),
+                binary,
+            ),
             (
                 "multi_cat",
                 OneHotEncoder(handle_unknown="ignore", sparse_output=False),
@@ -77,3 +93,93 @@ def build_preprocessor(
         ],
         remainder="drop",
     )
+
+
+def build_linear_preprocessor(
+    binary: list[str],
+    multi_cat: list[str],
+    numeric: list[str],
+) -> ColumnTransformer:
+    """Return an unfitted linear-family ColumnTransformer for binary, multi-cat, and numeric columns.
+
+    Designed for logistic regression and related linear models. Three key differences
+    from build_preprocessor (the tree path):
+
+    - OHE(drop='first') on all categoricals — avoids the dummy-variable trap that
+      inflates coefficient variance and destabilises estimates for linear models.
+    - StandardScaler on non-tenure numerics — required for comparable L2 regularisation
+      across features on different scales.
+    - tenure routed through a stateless cohort-binning branch via FunctionTransformer
+      over TENURE_COHORT_EDGES rather than passed as a continuous numeric — a single
+      linear slope on continuous tenure cannot represent the survival-distribution shape;
+      per-cohort OHE coefficients are directly readable in the odds-ratio table.
+
+    tenure is extracted from numeric internally; callers pass the same column groups as
+    the tree path (tenure stays in numeric) with no caller-side column swapping.
+    tenure_cohort is NOT a FeatureSchema column — it is encapsulated here.
+
+    Comparison-only: used by models/train/candidates.py to build the
+    DummyClassifier / LogisticRegressionCV candidate pipelines. Nothing past model
+    comparison imports it.
+
+    Must be fitted on the training split only so held-out statistics never leak.
+    """
+    non_tenure_numeric = [c for c in numeric if c != "tenure"]
+
+    binary_pipeline = Pipeline(
+        steps=[
+            (
+                "to_str",
+                FunctionTransformer(_cast_to_str, feature_names_out="one-to-one"),
+            ),
+            (
+                "ohe",
+                OneHotEncoder(
+                    drop="first", handle_unknown="ignore", sparse_output=False
+                ),
+            ),
+        ]
+    )
+
+    tenure_cohort_pipeline = Pipeline(
+        steps=[
+            (
+                "bin",
+                FunctionTransformer(_bin_tenure, feature_names_out="one-to-one"),
+            ),
+            (
+                "ohe",
+                OneHotEncoder(
+                    drop="first", handle_unknown="ignore", sparse_output=False
+                ),
+            ),
+        ]
+    )
+
+    transformers: list[Any] = [
+        ("binary", binary_pipeline, binary),
+        (
+            "multi_cat",
+            OneHotEncoder(drop="first", handle_unknown="ignore", sparse_output=False),
+            multi_cat,
+        ),
+    ]
+
+    if "tenure" in numeric:
+        transformers.append(("tenure_cohort", tenure_cohort_pipeline, ["tenure"]))
+
+    if non_tenure_numeric:
+        transformers.append(
+            (
+                "numeric",
+                Pipeline(
+                    steps=[
+                        ("impute", SimpleImputer(strategy="median")),
+                        ("scale", StandardScaler()),
+                    ]
+                ),
+                non_tenure_numeric,
+            )
+        )
+
+    return ColumnTransformer(transformers=transformers, remainder="drop")

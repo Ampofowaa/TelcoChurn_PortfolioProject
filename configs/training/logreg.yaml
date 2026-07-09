@@ -1,0 +1,9 @@
+# LogisticRegressionCV parameters for the candidate comparison (Dummy vs. LogReg vs. LightGBM).
+# Comparison-only — never registered, calibrated, or served.
+# class_weight lives in config.yaml training_setup — shared across all model families.
+
+Cs: 10              # number of C values on sklearn's default log-scale grid, not a literal C=10
+cv_folds: 5         # inner CV, runs inside each outer RSKF fold
+max_iter: 200       # above sklearn default of 100 — avoids silent ConvergenceWarnings
+solver: lbfgs       # supports L2 on dense data without sparse-gradient noise
+penalty: l2         # stable under correlated predictors (tenure/totalcharges/monthlycharges)

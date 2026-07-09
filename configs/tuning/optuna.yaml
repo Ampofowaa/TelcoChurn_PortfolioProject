@@ -1,0 +1,70 @@
+# Optuna study configuration for LightGBM hyperparameter tuning — every knob (sampler seed, warm-up budget, pruner, search space, early-stopping ceiling, selection rule) is recorded here, not a buried constant, so the study is reproducible from config alone.
+
+n_trials: 50
+direction: maximize
+metric: average_precision   # PR-AUC; sole selection metric (one-metric invariant)
+
+# Wall-clock cap for study.optimize, alongside n_trials — stops an automated retrain from hanging the schedule; only checked between trials, not mid-fit. null disables it.
+timeout_seconds: 5400   # 90 min; generous multiple of expected 50-trial runtime
+
+# Floor on completed trials before trusting the selection_rule pick — below it, a warning flags the pick as unreliable instead of blocking it. null disables the check.
+min_completed_trials: 10   # 20% of n_trials
+
+# Decoupled from training_setup.cv_folds — this cost compounds across n_trials, so it stays cheap. No cv_repeats for the same reason.
+cv_folds: 5
+random_state: 42
+
+# n_estimators_ceiling bounds early stopping; early_stopping_rounds resolves the per-fold tree count once validation average_precision (the study's own metric) plateaus.
+n_estimators_ceiling: 2000
+early_stopping_rounds: 50
+# Early-stopping validation slice is carved from each fold's training portion only — the fold's held-out rows and the sealed test are untouched.
+es_validation_size: 0.2
+
+search_space:
+  num_leaves:
+    low: 10
+    high: 200
+    type: int
+  learning_rate:
+    low: 0.005
+    high: 0.1
+    log: true    # log-uniform; biased low to pair with early-stopping tree count
+    type: float
+  min_child_samples:
+    low: 10
+    high: 100
+    type: int
+  subsample:
+    low: 0.5
+    high: 1.0
+    type: float
+  colsample_bytree:
+    low: 0.5
+    high: 1.0
+    type: float
+  reg_alpha:
+    low: 0.0
+    high: 10.0
+    type: float
+  reg_lambda:
+    low: 0.0
+    high: 10.0
+    type: float
+  # Guard rail: max_depth >= ceil(log2(num_leaves.high)) so leaf-wise growth can't build arbitrarily deep branches on ~5,600 training rows.
+  max_depth:
+    low: 3
+    high: 12
+    type: int
+
+# Disabled — n_startup_trials handles exploration instead; a future retrain flow can populate this from the current champion's params (see PROJECT_PLAN.md).
+warm_start_params: null
+
+sampler: tpe
+sampler_seed: 42       # reproducible suggestion sequence
+n_startup_trials: 10   # random warm-up before surrogate engages
+
+# Pruner kills a trial mid-CV when clearly behind the running median; 'none' disables it — still a recorded decision either way.
+pruner: median
+
+# '1se' picks the most-regularized trial within 1 SE of the best CV score (Breiman/glmnet convention); 'argmax' picks the raw-best trial.
+selection_rule: 1se

@@ -5,14 +5,17 @@ from __future__ import annotations
 import pandas as pd
 import pandera as pa
 
-from telco_churn.features.schema import CustomerFeaturesSchema, FeatureOutputSchema
+from telco_churn.features.schema import (
+    FEATURE_SCHEMA,
+    CustomerFeaturesSchema,
+    FeatureOutputSchema,
+    FeatureSchema,
+)
 from telco_churn.utils.logging import get_logger
 
 __all__ = [
-    "BINARY_STR_COLS",
-    "BINARY_INT_COLS",
-    "MULTI_CAT_COLS",
-    "NUMERIC_COLS",
+    "FEATURE_SCHEMA",
+    "FeatureSchema",
     "TARGET_COL",
     "SQL_FEATURE_COLS",
     "build_feature_df",
@@ -20,46 +23,13 @@ __all__ = [
 
 logger = get_logger(__name__)
 
-BINARY_STR_COLS: list[str] = [
-    "gender",
-    "has_partner",
-    "dependents",
-    "phoneservice",
-    "paperlessbilling",
-]
-
-BINARY_INT_COLS: list[str] = [
-    "seniorcitizen",
-]
-
-MULTI_CAT_COLS: list[str] = [
-    "multiplelines",
-    "internetservice",
-    "onlinesecurity",
-    "onlinebackup",
-    "deviceprotection",
-    "techsupport",
-    "streamingtv",
-    "streamingmovies",
-    "contract_type",
-    "paymentmethod",
-]
-
-NUMERIC_COLS: list[str] = [
-    "tenure",
-    "monthlycharges",
-    "totalcharges",
-    "charge_per_service",  # SQL-engineered: charge_per_service.sql (Phase 4a adoption)
-]
-
 TARGET_COL = "churn"
 
 SQL_FEATURE_COLS: list[str] = (
     ["customerid"]
-    + BINARY_STR_COLS
-    + BINARY_INT_COLS
-    + MULTI_CAT_COLS
-    + NUMERIC_COLS
+    + list(FEATURE_SCHEMA.binary)
+    + list(FEATURE_SCHEMA.multi_cat)
+    + list(FEATURE_SCHEMA.numeric)
     + [TARGET_COL]
 )
 
@@ -107,7 +77,11 @@ if __name__ == "__main__":
         processed_dir.mkdir(parents=True, exist_ok=True)
         df_out.to_csv(out_path, index=False)
 
-        feature_cols = BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS
+        feature_cols = (
+            list(FEATURE_SCHEMA.binary)
+            + list(FEATURE_SCHEMA.multi_cat)
+            + list(FEATURE_SCHEMA.numeric)
+        )
         logger.info(
             "feature dataframe saved",
             path=str(out_path),
