@@ -1,4 +1,4 @@
-"""Feature discovery machinery for the Phase 4a error-driven loop.
+"""Feature discovery machinery for the error-driven feature discovery loop.
 
 Pure, typed, testable functions — no feature engineering logic lives here.
 The discovery loop (notebooks/02a-feature-discovery.ipynb) imports these and
