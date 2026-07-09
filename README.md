@@ -125,11 +125,8 @@ make features          # build SQL views → write datasets/processed/telco_chur
 
 **6 — Browse experiment runs (Phase 5+)**
 
-```bash
-mlflow ui --backend-store-uri file:./mlruns
-```
-
-Open [http://localhost:5000](http://localhost:5000) to explore logged experiments.
+`make db-up` already started the MLflow tracking server alongside Postgres —
+open [http://localhost:5000](http://localhost:5000) to explore logged experiments.
 
 ---
 

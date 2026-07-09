@@ -4,8 +4,8 @@ Full modelling rationale for the [Telco Customer Churn](README.md) portfolio pro
 Covers problem framing, EDA, feature engineering, model selection, hyperparameter tuning,
 error analysis, SHAP explainability, calibration, threshold optimisation, and business impact.
 
-All analysis is reproducible from `notebooks/_archive/EDA-original.ipynb`.
-The `src/` package implements the production-ready version of the same logic.
+This document is the authoritative modelling record. `notebooks/_archive/EDA-original.ipynb` is kept only as a comparison notebook for the original exploratory pass — where `src/` and this document diverge from it, they are what's authoritative, per a stated reason recorded here or in commit/PR history.
+The `src/` package implements the production-ready version of the current logic.
 
 > *Section numbers follow the analytical lifecycle and do not correspond to implementation phase numbers in `PROJECT_PLAN.md`.*
 
@@ -17,22 +17,21 @@ The `src/` package implements the production-ready version of the same logic.
 1. [Data Ingestion & Quality Checks](#1-data-ingestion--quality-checks)
 2. [EDA & Statistical Testing](#2-eda--statistical-testing)
 3. [Feature Discovery & Engineering](#3-feature-discovery--engineering)
-4. [Baseline Models](#4-baseline-models)
-5. [Hyperparameter Tuning (Optuna)](#5-hyperparameter-tuning-optuna)
-6. [Error Analysis](#6-error-analysis)
-7. [SHAP Explainability](#7-shap-explainability)
-8. [Probability Calibration](#8-probability-calibration)
-9. [Business Impact & Threshold Selection](#9-business-impact--threshold-selection)
-10. [Final Test-Set Results](#10-final-test-set-results)
-11. [Production Refit & Model Registration](#11-production-refit--model-registration)
-12. [Known Limitations](#12-known-limitations)
-13. [Recommendations & Next Steps](#13-recommendations--next-steps)
+4. [Model Selection, Feature Selection & Hyperparameter Tuning](#4-model-selection-feature-selection--hyperparameter-tuning)
+5. [Error Analysis](#5-error-analysis)
+6. [SHAP Explainability](#6-shap-explainability)
+7. [Probability Calibration](#7-probability-calibration)
+8. [Business Impact & Threshold Selection](#8-business-impact--threshold-selection)
+9. [Final Test-Set Results](#9-final-test-set-results)
+10. [Production Refit & Model Registration](#10-production-refit--model-registration)
+11. [Known Limitations](#11-known-limitations)
+12. [Recommendations & Next Steps](#12-recommendations--next-steps)
 
 ---
 
 ## 0. Problem Framing & Cost Definition
 
-This step locks the rules that govern every modelling decision in §§1–11. It is documented here — before any EDA or model results — so that the cost-sensitive threshold, the choice of recall as the primary metric, and the class imbalance handling all have a traceable origin.
+This step locks the rules that govern every modelling decision in §§1–10. It is documented here — before any EDA or model results — so that the cost-sensitive threshold, the choice of recall as the primary metric, and the class imbalance handling all have a traceable origin.
 
 ### Prediction unit
 
@@ -46,9 +45,9 @@ The label captures *revealed* churn (cancellation has occurred), not *predicted 
 
 ### Decision the score feeds
 
-The score feeds a **proactive retention intervention decision**: whether to include a customer in the upcoming outreach cycle (discount offer, contract upgrade, service credit). The decision is binary per customer per cycle. A contacted customer either receives an offer or does not; there is no tiered response modelled at this stage (tiered outreach is a §13 recommendation).
+The score feeds a **proactive retention intervention decision**: whether to include a customer in the upcoming outreach cycle (discount offer, contract upgrade, service credit). The decision is binary per customer per cycle. A contacted customer either receives an offer or does not; there is no tiered response modelled at this stage (tiered outreach is a §12 recommendation).
 
-This framing makes the cost structure asymmetric and well-defined (see below). It has two metric consequences: **PR-AUC is the primary model selection and promotion metric** — it summarises precision-recall performance across all thresholds and is the promotion gate used in §§5 and 7. **Recall at the production threshold is the primary business metric** — once the model is deployed at the optimised production threshold (§9), the question the business asks is "how many churners did we catch this cycle?", and missed churners receive no offer and are lost.
+This framing makes the cost structure asymmetric and well-defined (see below). It has two metric consequences: **PR-AUC is the primary model selection and promotion metric** — it summarises precision-recall performance across all thresholds and is the promotion gate used in §4 and §6. **Recall at the production threshold is the primary business metric** — once the model is deployed at the optimised production threshold (§8), the question the business asks is "how many churners did we catch this cycle?", and missed churners receive no offer and are lost.
 
 ### FN vs FP cost structure
 
@@ -62,7 +61,7 @@ This framing makes the cost structure asymmetric and well-defined (see below). I
 1. The optimal decision threshold is **shifted left of 0.5** — accepting more FPs to recover more churners is cost-rational.
 2. **Recall is prioritised over Precision** as the primary metric. A model that catches fewer churners is not compensated by being more precise, because the asymmetry means false negatives are the more expensive error.
 
-The cost parameters ($68/intervention, $575 LTV, 30 % success rate) are illustrative and derived from plausible telecom industry benchmarks. They are not Finance-validated; see §12 Known Limitation #8. The three-scenario bracket (Conservative / Base / Optimistic) in §9 exists specifically to stress-test decisions against this uncertainty.
+The cost parameters ($68/intervention, $575 LTV, 30 % success rate) are illustrative and derived from plausible telecom industry benchmarks. They are not Finance-validated; see §11 Known Limitation #8. The three-scenario bracket (Conservative / Base / Optimistic) in §8 exists specifically to stress-test decisions against this uncertainty.
 
 ### Baseline to beat
 
@@ -75,7 +74,7 @@ Two reference points bound the performance target:
 
 **Heuristic derivation:** month-to-month customers = 3,875; total churners = 1,869; month-to-month churn rate ≈ 43 % (§2 bivariate analysis) → ~1,666 churners captured. Recall = 1,666 / 1,869 ≈ **88 %**. Precision = 1,666 / 3,875 ≈ **43 %** (equals the segment churn rate by definition — flagging an entire group sets precision equal to that group's base rate).
 
-The month-to-month heuristic sets a high recall bar but has two structural weaknesses. First, the ~12 % of churners it misses (~203 customers on annual or two-year contracts) are disproportionately long-tenure, higher-LTV customers — each FN in this segment costs more than the $172 average above, so the apparent 88 % recall understates the business cost of the misses. Second, the heuristic assigns equal weight to all 3,875 flagged customers; it cannot distinguish near-certain churners from borderline cases, making cost-efficient prioritisation of the outreach budget impossible. The ML model must therefore do more than match aggregate recall and precision — it must recover high-value churners the heuristic ignores and produce calibrated probability scores that enable threshold-optimised, cost-rational triage. This is also why the recall at the cost-optimised production threshold (§9) is set below 88 %: chasing the heuristic's recall ceiling requires flagging an ever-larger share of the customer base, flooding the outreach budget with low-confidence contacts. The economically rational operating point accepts a lower recall in exchange for materially higher precision and a better overall cost outcome.
+The month-to-month heuristic sets a high recall bar but has two structural weaknesses. First, the ~12 % of churners it misses (~203 customers on annual or two-year contracts) are disproportionately long-tenure, higher-LTV customers — each FN in this segment costs more than the $172 average above, so the apparent 88 % recall understates the business cost of the misses. Second, the heuristic assigns equal weight to all 3,875 flagged customers; it cannot distinguish near-certain churners from borderline cases, making cost-efficient prioritisation of the outreach budget impossible. The ML model must therefore do more than match aggregate recall and precision — it must recover high-value churners the heuristic ignores and produce calibrated probability scores that enable threshold-optimised, cost-rational triage. This is also why the recall at the cost-optimised production threshold (§8) is set below 88 %: chasing the heuristic's recall ceiling requires flagging an ever-larger share of the customer base, flooding the outreach budget with low-confidence contacts. The economically rational operating point accepts a lower recall in exchange for materially higher precision and a better overall cost outcome.
 
 ### Success criterion
 
@@ -86,9 +85,9 @@ The model is considered fit for production if, at the cost-optimised threshold o
 | PR-AUC | ≥ 0.60 | Primary ranking metric — threshold-free and imbalance-appropriate at a 27 % positive rate; ROC-AUC is optimistic under class imbalance and is not used as a gate |
 | Recall at the optimised production threshold | ≥ 0.75 | Primary business metric — proportion of churners caught at the deployed operating point |
 | P&L vs random (base scenario) | Positive — model P&L > random-targeting P&L | Confirms the model adds economic value over an unguided contact budget |
-| No test-set information used before final evaluation | Structural requirement — threshold derived from OOF predictions only | Preserves the "test set touched once" invariant (§9) |
+| No test-set information used before final evaluation | Structural requirement — threshold derived from OOF predictions only | Preserves the "test set touched once" invariant (§8) |
 
-These gates were set before the test set was opened. The final test-set results in §10 are evaluated against them exactly once.
+These gates were set before the test set was opened. The final test-set results in §9 are evaluated against them exactly once.
 
 ---
 
@@ -174,7 +173,7 @@ Chi-squared + Cramér's V for categorical features (V > 0.30 = strong, 0.10–0.
 
 - **Fiber optic churn** operates through two overlapping channels: a cost channel (average $91.50/month vs $58.10 for DSL — a 57 % premium) and a potential service quality channel. The data cannot separate the two; feature importance in the modelling phase will clarify each channel's contribution.
 - **Payment method and paperless billing reflect commitment depth, not direct drivers.** Automated payment methods (bank transfer, credit card) are associated with lower churn — consistent with greater friction to cancel. Paperless billing's elevated churn is a proxy for the month-to-month and fiber optic mix.
-- **Senior citizen churn** (~42 % vs ~24 %) is likely mediated by contract type and internet service; the EDA cannot decompose the independent age contribution. No systematic age-based under-service is evident in the error analysis (§6).
+- **Senior citizen churn** (~42 % vs ~24 %) is likely mediated by contract type and internet service; the EDA cannot decompose the independent age contribution. No systematic age-based under-service is evident in the error analysis (§5).
 - **`PhoneService_Yes`** has VIF = ∞ (perfectly collinear with `MultipleLines_No phone service`) yet V = 0.01 — the clearest illustration that VIF measures collinearity between features, not relevance to the target.
 
 ### Interaction effects
@@ -205,7 +204,7 @@ VIF > 10 flags severe multicollinearity. **14 of 30 encoded features** exceed th
 
 The remaining 16 features all have VIF ≤ 10, with `seniorcitizen` (≈ 1.15) and `gender_Male` (1.00) effectively orthogonal to all other features.
 
-**All features are retained — none are dropped on VIF grounds.** The practical impact of multicollinearity is model-family-dependent: tree-based methods (LightGBM, XGBoost, RandomForest) are immune — each split is evaluated independently and collinearity does not distort estimates. Linear models are materially affected and would require feature consolidation or regularisation. The null-importance experiment during model training (§5) is the explicit gate for any feature pruning.
+**All features are retained — none are dropped on VIF grounds.** The practical impact of multicollinearity is model-family-dependent: tree-based methods (LightGBM, XGBoost, RandomForest) are immune — each split is evaluated independently and collinearity does not distort estimates. Linear models are materially affected and would require feature consolidation or regularisation. The permutation-importance experiment during model training (§4) is the explicit gate for any feature pruning.
 
 The full EDA — rendered distributions, bivariate charts, interaction heatmaps, and VIF tables — is in [`notebooks/01-eda.ipynb`](notebooks/01-eda.ipynb).
 
@@ -215,7 +214,9 @@ The full EDA — rendered distributions, bivariate charts, interaction heatmaps,
 
 ### 3a. Feature Discovery
 
-Feature discovery precedes feature engineering to identify which new columns are worth building. The search follows two strategies: **error-driven** — profiling the base model's false negatives to find subgroups it systematically misses, then hypothesising a feature that targets each blind spot directly — and **domain-derived** — using knowledge of telecom pricing and service structure to construct row-level ratios and counts that no single tree split can replicate on its own. Both strategies feed the same evaluation pipeline: a baseline LightGBM trained on the 19 raw IBM columns (using 5-fold out-of-fold predictions — each row scored by a fold that never saw it during training — PR-AUC = **0.6432**, 95 % bootstrap CI: [0.6195, 0.6677]) sets the performance floor, and every candidate is assessed through a four-screen adoption gate, cheapest-first.
+Feature discovery precedes feature engineering to identify which new columns are worth building. The search follows two strategies: **error-driven** — profiling the base model's false negatives to find subgroups it systematically misses, then hypothesising a feature that targets each blind spot directly — and **domain-derived** — using knowledge of telecom pricing and service structure to construct row-level ratios and counts that no single tree split can replicate on its own. Both strategies feed the same evaluation pipeline: a baseline LightGBM trained on the 19 raw IBM columns (using 5-fold out-of-fold, or OOF, predictions — each row scored by a fold that never saw it during training — PR-AUC = **0.6387**, 95 % bootstrap CI: [0.6113, 0.6658]) sets the performance floor, and every candidate is assessed through a four-screen adoption gate, cheapest-first.
+
+The 7,043-row dataset is split 80/20 into a **dev partition** (5,634 rows) and a held-out **test set** (1,409 rows) by the canonical split module (`data/split.py`, `datasets/processed/split_manifest.parquet`). This split is sealed once, before feature discovery or any downstream modelling step runs, and the test set is touched exactly once — at final evaluation (§9). Discovery below runs on the **dev partition only**, so no candidate-adoption decision touches held-out data.
 
 **Four-screen gate:**
 
@@ -239,9 +240,9 @@ Screen 4 is the empirical backstop for collective or cross-type redundancy that 
 
 | Blind spot | FN rate | Missed churners |
 |---|---|---|
-| Two-year contract | 85.4 % | 48 |
-| One-year contract | 54.2 % | 166 |
-| Tenure 55–72 months | 53.7 % | 73 |
+| Two-year contract | 94.9 % | 37 |
+| Tenure 55–72 months | 55.9 % | 62 |
+| One-year contract | 51.5 % | 67 |
 
 *Rationale.* **One-year and two-year contract blind spots (Laps 1–4):** these groups churn at ~11 % and ~3 % respectively versus 43 % for month-to-month, so the model assigns nearly everyone in them a low churn score — even customers who show clear warning signs like fiber optic internet or high monthly charges. Each lap tests whether explicitly flagging a specific high-risk combination within that segment (e.g. "one-year contract AND fiber optic," "two-year contract AND above-median charge") could give the model a dedicated signal for those customers, rather than treating the whole contract group the same way. **Tenure blind spot (Laps 5–6):** the model reads tenure as a smooth number, but churn risk drops steeply at specific thresholds rather than declining gradually. Lap 5 tests whether bucketing tenure into lifecycle cohorts (0–12 mo, 13–24 mo, etc.) makes those risk tiers explicit enough to improve predictions; Lap 6 tests a flag for customers who have remained on a month-to-month contract for over 55 months — a "never upgraded despite years of opportunity" signal.
 
@@ -249,14 +250,14 @@ All six error-driven candidates are pairwise conjunctions of existing columns. A
 
 | Lap | Feature | Description | Outcome | Reason |
 |---|---|---|---|---|
-| 1 | `two_year_fiber` | `contract_type = Two year` AND `internetservice = Fiber optic` | REJECTED (Screen 4) | The model already sees both columns as separate inputs and finds their combination on its own — the flag adds nothing (importance 0.0000) |
-| 2 | `two_year_high_charge` | `contract_type = Two year` AND `monthlycharges` > dataset median | REJECTED (Screen 3) | A yes/no charge threshold is less informative than the raw `monthlycharges` value the model already has — PR-AUC fell (−0.0008) |
-| 3 | `one_year_streaming` | `contract_type = One year` AND at least one streaming service subscribed | REJECTED (Screen 4) | The model already sees `streamingtv` and `streamingmovies` as separate inputs and finds their combination on its own — 166 one-year churners confirm data sparsity is not the cause (importance 0.0009) |
-| 4 | `one_year_high_charge` | `contract_type = One year` AND `monthlycharges` > dataset median | REJECTED (Screen 3) | A yes/no charge threshold adds nothing above the continuous `monthlycharges` column the model already has — PR-AUC barely moved (+0.0012, below 0.0015 minimum) |
-| 5 | `tenure_cohort` | `tenure` bucketed into 5 lifecycle cohorts (0–12, 13–24, 25–48, 49–65, 65+ months) | REJECTED (Screen 4) | The model finds the same risk thresholds directly from raw `tenure` — the cohort buckets add nothing on top (importance 0.0024) |
-| 6 | `long_tenure_mtm` | `tenure` > 55 months AND `contract_type = Month-to-month` | REJECTED (Screen 4) | The model already identifies this group through its own decisions on `tenure` and `contract_type` (importance 0.0002) |
+| 1 | `two_year_fiber` | `contract_type = Two year` AND `internetservice = Fiber optic` | REJECTED (Screen 4) | PR-AUC passed Screen 3 (+0.0017, 0.6387→0.6404), but the model gains no independent signal from the flag once measured against the full context — importance 0.0001, below the 0.0054 floor |
+| 2 | `two_year_high_charge` | `contract_type = Two year` AND `monthlycharges` > dataset median | REJECTED (Screen 4) | PR-AUC also passed Screen 3 (+0.0017, 0.6387→0.6404 — an identical delta to Lap 1, both candidates converge on the same fiber-optic-heavy high-charge subset), but importance (0.0009) fell below the 0.0050 floor |
+| 3 | `one_year_streaming` | `contract_type = One year` AND at least one streaming service subscribed | REJECTED (Screen 3) | PR-AUC fell (−0.0009, 0.6387→0.6378), below the 0.0015 minimum |
+| 4 | `one_year_high_charge` | `contract_type = One year` AND `monthlycharges` > dataset median | REJECTED (Screen 3) | PR-AUC fell (−0.0003, 0.6387→0.6384), below the 0.0015 minimum |
+| 5 | `tenure_cohort` | `tenure` bucketed into 5 lifecycle cohorts (0–12, 13–24, 25–48, 49–65, 65+ months) | REJECTED (Screen 3) | PR-AUC fell (−0.0041, 0.6387→0.6346) — the largest drop of any candidate; the buckets discard information the raw continuous `tenure` column already carries |
+| 6 | `long_tenure_mtm` | `tenure` > 55 months AND `contract_type = Month-to-month` | REJECTED (Screen 3) | PR-AUC delta +0.0013 — positive but below the 0.0015 minimum |
 
-*Structural conclusion:* LightGBM's depth-2 split-finding discovers pairwise conjunctions independently; pre-computed binary flags add nothing the model cannot recover itself. Useful features must require operations no single tree split can replicate — row-level division or within-row summation.
+*Structural conclusion:* Two candidates (Laps 1–2) clear the PR-AUC bar but fail the importance backstop — LightGBM already recovers the same pairwise conjunction from its own splits, so the pre-computed flag adds no independent signal once the model has both source columns. The other four (Laps 3–6) fail earlier, directly at the PR-AUC screen — three with a negative delta and one with a positive delta too small to clear the threshold. Useful features must require operations no single tree split can replicate — row-level division or within-row summation.
 
 **Domain-derived laps (7–9).**
 
@@ -264,15 +265,15 @@ All six error-driven candidates are pairwise conjunctions of existing columns. A
 
 | Lap | Feature | Description | Outcome | Reason |
 |---|---|---|---|---|
-| 7 | `charge_per_service` | monthlycharges ÷ num_active_services | **ADOPTED** | Per-unit cost is genuinely new information not recoverable from raw charges alone — all four screens passed (importance 0.0056, PR-AUC +0.0018) |
-| 8 | `num_add_on_services` | Count of 7 optional add-on subscriptions | REJECTED (Screen 3) | The seven individual add-on flags are already in the model; their sum adds nothing collectively that they do not cover separately (PR-AUC −0.0011) |
-| 9 | `monthly_to_total_ratio` | monthlycharges ÷ totalcharges | REJECTED (Screen 3) | Reduces to ≈ 1/`tenure` (Spearman \|r\| = 0.999) — confirmed decoy; the model already has `tenure` directly (PR-AUC −0.0005) |
+| 7 | `charge_per_service` | monthlycharges ÷ num_active_services | **ADOPTED** | Per-unit cost is genuinely new information not recoverable from raw charges alone — all four screens passed (importance 0.0080, PR-AUC +0.0033, 0.6387→0.6420) |
+| 8 | `num_add_on_services` | Count of 7 optional add-on subscriptions | REJECTED (Screen 3) | Screen 2 nearly flagged it (max_corr 0.792, close to the 0.85 threshold) — the seven individual add-on flags are already in the model; their sum adds nothing collectively that they do not cover separately (PR-AUC −0.0021, 0.6420→0.6399) |
+| 9 | `monthly_to_total_ratio` | monthlycharges ÷ totalcharges | REJECTED (Screen 2 flagged, Screen 3 failed) | Reduces to ≈ 1/`tenure` (Spearman \|r\| = 0.999) — confirmed decoy; the model already has `tenure` directly (PR-AUC −0.0020, 0.6420→0.6400) |
 
 The domain-derived search confirmed the core insight from Laps 1–6: a feature must require operations the model cannot perform through its own splits. `charge_per_service` met that bar — dividing monthly charges by service count is a relationship no single split on either column can replicate. The other two did not: the add-on count was collectively redundant with its seven source flags despite passing Screen 2's pairwise check, and the charges ratio reduced to approximately `1/tenure` (Spearman |r| = 0.999), making it mathematically equivalent to a column the model already holds regardless of how it was framed.
 
-**Backward elimination.** Removing `charge_per_service` costs −0.0018 PR-AUC — it clears the 0.0015 threshold, though the margin is slim and consistent with the modest forward-pass delta. The feature holds its place in the full adopted set.
+**Backward elimination.** Removing `charge_per_service` drops PR-AUC from 0.6420 to 0.6387 (Δ = +0.0033), comfortably above the 0.0015 threshold — the feature holds its place in the full adopted set.
 
-**Result:** 1 feature adopted from 9 candidates. OOF PR-AUC: 0.6432 → **0.6450**. Adopted set: `charge_per_service`, frozen to `reports/feature_discovery/adopted_features.json`.
+**Result:** 1 feature adopted from 9 candidates. OOF PR-AUC: 0.6387 → **0.6420**. Adopted set: `charge_per_service`, frozen to `reports/feature_discovery/adopted_features.json`.
 
 The full lap-by-lap trail — per-screen outputs, provenance records, and diagnostic plots — is in [`notebooks/02a-feature-discovery.ipynb`](notebooks/02a-feature-discovery.ipynb).
 
@@ -288,79 +289,236 @@ The full 20-column inventory — grouped by type and always in sync with the cod
 
 ---
 
-## 4. Baseline Models
+## 4. Model Selection, Feature Selection & Hyperparameter Tuning
 
-Three models trained at minimum-viable-baseline settings (not tuned). Selection criterion: **5-fold stratified CV recall on the training set**. Val set used as diagnostic holdout only — never influenced model selection.
+### 4a. Model Selection
 
-| Model | Val Precision | Val Recall | Val F1 | Val ROC-AUC | Val PR-AUC | CV Recall (5-fold) |
-|---|---|---|---|---|---|---|
-| LightGBM | 0.495 | **0.900** | 0.638 | **0.867** | **0.696** | **0.843 ± 0.011** |
-| XGBoost | 0.519 | 0.813 | 0.634 | 0.810 | 0.592 | 0.766 ± 0.006 |
-| RandomForest | 0.589 | 0.727 | 0.651 | 0.820 | 0.612 | 0.668 ± 0.021 |
+#### Data split & evaluation strategy
 
-**LightGBM selected** — leads on CV recall (0.843), val recall (0.900), ROC-AUC (0.867), and PR-AUC (0.696). PR-AUC separates models more cleanly than ROC-AUC at this class imbalance ratio.
+The dev/test split is established once in §3a — the 5,634-row dev partition and the 1,409-row sealed test set, touched exactly once at final evaluation (§9). `train.py` imports the canonical split manifest (`data/split.py` / `datasets/processed/split_manifest.parquet`) directly rather than deriving its own — the two are the same split by construction, not just by convention. All comparisons and tuning below run on the dev partition using 10-fold cross-validation repeated 10 times (`configs/config.yaml: training_setup.cv_folds/cv_repeats`, tightened from an earlier 5×3 schedule to shrink the mean PR-AUC estimate's variance on ~5,600 dev rows), which gives more reliable estimates than a single held-out slice on a dataset of this size.
 
-**Why accuracy is a misleading metric here:** RandomForest achieved 79.3 % accuracy vs LightGBM's 72.9 %, but the gap is entirely driven by non-churner accuracy. At a 2.8:1 class imbalance, accuracy rewards over-predicting the majority class. Recall on the positive class is the primary metric.
+#### Model family scope
 
-### Pre-tuning diagnostics
+Only LightGBM and `LogisticRegressionCV` (the strongest interpretable linear baseline) are compared. Other tree ensembles (XGBoost, RandomForest) are skipped: on tabular data they typically perform within noise of each other, so comparing several at default config would just compare defaults, not tuned ceilings — added maintenance cost for no decision value. LightGBM is committed up front for build-specific reasons: fast exact TreeSHAP for the SHAP explainability work (§6) and its Streamlit surfacing, training speed for Optuna and the weekly retrain cadence, and clean interaction with `class_weight`-based imbalance handling.
 
-| Metric | Value | Threshold | Flag |
+**Native categorical splits vs. one-hot encoding (deliberate, not an oversight):** LightGBM supports native categorical splitting, often preferred over OHE for trees. OHE is used here instead because every categorical in this feature set has ≤ 4 unique values (the column-blowup cost OHE is usually criticized for is negligible), it keeps the tree and linear preprocessing pipelines structurally uniform, and it yields cleaner per-level SHAP attribution for the Streamlit top-5 contributions view.
+
+#### Candidate comparison (PR-AUC, RSKF 10×10)
+
+LightGBM and LogisticRegressionCV are compared on PR-AUC: threshold-free, aligned with the §0 cost structure, and more discriminating than ROC-AUC at this 2.77:1 class imbalance, since ROC-AUC is scored against the large negative class and can look nearly identical across models that rank the minority churn class very differently. Each model uses its own preprocessor (tree vs. linear — see `03a-model-selection.ipynb`), so OHE encoding choices don't handicap either candidate, and class imbalance is handled via `class_weight='balanced'` for both rather than SMOTE/resampling — chosen for three reasons: the ~27% positive rate is mild imbalance, and resampling pays off more at extreme ratios; the feature space is mostly one-hot, and SMOTE interpolates incoherently across dummy columns; and calibration is a later deliverable (§7) that resampling would undermine — base-rate-altering resamplers decalibrate probabilities while reweighting barely shifts them, and the operating threshold gets set explicitly at that point anyway (§8). Identical fold indices are shared across all three candidates (one `RepeatedStratifiedKFold` instance, instantiated once) so scores are paired by construction — the precondition for the bootstrap comparison below. A `DummyClassifier(strategy='prior')` — a baseline that ignores every customer feature and simply predicts the overall churn rate for everyone — is included as a safeguard: since it has no real signal to work with, a strong score from it would mean the target has somehow leaked into the features. `train.py` asserts its ROC-AUC sits at chance and its PR-AUC matches the churn rate, and aborts the run if either check fails.
+
+| Candidate | CV PR-AUC | ± std | Train s/fold |
 |---|---|---|---|
-| Train recall | 0.979 | — | — |
-| CV recall | 0.843 | — | — |
-| Train–CV gap | **+0.136** | 0.021 (= 2 × CV std) | **[OVERFIT]** |
-| CV std | 0.011 | — | Stable, reproducible overfitting |
+| `dummy_prior` | 0.2654 | 0.0007 | 0.00 |
+| `logreg_cv` | 0.6511 | 0.0366 | 0.91 |
+| `lgbm_default` | 0.6582 | 0.0347 | 0.25 |
 
-Clear overfitting at default settings, but CV std = 0.011 confirms it is consistent — making LightGBM an ideal Optuna regularisation target.
+**Safeguard check passed:** the dummy classifier scored 0.2654, matching the dev-set churn rate (0.2654) to four decimal places — confirming the real candidates' higher scores reflect genuine predictive signal, not a broken eval harness or leaked target.
 
----
+LightGBM leads by ~0.007 PR-AUC points; ROC-AUC is close and non-contradictory (0.8433 LogReg vs. 0.8446 LightGBM, both rounding to 0.84). LogReg is markedly more expensive to train here (`LogisticRegressionCV`'s inner 5-fold search over 10 `C` values costs ~3.6× LightGBM's single fit per outer fold) — a genuine simplicity-vs-cost tradeoff LogReg does *not* win on, despite its interpretability appeal.
 
-## 5. Hyperparameter Tuning (Optuna)
+#### Precision/F1-at-fixed-recall profile
+
+Threshold-dependent diagnostics (precision, F1) are not reported at the default 0.5 cutoff — they are reported as a profile over OOF predictions at three fixed recall targets, computed identically for both candidates:
+
+| Recall target | LogReg precision | LogReg F1 | LogReg threshold | LightGBM precision | LightGBM F1 | LightGBM threshold |
+|---|---|---|---|---|---|---|
+| 0.70 | 0.574 | 0.631 | 0.595 | 0.572 | 0.629 | 0.574 |
+| 0.80 | 0.514 | 0.626 | 0.482 | 0.519 | 0.630 | 0.450 |
+| 0.90 | 0.442 | 0.593 | 0.336 | 0.442 | 0.593 | 0.266 |
+
+Precision and F1 are essentially indistinguishable between candidates at every recall target — reinforcing the near-linear finding above. The threshold column is the actual cutoff each candidate needed to hit that recall target on its own OOF predictions; it differs more between the two models (e.g. 0.336 vs. 0.266 at the 0.90 target) because their predicted-probability distributions aren't shaped the same way, but neither is a committed decision threshold. These profiles are threshold-*planning* diagnostics, not selection tools (PR-AUC alone decides the family); the operating threshold itself is set later (§8).
+
+#### Disaggregated robustness & fairness check (flag-only)
+
+Pre-registered, computed on OOF predictions for all three candidates, and explicitly non-gating — aggregate PR-AUC still decides the family regardless of what this check finds.
+
+**Robustness** (`contract_type`, `tenure_cohort`, `internetservice`): per-segment PR-AUC tracks each segment's own churn-rate prevalence for both candidates (e.g. LightGBM: 0.428 churn rate → 0.693 PR-AUC on month-to-month; 0.029 → 0.073 on two-year contracts) — expected for a prevalence-sensitive metric, not a robustness failure. A paired row-level bootstrap (`segment_bootstrap_delta`, 1,000 resamples) puts a 95% CI on the LightGBM-minus-LogReg gap in each segment: only 3 of 11 exclude zero. LightGBM has a genuine edge among 0–12m-tenure customers (Δ = +0.022, CI [0.001, 0.044]) and no-internet customers (Δ = +0.080, CI [0.009, 0.156], the widest gap of any segment) — both large, high-churn groups where retention spend is concentrated. LogReg edges out on 49–65m tenure (Δ = −0.044, CI [−0.086, −0.003]), a smaller, lower-risk group. Every other split — including the full contract-type breakdown, where the point estimates are themselves mixed (LogReg ahead on one-year and two-year contracts, LightGBM ahead on month-to-month) — straddles zero and isn't distinguishable from sampling noise.
+
+**Fairness** (`gender`, `seniorcitizen`, `has_partner`, `dependents` — the four protected/quasi-protected axes, per this section's policy of measurement over exclusion (see "Protected attributes & fairness policy" below)): per-subgroup PR-AUC gaps track each subgroup's own churn-rate prevalence for both candidates (e.g. LightGBM: 0.729 PR-AUC for senior citizens, 42.0% churn rate, vs. 0.629 for non-seniors, 23.6% churn rate) — the same prevalence-driven pattern as the robustness segments, not evidence of differential treatment. The same CI test is unambiguous here: all 8 of 8 fairness segments straddle zero — no demographic split shows a LightGBM-vs-LogReg gap distinguishable from sampling noise, including `has_partner` (Δ = −0.004, CI [−0.024, 0.016]), which looked like a hairline LogReg edge before the CI was applied. So the family choice doesn't trade fairness for LightGBM's other advantages — a conclusion resting on a formal test, not eyeballed gaps. **No disparity is flagged for follow-up at this stage.**
+
+#### Bootstrap selection decision
+
+To judge whether LightGBM's lead is real or a quirk of fold assignment, the gap in PR-AUC (Δ = AP(LightGBM) − AP(LogReg)) is stress-tested with a paired bootstrap: the 100 paired fold scores are resampled 10,000 times, producing a 95% percentile CI on Δ. The percentile CI *is* the test — there is no separate significance-level gate layered on top. The pre-registered decision rule (fixed before seeing results) has three branches against a materiality threshold Δ\* = 0.005:
+
+| Branch | Condition | Outcome |
+|---|---|---|
+| `material_lgbm_win` | CI excludes 0 in LGBM's favour and Δ ≥ Δ\* | Adopt LightGBM on the evidence |
+| `tie_immaterial` | CI includes 0, or excludes 0 but \|Δ\| < Δ\* | Practical tie — adopt LightGBM on the build-specific rationale above (SHAP, speed, calibration, continuity), not on this comparison |
+| `kill_condition` | CI excludes 0 in LogReg's favour and Δ ≤ −Δ\* | LogReg confidently and materially wins — ship LogReg instead |
+
+| | |
+|---|---|
+| Observed gap (LightGBM − LogReg) | +0.007 |
+| 95% confidence interval | [+0.003, +0.011] — excludes zero, entirely in LightGBM's favour |
+| Probability the gap is ≤ 0 | 0.10% (p = 0.0010, informational only) |
+| Materiality threshold (Δ\*) | 0.005 |
+| **Branch fired** | **`material_lgbm_win`** |
+| **Verdict** | **LightGBM adopted on the evidence — the bootstrap shows a genuine, material PR-AUC advantage over LogReg, reinforced by (not resting on) the build-specific rationale above** |
+
+**This comparison uses default LightGBM as a conservative floor** — hyperparameter tuning happens later in this section, after the feature-selection freeze below, and cannot run earlier without violating select-then-tune. The asymmetry cuts in the safe direction: if untuned LightGBM already beats tuned-to-its-ceiling LogReg, tuning can only widen the gap in LightGBM's favour. The margin reported here is refreshed after the tuning subsection's result against the tuned model — recorded once that lands.
+
+#### Generative diagnostic loop: bias/variance and OOF segment profiling
+
+After the family is confirmed (LightGBM), a diagnostic pass on the development set (sealed test untouched) asks *how* the model is performing, not just how well: is it underfitting, overfitting, or failing on a specific customer slice? Three explanations are distinguished — **bias** (features can't capture the pattern, needs a new feature), **variance** (the model overfits what it has, needs regularisation or fewer features), and **localized segment failure** (a specific slice underperforms, needs a targeted feature) — so a tuning problem isn't mistaken for a feature gap, or vice versa. Both checks are non-gating; PR-AUC alone still decides any feature change.
+
+**Bias/variance.** Default-config LightGBM (identical config to the `lgbm_default` candidate above) is refit via the same `RepeatedStratifiedKFold(10×10)` scheme, this time capturing both in-sample (training-fold) and held-out (validation-fold) PR-AUC per fold:
+
+| | |
+|---|---|
+| Train PR-AUC (mean) | 0.7943 |
+| CV PR-AUC (mean) | 0.6582 |
+| Train − CV gap (variance) | 0.1362 |
+| Lift over Dummy floor (bias) | +0.3932 (0.6582 − 0.265) |
+
+The gap is wide — well above the ~0.05 healthy guideline — meaning default LightGBM (100 trees, `num_leaves=20`) overfits the ~4,500-row training folds noticeably. Three signals rule out bias: training PR-AUC (0.7943) is already far above the Dummy floor, so the model fits the pattern; the held-out lift over that floor (+0.3932) confirms it generalises; and the learning curve's train-CV gap narrows from 0.312 at 900 rows to 0.147 at 4,507 rows as training size grows 5× — a bias problem wouldn't shrink with more data. CV PR-AUC is still climbing (0.623 → 0.656) without plateauing, so more data would likely help further — a data-acquisition note (§11), not a feature gap.
+
+A single 80/20 early-stopping run makes the overfitting concrete round by round (illustrative only, not the fold-averaged number driving the decision): validation PR-AUC plateaus by round ~20 (0.708) and holds flat (mean 0.707, std 0.002) for the remaining 80 rounds, while training PR-AUC keeps climbing the whole time, from 0.861 at round 20 to 0.910 at round 100 — the model keeps "improving" on data it has already memorised, long after validation performance has stopped moving.
+
+This is a **variance** signal, not a bias one — and simplifying the model is itself a standard variance remedy, so both the hyperparameter regularisation search in the tuning subsection below (`reg_alpha`/`reg_lambda`, `num_leaves`, `min_child_samples`) and the feature-count reduction tested in the next section are legitimate responses to this gap, not just the former.
+
+**OOF segment profiling.** Out-of-fold predictions from the bias/variance CV run above are disaggregated across four cuts: contract type; a tenure band (< 12m / 12–36m / > 36m); a service-count quintile (each customer's count of nine active phone/internet/add-on services, split into five equal-sized groups, 1 = fewest active services and 5 = most); and a `charge_per_service` outlier flag (customers above the 95th percentile):
+
+| Segment | Value | n | Churn rate | PR-AUC | 95% CI |
+|---|---|---|---|---|---|
+| Contract | Month-to-month | 3,095 | 0.428 | 0.693 | [0.668, 0.719] |
+| Contract | One year | 1,178 | 0.110 | 0.191 | [0.155, 0.238] |
+| Contract | Two year | 1,361 | 0.029 | 0.073 | [0.045, 0.126] |
+| Tenure band | < 12m | 1,756 | 0.474 | 0.752 | [0.718, 0.784] |
+| Tenure band | 12–36m | 1,480 | 0.254 | 0.549 | [0.499, 0.605] |
+| Tenure band | > 36m | 2,398 | 0.120 | 0.364 | [0.314, 0.422] |
+| Service quintile | 1 (fewest) | 1,666 | 0.190 | 0.647 | [0.591, 0.703] |
+| Service quintile | 2 | 687 | 0.438 | 0.722 | [0.670, 0.778] |
+| Service quintile | 3 | 1,521 | 0.347 | 0.659 | [0.618, 0.705] |
+| Service quintile | 4 | 742 | 0.255 | 0.661 | [0.595, 0.732] |
+| Service quintile | 5 (most) | 1,018 | 0.158 | 0.500 | [0.416, 0.576] |
+| `charge_per_service` outlier (> p95) | outlier | 282 | 0.621 | 0.827 | [0.765, 0.889] |
+| `charge_per_service` outlier (> p95) | normal | 5,352 | 0.247 | 0.625 | [0.597, 0.654] |
+
+Every segment's PR-AUC clears its own churn-rate floor by a healthy margin, and a 95% CI on each segment's PR-AUC (a single-model bootstrap computed inline in the notebook, distinct from `segment_bootstrap_delta`) confirms this holds under sampling uncertainty too — its lower bound still clears the floor everywhere. The margin is narrowest on the two smallest, lowest-churn segments — One year contracts (floor 0.110, CI lower bound 0.155) and Two year contracts (floor 0.029, CI lower bound 0.045, ~39 churners) — but even there it clears comfortably; every other segment's margin is at least 3× wider. Service-count churn is non-monotonic (quintile 2 peaks at 43.8%), a genuine pattern the model tracks without degrading. **No systematic failure pattern is identified** — with no segment to target and no bias signal from the checks above, feature selection (below) proceeds on the current 20-column set without additional feature engineering.
+
+### 4b. Feature Selection (input-space freeze)
+
+Selected once against default LightGBM after family commitment, inside CV on the train set. The surviving columns are frozen into the model input space shared by tuning (below), calibration (§7), and serving. Selection runs once, not every retrain: the feature space is small (~20 named features) and stable, so rerunning it on a schedule risks more than it gains — a borderline feature like `paymentmethod` (49/100 fold stability) could flip in or out between retrains from data-split noise alone, breaking tuning's fixed-input assumption and making model versions hard to compare. So the list is frozen instead: downstream stages share the same fixed columns, and the diff between `feature_space.txt` (everything produced) and `feature_columns.txt` (what survived) records what was dropped.
+
+**Method.** Each feature is scored using **permutation importance**: how much the model's performance (PR-AUC) drops when that feature's values are shuffled into random noise, holding everything else fixed — a bigger drop means the feature was actually being used. A synthetic **decoy column**, built from pure noise, sets the bar for what "no real signal" looks like: a feature survives only if its measured importance beats the decoy's by a comfortable margin (`max(decoy_importance, 0) + 0.005`; `configs/training/selection.yaml`). This is model-agnostic — it doesn't lean on any one algorithm's internal bookkeeping — which is why it replaced this build's original approach (LightGBM's own "gain" importance, prone to overstating high-cardinality or frequently-split features; Boruta-SHAP was also considered and rejected for a thinly-maintained dependency with no clean sklearn API). A categorical's one-hot columns are always shuffled and judged together, so it is kept or dropped as a whole, never partially.
+
+Two checks guard against this method misleading:
+
+1. **Fluke check.** Refit across all 100 CV folds and track each feature's survival rate. Mostly consistent (survivors ≥49/100, dropped ≤13/100), but `paymentmethod` is a coin flip (49/100) despite a comfortable all-dev margin, and `charge_per_service` is the reverse — thin margin, but a stable 63/100.
+2. **Correlated-credit check.** Shuffling correlated features one at a time can under-count shared signal, so each correlated cluster is re-tested together before accepting an individual failure. The `tenure`/`totalcharges`/`monthlycharges` trio all clear the floor alone (no rescue needed). The 7-feature `internetservice` add-on cluster (VIF = ∞, §8b `01-eda.ipynb`) has only 3 individual survivors (`internetservice`, `techsupport`, `onlinesecurity`), but the other 4 didn't need rescuing either — credit-splitting never dragged a real signal under the floor.
+
+**Deciding keep vs. reduce, and the outcome.** Same mechanism as the model-family decision above: refit the full and reduced (11-feature) candidates on the same 100 folds, then bootstrap Δ = mean(AP_full) − mean(AP_reduced), paired fold by fold. Result: reduced **0.6510** vs. full **0.6580** — Δ = **0.0070**, 95% CI **[0.0040, 0.0090]**, p < 0.0001, full wins 72 of 100 folds — clears the materiality bar, so **`material_full_win`** fires: **the full set is retained, 20 of 20 kept**. Below, 11 of 20 features individually clear their own decoy floor; the other 9 — including all four protected/quasi-protected attributes (see below) — stay anyway, since this aggregate test, not the per-feature table, governs adoption. That table is a diagnostic audit trail only; it never touches the sealed test set.
+
+| Feature | Real importance | Decoy floor | Survived (all-dev) | Per-fold stability |
+|---|---:|---:|:---:|---:|
+| `tenure` | 0.1350 | 0.0070 | ✅ | 100/100 |
+| `contract_type` | 0.1120 | 0.0070 | ✅ | 100/100 |
+| `totalcharges` | 0.0390 | 0.0070 | ✅ | 91/100 |
+| `internetservice` | 0.0300 | 0.0070 | ✅ | 88/100 |
+| `monthlycharges` | 0.0300 | 0.0070 | ✅ | 98/100 |
+| `techsupport` | 0.0200 | 0.0070 | ✅ | 88/100 |
+| `paperlessbilling` | 0.0140 | 0.0070 | ✅ | 61/100 |
+| `paymentmethod` | 0.0140 | 0.0070 | ✅ | 49/100 |
+| `multiplelines` | 0.0130 | 0.0070 | ✅ | 75/100 |
+| `onlinesecurity` | 0.0110 | 0.0070 | ✅ | 65/100 |
+| `charge_per_service` | 0.0100 | 0.0070 | ✅ | 63/100 |
+| `seniorcitizen` | 0.0060 | 0.0070 | ❌ | 1/100 |
+| `onlinebackup` | 0.0040 | 0.0070 | ❌ | 2/100 |
+| `gender` | 0.0020 | 0.0070 | ❌ | 6/100 |
+| `dependents` | 0.0010 | 0.0070 | ❌ | 4/100 |
+| `streamingtv` | 0.0010 | 0.0070 | ❌ | 13/100 |
+| `streamingmovies` | 0.0010 | 0.0070 | ❌ | 0/100 |
+| `has_partner` | -0.0010 | 0.0070 | ❌ | 0/100 |
+| `phoneservice` | -0.0010 | 0.0070 | ❌ | 1/100 |
+| `deviceprotection` | -0.0010 | 0.0070 | ❌ | 0/100 |
+
+*(Decoy importance on the all-dev fit was 0.0020; the floor is `max(0.0020, 0) + 0.005 = 0.007` for every row.)*
+
+**Reasons for keeping the failed features.** Most of the 9 failing features carry real, statistically significant univariate correlation with churn per `01-eda.ipynb` §7's Cramér's V — the add-on quartet `onlinebackup`/`deviceprotection`/`streamingtv`/`streamingmovies` and the protected-attribute trio `seniorcitizen`/`has_partner`/`dependents`. That's redundancy, not noise: the signal doesn't survive as *marginal* contribution once the rest of the feature set is already in the model — though not a simple one-bigger-feature story, since the add-on cluster's own rescue check above found no credit-splitting, and `seniorcitizen` is VIF-orthogonal to everything else (§8b `01-eda.ipynb`). `gender` and `phoneservice` are the one clean case where EDA and permutation importance both agree there's no signal at all. `charge_per_service` — the sole engineered feature adopted during feature discovery (§3a) — now clears its own floor (0.0100 vs. 0.0070, 63/100 fold stability); `multiplelines` runs the opposite way, weak in EDA (V = 0.04) but real here. None of this changes the outcome: every one of the 20 stays regardless of its individual read, because the decision above is a single full-vs-reduced choice, not a per-feature filter.
+
+**SHAP audit (diagnostic only).** A second, different lens on the same 20 features: `compute_shap_audit` fits one more default-config LightGBM and measures each feature's average contribution to individual predictions — not the performance drop from removing it, like permutation importance measures. It never decides keep/drop; it's a cross-check only. The two methods agree completely on *which* 11 features matter: every permutation-importance survivor also lands in SHAP's top 11. They disagree only on order within that group: `contract_type` and `tenure` swap the top two spots (SHAP rates `contract_type` more than double `tenure`'s score — 1.115 vs. 0.465 — the reverse of permutation importance's order), and `paymentmethod` jumps from a middling permutation-importance rank to 3rd by SHAP (0.351) — plausibly because SHAP credits its role in individual predictions more than one shuffle-and-measure pass captures.
+
+**Tradeoff and future consideration.** The full set's edge costs something too: 9 extra columns to validate and monitor, for a ~1% relative PR-AUC gain — a team prioritizing simplicity or a smaller fairness-audit surface (e.g. dropping `gender`) could reasonably prefer the reduced set instead, with a different Δ\* set in advance rather than a different reading of the same evidence. A finer-grained method like `RFECV` could identify exactly which 1-2 features are safe to drop individually, but isn't worth adopting now: run naively it reintroduces the stepwise-selection bias the single pre-registered test avoids, and run correctly (nested CV, to avoid that bias) it costs meaningfully more compute — either way, for a marginal payoff at this feature-set size. Worth revisiting only if serving cost or audit-surface reduction becomes a real priority.
+
+#### Protected attributes & fairness policy
+
+All four protected / quasi-protected attributes — `gender` (sex), `seniorcitizen` (age), `has_partner` (marital status), `dependents` (familial status) — **remain model inputs; none is hand-excluded.**
+
+1. **Benefit, not a denial.** The model drives a retention offer, not a credit or employment decision — the domains where statutory protection binds. Demographic targeting is standard practice in marketing.
+2. **They carry genuine univariate churn signal** (three of four; see §2) — a real predictive case for eligibility, even though it is not the final word (see "Reasons for keeping the failed features" above).
+3. **Fairness is enforced by measurement.** Per-group PR-AUC parity is evaluated across all four axes at candidate-selection time (§4, "Disaggregated robustness & fairness check") and again on the champion during error analysis (§5). Keeping the attributes available through candidate comparison and selection is what makes that measurement possible; the fairness *monitoring* commitment stands regardless of which axes feature selection ultimately keeps as model inputs.
+
+### 4c. Hyperparameter Tuning (Optuna)
+
+Tunes LightGBM only, on the input space frozen by Feature Selection above (§4b: `material_full_win`, all 20 features retained). PR-AUC (`average_precision`) is the sole study objective, consistent with the one-metric invariant.
+
+Study configuration:
 
 | Setting | Value |
 |---|---|
-| Algorithm | Tree-structured Parzen Estimator (TPE) |
-| Trials | 50 |
-| Objective | 5-fold CV recall on training set only (val/test never exposed) |
-| Search space | `num_leaves`, `min_child_samples`, `reg_alpha`, `reg_lambda`, `learning_rate`, `n_estimators`, `subsample`, `colsample_bytree` |
+| Algorithm | Tree-structured Parzen Estimator (TPE), `sampler_seed=42`, `n_startup_trials=10` |
+| Trials | 50 requested |
+| Pruner | `MedianPruner` — kills a trial mid-CV once it's clearly behind the running median |
+| CV scheme | Single stratified 5-fold (`cv_folds=5`) — lighter than the candidate decision's repeated scheme, since 50 trials of early-stopped fits already sets the tuning budget |
+| `n_estimators` | Not searched — set per fold by early stopping on `average_precision` (ceiling 2000, `early_stopping_rounds=50`); each trial's value is the median tree count across its own 5 folds |
+| Search space | `num_leaves` (10–200), `learning_rate` (log-uniform, 0.005–0.1), `min_child_samples` (10–100), `subsample` (0.5–1.0), `colsample_bytree` (0.5–1.0), `reg_alpha` (0.0–10.0), `reg_lambda` (0.0–10.0), `max_depth` (3–12) |
+| Best-trial rule | **1-SE** (Breiman/glmnet convention) — most-regularized trial within one standard error of the raw-best trial's own CV score, not bare argmax |
 
-**Best hyperparameters (MLflow run ef055674):**
+**Study hygiene (four checks recorded):**
 
-```
-colsample_bytree: 0.8125   max_depth: 3          learning_rate: 0.01369
-min_child_samples: 43      reg_lambda: 4.167      n_estimators: 110
-reg_alpha: 0.333           subsample: 0.5535      num_leaves: 133
-```
+1. **Pruning** — MedianPruner adopted; **16 of 50 trials completed, 34 pruned** mid-CV, saving the budget for configurations plausibly competitive with the running median.
+2. **Boundary-hit check** — none of the 8 selected hyperparameters sit on its searched range's edge (all `False`); the widened ranges above comfortably contain the optimum.
+3. **Selection rule** — raw argmax (trial 37, CV PR-AUC 0.6664) is **not** adopted. The 1-SE rule picks **trial 10** (CV PR-AUC 0.6606, within one SE = 0.0140 of trial 37) for far fewer `num_leaves` (11 vs. 137) and about half the trees (59 vs. 102) — `num_leaves` is LightGBM's primary complexity control, and this study's own fANOVA chart confirms it dominates (~0.4–0.6 importance; the ranking below it isn't reproducible run-to-run, since Optuna's fANOVA evaluator is unseeded). Net effect: a ~0.006 PR-AUC sacrifice for a materially simpler configuration.
+4. **Convergence** — the running-best curve is flat from trial 37 onward (the five trials after it — 40, 41, 42, 47, 48 — all land below the running best); the study is not still climbing at the 50-trial budget.
 
-### Post-tuning bias/variance check
+**Selected hyperparameters (trial 10, 1-SE rule; MLflow run `tuning_study` → nested `trial_009`) vs. LightGBM defaults:**
 
-| Model | Train Recall | CV Recall | Train–CV Gap | Flag |
-|---|---|---|---|---|
-| Baseline LightGBM | 0.979 | 0.843 | +0.136 | OVERFIT |
-| **Tuned LightGBM** | **0.949** | **0.946** | **+0.003** | **OK** |
+| Hyperparameter | Default | Tuned (1-SE) |
+|---|---:|---:|
+| `num_leaves` | 20 | 11 |
+| `learning_rate` | 0.1 | 0.0575 |
+| `min_child_samples` | 50 | 74 |
+| `subsample` | 1.0 | 0.8645 |
+| `colsample_bytree` | 1.0 | 0.8856 |
+| `max_depth` | −1 (unbounded) | 4 |
+| `reg_alpha` | 0.0 | 0.7404 |
+| `reg_lambda` | 0.0 | 3.5847 |
+| `n_estimators` | 100 | 59 (median over folds) |
 
-- Gap reduced by **~98 %** (+0.136 → +0.003), within the 0.021 noise floor.
-- CV recall improved by **+0.103** (0.843 → 0.946).
-- Learning curve: train and CV lines nearly parallel and flat. The model is not data-hungry and has found the correct regularisation operating point for this dataset size.
+#### Full → reduced → tuned bias/variance progression
 
-### Baseline vs tuned — val set (threshold = 0.35)
+Three bias/variance reads chain across the decide→optimize boundary: ① the full-feature default model, ② the reduced-feature default model, and ③ the tuned model — all read via `diagnostics.generalization_gap` on the same `RepeatedStratifiedKFold(10×10)` scheme:
 
-| Metric | Baseline | Tuned | Δ |
-|---|---|---|---|
-| Recall | 0.900 | **0.940** | +0.040 |
-| Precision | 0.495 | 0.405 | −0.089 |
-| F1 | 0.638 | 0.566 | −0.072 |
-| ROC-AUC | 0.867 | 0.855 | −0.012 |
-| TP / FN | 135 / 15 | 141 / 9 | +6 TP, −6 FN |
-| FP | 138 | 207 | +69 |
+| Stage | Train PR-AUC | CV PR-AUC | Train − CV gap |
+|---|---:|---:|---:|
+| ① Full (20 features, default) | 0.7943 | 0.6582 | 0.1362 |
+| ② Reduced (20 features, default) | 0.7943 | 0.6582 | 0.1362 |
+| ③ Tuned (20 features, 1-SE) | 0.6987 | 0.6659 | **0.0328** |
 
-**McNemar's test:** χ² = 48.66, p < 0.0001 — the improvement in error pattern is statistically significant. Discordant pairs: b₁₀ = 8 (tuned recovers churners baseline misses), b₀₁ = 71 (tuned over-flags non-churners baseline got right). The b₀₁ > b₁₀ asymmetry is the expected cost of recall optimisation at a shared threshold — not model degradation.
+Selection alone (①→②) shows no movement this cycle, since Feature Selection (§4b) retained the full set — confirming feature count was never the primary overfit lever here. Tuning (②→③) is what does the work: the gap **shrinks 76%** (0.1362 → 0.0328) while CV PR-AUC simultaneously **improves** (0.6582 → 0.6659) — the default model was overfitting, fitting the training data (0.7943) far better than it generalized to unseen data (0.6582). Tuning deliberately gives up some of that training fit (down to 0.6987) to curb the overfitting, and it pays off: performance on unseen data still goes up (0.6582 → 0.6659) rather than just holding steady. (The tuned CV PR-AUC here, 0.6659, is computed on the 10×10 RSKF scheme for this comparison and differs slightly from the Optuna study's own reported 0.6606, which is a single 5-fold value from a different fold assignment — not a discrepancy, a different measuring instrument.)
+
+**Detailed threshold-dependent diagnostics (post-tuning error profile, baseline-vs-tuned confusion matrix, McNemar significance) are out of scope for Phase 5** — thresholding is a Phase 6 deliverable and champion error analysis is Phase 7's (`05-error-analysis.ipynb`); reporting them here against an undetermined threshold would violate the "one metric drives selection" invariant. §5 below still reflects the archived notebook's recall-threshold analysis pending the Phase 7 rewrite.
+
+#### Registration — `challenger`
+
+The tuned pipeline (`tree_preprocessor` + LightGBM at the 1-SE hyperparameters above, `n_estimators=59` fixed — no further early stopping on this final fit) is refit on all of development and logged as one `Pipeline` — not the bare estimator — onto the *same* MLflow run as the `tuning_study` parent (`run_id 29dd80a08871449796c52bd9923c4a94`), per the packaging checklist below:
+
+| Check | Result |
+|---|---|
+| Model signature + input example | Logged (`mlflow.sklearn.log_model`, `serialization_format="cloudpickle"` — mlflow's `skops` default rejects LightGBM's `Booster`/`OrderedDict` internals as untrusted types) |
+| Log → reload → predict parity | **Passed** — reloaded pipeline's predictions match the in-memory model exactly on the input sample |
+| `training_manifest.json` | Populated: git SHA, DVC data hash, hyperparameters, `feature_space` (20) / `feature_columns` (20), CV PR-AUC, paired-Δ vs LogReg with full bootstrap CI — the engineering audit trail |
+| Pinned environment | `uv export`-resolved `requirements.txt`/`conda.yaml` auto-logged (131 dependencies) |
+| Registered as | `telco-churn-pipeline`, alias **`challenger`**, version 1 |
+
+**This challenger is the raw tuned model** — uncalibrated, un-thresholded, and not evaluated on the sealed test set. Nothing downstream should serve it directly: Phase 6 adds calibration and a cost-sensitive threshold to the same run, Phase 7 evaluates on the sealed test once and promotes `champion`, and only `champion` is ever loaded by serving (Phase 9).
 
 ---
 
-## 6. Error Analysis
+## 5. Error Analysis
 
-All analysis is on the **tuned `best_pipe`** on the val set (threshold = 0.35). Calibration preserves rank order but cannot be used for SHAP (see §7).
+All analysis is on the **tuned `best_pipe`** on the val set (threshold = 0.35). Calibration preserves rank order but cannot be used for SHAP (see §6).
 
 ### Missed churners — profile (9 FNs, 6.0 % FN rate)
 
@@ -395,7 +553,7 @@ FPs have a nearly identical feature profile to actual churners: 80.7 % month-to-
 
 ---
 
-## 7. SHAP Explainability
+## 6. SHAP Explainability
 
 Using `shap.TreeExplainer` on `best_pipe` (exact tree values, not kernel approximation). Analysis conducted on both val and test sets; top-10 ranking is identical across both — confirming pipeline consistency.
 
@@ -443,9 +601,11 @@ Using `shap.TreeExplainer` on `best_pipe` (exact tree values, not kernel approxi
 
 ---
 
-## 8. Probability Calibration
+## 7. Probability Calibration
 
 Raw LightGBM probabilities are poorly calibrated — useful for ranking but not for expected-value calculations.
+
+**Where this fits in the registry workflow (Phase 6+, not yet built).** Calibration is applied to the same MLflow run already registered as `challenger` (§4c) — not a new registration. The calibrated pipeline is evaluated once against the sealed test set (§9) and, if it clears the promotion gate, promoted to `champion` (Phase 7's `register.py`). Only later, under continuous training (Phase 10), is that pipeline refit on 100% of the data (`refit-full`) for the deployed artifact — that refit happens after the promotion decision is already locked in on the pre-refit sealed-test metrics, and it reuses the same calibration method and threshold rather than re-deciding them.
 
 ### Pre- vs post-calibration (val set)
 
@@ -477,7 +637,7 @@ BSS rises from 0.14 (below the 0.20 meaningful-calibration guideline) to 0.33 �
 
 ---
 
-## 9. Business Impact & Threshold Selection
+## 8. Business Impact & Threshold Selection
 
 ### Business cost parameters (illustrative — replace with Finance actuals)
 
@@ -523,7 +683,7 @@ The OOF and val cost curves have minima at consistent thresholds (~0.03–0.36),
 
 ---
 
-## 10. Final Test-Set Results
+## 9. Final Test-Set Results
 
 One-time evaluation on the sealed test set (n = 1,409; 374 churners). No modelling decisions were made after seeing these numbers.
 
@@ -649,11 +809,11 @@ All three protected attributes contribute zero marginal signal at the individual
 
 ---
 
-## 11. Production Refit & Model Registration
+## 10. Production Refit & Model Registration
 
 ### Rationale
 
-All hyperparameter, calibration, and threshold decisions were finalised on held-out data before the production refit. Retraining on the full 7,043-customer dataset provides the production model with all available signal without contaminating the §10 benchmark figures.
+All hyperparameter, calibration, and threshold decisions were finalised on held-out data before the production refit. Retraining on the full 7,043-customer dataset provides the production model with all available signal without contaminating the §9 benchmark figures.
 
 ### Full-data refit
 
@@ -661,18 +821,18 @@ All hyperparameter, calibration, and threshold decisions were finalised on held-
 |---|---|
 | Training data | Full dataset: train + val + test (7,043 rows; 1,869 churners, 5,174 non-churners) |
 | Model architecture | LightGBM + sigmoid calibration (`CalibratedClassifierCV`, cv=5) |
-| Hyperparameters | Unchanged from Optuna best (§5) — no re-tuning on full data |
+| Hyperparameters | Unchanged from Optuna best (§4) — no re-tuning on full data |
 | `scale_pos_weight` | Recalculated on full-data class ratio (5,174 / 1,869 ≈ 2.77) |
 | Features | 40 (same as training pipeline) |
 | MLflow run | `f81665fa` (experiment `"Telco Churn - Final Model"`) |
 
 ### Production threshold re-derivation
 
-The §9 OOF threshold (0.2956) was derived on `X_train` only. With the full dataset, OOF cost minimisation was re-run under the base scenario:
+The §8 OOF threshold (0.2956) was derived on `X_train` only. With the full dataset, OOF cost minimisation was re-run under the base scenario:
 
 | Threshold source | Threshold | Dataset | Notes |
 |---|---|---|---|
-| §9 OOF cost min | 0.2956 | Train set only | Used for §10 test-set evaluation |
+| §8 OOF cost min | 0.2956 | Train set only | Used for §9 test-set evaluation |
 | **Production OOF cost min** | **0.3596** | **Full dataset** | **Production-shipped value** |
 
 The production threshold rises by 0.064, reflecting the broader distribution of the full dataset (proportionally more long-tenure, non-month-to-month customers shift the cost-optimal point rightward).
@@ -686,7 +846,7 @@ The production threshold rises by 0.064, reflecting the broader distribution of 
 | F1 | 0.634 |
 | PR-AUC (avg precision) | 0.644 |
 
-> OOF metrics on the full dataset are not directly comparable to §10 test-set figures — the test set is now included in training. These are a distributional sanity check only; the §10 test-set numbers remain the authoritative benchmark.
+> OOF metrics on the full dataset are not directly comparable to §9 test-set figures — the test set is now included in training. These are a distributional sanity check only; the §9 test-set numbers remain the authoritative benchmark.
 
 ### MLflow model registration
 
@@ -708,7 +868,7 @@ mlflow.sklearn.load_model("models:/telco-churn-pipeline@champion")
 
 ---
 
-## 12. Known Limitations
+## 11. Known Limitations
 
 1. **Annual/multi-year contract churners are a near-total blind spot.** One-year and two-year contract holders have FN rates of 0.972 and 1.000 respectively. The model learned "annual contract = committed customer" as a near-irrefutable heuristic.
 
@@ -726,11 +886,13 @@ mlflow.sklearn.load_model("models:/telco-churn-pipeline@champion")
 
 8. **Business cost parameters are illustrative.** The $68/intervention and $575/LTV figures are reasonable but not Finance-validated.
 
-9. **Feature discovery redundancy screen has a mixed-type gap.** Screen 2 in the lap framework checks numeric-vs-numeric relationships (Pearson) and categorical-vs-categorical (Cramér's V) but has no branch for categorical-derived-from-numeric (e.g. `tenure_cohort` vs `tenure`). Screen 4 — permutation importance given all adopted features — is the empirical backstop: a feature that adds no marginal signal because the model already has the underlying numeric column is identified and rejected regardless of type. Confirmed with `tenure_cohort` in Lap 5: Screen 2 passed (Cramér's V found no adopted categorical equivalent), but Screen 4 correctly rejected it (importance = 0.0024, below noise floor) because continuous `tenure` was already in the adopted set.
+9. **Feature discovery redundancy screen has a mixed-type gap.** Screen 2 in the lap framework checks numeric-vs-numeric relationships (Pearson) and categorical-vs-categorical (Cramér's V) but has no branch for categorical-derived-from-numeric (e.g. `tenure_cohort` vs `tenure`). Screen 4 — permutation importance given all adopted features — is the empirical backstop: a feature that adds no marginal signal because the model already has the underlying numeric column is identified and rejected regardless of type. On the dev-partition run, `tenure_cohort` (Lap 5) was redundant enough to fail earlier, directly at Screen 3 (PR-AUC fell −0.0041) — Screen 2 raised no flag, since it has no cross-type branch, but the feature never reached Screen 4. `two_year_fiber` (Lap 1) demonstrates the Screen 4 backstop directly on this run: Screen 2 passed (max_corr 0.389), Screen 3 passed (+0.0017 PR-AUC), and Screen 4 correctly rejected it (importance 0.0001, below the 0.0054 floor) once measured against the full adopted context.
+
+10. **Learning curve had not plateaued at Phase 5 Step 2c.** CV PR-AUC was still rising at the maximum training size in the Steps 2c/2d generative diagnostic loop (0.613 → 0.655 from 20%→100% of the dev-training folds) — more historical data would plausibly still improve ranking quality. Not acted on in Phase 5 (no feature was engineered in response); flagged as a Phase 10 retrain / data-acquisition consideration.
 
 ---
 
-## 13. Recommendations & Next Steps
+## 12. Recommendations & Next Steps
 
 ### Immediate (model v1 deployment)
 

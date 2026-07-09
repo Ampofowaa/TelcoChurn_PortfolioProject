@@ -2,7 +2,221 @@
 
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versions map to project phases; see [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
+Versions map to project phases, not strict Semantic Versioning: a new phase bumps MINOR
+(e.g. Phase 5 starts at `0.5.0`); QA passes and sub-steps within a phase bump PATCH.
+See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
+
+---
+
+## [Unreleased]
+
+---
+
+## [0.5.3] - 2026-07-09 — QA: Step 2/3 Orchestrator Test Coverage
+
+*A Phase 5 QA pass found that `run_comparison_step` and `run_selection_step` — the Step 2 and
+Step 3 top-level entry points — had no direct unit test, unlike their sibling step orchestrators
+(`run_candidate_step`, `run_tuning_step`, `run_registration_step`); they were only exercised
+indirectly through the full subprocess integration test. No production code changed.*
+
+### Added
+- **`tests/unit/test_train_feature_freeze.py`** (7 tests, new file) — direct coverage of
+  `run_selection_step`: `committed_features`/SHAP-audit consistency with the `reduced`/`full`
+  decision branch, a wiring cross-check against `bootstrap_test`'s own decision, and the MLflow
+  artifact/tag contract via a real `MlflowClient`.
+- **`tests/unit/test_train_comparison.py`** — +4 tests covering `run_comparison_step` directly:
+  return-keys contract, decision cross-checked against `bootstrap_comparison` called independently
+  on the same inputs, the comparison/diagnostics MLflow artifact contract, and the tag contract.
+
+### Fixed
+- Coverage on `models/train/comparison.py` and `models/train/feature_freeze.py` raised from
+  60%/20% to 100%/100% (full suite: 350 → 361 tests; 86.5% → 93.0% overall).
+
+---
+
+## [0.5.2] - 2026-07-08 — Phase 5 Steps 4-5: Hyperparameter Tuning & Challenger Registration
+
+*A 50-trial TPE Optuna study tunes LightGBM on the frozen feature set (single stratified 5-fold,
+`average_precision`; `n_estimators` resolved per fold by early stopping). The 1-SE rule selects a
+more-regularized trial than raw-best: CV PR-AUC rises from 0.6582 (reduced set, default
+hyperparameters) to 0.6659 while the train-vs-CV gap narrows from 0.1362 to 0.0328. The tuned
+pipeline is registered as `telco-churn-pipeline` / `challenger` — uncalibrated and un-thresholded,
+not serving-ready (Phase 6/7).*
+
+### Added
+- **`src/telco_churn/models/train/tuning.py`** — Step 4: `run_tuning_step` (Postgres-backed Optuna
+  study; TPE sampler; `MedianPruner`; content-addressed study naming keyed on data hash + committed
+  features + search space + CV scheme, so an incompatible trial pool can never mix silently).
+- `select_best_trial` (`argmax`/`1se` — 1-SE ties broken by fewest `num_leaves` then fewest
+  `n_estimators_median`) and `boundary_hit_check` (flags a selected hyperparameter sitting on its
+  searched range's edge); nested per-trial MLflow child runs under one `tuning_study` parent run.
+- **`src/telco_churn/models/train/registration.py`** — Step 5: `run_registration_step` refits
+  `[tree_preprocessor → LightGBM]` on all of development at the selected trial's hyperparameters,
+  logs the full `Pipeline` as pyfunc (signature + input example, `cloudpickle` serialization —
+  mlflow≥3's default skops format rejects LightGBM's `Booster` internals), asserts a
+  log→reload→predict parity check, and registers `telco-churn-pipeline` / alias `challenger`.
+- **`configs/tuning/optuna.yaml`** — `n_trials=50`, `cv_folds=5`, `early_stopping_rounds=50`,
+  `n_estimators_ceiling=2000`, `selection_rule=1se`, `pruner=median`, `sampler_seed=42` /
+  `n_startup_trials=10`; search space for `num_leaves`/`learning_rate`/`min_child_samples`/
+  `subsample`/`colsample_bytree`/`reg_alpha`/`reg_lambda`/`max_depth`.
+- **`training_manifest.json`** (logged at registration) — git SHA, DVC data hash, full
+  hyperparameters, feature space vs. committed feature columns, CV PR-AUC, the paired-Δ vs. LogReg
+  with its bootstrap CI, and `tuning_summary` (trial counts, selected vs. raw-best trial
+  number/score, the 1-SE standard error and band floor).
+- **`tests/unit/test_train_tuning.py`** (24), **`test_train_registration.py`** (4) — 1-SE
+  selection-rule branches, boundary-hit/too-few-completed-trials warnings, idempotent re-run
+  against an already-completed study, reload-parity hard-assertion failure path.
+- **`tests/integration/test_train_subprocess.py`** (2) — subprocess integration test of
+  `python -m telco_churn.models.train`'s full Steps 1-5 composition path (exit 0; exit 1 on missing
+  processed data).
+
+### Changed
+- **`ANALYSIS.md`** §4c — Optuna study result recorded: selected trial (1-SE rule) vs. raw-best;
+  boundary-hit check clears on all 8 tuned hyperparameters; CV PR-AUC 0.6582 → 0.6659, train–CV gap
+  0.1362 → 0.0328. Registration result recorded: `telco-churn-pipeline` version 1, alias
+  `challenger`, `n_estimators=59` fixed on the full-development refit.
+
+---
+
+## [0.5.1] - 2026-07-03 — Phase 5 Step 3: Permutation-Importance Feature Selection
+
+*Replaces Step 3's gain-based null-importance selector with permutation importance measured
+against a synthetic noise-decoy column — the same rule Phase 4 discovery's Screen 4 already uses,
+now shared end-to-end and model-agnostic by construction, unlike gain. Adds a non-gating SHAP
+audit over the full feature space (flagging any dropped feature that would outrank a kept one),
+and replaces the keep-vs-reduce adoption test with a paired-bootstrap test mirroring Step 2's
+model-family decision, rather than an unpaired interval-containment check. Re-running Step 3
+against real data: the full 20-feature set is retained, and decisively so under the paired test
+(Δ = 0.0173, 95% CI [0.0104, 0.0246], `material_full_win`) — sharper than the near-miss the
+earlier unpaired test reported for the same underlying gap.*
+
+### Added
+- **`src/telco_churn/features/select.py`** — `PermutationImportanceSelector` replaces
+  `NullImportanceSelector`: grouped permutation importance (mean PR-AUC drop from jointly
+  shuffling a source feature's one-hot dummies on a held-out split) thresholded against a
+  synthetic decoy column (`DECOY_FEATURE`); `decide_survivors()` replaces `select_survivors()` as
+  the pure decoy-referenced decision function; `compute_shap_audit()` logs a non-gating
+  mean(|SHAP|) diagnostic over every candidate feature (not just committed ones), flagged via the
+  new `flag_high_shap_dropouts()`; `reduced_set_bootstrap_test()` replaces `reduced_set_within_ci()`
+  with a paired-difference bootstrap test (mirrors `train.comparison.bootstrap_comparison`).
+  `run_selection_cv` and `mint_committed_list` gain an `inner_val_size` parameter (the selector's
+  internal train/val split fraction, previously a hardcoded `0.2`).
+- **`shap`** added as a project dependency (`pyproject.toml`).
+
+### Changed
+- **`src/telco_churn/models/train/feature_freeze.py`** — calls `compute_shap_audit` and
+  `flag_high_shap_dropouts` after `mint_committed_list`; adopts the reduced set by default per
+  `reduced_set_bootstrap_test`'s decision, overriding to the full set only on `material_full_win`;
+  logs `selection/permutation_importance_table.csv`, `selection/shap_importance_audit.csv`,
+  `selection/high_shap_dropouts.txt`, and a `selection/bootstrap_delta_dist.png` plot.
+- **`configs/training/selection.yaml`** — `n_permutations`/`cutoff_percentile` renamed to
+  `n_repeats`/`noise_floor_margin` (0.005, matching Phase 4 Screen 4); adds `inner_val_size` (0.2)
+  as its own key, distinct from `training_setup.test_size`; the keep-vs-reduce materiality
+  threshold reuses `training_setup.delta_threshold` rather than duplicating it.
+- **`tests/unit/test_select.py`** — rewritten onto the new API; adds grouped
+  permutation-importance, SHAP-audit (full-space), `flag_high_shap_dropouts`, and
+  `reduced_set_bootstrap_test` (`material_full_win`/`tie_immaterial`/`material_reduced_win`) tests.
+- **`ANALYSIS.md`** §4 "Feature selection" and "Protected attributes & fairness policy" —
+  rewritten with the real re-run result under the paired-bootstrap test: full 20-feature set
+  retained (Δ = 0.0173, CI [0.0104, 0.0246], p = 0.0); flags §5's Optuna results as stale pending
+  a follow-up re-run against the changed committed set.
+- **`notebooks/03b-feature-selection.ipynb`** — rewritten to render the paired-bootstrap test
+  (reading its logged result rather than recomputing it) and the permutation-importance/SHAP
+  tables; re-executed against the real MLflow run.
+- **`PROJECT_PLAN.md`**, **`docs/phase-5-tasks.md`** — Step 3 description, selector deliverable,
+  hyperparameters, and correlation-aware rescue callouts rewritten for the new method and the
+  paired-bootstrap adoption test; Step 2's LogReg-contingency note simplified (permutation
+  importance needs no method swap on a LogReg win, only an estimator swap, since it is
+  model-agnostic by construction).
+
+### Fixed
+- **`tests/unit/test_train_common.py::test_compose_config_loads_expected_structure`** — asserted
+  the old `selection.n_permutations`/`cutoff_percentile` config keys; updated to the renamed keys.
+
+---
+
+## [0.5.0] - 2026-07-03 — Phase 5 Steps 1-2: Model Selection (Candidate Comparison & Diagnostics)
+
+*Candidate bake-off — `DummyClassifier(strategy='prior')`, `LogisticRegressionCV`, and default-config
+LightGBM — on one shared `RepeatedStratifiedKFold` over the canonical dev split. LightGBM is
+adopted as the modelling family under the pre-registered paired-bootstrap decision rule:
+Δ = +0.0071 PR-AUC, 95% CI [+0.0029, +0.0113], clears the Δ*=0.005 materiality threshold
+(`material_lgbm_win`). Non-gating fixed-recall and per-segment robustness/fairness diagnostics are
+logged alongside the decision — they flag concerns but never decide the family (CLAUDE.md's
+one-metric invariant).*
+
+### Added
+- **`src/telco_churn/features/schema.py`** — `FeatureSchema` frozen dataclass (`binary`/
+  `multi_cat`/`numeric` as validated `tuple[str, ...]` fields, non-empty + no-duplicate checks);
+  the `FEATURE_SCHEMA` module singleton replaces the bare `list[str]` column-group constants
+  previously in `features/build.py`.
+- **`src/telco_churn/features/preprocessing.py`** — `build_linear_preprocessor` (OHE `drop='first'`
+  + `StandardScaler`, plus an internal stateless `tenure`-cohort binning branch via
+  `FunctionTransformer(pd.cut)` over `TENURE_COHORT_EDGES`/`TENURE_COHORT_LABELS`) for the
+  `DummyClassifier`/`LogisticRegressionCV` baselines; the existing tree-family builder is unchanged
+  and now named `build_preprocessor`.
+- **`src/telco_churn/models/train/common.py`** — shared helpers reused by every training step:
+  `cv_score_candidate` (fold-parallel CV scoring + OOF accumulation), `lgbm_default_params` /
+  `logreg_default_params`, `_load_dev_features` (imports the canonical `data.split.partition()`
+  rather than redefining the split inline), `_resolve_tracking_uri`, `_git_sha`/`_dvc_hash`.
+- **`src/telco_churn/models/train/candidates.py`** — Step 1: CV-scores `dummy_prior`/`logreg_cv`/
+  `lgbm_default` on one shared `RepeatedStratifiedKFold(10×10)` instance so every candidate trains
+  and validates on identical folds; hard-assertion leakage canary on the dummy candidate (ROC-AUC
+  ≈ 0.5, PR-AUC ≈ prevalence); each candidate logged as its own MLflow run.
+- **`src/telco_churn/models/train/comparison.py`** — Step 2: `bootstrap_comparison`, a paired
+  bootstrap on Δ = AP(LGBM) − AP(LogReg) under the pre-registered `Δ*=0.005` decision rule.
+- `run_diagnostics_step` — fixed-recall precision/F1 profile at recall ∈ {0.70, 0.80, 0.90}, plus
+  `contract_type`/`tenure_cohort`/`internetservice` robustness and `gender`/`seniorcitizen`/
+  `has_partner`/`dependents` fairness segment flags. Both are logged but never gating.
+- **`src/telco_churn/models/diagnostics.py`** — pure, side-effect-free helpers: `fixed_recall_profile`,
+  `segment_oof_errors`, `segment_bootstrap_delta`, `generalization_gap`, `learning_curve_points`.
+- **`src/telco_churn/models/train/__main__.py`** — CLI entry point (`python -m telco_churn.models.train`);
+  loads the dev partition, runs Steps 1-2 (and 3-5 once the family is confirmed), exits 1 loudly on
+  a schema-invalid processed frame, a broken leakage canary, or missing processed data.
+- **`configs/training/lightgbm.yaml`**, **`configs/training/logreg.yaml`** — candidate
+  hyperparameters plus the LightGBM determinism/imbalance knobs shared by every downstream step
+  (`class_weight`, `subsample_freq=1`, `deterministic`, `force_row_wise`, pinned `n_jobs`).
+- **`docker/mlflow/Dockerfile`**, **`sql/schema/000_create_mlflow_db.sql`**, `docker-compose.yml`
+  `mlflow` service — Postgres-backed MLflow tracking server (`--backend-store-uri`,
+  `--serve-artifacts`), started via `docker compose --profile infra up -d`.
+- **`tests/unit/test_train_candidates.py`** (4), **`test_train_comparison.py`** (13),
+  **`test_train_common.py`** (15), **`test_diagnostics.py`** (25) — leakage-canary assertion,
+  metric-logging contract against a mocked MLflow client, paired-bootstrap decision-rule branches,
+  fixed-recall/segment diagnostics on planted-failure synthetic data.
+
+### Changed
+- **`ANALYSIS.md`** — Step 2 model-selection result recorded: `material_lgbm_win`
+  (Δ = +0.0071, 95% CI [+0.0029, +0.0113]).
+
+---
+
+## [0.4.3] - 2026-07-02 — Canonical Split Refactor (Phase 4a Rework)
+
+*Seals the dev/test split as a canonical artifact before feature discovery runs, closing the
+"test set touched once" gap Phase 4a previously accepted as a documented limitation. Phase 4a
+discovery re-run on the dev partition only; adopted feature set unchanged (`charge_per_service`).
+14 new tests.*
+
+### Added
+- **`src/telco_churn/data/split.py`** — canonical `customerid`/`churn` partition: `make_split()`,
+  `write_split()`/`load_split()`, `dev_ids()`/`test_ids()`/`partition()`; `__main__` CLI writes
+  `datasets/processed/split_manifest.parquet`.
+- **`tests/unit/test_split.py`** — 14 tests: determinism, order-invariance, stratification,
+  disjointness, full coverage, manifest round-trip, `partition()` membership assertion.
+- **`make split`** Makefile target, between `validate` and `features`; `test-data` scoped target.
+
+### Changed
+- **`notebooks/02a-feature-discovery.ipynb`** — re-run on the dev partition only (via
+  `data.split.partition()`), superseding the earlier full-dataset run; adopted set unchanged.
+- **`ANALYSIS.md`** §3a/§4 — OOF PR-AUC and blind-spot figures updated to the dev-only rerun.
+- **`PROJECT_PLAN.md`** — added the Canonical Data Split step before Phase 4a; rewrote the
+  Phase 4a split-timing caveat from "documented limitation" to "resolved".
+
+### Fixed
+- **`make_split()`** — sorted `ids`/`labels` by `customerid` before splitting, since
+  `sklearn.train_test_split`'s stratified sampling is positionally order-sensitive even with a
+  fixed `random_state`; an unordered source (e.g. Postgres `SELECT *`) could otherwise select a
+  different partition than a CSV-ordered source.
 
 ---
 
@@ -353,8 +567,17 @@ phases build on.*
 
 ---
 
-<!-- Version comparison links (added in Phase 11 when the GitHub remote is wired into CI/CD):
-[Unreleased]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.4.0...HEAD
+<!-- Version comparison links: the `origin` remote (github.com/Ampofowaa/TelcoChurn_PortfolioProject)
+already exists, but no `vX.Y.Z` tags have been pushed yet, so these links would 404 if uncommented
+now. Un-comment once tags are pushed for each released version below.
+[Unreleased]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.2...v0.5.3
+[0.5.2]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.4.3...v0.5.0
+[0.4.3]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.2.1...v0.2.2

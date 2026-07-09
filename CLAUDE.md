@@ -6,7 +6,7 @@ End-to-end ML portfolio project on the IBM Telco Customer Churn dataset. The goa
 
 ## Source of Truth
 
-- **Modelling science:** `notebooks/_archive/EDA-original.ipynb` is the authoritative reference for all data validation gates, preprocessing logic, feature engineering decisions, Optuna hyperparameters, calibration, cost-sensitive threshold derivation, and evaluation metrics. When migrating logic to `src/`, preserve the math exactly — do not silently simplify or alter it.
+- **Modelling science:** `notebooks/_archive/EDA-original.ipynb` is a **comparison notebook, not a source of truth** — the original exploratory pass over data validation gates, preprocessing logic, feature engineering decisions, Optuna hyperparameters, calibration, cost-sensitive threshold derivation, and evaluation metrics. `src/` and `ANALYSIS.md` are authoritative wherever they diverge from it; the archive is useful only as a historical reference for *why* a decision changed, not as a bar current work must clear. Significant deviations (wider search ranges, different selection rules, different decision mechanisms entirely, etc.) are expected at this point in the project — document each new decision's rationale in `ANALYSIS.md`, or inline (config comments, docstring, commit/PR body) for smaller ones, rather than re-justifying current work against the archived notebook.
 - **Modelling rationale:** `ANALYSIS.md` documents every modelling decision, analytical results and findings, and known limitations — the full narrative from data insights through to model results. **§0 (Problem Framing & Cost Definition)** is the entry point — it defines the prediction unit, label definition, cost structure, success criteria, and the two modelling invariants (test set touched once; one metric drives selection) that govern all phases. Do not contradict it.
 - **System & workflow diagrams:** `docs/architecture.md` — system architecture diagram (infrastructure flow) and ML workflow diagram (modelling lifecycle with the two feedback loops).
 - **Project landing page:** `README.md` is the recruiter-facing overview (headline metrics, pipeline diagram, quick start, project status). It does not contain modelling rationale.
@@ -45,10 +45,12 @@ docker compose up -d                    # start full local stack (Phase 9+)
 - **Registered model name:** `telco-churn-pipeline`
 - **Production alias:** `champion` — the FastAPI service loads whichever run carries this alias at startup.
 - **Challenger alias:** `challenger` — used during evaluation before promotion.
-- **Logged artifacts per run:** model (pyfunc), `feature_space.txt`, `feature_columns.txt`, `preprocessing.pkl`, `model_card.json`.
+- **Logged artifacts per run (every registration, Phase 5+):** model (pyfunc), `feature_space.txt`, `feature_columns.txt`, `preprocessing.pkl`, `training_manifest.json`.
   - `feature_space.txt` — full **feature space**: every column `build_feature_df` produced before selection (the complete output of the Phase 4 feature pipeline).
   - `feature_columns.txt` — **model input space**: the subset that survived `select.py` and entered the `ColumnTransformer`. The diff between `feature_space.txt` and `feature_columns.txt` is what selection dropped for that run — a per-run audit trail that requires no git lookup.
   - `preprocessing.pkl` — fitted `ColumnTransformer`; encodes the exact transformations applied to the model input space at training time.
+  - `training_manifest.json` — **engineering audit trail**: git SHA, DVC data hash, model family, full hyperparameters, `feature_space`/`feature_columns`, CV PR-AUC, the paired-Δ vs LogReg with its full bootstrap CI, and `tuning_summary` (trial counts, selected vs. raw-best trial number/score, 1-SE standard error and band floor — the diagnostics behind the `selection_rule` pick).
+- **`model_card.json` — written once, at champion promotion (Phase 7 `register.py`), not at every registration.** Stakeholder-facing narrative: intended use, known limitations, performance summary vs. LogReg, fixed-recall profile, fairness/robustness flags. It is not populated at Phase 5 challenger registration — at that point the model is uncalibrated, un-thresholded, and untested on the sealed set, so a "known limitations" section would just be a disclaimer about an unfinished product. No hyperparameters, hashes, or raw statistical detail either way — that lives in `training_manifest.json`.
 
 ## Data Handling
 
@@ -182,7 +184,7 @@ Lifecycle-ordered. Tests are written alongside each module — there is no dedic
 | 2 | Data validation (Pandera + 5 gates) | `data/schema.py` + `data/checks.py` + `data/validate.py` + `tests/unit/test_checks.py` + `tests/unit/test_validate.py` |
 | 3 | EDA notebook (slim rewrite) | `notebooks/01-eda.ipynb` importing from `src/`; original archived |
 | 4 | Feature engineering (SQL + Python) | `sql/features/*.sql` + `features/sql_features.py` + `features/build.py` |
-| 5 | Model training (LightGBM + Optuna + MLflow) | `models/train.py` + `configs/{model,training}/*.yaml`; challenger registered |
+| 5 | Model training (LightGBM + Optuna + MLflow) | `models/train/` + `configs/{model,training}/*.yaml`; challenger registered |
 | 6 | Calibration + cost-sensitive threshold | `models/calibrate.py` + `models/threshold.py` |
 | 7 | Evaluation + error analysis + registry promotion | `models/evaluate.py` + `models/register.py` + `notebooks/05-error-analysis.ipynb` |
 | 8 | DVC pipeline wrap | `dvc.yaml` with 5 stages; reproducible end-to-end |
