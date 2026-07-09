@@ -18,7 +18,7 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# Allowed categorical values (source of truth: notebooks/_archive/EDA-original.ipynb)
+# Allowed categorical values (originally catalogued in notebooks/_archive/EDA-original.ipynb, kept there only as a comparison reference)
 # ---------------------------------------------------------------------------
 
 YES_NO: Final[frozenset[str]] = frozenset({"Yes", "No"})

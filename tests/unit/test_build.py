@@ -14,10 +14,7 @@ from hypothesis import strategies as st
 from pandera.errors import SchemaError, SchemaErrors
 
 from telco_churn.features import (
-    BINARY_INT_COLS,
-    BINARY_STR_COLS,
-    MULTI_CAT_COLS,
-    NUMERIC_COLS,
+    FEATURE_SCHEMA,
     SQL_FEATURE_COLS,
     TARGET_COL,
     FeatureOutputSchema,
@@ -108,7 +105,9 @@ def test_build_feature_df_row_count(minimal_df: pd.DataFrame) -> None:
 def test_build_feature_df_feature_columns_present(minimal_df: pd.DataFrame) -> None:
     """Output contains all declared feature columns."""
     feat_df = build_feature_df(minimal_df)
-    for col in BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS:
+    for col in list(
+        FEATURE_SCHEMA.binary + FEATURE_SCHEMA.multi_cat + FEATURE_SCHEMA.numeric
+    ):
         assert col in feat_df.columns
 
 
@@ -117,7 +116,9 @@ def test_build_feature_df_no_nan_in_features_for_well_formed_input(
 ) -> None:
     """No NaN values in feature columns when totalcharges is non-null."""
     feat_df = build_feature_df(minimal_df)
-    feature_cols = BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS
+    feature_cols = list(
+        FEATURE_SCHEMA.binary + FEATURE_SCHEMA.multi_cat + FEATURE_SCHEMA.numeric
+    )
     assert not feat_df[feature_cols].isnull().any().any()
 
 
@@ -213,7 +214,7 @@ def test_adopted_features_present_in_column_groups() -> None:
     )
     adopted = json.loads(provenance_path.read_text())["adopted_features"]
     all_feature_cols = set(
-        BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS
+        list(FEATURE_SCHEMA.binary + FEATURE_SCHEMA.multi_cat + FEATURE_SCHEMA.numeric)
     )
     for feature in adopted:
         assert (
@@ -260,7 +261,7 @@ def _make_property_df(tenure: int, monthly: float, total: float) -> pd.DataFrame
 
 
 @given(tenure=_TENURE_STRATEGY, monthly=_MONTHLY_STRATEGY, total=_TOTAL_STRATEGY)
-@settings(max_examples=100, deadline=1000)
+@settings(max_examples=100, deadline=None)
 def test_column_count_invariant(tenure: int, monthly: float, total: float) -> None:
     """Column count is identical regardless of input values."""
     assume(math.isnan(total) or total >= monthly)

@@ -1,0 +1,18 @@
+# LightGBM model constants — determinism and correctness knobs.
+#
+# These are applied at every fit (candidate comparison, Optuna trials, final fit)
+# and are never searched. Hyperparameter search space and tuning knobs live in
+# configs/tuning/optuna.yaml.
+
+fixed:
+  subsample_freq: 1            # must be >= 1 to enable subsample; default 0 silently disables it
+  deterministic: true          # bit-reproducible histogram build across runs
+  force_row_wise: true         # required companion to deterministic
+  n_jobs: 1                    # pinned: parallel workers break seed-fixed determinism
+  verbose: -1                  # silence LightGBM's per-iteration stdout
+  # class_weight lives in config.yaml training_setup — shared across all model families
+
+candidate:
+  n_estimators: 100       # fast fixed budget for Step 1 comparison only; not the Optuna ceiling
+  num_leaves: 20          # default 31 is sized for large datasets; 20 prevents over-splitting on ~5.6k rows
+  min_child_samples: 50   # default 20 allows tiny leaf memorisation; 50 is the small-data floor

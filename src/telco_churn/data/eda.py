@@ -153,6 +153,11 @@ def detect_outliers(
                 }
             )
             continue
+        if not pd.api.types.is_numeric_dtype(series):
+            raise TypeError(
+                f"unsupported operand type for IQR: '{col}' has dtype {series.dtype!r};"
+                " expected a numeric column"
+            )
         q1 = float(series.quantile(0.25))
         q3 = float(series.quantile(0.75))
         iqr = q3 - q1

@@ -1,13 +1,18 @@
-"""Pandera schemas for the feature engineering layer.
+"""Pandera schemas and column-group registry for the feature engineering layer.
 
 CustomerFeaturesSchema: validates the SQL-view DataFrame passed into build_feature_df.
-FeatureOutputSchema: identical to CustomerFeaturesSchema — the Phase 4a adopted feature
+FeatureOutputSchema: identical to CustomerFeaturesSchema — the adopted feature
 (charge_per_service) is SQL-engineered; no additional columns are computed in Python.
 Kept as a distinct exported name so model training imports remain stable when the output
 contract is extended.
+FeatureSchema: frozen dataclass owning the three column groups that feed the
+ColumnTransformer. FEATURE_SCHEMA is the module-level singleton — import it directly
+rather than constructing a new instance.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 from pandera.pandas import DataFrameModel, Field
@@ -18,6 +23,8 @@ from telco_churn.data.schema import YES_NO, YES_NO_NO_INTERNET, YES_NO_NO_PHONE
 __all__ = [
     "CustomerFeaturesSchema",
     "FeatureOutputSchema",
+    "FeatureSchema",
+    "FEATURE_SCHEMA",
 ]
 
 
@@ -81,8 +88,71 @@ class FeatureOutputSchema(CustomerFeaturesSchema):
     Identical to CustomerFeaturesSchema — the sole adopted feature (charge_per_service)
     is computed in SQL; no additional columns are added in Python.
     Kept as a distinct exported name so model training imports remain stable when the output
-    contract is extended (e.g. a FeatureSchema frozen dataclass added during model training).
+    contract is extended.
     """
 
     class Config(CustomerFeaturesSchema.Config):
         coerce = False  # types must be correct by construction — mismatch is a bug, not a cast
+
+
+@dataclass(frozen=True)
+class FeatureSchema:
+    """Immutable column-group registry for the feature engineering pipeline.
+
+    Owns the three groups fed to the ColumnTransformer at training and inference:
+    binary (str + int combined), multi_cat, numeric. The Pandera schemas above
+    validate row *values*; this class owns column *grouping* — complementary roles
+    in one module.
+
+    Use the module-level FEATURE_SCHEMA singleton rather than constructing a new instance.
+    frozen=True prevents runtime mutation; evolving the feature set requires explicit
+    code changes to FEATURE_SCHEMA and build_feature_df, never accidental side-effects.
+    """
+
+    binary: tuple[str, ...]
+    multi_cat: tuple[str, ...]
+    numeric: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Validate non-empty and no intra-group duplicates."""
+        for field_name, cols in (
+            ("binary", self.binary),
+            ("multi_cat", self.multi_cat),
+            ("numeric", self.numeric),
+        ):
+            if not cols:
+                raise ValueError(f"FeatureSchema.{field_name} must not be empty")
+            if len(cols) != len(set(cols)):
+                raise ValueError(
+                    f"FeatureSchema.{field_name} contains duplicate column names"
+                )
+
+
+FEATURE_SCHEMA = FeatureSchema(
+    binary=(
+        "gender",
+        "has_partner",
+        "dependents",
+        "phoneservice",
+        "paperlessbilling",
+        "seniorcitizen",
+    ),
+    multi_cat=(
+        "multiplelines",
+        "internetservice",
+        "onlinesecurity",
+        "onlinebackup",
+        "deviceprotection",
+        "techsupport",
+        "streamingtv",
+        "streamingmovies",
+        "contract_type",
+        "paymentmethod",
+    ),
+    numeric=(
+        "tenure",
+        "monthlycharges",
+        "totalcharges",
+        "charge_per_service",
+    ),
+)

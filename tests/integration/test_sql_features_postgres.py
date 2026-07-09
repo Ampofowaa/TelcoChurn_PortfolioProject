@@ -17,10 +17,7 @@ from testcontainers.postgres import PostgresContainer
 
 from telco_churn.data.ingest import ingest
 from telco_churn.features import (
-    BINARY_INT_COLS,
-    BINARY_STR_COLS,
-    MULTI_CAT_COLS,
-    NUMERIC_COLS,
+    FEATURE_SCHEMA,
     SQL_FEATURE_COLS,
     build_feature_df,
     build_sql_features,
@@ -223,7 +220,9 @@ def test_pipeline_row_count(feature_df: pd.DataFrame) -> None:
 
 def test_pipeline_all_feature_columns_present(feature_df: pd.DataFrame) -> None:
     """All declared feature columns are present after the SQL → Python pipeline."""
-    for col in BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS:
+    for col in list(
+        FEATURE_SCHEMA.binary + FEATURE_SCHEMA.multi_cat + FEATURE_SCHEMA.numeric
+    ):
         assert col in feature_df.columns
 
 
@@ -231,7 +230,9 @@ def test_pipeline_no_unexpected_nulls(feature_df: pd.DataFrame) -> None:
     """Only totalcharges may be null in pipeline output (11 zero-tenure rows)."""
     non_nullable = [
         c
-        for c in BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS
+        for c in list(
+            FEATURE_SCHEMA.binary + FEATURE_SCHEMA.multi_cat + FEATURE_SCHEMA.numeric
+        )
         if c != "totalcharges"
     ]
     assert not feature_df[non_nullable].isnull().any().any()
@@ -250,7 +251,14 @@ def test_pipeline_csv_write_shape(
 
     df_loaded = pd.read_csv(out_path)
     expected_cols = (
-        len(BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS) + 2
+        len(
+            list(
+                FEATURE_SCHEMA.binary
+                + FEATURE_SCHEMA.multi_cat
+                + FEATURE_SCHEMA.numeric
+            )
+        )
+        + 2
     )  # + customerid + churn
     assert df_loaded.shape == (_RAW_COUNT, expected_cols)
 
@@ -290,6 +298,13 @@ def test_build_main_cli_composition(
     assert out_path.exists(), "processed CSV was not written by the CLI"
     df = pd.read_csv(out_path)
     expected_cols = (
-        len(BINARY_STR_COLS + BINARY_INT_COLS + MULTI_CAT_COLS + NUMERIC_COLS) + 2
+        len(
+            list(
+                FEATURE_SCHEMA.binary
+                + FEATURE_SCHEMA.multi_cat
+                + FEATURE_SCHEMA.numeric
+            )
+        )
+        + 2
     )  # + customerid + churn
     assert df.shape == (_RAW_COUNT, expected_cols)

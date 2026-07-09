@@ -27,6 +27,9 @@ dependencies = [
     "sqlalchemy>=2.0",
     "structlog>=25.5.0",
     "pandera>=0.18",
+    "mlflow>=3.12.0",
+    "pyarrow>=24.0.0",
+    "shap>=0.44",
 ]
 
 [dependency-groups]
@@ -85,4 +88,10 @@ fail_under = 80
 show_missing = true
 exclude_lines = [
     "if __name__ == .__main__.:",
+]
+
+[tool.uv]
+override-dependencies = [
+    # mlflow's pandas<3 metadata is stale; 3.x is compatible with pandas 3 at runtime.
+    "pandas>=3.0.3",
 ]

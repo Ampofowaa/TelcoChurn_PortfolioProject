@@ -220,6 +220,7 @@ __marimo__/
 # Project-specific
 datasets/
 mlruns/
+mlflow.db
 reports/
 .dvc/cache/
 project_thoughts.md

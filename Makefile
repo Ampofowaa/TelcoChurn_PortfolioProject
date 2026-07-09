@@ -1,4 +1,4 @@
-.PHONY: lint format test test-features test-integration data db-up db-down ingest validate features train
+.PHONY: lint format test test-data test-features test-models test-integration data db-up db-down ingest validate split features train
 
 lint:
 	uv run ruff check src/
@@ -11,10 +11,20 @@ format:
 test:
 	uv run pytest
 
+test-data:
+	uv run pytest tests/unit/test_split.py tests/unit/test_checks.py tests/unit/test_eda.py tests/unit/test_ingest.py tests/unit/test_schema.py tests/unit/test_validate.py \
+		--override-ini="addopts=" \
+		--cov=src/telco_churn/data --cov-report=term-missing
+
 test-features:
-	uv run pytest tests/unit/test_build.py tests/unit/test_sql_features.py tests/unit/test_generate.py tests/unit/test_preprocessing.py \
+	uv run pytest tests/unit/test_build.py tests/unit/test_sql_features.py tests/unit/test_generate.py tests/unit/test_preprocessing.py tests/unit/test_select.py \
 		--override-ini="addopts=" \
 		--cov=src/telco_churn/features --cov-report=term-missing
+
+test-models:
+	uv run pytest tests/unit/test_train_common.py tests/unit/test_train_candidates.py tests/unit/test_train_comparison.py tests/unit/test_train_tuning.py tests/unit/test_train_registration.py tests/unit/test_diagnostics.py \
+		--override-ini="addopts=" \
+		--cov=src/telco_churn/models --cov-report=term-missing
 
 test-integration:
 	uv run pytest -m integration --run-integration
@@ -33,6 +43,9 @@ ingest:
 
 validate:
 	uv run python -m telco_churn.data.validate
+
+split:
+	uv run python -m telco_churn.data.split
 
 features:
 	uv run python -m telco_churn.features.build
