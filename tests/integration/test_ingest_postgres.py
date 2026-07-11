@@ -191,6 +191,7 @@ def test_ingest_main_cli_exits_zero(
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=str(_PROJECT_ROOT),
     )
     assert (
@@ -214,6 +215,7 @@ def test_ingest_main_cli_exits_one_on_missing_csv(pg_url: str, tmp_path: Path) -
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=str(_PROJECT_ROOT),
     )
     assert (

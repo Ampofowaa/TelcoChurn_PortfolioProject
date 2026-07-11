@@ -42,8 +42,16 @@ def build_feature_df(df: pd.DataFrame) -> pd.DataFrame:
     df must contain all columns produced by the customer_features SQL view plus a
     churn column. customerid and churn pass through unchanged. Extracting y and
     selecting feature columns before training is the caller's responsibility (train.py).
+
+    Sorted by customerid: customer_features is a SQL view with no ORDER BY, so
+    its row order is whatever Postgres's query plan happens to produce for that
+    JOIN — not guaranteed stable across different loads of the same data. Every
+    downstream consumer (CV fold assignment in particular) splits by row
+    position, so an unpinned order makes "reproducible given random_state=42"
+    false in practice. Same fix data/split.py already applies to the manifest,
+    for the same reason.
     """
-    return df.copy()
+    return df.sort_values("customerid", kind="stable").reset_index(drop=True)
 
 
 if __name__ == "__main__":

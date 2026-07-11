@@ -288,6 +288,7 @@ def test_build_main_cli_composition(
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=str(get_project_root()),
     )
     assert (

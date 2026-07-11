@@ -94,6 +94,7 @@ def test_split_main_cli_exits_zero(
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=str(_PROJECT_ROOT),
     )
     assert (
@@ -133,6 +134,7 @@ def test_split_main_cli_exits_one_when_customers_raw_missing(tmp_path: Path) -> 
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             cwd=str(_PROJECT_ROOT),
         )
 

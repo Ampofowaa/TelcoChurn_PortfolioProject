@@ -1,12 +1,8 @@
 """Public API for the telco_churn.features package."""
 
-from telco_churn.features.build import (
-    FEATURE_SCHEMA,
-    SQL_FEATURE_COLS,
-    TARGET_COL,
-    FeatureSchema,
-    build_feature_df,
-)
+import importlib
+from typing import Any
+
 from telco_churn.features.generate import (
     CORR_THRESHOLD,
     CRAMERS_V_THRESHOLD,
@@ -34,18 +30,45 @@ from telco_churn.features.preprocessing import (
     build_preprocessor,
 )
 from telco_churn.features.schema import CustomerFeaturesSchema, FeatureOutputSchema
-from telco_churn.features.sql_features import build_sql_features
+
+_LAZY_SOURCES: dict[str, str] = {
+    "FEATURE_SCHEMA": "telco_churn.features.build",
+    "SQL_FEATURE_COLS": "telco_churn.features.build",
+    "TARGET_COL": "telco_churn.features.build",
+    "FeatureSchema": "telco_churn.features.build",
+    "build_feature_df": "telco_churn.features.build",
+    "build_sql_features": "telco_churn.features.sql_features",
+}
 
 
-def __getattr__(name: str) -> object:
-    """Lazily resolve SERVING_COLS so package import does not pay Pandera cost eagerly."""
+def __getattr__(name: str) -> Any:
+    """Lazily resolve re-exports that would otherwise pay an eager import cost.
+
+    Two distinct reasons live behind this one hook:
+    - SERVING_COLS calls generate._get_serving_cols() at package-import time
+      otherwise, paying Pandera's import/validation cost even for callers who
+      never touch serving columns.
+    - build.py and sql_features.py each carry a `__main__` CLI block. Eagerly
+      importing them here would register them in sys.modules under their real
+      dotted name before `python -m telco_churn.features.<module>` gets a
+      chance to load them fresh as __main__ — runpy then re-executes the
+      module's top-level code a second time under a second identity and warns
+      about the collision. Deferring the import until the symbol is actually
+      accessed avoids it.
+    """
     if name == "SERVING_COLS":
         from telco_churn.features.generate import _get_serving_cols
 
         val = _get_serving_cols()
         globals()["SERVING_COLS"] = val
         return val
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_path = _LAZY_SOURCES.get(name)
+    if module_path is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(module_path)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
 
 
 __all__ = [

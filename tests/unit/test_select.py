@@ -665,7 +665,7 @@ def test_flag_high_shap_dropouts_empty_when_all_features_committed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_reduced_set_bootstrap_test_material_full_win() -> None:
+def test_reduced_set_bootstrap_test_full_features_win() -> None:
     """CI fully above 0 and Δ clears Δ*: the full set wins on the evidence."""
     full_scores = [0.5] * 15
     reduced_scores = [0.4] * 15
@@ -677,7 +677,7 @@ def test_reduced_set_bootstrap_test_material_full_win() -> None:
         random_state=42,
     )
     assert result["decision"] == "full"
-    assert result["decision_rule"] == "material_full_win"
+    assert result["decision_rule"] == "full_features_win"
     assert result["delta_obs"] > 0
 
 
@@ -693,7 +693,7 @@ def test_reduced_set_bootstrap_test_below_threshold_ties_reduced() -> None:
         random_state=42,
     )
     assert result["decision"] == "reduced"
-    assert result["decision_rule"] == "tie_immaterial"
+    assert result["decision_rule"] == "tie"
 
 
 def test_reduced_set_bootstrap_test_ci_includes_zero_ties_reduced() -> None:
@@ -725,11 +725,11 @@ def test_reduced_set_bootstrap_test_ci_includes_zero_ties_reduced() -> None:
         random_state=42,
     )
     assert result["decision"] == "reduced"
-    assert result["decision_rule"] == "tie_immaterial"
+    assert result["decision_rule"] == "tie"
     assert result["delta_ci_lower"] < 0 < result["delta_ci_upper"]
 
 
-def test_reduced_set_bootstrap_test_material_reduced_win() -> None:
+def test_reduced_set_bootstrap_test_reduced_features_win() -> None:
     """CI fully below 0 and |Δ| clears Δ* in the reduced set's favour."""
     full_scores = [0.4] * 15
     reduced_scores = [0.5] * 15
@@ -741,7 +741,7 @@ def test_reduced_set_bootstrap_test_material_reduced_win() -> None:
         random_state=42,
     )
     assert result["decision"] == "reduced"
-    assert result["decision_rule"] == "material_reduced_win"
+    assert result["decision_rule"] == "reduced_features_win"
 
 
 def test_reduced_set_bootstrap_test_ci_contains_obs() -> None:
@@ -793,4 +793,4 @@ def test_reduced_set_bootstrap_test_equal_scores_p_value_is_one() -> None:
     )
     assert result["p_value"] == 1.0
     assert result["delta_obs"] == 0.0
-    assert result["decision_rule"] == "tie_immaterial"
+    assert result["decision_rule"] == "tie"
