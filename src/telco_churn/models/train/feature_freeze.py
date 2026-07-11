@@ -193,10 +193,8 @@ def run_selection_step(
     )
     full_disp.line_.set_label(f"Full set (pooled OOF AP = {full_pr_auc_oof:.3f})")
     ax_pr.legend()
-    ax_pr.set_title(
-        "Pooled OOF Precision-Recall Curves — full vs. reduced feature set (dev set)\n"
-        "(NOT the mean-of-fold PR-AUC the decision below is based on)"
-    )
+    ax_pr.set_title("Pooled OOF PR Curves — full vs. reduced feature set")
+    fig_pr.tight_layout()
 
     fig_bs, ax_bs = plt.subplots(figsize=(6, 4))
     ax_bs.hist(
@@ -219,6 +217,7 @@ def run_selection_step(
     ax_bs.set_ylabel("Bootstrap resamples")
     ax_bs.set_title("Paired-Bootstrap Δ Distribution — full vs. reduced feature set")
     ax_bs.legend()
+    fig_bs.tight_layout()
 
     mlflow.set_tracking_uri(_resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     mlflow.set_experiment(cfg.mlflow.experiment_name)

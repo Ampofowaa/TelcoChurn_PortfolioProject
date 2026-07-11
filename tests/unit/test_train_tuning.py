@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import Mock
 
-import mlflow
 import optuna
 import pandas as pd
 import pytest
@@ -235,12 +234,10 @@ def test_boundary_hit_check_interior_values_not_flagged() -> None:
 
 
 @pytest.fixture
-def tuning_mlflow_uri(tmp_path: Path) -> str:
-    """Point MLflow at a throwaway local SQLite store (see diagnostics_mlflow_uri)."""
-    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
-    mlflow.set_tracking_uri(uri)
-    mlflow.set_experiment("test_run_tuning_step")
-    return uri
+def tuning_mlflow_uri(mlflow_test_experiment: Callable[[str], str]) -> str:
+    """Point MLflow at the shared tmp-scoped experiment (conftest.py ::
+    mlflow_test_experiment)."""
+    return mlflow_test_experiment("test_run_tuning_step")
 
 
 @pytest.fixture
@@ -284,6 +281,7 @@ def tuning_cfg() -> OmegaConf:
                 "sampler_seed": 42,
                 "n_startup_trials": 1,
                 "pruner": "none",
+                "pruner_n_warmup_steps": 0,
                 "selection_rule": "1se",
             },
             "mlflow": {
@@ -332,6 +330,10 @@ def test_run_tuning_step_returns_expected_keys(
     assert tuning_summary["selected_cv_pr_auc"] == result["best_cv_pr_auc_mean"]
     assert tuning_summary["raw_best_cv_pr_auc"] >= tuning_summary["selected_cv_pr_auc"]
     assert tuning_summary["se"] >= 0.0
+    # base tuning_cfg has no min_completed_trials configured — the unset case
+    # must default to "not below threshold", not raise or silently flag true.
+    assert tuning_summary["min_completed_trials"] is None
+    assert tuning_summary["trial_count_below_threshold"] is False
     assert tuning_summary["band_floor"] == pytest.approx(
         tuning_summary["raw_best_cv_pr_auc"] - tuning_summary["se"]
     )
@@ -536,6 +538,10 @@ def test_run_tuning_step_warns_on_too_few_completed_trials(
     assert too_few_calls[0].kwargs["n_completed_trials"] == result["n_completed_trials"]
     assert too_few_calls[0].kwargs["min_completed_trials"] == 10
 
+    tuning_summary = result["tuning_summary"]
+    assert tuning_summary["min_completed_trials"] == 10
+    assert tuning_summary["trial_count_below_threshold"] is True
+
 
 def test_run_tuning_step_no_warning_when_completed_trials_meet_floor(
     monkeypatch: pytest.MonkeyPatch,
@@ -552,7 +558,7 @@ def test_run_tuning_step_no_warning_when_completed_trials_meet_floor(
     warning_mock = Mock()
     monkeypatch.setattr(tuning.logger, "warning", warning_mock)
 
-    tuning.run_tuning_step(
+    result = tuning.run_tuning_step(
         X_dev,
         y_dev,
         committed_features,
@@ -566,6 +572,10 @@ def test_run_tuning_step_no_warning_when_completed_trials_meet_floor(
         if call.args[0] == "tuning_too_few_completed_trials"
     ]
     assert too_few_calls == []
+
+    tuning_summary = result["tuning_summary"]
+    assert tuning_summary["min_completed_trials"] == 1
+    assert tuning_summary["trial_count_below_threshold"] is False
 
 
 def test_run_tuning_step_passes_timeout_seconds_to_optimize(

@@ -2,7 +2,7 @@
 
 Data loading, MLflow/DVC/git metadata resolution, and the LightGBM knob builders
 reused across every step (candidates.py, feature_freeze.py, tuning.py,
-registration.py) so each step's fit is representative of the one that ships.
+log_model.py) so each step's fit is representative of the one that ships.
 """
 
 from __future__ import annotations
@@ -52,16 +52,23 @@ def _load_processed(cfg: DictConfig) -> pd.DataFrame:
 
 
 def _resolve_tracking_uri(uri: str) -> str:
-    """Resolve relative MLflow tracking URIs to absolute project-rooted paths.
+    """Resolve relative MLflow tracking URIs to absolute project-rooted file:// URIs.
 
     Any URI with an explicit scheme (http(s)://, sqlite://, postgresql://, ...) is
     returned unchanged — only a bare relative path like 'mlruns' needs anchoring to
     get_project_root() so the tracking store is always written to the same
     location regardless of the shell's working directory.
+
+    Returns a file:// URI, not a bare path — on Windows, str(path) yields
+    'C:\\...\\mlruns', and MLflow's store registry reads urlparse's scheme off
+    that string, which is 'c' for a drive letter, not a recognized backend. This
+    is the default branch for any fresh clone or CI runner (no .env, so
+    tracking_uri resolves to the bare 'mlruns' default in configs/config.yaml),
+    so it isn't a latent edge case.
     """
     if "://" in uri:
         return uri
-    return str(get_project_root() / uri)
+    return (get_project_root() / uri).as_uri()
 
 
 def _git_sha() -> str:
@@ -249,6 +256,12 @@ def logreg_default_params(cfg: DictConfig, random_state: int) -> dict[str, Any]:
     Public (not underscore-prefixed): the notebook refits this exact candidate to
     read off coefficients and must build the same kwargs `logreg_cv` trained with,
     not a hand-copied reconstruction that can silently drift from it.
+
+    l1_ratios (not penalty=): sklearn 1.8 deprecated the penalty string in favor of
+    l1_ratios (0=L2, 1=L1), removed entirely in 1.10 — l1_ratios=(0,) is identical to
+    the old penalty='l2'. use_legacy_attributes=False opts fitted attributes (coef_,
+    C_, ...) into the post-1.10 shape now, since nothing reads the legacy shape yet —
+    the odds-ratio exhibit above doesn't exist yet either, so there's nothing to migrate.
     """
     logreg = cfg.logreg
     return {
@@ -256,9 +269,10 @@ def logreg_default_params(cfg: DictConfig, random_state: int) -> dict[str, Any]:
         "cv": int(logreg.cv_folds),
         "scoring": "average_precision",
         "solver": str(logreg.solver),
-        "penalty": str(logreg.penalty),
+        "l1_ratios": (float(logreg.l1_ratio),),
         "max_iter": int(logreg.max_iter),
         "class_weight": str(cfg.training_setup.class_weight),
         "random_state": random_state,
         "n_jobs": 1,
+        "use_legacy_attributes": False,
     }

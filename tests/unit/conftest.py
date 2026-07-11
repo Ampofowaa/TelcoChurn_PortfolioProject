@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
+
+import mlflow
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,6 +13,35 @@ from helpers import make_row
 
 from telco_churn.features.build import TARGET_COL
 from telco_churn.models.train.common import _FEATURE_COLS
+
+
+@pytest.fixture
+def mlflow_test_experiment(tmp_path: Path) -> Callable[[str], str]:
+    """Factory: point MLflow at a tmp-scoped SQLite store with an explicit
+    artifact_location, returning the tracking URI once the named experiment is
+    active.
+
+    A SQLite-backed tracking store with no explicit artifact root defaults run
+    artifacts to './mlruns' relative to CWD — the repo root under pytest — so
+    every models/train/* test that opened a real MLflow run leaked artifacts
+    into the tracked mlruns/ directory even though its tracking metadata lived
+    in a discarded tmp_path SQLite file. create_experiment(artifact_location=...)
+    is required rather than set_experiment(name): set_experiment cannot set an
+    artifact_location on an experiment that doesn't exist yet, and by the time
+    it exists, the default has already been applied.
+    """
+
+    def _make(experiment_name: str) -> str:
+        tracking_uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+        mlflow.set_tracking_uri(tracking_uri)
+        artifact_location = (tmp_path / "artifacts").as_uri()
+        experiment_id = mlflow.create_experiment(
+            experiment_name, artifact_location=artifact_location
+        )
+        mlflow.set_experiment(experiment_id=experiment_id)
+        return tracking_uri
+
+    return _make
 
 
 @pytest.fixture
@@ -53,7 +86,7 @@ def feature_df() -> pd.DataFrame:
     """Synthetic feature DataFrame matching _FEATURE_COLS + customerid + churn.
 
     Shared across the models/train/* unit test modules (candidates, comparison,
-    tuning, registration) — one synthetic frame shape for the whole training
+    tuning, log_model) — one synthetic frame shape for the whole training
     pipeline test suite.
     """
     rng = np.random.default_rng(0)

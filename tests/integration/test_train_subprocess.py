@@ -7,19 +7,20 @@ import subprocess
 import sys
 from pathlib import Path
 
+import mlflow
 import numpy as np
 import pandas as pd
 import pytest
 
 from telco_churn.data.split import make_split, write_split
-from telco_churn.utils.paths import get_project_root
+from telco_churn.utils.paths import compose_config, get_project_root
 
 pytestmark = pytest.mark.integration
 
 _PROJECT_ROOT = get_project_root()
 
 # Fast-path Hydra CLI overrides — keep the full Steps 1-5 pipeline (candidates,
-# selection, Optuna tuning, registration) to well under a minute instead of the
+# selection, Optuna tuning, model logging) to well under a minute instead of the
 # ~5-minute real-config run, without touching any production config file.
 _FAST_OVERRIDES = [
     "training_setup.cv_folds=2",
@@ -110,26 +111,42 @@ def test_train_main_cli_exits_zero(tmp_path: Path) -> None:
     CLAUDE.md: every __main__ entry point requires a subprocess integration test
     covering the full composition path — here that's compose_config() ->
     _load_dev_features() -> run_candidate_step -> run_comparison_step ->
-    run_selection_step -> run_tuning_step -> run_registration_step. Fast-path
+    run_selection_step -> run_tuning_step -> run_model_logging_step. Fast-path
     Hydra CLI overrides (_FAST_OVERRIDES) keep this well under a minute; MLflow
     points at a throwaway local SQLite store so no Docker server is required and
     the real experiment history is never touched.
+
+    The experiment is pre-created here, in the parent process, with an explicit
+    artifact_location under tmp_path — the child subprocess runs with
+    cwd=_PROJECT_ROOT, so its own mlflow.set_experiment(name) would otherwise
+    create the experiment on first use with the SQLite store's default artifact
+    root, './mlruns' relative to CWD, leaking real run artifacts into the
+    tracked mlruns/ directory (same root cause as conftest.py ::
+    mlflow_test_experiment).
     """
     data_dir = tmp_path / "processed"
     data_dir.mkdir()
     _seed_processed_data(data_dir)
     mlflow_db = tmp_path / "mlflow.db"
+    tracking_uri = f"sqlite:///{mlflow_db}"
+
+    experiment_name = str(compose_config().mlflow.experiment_name)
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.create_experiment(
+        experiment_name, artifact_location=(tmp_path / "artifacts").as_uri()
+    )
 
     env = {
         **os.environ,
         "PROCESSED_DATA_DIR": str(data_dir),
-        "MLFLOW_TRACKING_URI": f"sqlite:///{mlflow_db}",
+        "MLFLOW_TRACKING_URI": tracking_uri,
     }
     result = subprocess.run(
         [sys.executable, "-m", "telco_churn.models.train", *_FAST_OVERRIDES],
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=str(_PROJECT_ROOT),
         timeout=300,
     )
@@ -137,7 +154,13 @@ def test_train_main_cli_exits_zero(tmp_path: Path) -> None:
     assert (
         result.returncode == 0
     ), f"train CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    assert "registration_step_done" in result.stdout
+    assert "model_logged" in result.stdout
+
+    # Real SQLite-backed registry, not a mock — the CI guard that Step 5 never
+    # registers (CLAUDE.md: an uncalibrated pipeline is a stage of construction,
+    # never a registry version).
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+    assert client.search_registered_models() == []
 
 
 def test_train_main_cli_exits_one_when_processed_data_missing(tmp_path: Path) -> None:
@@ -160,6 +183,7 @@ def test_train_main_cli_exits_one_when_processed_data_missing(tmp_path: Path) ->
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=str(_PROJECT_ROOT),
         timeout=60,
     )

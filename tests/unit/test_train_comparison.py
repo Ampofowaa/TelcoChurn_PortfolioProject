@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from collections.abc import Callable
 
 import mlflow
 import pandas as pd
@@ -19,7 +19,7 @@ from telco_churn.models.train.common import cv_score_candidate
 # ---------------------------------------------------------------------------
 
 
-def test_bootstrap_comparison_material_lgbm_win() -> None:
+def test_bootstrap_comparison_lgbm_win() -> None:
     """CI fully above 0 and Δ clears Δ*: adopt LGBM on the evidence."""
     scores_lgbm = [0.5] * 15
     scores_logreg = [0.4] * 15
@@ -31,7 +31,7 @@ def test_bootstrap_comparison_material_lgbm_win() -> None:
         random_state=42,
     )
     assert result["decision"] == "lgbm"
-    assert result["decision_rule"] == "material_lgbm_win"
+    assert result["decision_rule"] == "lgbm_win"
     assert result["delta_obs"] > 0
 
 
@@ -47,7 +47,7 @@ def test_bootstrap_comparison_below_threshold_ties_lgbm() -> None:
         random_state=42,
     )
     assert result["decision"] == "lgbm"
-    assert result["decision_rule"] == "tie_immaterial"
+    assert result["decision_rule"] == "tie"
 
 
 def test_bootstrap_comparison_ci_includes_zero_ties_lgbm() -> None:
@@ -80,11 +80,11 @@ def test_bootstrap_comparison_ci_includes_zero_ties_lgbm() -> None:
     )
     assert result["delta_ci_lower"] < 0 < result["delta_ci_upper"]
     assert result["decision"] == "lgbm"
-    assert result["decision_rule"] == "tie_immaterial"
+    assert result["decision_rule"] == "tie"
 
 
-def test_bootstrap_comparison_kill_condition_selects_logreg() -> None:
-    """CI fully below 0 and |Δ| clears Δ* in LogReg's favour: the kill condition."""
+def test_bootstrap_comparison_logreg_win() -> None:
+    """CI fully below 0 and |Δ| clears Δ* in LogReg's favour: LogReg wins decisively."""
     scores_lgbm = [0.4] * 15
     scores_logreg = [0.5] * 15
     result = comparison.bootstrap_comparison(
@@ -95,7 +95,7 @@ def test_bootstrap_comparison_kill_condition_selects_logreg() -> None:
         random_state=42,
     )
     assert result["decision"] == "logreg"
-    assert result["decision_rule"] == "kill_condition"
+    assert result["decision_rule"] == "logreg_win"
 
 
 def test_bootstrap_comparison_ci_contains_obs() -> None:
@@ -147,7 +147,7 @@ def test_bootstrap_comparison_equal_scores_p_value_is_one() -> None:
     )
     assert result["p_value"] == 1.0
     assert result["delta_obs"] == 0.0
-    assert result["decision_rule"] == "tie_immaterial"
+    assert result["decision_rule"] == "tie"
 
 
 # ---------------------------------------------------------------------------
@@ -171,15 +171,18 @@ def diagnostics_candidate_results(
 
 
 @pytest.fixture
-def diagnostics_mlflow_uri(tmp_path: Path) -> None:
-    """Point MLflow at a throwaway local SQLite store so tests never touch mlruns/.
+def diagnostics_mlflow_uri(mlflow_test_experiment: Callable[[str], str]) -> None:
+    """Point MLflow at the shared tmp-scoped experiment (conftest.py ::
+    mlflow_test_experiment) so tests never touch mlruns/ — the explicit
+    artifact_location there is what prevents the leak, not the SQLite backend
+    alone: SQLite with no artifact_location still defaults artifacts to
+    './mlruns' relative to CWD.
 
     mlflow>=3 deprecates the raw filesystem tracking backend (raises unless
     MLFLOW_ALLOW_FILE_STORE=true); SQLite is a supported local backend that needs
     no such escape hatch and no Docker/server dependency.
     """
-    mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
-    mlflow.set_experiment("test_run_diagnostics_step")
+    mlflow_test_experiment("test_run_diagnostics_step")
 
 
 def test_run_diagnostics_step_covers_all_candidates(
@@ -334,12 +337,10 @@ def test_run_diagnostics_step_includes_segment_delta_cis(
 
 
 @pytest.fixture
-def comparison_mlflow_uri(tmp_path: Path) -> str:
-    """Point MLflow at a throwaway local SQLite store (see test_train_registration.py)."""
-    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
-    mlflow.set_tracking_uri(uri)
-    mlflow.set_experiment("test_run_comparison_step")
-    return uri
+def comparison_mlflow_uri(mlflow_test_experiment: Callable[[str], str]) -> str:
+    """Point MLflow at the shared tmp-scoped experiment (conftest.py ::
+    mlflow_test_experiment)."""
+    return mlflow_test_experiment("test_run_comparison_step")
 
 
 @pytest.fixture

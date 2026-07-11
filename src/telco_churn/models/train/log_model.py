@@ -1,4 +1,4 @@
-"""Step 5: register the tuned pipeline as MLflow challenger."""
+"""Step 5: log the tuned pipeline as an MLflow run artifact — no registration."""
 
 from __future__ import annotations
 
@@ -26,41 +26,45 @@ from telco_churn.models.train.common import (
 )
 from telco_churn.utils.logging import get_logger
 
-__all__ = ["run_registration_step"]
+__all__ = ["run_model_logging_step"]
 
 logger = get_logger(__name__)
 
 
-def run_registration_step(
+def run_model_logging_step(
     X_dev: pd.DataFrame,
     y_dev: pd.Series,
     comparison: dict[str, Any],
     tuning_result: dict[str, Any],
     cfg: DictConfig,
 ) -> dict[str, Any]:
-    """Register the tuned pipeline as MLflow challenger.
+    """Log the tuned pipeline to the tuning_study MLflow run — do not register it.
 
     Refits [tree_preprocessor -> LightGBM] on all of development with the Step 4
     hyperparameters (n_estimators fixed at the selected trial's median
     early-stopped tree count — no further early stopping here). Logged onto the
     same MLflow run as the Step 4 tuning_study parent, reopened via its run_id.
 
-    Logs the full Pipeline (not the bare estimator) with a signature + input
-    example, runs a log -> reload -> predict parity check (hard assertion), and
-    logs feature_space.txt / feature_columns.txt / preprocessing.pkl plus
-    training_manifest.json — the engineering audit trail (git SHA, DVC data hash,
-    hyperparameters, feature space/columns, CV PR-AUC, paired-Δ vs LogReg with
-    full bootstrap CI, and tuning_summary — the trial counts and 1-SE band
-    diagnostics behind the selection_rule pick, passed through from
-    run_tuning_step unchanged). The stakeholder-facing model_card.json is a
-    Phase 7 deliverable, written once at champion promotion when calibration,
-    threshold, and sealed-test results are real — not here.
+    Logs the full Pipeline (not the bare estimator) with a probability signature +
+    input example, runs a log -> reload -> predict_proba parity check (hard
+    assertion), and logs feature_space.txt / feature_columns.txt /
+    preprocessing.pkl plus training_manifest.json — the engineering audit trail,
+    one section per pipeline step: model_comparison (Step 2's family decision),
+    feature_selection (Step 3's frozen input space), training_summary (the
+    fixed LightGBM knobs applied to every fit, tuned or not), and tuning_summary
+    (Step 4's trial counts, 1-SE band diagnostics, and the selected
+    hyperparameters, passed through from run_tuning_step plus
+    selected_hyperparameters added here). The stakeholder-facing
+    model_card.json is a Phase 7 deliverable, written once at champion promotion
+    when calibration, threshold, and sealed-test results are real — not here.
 
-    Registers the model as cfg.mlflow.registered_model_name and points the
-    'challenger' alias at it. This challenger is uncalibrated, un-thresholded, and
-    not evaluated on the sealed test set — not serving-ready.
+    This artifact is uncalibrated, un-thresholded, and not evaluated on the
+    sealed test set — not a valid rollback target, and therefore not registered
+    (CLAUDE.md § Run artifacts vs. registry versions). Phase 6's calibrate.py
+    performs the training cycle's single registration, on the calibrated
+    artifact, resolved via this manifest's logged_model_uri.
 
-    Returns {"run_id", "model_uri", "version", "parity_ok", "training_manifest"}.
+    Returns {"run_id", "model_uri", "parity_ok", "training_manifest"}.
     """
     random_state = int(cfg.random_seed)
     committed_features = list(tuning_result["committed_features"])
@@ -69,11 +73,12 @@ def run_registration_step(
     multi_cat = [c for c in FEATURE_SCHEMA.multi_cat if c in committed_features]
     numeric = [c for c in FEATURE_SCHEMA.numeric if c in committed_features]
 
-    model_params = {
+    fixed_hyperparameters = _lgbm_fixed_knobs(cfg, random_state)
+    selected_hyperparameters = {
         "n_estimators": int(tuning_result["best_n_estimators_median"]),
         **dict(tuning_result["best_params"]),
-        **_lgbm_fixed_knobs(cfg, random_state),
     }
+    model_params = {**selected_hyperparameters, **fixed_hyperparameters}
 
     X_committed = X_dev[committed_features]
     preprocessor = build_preprocessor(binary, multi_cat, numeric)
@@ -86,8 +91,8 @@ def run_registration_step(
     pipeline.fit(X_committed, y_dev)
 
     input_example = X_committed.head(5)
-    in_memory_preds = pipeline.predict(input_example)
-    signature = infer_signature(X_committed, pipeline.predict(X_committed))
+    in_memory_preds = pipeline.predict_proba(input_example)
+    signature = infer_signature(X_committed, pipeline.predict_proba(X_committed))
 
     full_feature_space = (
         list(FEATURE_SCHEMA.binary)
@@ -97,22 +102,33 @@ def run_registration_step(
 
     training_manifest: dict[str, Any] = {
         "model_name": str(cfg.mlflow.registered_model_name),
-        "alias": "challenger",
+        "model_family": "lightgbm",
         "git_sha": _git_sha(),
         "dvc_data_hash": _dvc_hash(cfg),
-        "model_family": "lightgbm",
-        "hyperparameters": model_params,
-        "feature_space": full_feature_space,
-        "feature_columns": committed_features,
-        "cv_pr_auc_mean": tuning_result["best_cv_pr_auc_mean"],
-        "tuning_selection_rule": str(cfg.tuning.selection_rule),
-        "tuning_summary": tuning_result["tuning_summary"],
-        "paired_delta_vs_logreg": {
+        # One section per pipeline step, in dependency order: comparison (Step 2)
+        # decides the family, feature_selection (Step 3) freezes the input space,
+        # training_summary is the fixed config every trial AND the final fit use
+        # (tuning searches on top of it, not after it), tuning_summary is what
+        # that search found. Nothing here is recomputed — this is the same data
+        # as before, grouped so "is this hyperparameter tuned or fixed?" is
+        # answered by which section it's in, not by cross-referencing config.
+        "model_comparison": {
             "delta_obs": comparison["delta_obs"],
             "delta_ci_lower": comparison["delta_ci_lower"],
             "delta_ci_upper": comparison["delta_ci_upper"],
             "decision": comparison["decision"],
             "decision_rule": comparison["decision_rule"],
+        },
+        "feature_selection": {
+            "feature_space": full_feature_space,
+            "model_features": committed_features,
+        },
+        "training_summary": {
+            "fixed_hyperparameters": fixed_hyperparameters,
+        },
+        "tuning_summary": {
+            **tuning_result["tuning_summary"],
+            "selected_hyperparameters": selected_hyperparameters,
         },
     }
 
@@ -123,7 +139,6 @@ def run_registration_step(
     with mlflow.start_run(run_id=run_id):
         mlflow.log_text("\n".join(full_feature_space), "feature_space.txt")
         mlflow.log_text("\n".join(committed_features), "feature_columns.txt")
-        mlflow.log_dict(training_manifest, "training_manifest.json")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             preprocessing_path = Path(tmp_dir) / "preprocessing.pkl"
@@ -135,7 +150,10 @@ def run_registration_step(
             name="model",
             signature=signature,
             input_example=input_example,
-            registered_model_name=str(cfg.mlflow.registered_model_name),
+            # default pyfunc_predict_fn is "predict" -> 0/1 labels; Phase 9 loads
+            # by pyfunc URI and takes what comes out, so the declared and
+            # exercised paths must be the same path.
+            pyfunc_predict_fn="predict_proba",
             # mlflow>=3's skops default rejects LightGBM's Booster/OrderedDict
             # internals (untrusted types by skops' allowlist) — cloudpickle
             # handles the full Pipeline's arbitrary object graph without a
@@ -143,26 +161,26 @@ def run_registration_step(
             serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE,
         )
 
+        # models:/m-<id> under MLflow 3 — a permanent handle on this artifact.
+        # calibrate.py resolves the unfitted pipeline through this field, never
+        # through runs:/<run_id>/model, which becomes ambiguous once Phase 6
+        # logs a second model onto this same run.
+        training_manifest["logged_model_uri"] = model_info.model_uri
+        mlflow.log_dict(training_manifest, "training_manifest.json")
+
     reloaded = mlflow.sklearn.load_model(model_info.model_uri)
-    reload_preds = reloaded.predict(input_example)
-    parity_ok = bool(np.array_equal(in_memory_preds, reload_preds))
+    reload_preds = reloaded.predict_proba(input_example)
+    parity_ok = bool(np.allclose(in_memory_preds, reload_preds, rtol=0, atol=1e-12))
     assert parity_ok, (
         "Reload parity check failed: predictions from the reloaded model differ "
         "from the in-memory pipeline on the same input sample — the serialized "
-        "model is not safe to register."
-    )
-
-    client = mlflow.tracking.MlflowClient()
-    client.set_registered_model_alias(
-        name=str(cfg.mlflow.registered_model_name),
-        alias="challenger",
-        version=str(model_info.registered_model_version),
+        "model is not safe to log."
     )
 
     logger.info(
-        "registration_step_done",
+        "model_logged",
         run_id=run_id,
-        model_version=model_info.registered_model_version,
+        model_uri=model_info.model_uri,
         parity_ok=parity_ok,
         n_committed_features=len(committed_features),
     )
@@ -170,7 +188,6 @@ def run_registration_step(
     return {
         "run_id": run_id,
         "model_uri": model_info.model_uri,
-        "version": model_info.registered_model_version,
         "parity_ok": parity_ok,
         "training_manifest": training_manifest,
     }

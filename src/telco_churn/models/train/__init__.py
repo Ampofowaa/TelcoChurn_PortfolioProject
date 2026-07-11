@@ -9,8 +9,9 @@ Step 3: feature selection via features/select.py — freezes the input space.
     See feature_freeze.py.
 Step 4: Optuna hyperparameter tuning on the frozen feature set.
     See tuning.py.
-Step 5: register the tuned pipeline as MLflow challenger.
-    See registration.py.
+Step 5: log the tuned pipeline as an MLflow run artifact — not registered.
+    See log_model.py. Phase 6's calibrate.py performs the training cycle's
+    single registration, on the calibrated artifact.
 
 Run as `python -m telco_churn.models.train` (see __main__.py) to execute all five
 steps in sequence.
@@ -36,7 +37,7 @@ from telco_churn.models.train.comparison import (  # noqa: E402
     run_diagnostics_step,
 )
 from telco_churn.models.train.feature_freeze import run_selection_step  # noqa: E402
-from telco_churn.models.train.registration import run_registration_step  # noqa: E402
+from telco_churn.models.train.log_model import run_model_logging_step  # noqa: E402
 from telco_churn.models.train.tuning import (  # noqa: E402
     boundary_hit_check,
     run_tuning_step,
@@ -51,7 +52,7 @@ __all__ = [
     "run_candidate_step",
     "run_comparison_step",
     "run_diagnostics_step",
-    "run_registration_step",
+    "run_model_logging_step",
     "run_selection_step",
     "run_tuning_step",
     "select_best_trial",

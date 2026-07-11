@@ -42,9 +42,15 @@ def test_resolve_tracking_uri_passes_through_sqlite() -> None:
 
 
 def test_resolve_tracking_uri_anchors_bare_relative_path() -> None:
-    """A bare relative path like 'mlruns' is anchored to the project root."""
+    """A bare relative path like 'mlruns' is anchored to the project root and
+    returned as a file:// URI — not a bare OS path, which on Windows is
+    misread as scheme 'c' (the drive letter) by MLflow's store registry.
+    """
+    from urllib.parse import urlparse
+
     resolved = common._resolve_tracking_uri("mlruns")
-    assert resolved == str(common.get_project_root() / "mlruns")
+    assert urlparse(resolved).scheme == "file"
+    assert resolved == (common.get_project_root() / "mlruns").as_uri()
 
 
 # ---------------------------------------------------------------------------

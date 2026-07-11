@@ -95,7 +95,7 @@ def test_run_candidate_step_logs_metric_contract(
                 "cv_folds": 2,
                 "max_iter": 50,
                 "solver": "lbfgs",
-                "penalty": "l2",
+                "l1_ratio": 0.0,
             },
             "training": {
                 "candidate": {
