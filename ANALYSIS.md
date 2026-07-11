@@ -49,19 +49,50 @@ The score feeds a **proactive retention intervention decision**: whether to incl
 
 This framing makes the cost structure asymmetric and well-defined (see below). It has two metric consequences: **PR-AUC is the primary model selection and promotion metric** — it summarises precision-recall performance across all thresholds and is the promotion gate used in §4 and §6. **Recall at the production threshold is the primary business metric** — once the model is deployed at the optimised production threshold (§8), the question the business asks is "how many churners did we catch this cycle?", and missed churners receive no offer and are lost.
 
-### FN vs FP cost structure
+### Cost structure — cost attaches to the *action*, not to the error
+
+The intervention is paid whenever we contact someone. We do not know whether they were going to churn at the moment we dial. So the decision table is over (action, true state), and the correct cell to interrogate is the **true positive** — which is *not* free:
+
+| | **contact** (spend `c`) | **do nothing** |
+|---|---|---|
+| **churner** (prob `q`) | `−c + r·LTV` — offer works with prob `r` | `0` |
+| **non-churner** (prob `1−q`) | `−c + LTV` — offer wasted, customer stays anyway | `LTV` |
+
+Contact iff `E[contact] > E[do nothing]`. The `(1−q)·LTV` terms cancel and the rule collapses to:
+
+> **Contact iff `q · r · LTV > c`, i.e. the operating threshold is `t* = c / (r × LTV)`.**
+
+Base scenario (`c = $68`, `r = 0.30`, `LTV = $575`): **`t* = 68 / 172.50 = 0.3942`**. Left of 0.5, as the asymmetry implies — but materially right of the 0.2956 reported in §8, which was selected under a cost function that charges the intervention only to false positives. See the superseding note at the head of §8.
+
+The familiar error-cost view is a *diagnostic*, not the decision rule:
 
 | Error type | Business consequence | Base-scenario cost |
 |---|---|---|
-| **False Negative (FN)** | Churner not contacted — no retention offer issued. Customer cancels; LTV is lost. | ~$172 opportunity cost (30 % retention success × $575 LTV − $0 spend) |
-| **False Positive (FP)** | Non-churner contacted unnecessarily. Retention offer issued at cost; customer was going to stay anyway. | ~$68 direct spend per intervention |
+| **False Negative (FN)** | Churner not contacted. Customer cancels; the recoverable share of LTV is lost. | ~$172 opportunity cost (`r × LTV` = 30 % × $575) |
+| **False Positive (FP)** | Non-churner contacted. Offer issued at cost; customer was going to stay anyway. | ~$68 direct spend |
 
-**FN/FP cost ratio ≈ 2.5:1** under the base scenario. Missing a churner costs approximately 2.5× more than a wasted offer. This ratio has two concrete consequences:
+**FN/FP ≈ 2.5:1.** Missing a churner costs ~2.5× a wasted offer, so the threshold sits left of 0.5 and **recall is favoured over precision** among the reported diagnostics. This ratio does **not** by itself give the threshold: `C_FP/(C_FP + C_FN) = 0.283` presumes correct decisions are free, and a true positive costs `c` like any other contact. *(Selection remains governed by PR-AUC alone — see `CLAUDE.md` § Modelling Invariants. Recall's priority here is a statement about the cost structure, not a second selection metric.)*
 
-1. The optimal decision threshold is **shifted left of 0.5** — accepting more FPs to recover more churners is cost-rational.
-2. **Recall is prioritised over Precision** as the primary metric. A model that catches fewer churners is not compensated by being more precise, because the asymmetry means false negatives are the more expensive error.
+#### The retention rate `r` is the dominant uncertainty — not the model
 
-The cost parameters ($68/intervention, $575 LTV, 30 % success rate) are illustrative and derived from plausible telecom industry benchmarks. They are not Finance-validated; see §11 Known Limitation #8. The three-scenario bracket (Conservative / Base / Optimistic) in §8 exists specifically to stress-test decisions against this uncertainty.
+`t*` is inversely proportional to `r`, and `r` is the one parameter that **cannot be estimated from this dataset**. It is the fraction of contacted churners the offer actually saves; measuring it requires intervening on customers and observing what happens. `EDA-original.ipynb` §14.3 says so outright — *"industry benchmark — not observable in dataset"* — and takes 0.30 from a literature range of 0.15–0.40.
+
+| `r` | `t* = c / (r × LTV)` |
+|---|---|
+| 0.15 | 0.7884 |
+| 0.20 | 0.5913 |
+| **0.30** (assumed) | **0.3942** |
+| 0.40 | 0.2957 |
+| 0.45 | 0.2628 |
+
+Moving `r` from 0.30 to 0.20 moves the threshold by **0.20** — far more than any plausible improvement in PR-AUC would move the operating point. **The single most consequential number in the deployment decision is a benchmark guess, not a model output.** (Note that `r = 0.40` yields `t* = 0.2957` — essentially the archived 0.2956. That threshold is defensible only under optimistic retention combined with base-case costs, a pairing nobody chose deliberately.)
+
+Two consequences, both load-bearing:
+
+1. **The Phase 6 threshold is provisional by construction**, not because the modelling is weak. It is the correct decision *given* `r = 0.30`, and it should be shipped with that conditional stated.
+2. **`r` becomes measurable exactly when the realised-outcome loop exists** — Phase 10's `prediction_outcomes` table and `performance_check.py`, which join logged predictions to matured labels. Estimating `r` from that join, and re-deriving `t*`, is the intended resolution. Until then, the three-scenario bracket (Conservative / Base / Optimistic) in §8 exists specifically to stress-test the decision against this uncertainty.
+
+The cost parameters ($68/intervention, $575 LTV, 30 % success rate) are illustrative, derived from plausible telecom industry benchmarks, and not Finance-validated; see §11 Known Limitation #8.
 
 ### Baseline to beat
 
@@ -131,12 +162,12 @@ The full gate walkthrough — rendered results and failure detail tables — is 
 - `totalcharges` is right-skewed, with a long tail of high-value, long-tenure customers. Billing amounts shift over time for ~91 % of customers, so `totalcharges` carries signal independent of the other two numeric features.
 
 **Categorical features:**
-- **Demographics:** gender is near-balanced (~51 % male); senior citizens represent ~16 % of the base; customers with a partner or dependents are ~41 % and ~30 % respectively — the base skews toward younger, independent adults.
+- **Demographics:** gender is near-balanced (~51 % male); senior citizens represent ~16 % of the base; customers with a partner or dependents are ~48 % and ~30 % respectively — the base skews toward younger, independent adults.
 - **Services:** ~90 % have phone service; internet service splits across fiber optic (~44 %), DSL (~34 %), and no internet (~22 %). Security and support add-ons skew heavily toward "No" — the ~22 % without internet cannot subscribe, and month-to-month customers show lower uptake. Streaming add-ons are more evenly split.
 - **Contract and billing:** month-to-month contracts dominate (~55 %); paperless billing is the majority preference (~59 %); electronic check is the most common payment method (~34 %).
 
 **Outliers:**
-All three numeric features have zero IQR-flagged outliers. The bounds are wide because the features span their full natural ranges — tenure 0–72 months (by contract design), monthlycharges ~$18–$119, totalcharges $0–$8,684. The right-skew in `totalcharges` reflects a genuine business pattern, not contamination. All values are retained.
+All three numeric features have zero IQR-flagged outliers. The bounds are wide because the features span their full natural ranges — tenure 0–72 months (by contract design), monthlycharges ~$18–$119, totalcharges ~$19–$8,685. The right-skew in `totalcharges` reflects a genuine business pattern, not contamination. All values are retained.
 
 **Categorical cardinality:**
 Excluding `customerid` (7,043 unique values — one per customer), all 15 modelling features have 2–4 distinct values — low cardinality throughout, so one-hot encoding is safe with no dimensionality or sparsity concern.
@@ -153,8 +184,8 @@ Chi-squared + Cramér's V for categorical features (V > 0.30 = strong, 0.10–0.
 |---|---|---|---|
 | Contract type | Cramér's V | **0.41** (strong) | Month-to-month: ~43 % churn; One year: ~11 %; Two year: < 3 % |
 | tenure | Rank-biserial r | **−0.48** | Churners average 18 months; non-churners 38 months |
-| OnlineSecurity | Cramér's V | 0.35 (strong) | Churn ~2× higher without the service |
-| TechSupport | Cramér's V | 0.34 (strong) | Churn ~2× higher without the service |
+| OnlineSecurity | Cramér's V | 0.35 (strong) | Churn ~3× higher without the service |
+| TechSupport | Cramér's V | 0.34 (strong) | Churn ~3× higher without the service |
 | InternetService | Cramér's V | 0.32 (strong) | Fiber optic carries disproportionately high churn |
 | PaymentMethod | Cramér's V | 0.30 (strong) | Electronic check is the highest-churn payment method |
 | TotalCharges | Rank-biserial r | −0.30 | Churners accumulate less ($1,532 vs $2,555) before leaving |
@@ -166,8 +197,8 @@ Chi-squared + Cramér's V for categorical features (V > 0.30 = strong, 0.10–0.
 | SeniorCitizen | Cramér's V | 0.15 | ~42 % churn vs ~24 % — likely mediated by contract type and internet service |
 | Partner | Cramér's V | 0.15 | Without a partner: above-average churn |
 | MultipleLines | Cramér's V | 0.04 | Statistically significant but practically negligible |
-| **PhoneService** | Cramér's V | **0.01** (p = 0.34) | **Non-predictor** |
-| **Gender** | Cramér's V | **0.0086** (p = 0.49) | **Non-predictor** |
+| **PhoneService** | Cramér's V | **0.01** (p = 0.32) | **Non-predictor** |
+| **Gender** | Cramér's V | **0.0086** (p = 0.47) | **Non-predictor** |
 
 **Interpretive notes:**
 
@@ -309,13 +340,13 @@ LightGBM and LogisticRegressionCV are compared on PR-AUC: threshold-free, aligne
 
 | Candidate | CV PR-AUC | ± std | Train s/fold |
 |---|---|---|---|
-| `dummy_prior` | 0.2654 | 0.0007 | 0.00 |
-| `logreg_cv` | 0.6511 | 0.0366 | 0.91 |
-| `lgbm_default` | 0.6582 | 0.0347 | 0.25 |
+| `dummy_prior` | 0.265 | 0.001 | 0.00 |
+| `logreg_cv` | 0.651 | 0.033 | 0.89 |
+| `lgbm_default` | 0.658 | 0.035 | 0.25 |
 
-**Safeguard check passed:** the dummy classifier scored 0.2654, matching the dev-set churn rate (0.2654) to four decimal places — confirming the real candidates' higher scores reflect genuine predictive signal, not a broken eval harness or leaked target.
+**Safeguard check passed:** the dummy classifier scored 0.265, matching the dev-set churn rate (0.265) — confirming the real candidates' higher scores reflect genuine predictive signal, not a broken eval harness or leaked target.
 
-LightGBM leads by ~0.007 PR-AUC points; ROC-AUC is close and non-contradictory (0.8433 LogReg vs. 0.8446 LightGBM, both rounding to 0.84). LogReg is markedly more expensive to train here (`LogisticRegressionCV`'s inner 5-fold search over 10 `C` values costs ~3.6× LightGBM's single fit per outer fold) — a genuine simplicity-vs-cost tradeoff LogReg does *not* win on, despite its interpretability appeal.
+LightGBM leads by ~0.007 PR-AUC points; ROC-AUC is close and non-contradictory (0.844 for both candidates). LogReg is markedly more expensive to train here (`LogisticRegressionCV`'s inner 5-fold search over 10 `C` values costs ~3.6× LightGBM's single fit per outer fold — 0.89s vs. 0.25s) — a genuine simplicity-vs-cost tradeoff LogReg does *not* win on, despite its interpretability appeal.
 
 #### Precision/F1-at-fixed-recall profile
 
@@ -323,19 +354,19 @@ Threshold-dependent diagnostics (precision, F1) are not reported at the default 
 
 | Recall target | LogReg precision | LogReg F1 | LogReg threshold | LightGBM precision | LightGBM F1 | LightGBM threshold |
 |---|---|---|---|---|---|---|
-| 0.70 | 0.574 | 0.631 | 0.595 | 0.572 | 0.629 | 0.574 |
-| 0.80 | 0.514 | 0.626 | 0.482 | 0.519 | 0.630 | 0.450 |
-| 0.90 | 0.442 | 0.593 | 0.336 | 0.442 | 0.593 | 0.266 |
+| 0.70 | 0.573 | 0.631 | 0.596 | 0.574 | 0.631 | 0.572 |
+| 0.80 | 0.516 | 0.628 | 0.485 | 0.517 | 0.628 | 0.453 |
+| 0.90 | 0.445 | 0.595 | 0.341 | 0.446 | 0.596 | 0.269 |
 
-Precision and F1 are essentially indistinguishable between candidates at every recall target — reinforcing the near-linear finding above. The threshold column is the actual cutoff each candidate needed to hit that recall target on its own OOF predictions; it differs more between the two models (e.g. 0.336 vs. 0.266 at the 0.90 target) because their predicted-probability distributions aren't shaped the same way, but neither is a committed decision threshold. These profiles are threshold-*planning* diagnostics, not selection tools (PR-AUC alone decides the family); the operating threshold itself is set later (§8).
+Precision and F1 are essentially indistinguishable between candidates at every recall target — reinforcing the near-linear finding above. The threshold column is the actual cutoff each candidate needed to hit that recall target on its own OOF predictions; it differs more between the two models (e.g. 0.341 vs. 0.269 at the 0.90 target) because their predicted-probability distributions aren't shaped the same way, but neither is a committed decision threshold. These profiles are threshold-*planning* diagnostics, not selection tools (PR-AUC alone decides the family); the operating threshold itself is set later (§8).
 
 #### Disaggregated robustness & fairness check (flag-only)
 
 Pre-registered, computed on OOF predictions for all three candidates, and explicitly non-gating — aggregate PR-AUC still decides the family regardless of what this check finds.
 
-**Robustness** (`contract_type`, `tenure_cohort`, `internetservice`): per-segment PR-AUC tracks each segment's own churn-rate prevalence for both candidates (e.g. LightGBM: 0.428 churn rate → 0.693 PR-AUC on month-to-month; 0.029 → 0.073 on two-year contracts) — expected for a prevalence-sensitive metric, not a robustness failure. A paired row-level bootstrap (`segment_bootstrap_delta`, 1,000 resamples) puts a 95% CI on the LightGBM-minus-LogReg gap in each segment: only 3 of 11 exclude zero. LightGBM has a genuine edge among 0–12m-tenure customers (Δ = +0.022, CI [0.001, 0.044]) and no-internet customers (Δ = +0.080, CI [0.009, 0.156], the widest gap of any segment) — both large, high-churn groups where retention spend is concentrated. LogReg edges out on 49–65m tenure (Δ = −0.044, CI [−0.086, −0.003]), a smaller, lower-risk group. Every other split — including the full contract-type breakdown, where the point estimates are themselves mixed (LogReg ahead on one-year and two-year contracts, LightGBM ahead on month-to-month) — straddles zero and isn't distinguishable from sampling noise.
+**Robustness** (`contract_type`, `tenure_cohort`, `internetservice`): per-segment PR-AUC tracks each segment's own churn-rate prevalence for both candidates (e.g. LightGBM: 0.428 churn rate → 0.694 PR-AUC on month-to-month; 0.029 → 0.070 on two-year contracts) — expected for a prevalence-sensitive metric, not a robustness failure. A paired row-level bootstrap (`segment_bootstrap_delta`, 1,000 resamples) puts a 95% CI on the LightGBM-minus-LogReg gap in each segment: 4 of 11 exclude zero, split evenly between the two candidates. LightGBM has a genuine edge among 0–12m-tenure customers (Δ = +0.025, CI [0.005, 0.047]; the highest-churn tenure band, 47.4%) and no-internet customers (Δ = +0.092, CI [0.024, 0.164], the widest gap of any segment; one of the lowest-churn segments, 7.5%) — spanning both risk tiers, not just the high-churn one. LogReg edges out on 13–24m tenure (Δ = −0.036, CI [−0.066, −0.001]) and 49–65m tenure (Δ = −0.046, CI [−0.084, −0.001]). Every other split — including the full contract-type breakdown, where the point estimates are themselves mixed (LogReg ahead on one-year and two-year contracts, LightGBM ahead on month-to-month) — straddles zero and isn't distinguishable from sampling noise.
 
-**Fairness** (`gender`, `seniorcitizen`, `has_partner`, `dependents` — the four protected/quasi-protected axes, per this section's policy of measurement over exclusion (see "Protected attributes & fairness policy" below)): per-subgroup PR-AUC gaps track each subgroup's own churn-rate prevalence for both candidates (e.g. LightGBM: 0.729 PR-AUC for senior citizens, 42.0% churn rate, vs. 0.629 for non-seniors, 23.6% churn rate) — the same prevalence-driven pattern as the robustness segments, not evidence of differential treatment. The same CI test is unambiguous here: all 8 of 8 fairness segments straddle zero — no demographic split shows a LightGBM-vs-LogReg gap distinguishable from sampling noise, including `has_partner` (Δ = −0.004, CI [−0.024, 0.016]), which looked like a hairline LogReg edge before the CI was applied. So the family choice doesn't trade fairness for LightGBM's other advantages — a conclusion resting on a formal test, not eyeballed gaps. **No disparity is flagged for follow-up at this stage.**
+**Fairness** (`gender`, `seniorcitizen`, `has_partner`, `dependents` — the four protected/quasi-protected axes, per this section's policy of measurement over exclusion (see "Protected attributes & fairness policy" below)): per-subgroup PR-AUC gaps track each subgroup's own churn-rate prevalence for both candidates (e.g. LightGBM: 0.726 PR-AUC for senior citizens, 42.0% churn rate, vs. 0.632 for non-seniors, 23.6% churn rate) — the same prevalence-driven pattern as the robustness segments, not evidence of differential treatment. The same CI test is unambiguous here: all 8 of 8 fairness segments straddle zero — no demographic split shows a LightGBM-vs-LogReg gap distinguishable from sampling noise, including `has_partner` (Δ = −0.003, CI [−0.026, 0.016]), which looked like a hairline LogReg edge before the CI was applied. So the family choice doesn't trade fairness for LightGBM's other advantages — a conclusion resting on a formal test, not eyeballed gaps. **No disparity is flagged for follow-up at this stage.**
 
 #### Bootstrap selection decision
 
@@ -343,17 +374,17 @@ To judge whether LightGBM's lead is real or a quirk of fold assignment, the gap 
 
 | Branch | Condition | Outcome |
 |---|---|---|
-| `material_lgbm_win` | CI excludes 0 in LGBM's favour and Δ ≥ Δ\* | Adopt LightGBM on the evidence |
-| `tie_immaterial` | CI includes 0, or excludes 0 but \|Δ\| < Δ\* | Practical tie — adopt LightGBM on the build-specific rationale above (SHAP, speed, calibration, continuity), not on this comparison |
-| `kill_condition` | CI excludes 0 in LogReg's favour and Δ ≤ −Δ\* | LogReg confidently and materially wins — ship LogReg instead |
+| `lgbm_win` | CI excludes 0 in LGBM's favour and Δ ≥ Δ\* | Adopt LightGBM on the evidence |
+| `tie` | CI includes 0, or excludes 0 but \|Δ\| < Δ\* | Practical tie — adopt LightGBM on the build-specific rationale above (SHAP, speed, calibration, continuity), not on this comparison |
+| `logreg_win` | CI excludes 0 in LogReg's favour and Δ ≤ −Δ\* | LogReg confidently and materially wins — ship LogReg instead |
 
 | | |
 |---|---|
 | Observed gap (LightGBM − LogReg) | +0.007 |
-| 95% confidence interval | [+0.003, +0.011] — excludes zero, entirely in LightGBM's favour |
-| Probability the gap is ≤ 0 | 0.10% (p = 0.0010, informational only) |
+| 95% confidence interval | [+0.002, +0.012] — excludes zero, entirely in LightGBM's favour |
+| Probability the gap is ≤ 0 | 0.20% (p = 0.0020, informational only) |
 | Materiality threshold (Δ\*) | 0.005 |
-| **Branch fired** | **`material_lgbm_win`** |
+| **Branch fired** | **`lgbm_win`** |
 | **Verdict** | **LightGBM adopted on the evidence — the bootstrap shows a genuine, material PR-AUC advantage over LogReg, reinforced by (not resting on) the build-specific rationale above** |
 
 **This comparison uses default LightGBM as a conservative floor** — hyperparameter tuning happens later in this section, after the feature-selection freeze below, and cannot run earlier without violating select-then-tune. The asymmetry cuts in the safe direction: if untuned LightGBM already beats tuned-to-its-ceiling LogReg, tuning can only widen the gap in LightGBM's favour. The margin reported here is refreshed after the tuning subsection's result against the tuned model — recorded once that lands.
@@ -366,14 +397,14 @@ After the family is confirmed (LightGBM), a diagnostic pass on the development s
 
 | | |
 |---|---|
-| Train PR-AUC (mean) | 0.7943 |
-| CV PR-AUC (mean) | 0.6582 |
+| Train PR-AUC (mean) | 0.7945 |
+| CV PR-AUC (mean) | 0.6583 |
 | Train − CV gap (variance) | 0.1362 |
-| Lift over Dummy floor (bias) | +0.3932 (0.6582 − 0.265) |
+| Lift over Dummy floor (bias) | +0.3933 (0.6583 − 0.265) |
 
-The gap is wide — well above the ~0.05 healthy guideline — meaning default LightGBM (100 trees, `num_leaves=20`) overfits the ~4,500-row training folds noticeably. Three signals rule out bias: training PR-AUC (0.7943) is already far above the Dummy floor, so the model fits the pattern; the held-out lift over that floor (+0.3932) confirms it generalises; and the learning curve's train-CV gap narrows from 0.312 at 900 rows to 0.147 at 4,507 rows as training size grows 5× — a bias problem wouldn't shrink with more data. CV PR-AUC is still climbing (0.623 → 0.656) without plateauing, so more data would likely help further — a data-acquisition note (§11), not a feature gap.
+The gap is wide — well above the ~0.05 healthy guideline — meaning default LightGBM (100 trees, `num_leaves=20`) overfits the ~4,500-row training folds noticeably. Three signals rule out bias: training PR-AUC (0.7945) is already far above the Dummy floor, so the model fits the pattern; the held-out lift over that floor (+0.3933) confirms it generalises; and the learning curve's train-CV gap narrows from 0.316 at 901 rows to 0.153 at 4,507 rows as training size grows 5× — a bias problem wouldn't shrink with more data. CV PR-AUC is still climbing (0.610 → 0.652) without plateauing, so more data would likely help further — a data-acquisition note (§11), not a feature gap.
 
-A single 80/20 early-stopping run makes the overfitting concrete round by round (illustrative only, not the fold-averaged number driving the decision): validation PR-AUC plateaus by round ~20 (0.708) and holds flat (mean 0.707, std 0.002) for the remaining 80 rounds, while training PR-AUC keeps climbing the whole time, from 0.861 at round 20 to 0.910 at round 100 — the model keeps "improving" on data it has already memorised, long after validation performance has stopped moving.
+A single 80/20 early-stopping run makes the overfitting concrete round by round (illustrative only, not the fold-averaged number driving the decision): validation PR-AUC peaks at round 41 (0.6608), then drifts down to 0.6513 by round 100 as the model starts overfitting, while training PR-AUC climbs the whole time, from 0.812 at round 1 to 0.914 at round 100 — the model keeps "improving" on data it has already memorised, well past the point where validation peaked.
 
 This is a **variance** signal, not a bias one — and simplifying the model is itself a standard variance remedy, so both the hyperparameter regularisation search in the tuning subsection below (`reg_alpha`/`reg_lambda`, `num_leaves`, `min_child_samples`) and the feature-count reduction tested in the next section are legitimate responses to this gap, not just the former.
 
@@ -381,21 +412,21 @@ This is a **variance** signal, not a bias one — and simplifying the model is i
 
 | Segment | Value | n | Churn rate | PR-AUC | 95% CI |
 |---|---|---|---|---|---|
-| Contract | Month-to-month | 3,095 | 0.428 | 0.693 | [0.668, 0.719] |
-| Contract | One year | 1,178 | 0.110 | 0.191 | [0.155, 0.238] |
-| Contract | Two year | 1,361 | 0.029 | 0.073 | [0.045, 0.126] |
-| Tenure band | < 12m | 1,756 | 0.474 | 0.752 | [0.718, 0.784] |
-| Tenure band | 12–36m | 1,480 | 0.254 | 0.549 | [0.499, 0.605] |
-| Tenure band | > 36m | 2,398 | 0.120 | 0.364 | [0.314, 0.422] |
-| Service quintile | 1 (fewest) | 1,666 | 0.190 | 0.647 | [0.591, 0.703] |
-| Service quintile | 2 | 687 | 0.438 | 0.722 | [0.670, 0.778] |
-| Service quintile | 3 | 1,521 | 0.347 | 0.659 | [0.618, 0.705] |
-| Service quintile | 4 | 742 | 0.255 | 0.661 | [0.595, 0.732] |
-| Service quintile | 5 (most) | 1,018 | 0.158 | 0.500 | [0.416, 0.576] |
-| `charge_per_service` outlier (> p95) | outlier | 282 | 0.621 | 0.827 | [0.765, 0.889] |
-| `charge_per_service` outlier (> p95) | normal | 5,352 | 0.247 | 0.625 | [0.597, 0.654] |
+| Contract | Month-to-month | 3,095 | 0.428 | 0.694 | [0.667, 0.721] |
+| Contract | One year | 1,178 | 0.110 | 0.188 | [0.150, 0.236] |
+| Contract | Two year | 1,361 | 0.029 | 0.070 | [0.043, 0.118] |
+| Tenure band | < 12m | 1,756 | 0.474 | 0.754 | [0.722, 0.785] |
+| Tenure band | 12–36m | 1,480 | 0.254 | 0.547 | [0.496, 0.605] |
+| Tenure band | > 36m | 2,398 | 0.120 | 0.360 | [0.311, 0.422] |
+| Service quintile | 1 (fewest) | 1,666 | 0.190 | 0.644 | [0.595, 0.694] |
+| Service quintile | 2 | 687 | 0.438 | 0.726 | [0.673, 0.778] |
+| Service quintile | 3 | 1,521 | 0.347 | 0.662 | [0.617, 0.707] |
+| Service quintile | 4 | 742 | 0.255 | 0.663 | [0.593, 0.730] |
+| Service quintile | 5 (most) | 1,018 | 0.158 | 0.499 | [0.424, 0.579] |
+| `charge_per_service` outlier (> p95) | outlier | 282 | 0.621 | 0.827 | [0.765, 0.883] |
+| `charge_per_service` outlier (> p95) | normal | 5,352 | 0.247 | 0.626 | [0.599, 0.652] |
 
-Every segment's PR-AUC clears its own churn-rate floor by a healthy margin, and a 95% CI on each segment's PR-AUC (a single-model bootstrap computed inline in the notebook, distinct from `segment_bootstrap_delta`) confirms this holds under sampling uncertainty too — its lower bound still clears the floor everywhere. The margin is narrowest on the two smallest, lowest-churn segments — One year contracts (floor 0.110, CI lower bound 0.155) and Two year contracts (floor 0.029, CI lower bound 0.045, ~39 churners) — but even there it clears comfortably; every other segment's margin is at least 3× wider. Service-count churn is non-monotonic (quintile 2 peaks at 43.8%), a genuine pattern the model tracks without degrading. **No systematic failure pattern is identified** — with no segment to target and no bias signal from the checks above, feature selection (below) proceeds on the current 20-column set without additional feature engineering.
+Every segment's PR-AUC clears its own churn-rate floor by a healthy margin, and a 95% CI on each segment's PR-AUC (a single-model bootstrap computed inline in the notebook, distinct from `segment_bootstrap_delta`) confirms this holds under sampling uncertainty too — its lower bound still clears the floor everywhere. The margin is narrowest on the two smallest, lowest-churn segments — One year contracts (floor 0.110, CI lower bound 0.150) and Two year contracts (floor 0.029, CI lower bound 0.043, ~39 churners) — but even there it clears comfortably; every other segment's margin is at least 3× wider. Service-count churn is non-monotonic (quintile 2 peaks at 43.8%), a genuine pattern the model tracks without degrading. **No systematic failure pattern is identified** — with no segment to target and no bias signal from the checks above, feature selection (below) proceeds on the current 20-column set without additional feature engineering.
 
 ### 4b. Feature Selection (input-space freeze)
 
@@ -405,41 +436,41 @@ Selected once against default LightGBM after family commitment, inside CV on the
 
 Two checks guard against this method misleading:
 
-1. **Fluke check.** Refit across all 100 CV folds and track each feature's survival rate. Mostly consistent (survivors ≥49/100, dropped ≤13/100), but `paymentmethod` is a coin flip (49/100) despite a comfortable all-dev margin, and `charge_per_service` is the reverse — thin margin, but a stable 63/100.
-2. **Correlated-credit check.** Shuffling correlated features one at a time can under-count shared signal, so each correlated cluster is re-tested together before accepting an individual failure. The `tenure`/`totalcharges`/`monthlycharges` trio all clear the floor alone (no rescue needed). The 7-feature `internetservice` add-on cluster (VIF = ∞, §8b `01-eda.ipynb`) has only 3 individual survivors (`internetservice`, `techsupport`, `onlinesecurity`), but the other 4 didn't need rescuing either — credit-splitting never dragged a real signal under the floor.
+1. **Fluke check.** Refit across all 100 CV folds and track each feature's survival rate. 8 of the 10 all-dev survivors are selected in at least 70 of 100 folds (`tenure`/`contract_type` every time), but `streamingtv` — the thinnest all-dev survivor — is picked in only 5 of 100 folds, and `paymentmethod` in just 33. Two dropped features cross over the other way: `paperlessbilling` (55/100) and `charge_per_service` (46/100) are both selected more often than either `streamingtv` or `paymentmethod`, despite failing the all-dev floor outright.
+2. **Correlated-credit check.** Shuffling correlated features one at a time can under-count shared signal, so each correlated cluster is re-tested together before accepting an individual failure. The `tenure`/`totalcharges`/`monthlycharges` trio all clear the floor alone (no rescue needed; `tenure`–`totalcharges` correlate at 0.89, the strongest pair in the trio). The 7-feature `internetservice` add-on cluster (VIF = ∞, §8b `01-eda.ipynb`) has 4 individual survivors (`internetservice`, `onlinesecurity`, `techsupport`, `streamingtv`), but the other 3 (`onlinebackup`, `deviceprotection`, `streamingmovies`) didn't need rescuing either — credit-splitting never dragged a real signal under the floor.
 
-**Deciding keep vs. reduce, and the outcome.** Same mechanism as the model-family decision above: refit the full and reduced (11-feature) candidates on the same 100 folds, then bootstrap Δ = mean(AP_full) − mean(AP_reduced), paired fold by fold. Result: reduced **0.6510** vs. full **0.6580** — Δ = **0.0070**, 95% CI **[0.0040, 0.0090]**, p < 0.0001, full wins 72 of 100 folds — clears the materiality bar, so **`material_full_win`** fires: **the full set is retained, 20 of 20 kept**. Below, 11 of 20 features individually clear their own decoy floor; the other 9 — including all four protected/quasi-protected attributes (see below) — stay anyway, since this aggregate test, not the per-feature table, governs adoption. That table is a diagnostic audit trail only; it never touches the sealed test set.
+**Deciding keep vs. reduce, and the outcome.** Same mechanism as the model-family decision above: refit the full and reduced (10-feature) candidates on the same 100 folds, then bootstrap Δ = mean(AP_full) − mean(AP_reduced), paired fold by fold. Result: reduced **0.6490** vs. full **0.6580** — Δ = **0.0100**, 95% CI **[0.0060, 0.0140]**, p < 0.0001, full wins 65 of 100 folds — clears the materiality bar, so **`full_features_win`** fires: **the full set is retained, 20 of 20 kept**. Below, 10 of 20 features individually clear their own decoy floor; the other 10 — including all four protected/quasi-protected attributes (see below) — stay anyway, since this aggregate test, not the per-feature table, governs adoption. That table is a diagnostic audit trail only; it never touches the sealed test set.
 
 | Feature | Real importance | Decoy floor | Survived (all-dev) | Per-fold stability |
 |---|---:|---:|:---:|---:|
-| `tenure` | 0.1350 | 0.0070 | ✅ | 100/100 |
-| `contract_type` | 0.1120 | 0.0070 | ✅ | 100/100 |
-| `totalcharges` | 0.0390 | 0.0070 | ✅ | 91/100 |
-| `internetservice` | 0.0300 | 0.0070 | ✅ | 88/100 |
-| `monthlycharges` | 0.0300 | 0.0070 | ✅ | 98/100 |
-| `techsupport` | 0.0200 | 0.0070 | ✅ | 88/100 |
-| `paperlessbilling` | 0.0140 | 0.0070 | ✅ | 61/100 |
-| `paymentmethod` | 0.0140 | 0.0070 | ✅ | 49/100 |
-| `multiplelines` | 0.0130 | 0.0070 | ✅ | 75/100 |
-| `onlinesecurity` | 0.0110 | 0.0070 | ✅ | 65/100 |
-| `charge_per_service` | 0.0100 | 0.0070 | ✅ | 63/100 |
-| `seniorcitizen` | 0.0060 | 0.0070 | ❌ | 1/100 |
-| `onlinebackup` | 0.0040 | 0.0070 | ❌ | 2/100 |
-| `gender` | 0.0020 | 0.0070 | ❌ | 6/100 |
-| `dependents` | 0.0010 | 0.0070 | ❌ | 4/100 |
-| `streamingtv` | 0.0010 | 0.0070 | ❌ | 13/100 |
-| `streamingmovies` | 0.0010 | 0.0070 | ❌ | 0/100 |
-| `has_partner` | -0.0010 | 0.0070 | ❌ | 0/100 |
-| `phoneservice` | -0.0010 | 0.0070 | ❌ | 1/100 |
-| `deviceprotection` | -0.0010 | 0.0070 | ❌ | 0/100 |
+| `tenure` | 0.0880 | 0.0050 | ✅ | 100/100 |
+| `contract_type` | 0.0840 | 0.0050 | ✅ | 100/100 |
+| `internetservice` | 0.0280 | 0.0050 | ✅ | 95/100 |
+| `totalcharges` | 0.0240 | 0.0050 | ✅ | 91/100 |
+| `monthlycharges` | 0.0200 | 0.0050 | ✅ | 94/100 |
+| `multiplelines` | 0.0160 | 0.0050 | ✅ | 72/100 |
+| `paymentmethod` | 0.0130 | 0.0050 | ✅ | 33/100 |
+| `techsupport` | 0.0090 | 0.0050 | ✅ | 88/100 |
+| `onlinesecurity` | 0.0080 | 0.0050 | ✅ | 70/100 |
+| `streamingtv` | 0.0060 | 0.0050 | ✅ | 5/100 |
+| `paperlessbilling` | 0.0050 | 0.0050 | ❌ | 55/100 |
+| `streamingmovies` | 0.0040 | 0.0050 | ❌ | 3/100 |
+| `seniorcitizen` | 0.0030 | 0.0050 | ❌ | 4/100 |
+| `onlinebackup` | 0.0030 | 0.0050 | ❌ | 7/100 |
+| `charge_per_service` | 0.0010 | 0.0050 | ❌ | 46/100 |
+| `deviceprotection` | -0.0000 | 0.0050 | ❌ | 0/100 |
+| `phoneservice` | -0.0010 | 0.0050 | ❌ | 0/100 |
+| `dependents` | -0.0010 | 0.0050 | ❌ | 3/100 |
+| `has_partner` | -0.0010 | 0.0050 | ❌ | 0/100 |
+| `gender` | -0.0010 | 0.0050 | ❌ | 5/100 |
 
-*(Decoy importance on the all-dev fit was 0.0020; the floor is `max(0.0020, 0) + 0.005 = 0.007` for every row.)*
+*(Decoy importance on the all-dev fit was -0.0060; the floor is `max(-0.0060, 0) + 0.005 = 0.005` for every row.)*
 
-**Reasons for keeping the failed features.** Most of the 9 failing features carry real, statistically significant univariate correlation with churn per `01-eda.ipynb` §7's Cramér's V — the add-on quartet `onlinebackup`/`deviceprotection`/`streamingtv`/`streamingmovies` and the protected-attribute trio `seniorcitizen`/`has_partner`/`dependents`. That's redundancy, not noise: the signal doesn't survive as *marginal* contribution once the rest of the feature set is already in the model — though not a simple one-bigger-feature story, since the add-on cluster's own rescue check above found no credit-splitting, and `seniorcitizen` is VIF-orthogonal to everything else (§8b `01-eda.ipynb`). `gender` and `phoneservice` are the one clean case where EDA and permutation importance both agree there's no signal at all. `charge_per_service` — the sole engineered feature adopted during feature discovery (§3a) — now clears its own floor (0.0100 vs. 0.0070, 63/100 fold stability); `multiplelines` runs the opposite way, weak in EDA (V = 0.04) but real here. None of this changes the outcome: every one of the 20 stays regardless of its individual read, because the decision above is a single full-vs-reduced choice, not a per-feature filter.
+**Reasons for keeping the failed features.** Most of the 10 failing features carry real, statistically significant univariate correlation with churn per `01-eda.ipynb` §7's Cramér's V — the add-on trio `onlinebackup`/`deviceprotection`/`streamingmovies` (V = 0.23–0.29), `paperlessbilling` (V = 0.19), and the protected-attribute trio `seniorcitizen`/`has_partner`/`dependents` (V = 0.15–0.16). That's redundancy, not noise: the signal doesn't survive as *marginal* contribution once the rest of the feature set is already in the model — though not a simple one-bigger-feature story, since the add-on cluster's own rescue check above found no credit-splitting, and `seniorcitizen` is VIF-orthogonal to everything else (§8b `01-eda.ipynb`). `gender` and `phoneservice` are the one clean case where EDA and permutation importance both agree there's no signal at all (V ≈ 0.01, both fail to reject the null). `charge_per_service` — the sole engineered feature adopted during feature discovery, constructed in LAP 7 of `02a-feature-discovery.ipynb` — fails its own floor here (0.0010 vs. 0.0050, 46/100 fold stability) despite passing a different, incremental-signal screen at adoption time (§3a); `multiplelines` runs the opposite way, weak in EDA (V = 0.04) but real here. None of this changes the outcome: every one of the 20 stays regardless of its individual read, because the decision above is a single full-vs-reduced choice, not a per-feature filter.
 
-**SHAP audit (diagnostic only).** A second, different lens on the same 20 features: `compute_shap_audit` fits one more default-config LightGBM and measures each feature's average contribution to individual predictions — not the performance drop from removing it, like permutation importance measures. It never decides keep/drop; it's a cross-check only. The two methods agree completely on *which* 11 features matter: every permutation-importance survivor also lands in SHAP's top 11. They disagree only on order within that group: `contract_type` and `tenure` swap the top two spots (SHAP rates `contract_type` more than double `tenure`'s score — 1.115 vs. 0.465 — the reverse of permutation importance's order), and `paymentmethod` jumps from a middling permutation-importance rank to 3rd by SHAP (0.351) — plausibly because SHAP credits its role in individual predictions more than one shuffle-and-measure pass captures.
+**SHAP audit (diagnostic only).** A second, different lens on the same 20 features: `compute_shap_audit` fits one more default-config LightGBM and measures each feature's average contribution to individual predictions — not the performance drop from removing it, like permutation importance measures. It never decides keep/drop; it's a cross-check only. The two methods mostly agree on *which* features matter, but not completely: 9 of the 10 permutation-importance survivors occupy 9 of the top 10 SHAP ranks. The exception is `streamingtv`, the thinnest survivor (real importance 0.006, barely above the 0.005 floor), which falls to 12th by SHAP (mean |SHAP| 0.105) — behind two features that failed the decoy floor outright: `charge_per_service` (8th, 0.167) and `paperlessbilling` (11th, 0.113). Among the features both methods agree on, ordering still reshuffles: `contract_type` and `tenure` swap the top two spots (SHAP rates `contract_type` more than double `tenure`'s score — 1.115 vs. 0.465 — the reverse of permutation importance's order, 0.084 vs. 0.088), and `paymentmethod` jumps from a modest 7th-of-10 permutation-importance rank (0.013) to 3rd by SHAP (0.351) — plausibly because SHAP credits its role in individual predictions more than one shuffle-and-measure pass captures.
 
-**Tradeoff and future consideration.** The full set's edge costs something too: 9 extra columns to validate and monitor, for a ~1% relative PR-AUC gain — a team prioritizing simplicity or a smaller fairness-audit surface (e.g. dropping `gender`) could reasonably prefer the reduced set instead, with a different Δ\* set in advance rather than a different reading of the same evidence. A finer-grained method like `RFECV` could identify exactly which 1-2 features are safe to drop individually, but isn't worth adopting now: run naively it reintroduces the stepwise-selection bias the single pre-registered test avoids, and run correctly (nested CV, to avoid that bias) it costs meaningfully more compute — either way, for a marginal payoff at this feature-set size. Worth revisiting only if serving cost or audit-surface reduction becomes a real priority.
+**Tradeoff and future consideration.** The full set's edge costs something too: 10 extra columns to validate and monitor, for a ~1.4% relative PR-AUC gain — a team prioritizing simplicity or a smaller fairness-audit surface (e.g. dropping `gender`) could reasonably prefer the reduced set instead, with a different Δ\* set in advance rather than a different reading of the same evidence. A finer-grained method like `RFECV` could identify exactly which 1-2 features are safe to drop individually, but isn't worth adopting now: run naively it reintroduces the stepwise-selection bias the single pre-registered test avoids, and run correctly (nested CV, to avoid that bias) it costs meaningfully more compute — either way, for a marginal payoff at this feature-set size. Worth revisiting only if serving cost or audit-surface reduction becomes a real priority.
 
 #### Protected attributes & fairness policy
 
@@ -451,7 +482,7 @@ All four protected / quasi-protected attributes — `gender` (sex), `seniorcitiz
 
 ### 4c. Hyperparameter Tuning (Optuna)
 
-Tunes LightGBM only, on the input space frozen by Feature Selection above (§4b: `material_full_win`, all 20 features retained). PR-AUC (`average_precision`) is the sole study objective, consistent with the one-metric invariant.
+Tunes LightGBM only, on the input space frozen by Feature Selection above (§4b: `full_features_win`, all 20 features retained). PR-AUC (`average_precision`) is the sole study objective, consistent with the one-metric invariant.
 
 Study configuration:
 
@@ -462,21 +493,21 @@ Study configuration:
 | Pruner | `MedianPruner` — kills a trial mid-CV once it's clearly behind the running median |
 | CV scheme | Single stratified 5-fold (`cv_folds=5`) — lighter than the candidate decision's repeated scheme, since 50 trials of early-stopped fits already sets the tuning budget |
 | `n_estimators` | Not searched — set per fold by early stopping on `average_precision` (ceiling 2000, `early_stopping_rounds=50`); each trial's value is the median tree count across its own 5 folds |
-| Search space | `num_leaves` (10–200), `learning_rate` (log-uniform, 0.005–0.1), `min_child_samples` (10–100), `subsample` (0.5–1.0), `colsample_bytree` (0.5–1.0), `reg_alpha` (0.0–10.0), `reg_lambda` (0.0–10.0), `max_depth` (3–12) |
+| Search space | `num_leaves` (5–200), `learning_rate` (log-uniform, 0.005–0.1), `min_child_samples` (10–100), `subsample` (0.5–1.0), `colsample_bytree` (0.5–1.0), `reg_alpha` (0.0–10.0), `reg_lambda` (0.0–10.0), `max_depth` (3–12) |
 | Best-trial rule | **1-SE** (Breiman/glmnet convention) — most-regularized trial within one standard error of the raw-best trial's own CV score, not bare argmax |
 
 **Study hygiene (four checks recorded):**
 
-1. **Pruning** — MedianPruner adopted; **16 of 50 trials completed, 34 pruned** mid-CV, saving the budget for configurations plausibly competitive with the running median.
+1. **Pruning** — MedianPruner adopted; **47 of 50 trials completed, 3 pruned** mid-CV, saving the budget for configurations plausibly competitive with the running median.
 2. **Boundary-hit check** — none of the 8 selected hyperparameters sit on its searched range's edge (all `False`); the widened ranges above comfortably contain the optimum.
-3. **Selection rule** — raw argmax (trial 37, CV PR-AUC 0.6664) is **not** adopted. The 1-SE rule picks **trial 10** (CV PR-AUC 0.6606, within one SE = 0.0140 of trial 37) for far fewer `num_leaves` (11 vs. 137) and about half the trees (59 vs. 102) — `num_leaves` is LightGBM's primary complexity control, and this study's own fANOVA chart confirms it dominates (~0.4–0.6 importance; the ranking below it isn't reproducible run-to-run, since Optuna's fANOVA evaluator is unseeded). Net effect: a ~0.006 PR-AUC sacrifice for a materially simpler configuration.
-4. **Convergence** — the running-best curve is flat from trial 37 onward (the five trials after it — 40, 41, 42, 47, 48 — all land below the running best); the study is not still climbing at the 50-trial budget.
+3. **Selection rule** — raw argmax (trial 13, CV PR-AUC 0.6668) is **not** adopted. The 1-SE rule picks **trial 10** (CV PR-AUC 0.6621, within one SE = 0.0060 of trial 13) for far fewer `num_leaves` (6 vs. 151) and about 60% of the trees (94 vs. 161) — `num_leaves` is LightGBM's documented main complexity control under leaf-wise growth, though this particular study's own fANOVA ranking (now seeded for reproducibility) doesn't reflect that theoretical primacy: `max_depth` dominates at 22.5% of total importance, with `num_leaves` mid-pack at 9.9%. Net effect: a ~0.0047 PR-AUC sacrifice for a materially simpler configuration.
+4. **Convergence** — the running-best curve is flat from trial 13 onward (every trial from 14 through 50 lands at or below it — a wide plateau, not a narrow cutoff); the study is not still climbing at the 50-trial budget.
 
 **Selected hyperparameters (trial 10, 1-SE rule; MLflow run `tuning_study` → nested `trial_009`) vs. LightGBM defaults:**
 
 | Hyperparameter | Default | Tuned (1-SE) |
 |---|---:|---:|
-| `num_leaves` | 20 | 11 |
+| `num_leaves` | 20 | 6 |
 | `learning_rate` | 0.1 | 0.0575 |
 | `min_child_samples` | 50 | 74 |
 | `subsample` | 1.0 | 0.8645 |
@@ -484,7 +515,7 @@ Study configuration:
 | `max_depth` | −1 (unbounded) | 4 |
 | `reg_alpha` | 0.0 | 0.7404 |
 | `reg_lambda` | 0.0 | 3.5847 |
-| `n_estimators` | 100 | 59 (median over folds) |
+| `n_estimators` | 100 | 94 (median over folds) |
 
 #### Full → reduced → tuned bias/variance progression
 
@@ -492,27 +523,26 @@ Three bias/variance reads chain across the decide→optimize boundary: ① the f
 
 | Stage | Train PR-AUC | CV PR-AUC | Train − CV gap |
 |---|---:|---:|---:|
-| ① Full (20 features, default) | 0.7943 | 0.6582 | 0.1362 |
-| ② Reduced (20 features, default) | 0.7943 | 0.6582 | 0.1362 |
-| ③ Tuned (20 features, 1-SE) | 0.6987 | 0.6659 | **0.0328** |
+| ① Full (20 features, default) | 0.7945 | 0.6583 | 0.1362 |
+| ② Reduced (20 features, default) | 0.7945 | 0.6583 | 0.1362 |
+| ③ Tuned (20 features, 1-SE) | 0.6944 | 0.6690 | **0.0254** |
 
-Selection alone (①→②) shows no movement this cycle, since Feature Selection (§4b) retained the full set — confirming feature count was never the primary overfit lever here. Tuning (②→③) is what does the work: the gap **shrinks 76%** (0.1362 → 0.0328) while CV PR-AUC simultaneously **improves** (0.6582 → 0.6659) — the default model was overfitting, fitting the training data (0.7943) far better than it generalized to unseen data (0.6582). Tuning deliberately gives up some of that training fit (down to 0.6987) to curb the overfitting, and it pays off: performance on unseen data still goes up (0.6582 → 0.6659) rather than just holding steady. (The tuned CV PR-AUC here, 0.6659, is computed on the 10×10 RSKF scheme for this comparison and differs slightly from the Optuna study's own reported 0.6606, which is a single 5-fold value from a different fold assignment — not a discrepancy, a different measuring instrument.)
+Selection alone (①→②) shows no movement this cycle, since Feature Selection (§4b) retained the full set — confirming feature count was never the primary overfit lever here. Tuning (②→③) is what does the work: the gap **shrinks 81%** (0.1362 → 0.0254) while CV PR-AUC simultaneously **improves** (0.6583 → 0.6690) — the default model was overfitting, fitting the training data (0.7945) far better than it generalized to unseen data (0.6583). Tuning deliberately gives up some of that training fit (down to 0.6944) to curb the overfitting, and it pays off: performance on unseen data still goes up (0.6583 → 0.6690) rather than just holding steady. (The tuned CV PR-AUC here, 0.6690, is computed on the 10×10 RSKF scheme for this comparison and differs slightly from the Optuna study's own reported 0.6621, which is a single 5-fold value from a different fold assignment — not a discrepancy, a different measuring instrument.)
 
 **Detailed threshold-dependent diagnostics (post-tuning error profile, baseline-vs-tuned confusion matrix, McNemar significance) are out of scope for Phase 5** — thresholding is a Phase 6 deliverable and champion error analysis is Phase 7's (`05-error-analysis.ipynb`); reporting them here against an undetermined threshold would violate the "one metric drives selection" invariant. §5 below still reflects the archived notebook's recall-threshold analysis pending the Phase 7 rewrite.
 
-#### Registration — `challenger`
+#### Model logging (not registered)
 
-The tuned pipeline (`tree_preprocessor` + LightGBM at the 1-SE hyperparameters above, `n_estimators=59` fixed — no further early stopping on this final fit) is refit on all of development and logged as one `Pipeline` — not the bare estimator — onto the *same* MLflow run as the `tuning_study` parent (`run_id 29dd80a08871449796c52bd9923c4a94`), per the packaging checklist below:
+The tuned pipeline (`tree_preprocessor` + LightGBM at the 1-SE hyperparameters above, `n_estimators=94` fixed — no further early stopping on this final fit) is refit on all of development and logged as one `Pipeline` — not the bare estimator — onto the *same* MLflow run as the `tuning_study` parent (`run_id 6450decd98cc40ea96f49a6a9de56b39`), per the packaging checklist below:
 
 | Check | Result |
 |---|---|
-| Model signature + input example | Logged (`mlflow.sklearn.log_model`, `serialization_format="cloudpickle"` — mlflow's `skops` default rejects LightGBM's `Booster`/`OrderedDict` internals as untrusted types) |
-| Log → reload → predict parity | **Passed** — reloaded pipeline's predictions match the in-memory model exactly on the input sample |
-| `training_manifest.json` | Populated: git SHA, DVC data hash, hyperparameters, `feature_space` (20) / `feature_columns` (20), CV PR-AUC, paired-Δ vs LogReg with full bootstrap CI — the engineering audit trail |
-| Pinned environment | `uv export`-resolved `requirements.txt`/`conda.yaml` auto-logged (131 dependencies) |
-| Registered as | `telco-churn-pipeline`, alias **`challenger`**, version 1 |
+| Model signature + input example | Logged (`mlflow.sklearn.log_model`) |
+| Log → reload → predict parity | **Passed** — reloaded pipeline's predictions match the in-memory model exactly on a 5-row dev sample |
+| `training_manifest.json` | Populated: git SHA, DVC data hash, hyperparameters, `feature_space` (20) / `feature_columns` (20), CV PR-AUC, paired-Δ vs LogReg with full bootstrap CI, and `tuning_summary` — the engineering audit trail |
+| Registered | **Not at this stage** — logged only (`models:/m-30fc7b1c87c844ff98d6545d79277104`), no `registered_model_name`, no alias |
 
-**This challenger is the raw tuned model** — uncalibrated, un-thresholded, and not evaluated on the sealed test set. Nothing downstream should serve it directly: Phase 6 adds calibration and a cost-sensitive threshold to the same run, Phase 7 evaluates on the sealed test once and promotes `champion`, and only `champion` is ever loaded by serving (Phase 9).
+**This logged pipeline is the raw tuned model** — uncalibrated, un-thresholded, and not evaluated on the sealed test set. Nothing downstream should serve it directly: model calibration (`models/calibrate.py`) performs the training cycle's *single* registration — pointing the `challenger` alias at the calibrated artifact, not this one — Phase 7 evaluates on the sealed test once and promotes `champion`, and only `champion` is ever loaded by serving (Phase 9). Registering an intermediate, uncalibrated artifact here would leave two versions per cycle with no way to tell which is the valid rollback target — exactly the failure mode `CLAUDE.md`'s *Run artifacts vs. registry versions* policy is designed to prevent.
 
 ---
 
@@ -623,6 +653,8 @@ BSS rises from 0.14 (below the 0.20 meaningful-calibration guideline) to 0.33 �
 
 **`cal_pipe` is used for all subsequent scoring.** `best_pipe` is retained for SHAP only, as `CalibratedClassifierCV` wraps an ensemble of 5 internal clones that `TreeExplainer` cannot cleanly penetrate.
 
+> **⚠ Superseded by Phase 6 — the clone-ensemble problem does not exist under `ensemble=False`.** The archived pass used `CalibratedClassifierCV`'s default `ensemble=True`, which fits one base estimator per calibration fold and averages them — hence "5 internal clones" and the fold-0 extraction workaround in §9. Phase 6 `calibrate.py` uses **`ensemble=False`**: the calibrator is fit on out-of-fold predictions while the base estimator is refit once on all of development. There is then **exactly one** internal estimator, reachable directly as `calibrated.calibrated_classifiers_[0].estimator` — the uncalibrated `Pipeline` that `TreeExplainer` needs. No separate `best_pipe` need be retained, and nothing is extracted from a fold. Phase 7's `05-error-analysis.ipynb` uses that access path; **do not implement the fold-0 workaround from this section or from §9.**
+
 ### Bootstrap confidence intervals (1,000 resamples, val set)
 
 | Metric | Point Estimate | 95 % CI | Width |
@@ -638,6 +670,14 @@ BSS rises from 0.14 (below the 0.20 meaningful-calibration guideline) to 0.33 �
 ---
 
 ## 8. Business Impact & Threshold Selection
+
+> **⚠ Superseded by Phase 6 — every threshold in this section (0.2464 / 0.2956 / 0.3596) is derived from an objective this project does not use.** These numbers come from `EDA-original.ipynb` §14.3, which selects the threshold by `np.argmin` over `Cost = FP·c + FN·r·LTV`. **That cost function charges the intervention only to false positives** — in it, a true positive contributes zero, so contacting a churner is free while contacting a non-churner costs `c`. You do not know which you have when you dial the phone; the agent and the discount are paid either way. The recovery benefit is counted (an FN→TP conversion saves `r·LTV`); only the *charge* on true positives is missing, understating the cost of contacting by `q·c` and systematically over-contacting.
+>
+> The archived notebook contains the correct objective and does not select from it: cell 121's second panel plots `P&L = TP·(r·LTV − c) − FP·c`, which per customer is `q·r·LTV − c` — expected value against a "do nothing" baseline. Two panels of one figure, inconsistent economics, selection taken from the wrong one. Its own diagnostics show the damage: P&L is *"small but positive"* at the chosen threshold (left of the P&L maximum), and §15 reports the implied 40.1 % contact budget buying marginal lift of **0.99×** against a KS-optimal cut-off of 34.2 %.
+>
+> **Phase 6 `threshold.py` uses the closed form `t* = c / (r × LTV)`** — contact iff `q·r·LTV > c`. Corrected operating points: **Conservative 0.2736 · Base 0.3942 · Optimistic 0.4963.** The *parameter derivation* below (ARPU → LTV, outreach + offer → `c`, benchmark retention rate) is sound, is retained verbatim, and moves to `configs/costs.yaml`. What changes is the decision rule applied to those parameters, not the parameters. The principle: **in the classical cost matrix, cost attaches to errors; in retention, cost attaches to actions** — `t* = C_FP/(C_FP + C_FN)` presumes correct decisions are free, and here they are not.
+>
+> Everything below this note, and the test-set metrics in §9 that were computed at 0.2956, remain as the historical record of the archived pass. They are **not** the project's results. This section is rewritten when Phase 6 lands.
 
 ### Business cost parameters (illustrative — replace with Finance actuals)
 
@@ -787,6 +827,8 @@ The model delivers **+27 percentage-point improvement** over random targeting at
 
 SHAP is applied to the LightGBM base estimator extracted from fold 0 of `cal_pipe`. Top-10 feature ranking on the sealed test set is **identical** to the validation-set ranking — zero rank shifts across the top 10. SHAP base value: **−0.3009** (log-odds space).
 
+> **⚠ "Fold 0" is an artefact of the archived `ensemble=True` calibrator and must not be carried into `src/`.** Under Phase 6's `ensemble=False` there is one base estimator, not five, and the access path is `calibrated.calibrated_classifiers_[0].estimator` — no fold indexing, no averaging, no `best_pipe` kept alongside. See the note in §7. Phase 7's error analysis is written against that path.
+
 **Protected attributes:**
 
 | Attribute | Mean \|SHAP\| | Rank of 40 | Assessment |
@@ -888,7 +930,9 @@ mlflow.sklearn.load_model("models:/telco-churn-pipeline@champion")
 
 9. **Feature discovery redundancy screen has a mixed-type gap.** Screen 2 in the lap framework checks numeric-vs-numeric relationships (Pearson) and categorical-vs-categorical (Cramér's V) but has no branch for categorical-derived-from-numeric (e.g. `tenure_cohort` vs `tenure`). Screen 4 — permutation importance given all adopted features — is the empirical backstop: a feature that adds no marginal signal because the model already has the underlying numeric column is identified and rejected regardless of type. On the dev-partition run, `tenure_cohort` (Lap 5) was redundant enough to fail earlier, directly at Screen 3 (PR-AUC fell −0.0041) — Screen 2 raised no flag, since it has no cross-type branch, but the feature never reached Screen 4. `two_year_fiber` (Lap 1) demonstrates the Screen 4 backstop directly on this run: Screen 2 passed (max_corr 0.389), Screen 3 passed (+0.0017 PR-AUC), and Screen 4 correctly rejected it (importance 0.0001, below the 0.0054 floor) once measured against the full adopted context.
 
-10. **Learning curve had not plateaued at Phase 5 Step 2c.** CV PR-AUC was still rising at the maximum training size in the Steps 2c/2d generative diagnostic loop (0.613 → 0.655 from 20%→100% of the dev-training folds) — more historical data would plausibly still improve ranking quality. Not acted on in Phase 5 (no feature was engineered in response); flagged as a Phase 10 retrain / data-acquisition consideration.
+10. **Learning curve had not plateaued at Phase 5 Step 2c.** CV PR-AUC was still rising at the maximum training size in the Steps 2c/2d generative diagnostic loop (0.613 → 0.655 from 20%→100% of the dev-training folds) — more historical data would plausibly still improve ranking quality. Not acted on in Phase 5 (no feature was engineered in response); flagged as a Phase 10 retrain / data-acquisition consideration. **This is the empirical justification for the Phase 7 full-data refit** (`models/refit.py`): on this project's own evidence the extra 1,409 rows are still buying ranking quality, so the refit is not a ritual.
+
+11. **Calibrated probabilities are calibrated *to development-set prevalence* — prevalence drift invalidates both the calibration and the threshold.** LightGBM trains with `class_weight='balanced'` (`models/train/common.py`), which systematically inflates scores toward the positive class. `CalibratedClassifierCV` corrects this because sklearn fits the calibrator on **unweighted** out-of-fold data, mapping the reweighted scores back to true posteriors against the real ~26.5 % dev prevalence. That is the right behaviour, and it is the mechanism that makes the closed-form threshold `t* = c/(r × LTV)` valid at all — `t*` is only Bayes-optimal against *honest* posteriors. The dependency runs both ways: if production churn prevalence shifts away from 26.5 %, the calibration map is stale, the posteriors are biased, and `t*` is being applied to numbers that no longer mean what it assumes. Neither a PR-AUC check nor a reliability diagram computed on old data will catch this. **This is the hook for Phase 13 drift monitoring:** track prevalence alongside feature PSI, and treat a sustained prevalence shift as a re-calibration trigger, not merely a retrain trigger — they are different remedies.
 
 ---
 
@@ -896,8 +940,8 @@ mlflow.sklearn.load_model("models:/telco-churn-pipeline@champion")
 
 ### Immediate (model v1 deployment)
 
-1. **Deploy at threshold 0.2956** for the base cost scenario. Revisit threshold if intervention cost assumptions change.
-2. **Implement tiered outreach:** cheap outreach (email/SMS) for scores in 0.30–0.50; expensive retention offers only for scores > 0.50.
+1. ~~**Deploy at threshold 0.2956** for the base cost scenario.~~ **Superseded — see §0 and the note at the head of §8.** 0.2956 was selected by minimising a cost function that charges the intervention only to false positives; at that threshold the marginal contact has an expected value of **−$17.01**. The base-scenario operating point is `t* = c/(r × LTV) = `**`0.3942`**, pending Phase 6's derivation from `configs/costs.yaml`. Revisit whenever the cost parameters change — and note that `t*` is far more sensitive to the retention rate `r` than to anything the model does.
+2. **Implement tiered outreach:** cheap outreach (email/SMS) for scores in the band just below the deployed threshold; expensive retention offers only for high-confidence scores. *(The archived 0.30–0.50 band was anchored to the superseded threshold — Phase 6 re-derives the bands from `t*`.)*
 3. **Apply a 90-day re-contact suppression window** to prevent intervention fatigue.
 
 ### Short-term (next model iteration)

@@ -12,6 +12,42 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ---
 
+## [0.5.4] - 2026-07-11 — Phase 5→6 Bridge: Registration Boundary Remediation
+
+*Phase 5 shipped before the registry boundary in `CLAUDE.md` § "Run artifacts vs. registry
+versions" was written, and had registered the uncalibrated pipeline as `challenger` — not a valid
+rollback target under that boundary. This bridge removes registration from Phase 5 (deferred to
+Phase 6's `calibrate.py`), fixes two defects surfaced in the same code paths, and rebuilds the
+pipeline from a hard reset (`mlruns/` and the Postgres volume both cleared) to prove it still
+reproduces from zero — `mlruns/1/` went from 223 leaked/historical run directories to 3.*
+
+### Changed
+- **`src/telco_churn/models/train/log_model.py`** (replaces `registration.py`) —
+  `run_model_logging_step` logs the tuned `Pipeline` onto the `tuning_study` run without
+  `registered_model_name=` or a `challenger` alias; adds `training_manifest["logged_model_uri"]`
+  as the permanent handle Phase 6 resolves by.
+- **`tests/unit/test_train_log_model.py`** (renamed from `test_train_registration.py`) — asserts
+  `search_registered_models()` stays empty after Step 5, and that the logged signature declares a
+  float output.
+- **`ANALYSIS.md`** §4c "Registration — `challenger`" renamed to "Model logging (not registered)";
+  **`notebooks/03c-hyperparameter-tuning.ipynb`** — registration narrative and the two cells that
+  resolved runs via the `challenger` alias updated to resolve by run recency/tag instead.
+- **`PROJECT_PLAN.md`** Phase 5 deliverable updated to log-only, no registration.
+
+### Fixed
+- **`models/train/common.py::_resolve_tracking_uri`** — a bare relative tracking URI (the default
+  on any fresh clone with no `.env`) resolved to a Windows path MLflow's store registry rejected
+  (`urlparse` read the drive letter as scheme `'c'`); now anchored via `.as_uri()`.
+- **MLflow test-fixture artifact leak** — five unit-test fixtures plus the subprocess integration
+  test pointed the tracking URI at a tmp SQLite store but left the artifact root defaulting to
+  `./mlruns`, leaking run directories into the repo on every test run. Fixed via a shared
+  `conftest.py` fixture with an explicit `artifact_location`.
+- **Logged model signature declared `predict()` output (int labels), not `predict_proba()`** —
+  `pyfunc_predict_fn` was left at its default, so the pyfunc flavour served argmax labels while the
+  signature described probabilities; now explicit.
+
+---
+
 ## [0.5.3] - 2026-07-09 — QA: Step 2/3 Orchestrator Test Coverage
 
 *A Phase 5 QA pass found that `run_comparison_step` and `run_selection_step` — the Step 2 and

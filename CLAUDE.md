@@ -45,18 +45,33 @@ docker compose up -d                    # start full local stack (Phase 9+)
 - **Registered model name:** `telco-churn-pipeline`
 - **Production alias:** `champion` — the FastAPI service loads whichever run carries this alias at startup.
 - **Challenger alias:** `challenger` — used during evaluation before promotion.
-- **Logged artifacts per run (every registration, Phase 5+):** model (pyfunc), `feature_space.txt`, `feature_columns.txt`, `preprocessing.pkl`, `training_manifest.json`.
+
+### Run artifacts vs. registry versions
+
+The **run** is the experiment record; the **registry** is the deployment surface. Everything fitted during a training cycle is logged to the run and is retrievable there via `runs:/<run_id>/model` — nothing needs registering to be loadable. A registered model version answers exactly one question: *could this be serving traffic right now?*
+
+- **Every version in the registry must be a valid rollback target.** Emergency rollback is `MlflowClient().set_registered_model_alias(name, "champion", version=N-1)`, typed under pressure. If undeployable intermediates occupy version numbers, that command succeeds, the service restarts cleanly, and it silently serves the wrong thing. Nothing errors and nothing alerts.
+- **One registration per training cycle, at the point the artifact becomes serving-shaped.** Calibration is part of the model's inference graph, not a downstream consumer of it — `CalibratedClassifierCV(Pipeline([preprocessor, lgbm]))` is one sklearn estimator with one `predict_proba`, logged with one `log_model` call. The uncalibrated pipeline is a *stage of construction*, not a model that lost a comparison: it is logged to the run for auditability and **never registered**.
+- Concretely: **Phase 5 logs, does not register** (no `registered_model_name=`, no alias). **Phase 6 `calibrate.py` performs the single registration** of the calibrated pipeline and points `challenger` at it. **Phase 7 `evaluate.py` → `refit.py` → `register.py`** then closes the cycle. An alias is a unique pointer per model name — re-aliasing does not create a second challenger, it silently orphans the previous version.
+- **Model-version tag `refit_scope: dev | full`**, set at registration. The registry legitimately holds two shapes of deployable artifact: the dev-set calibrated model (sealed-test metrics of record) and the full-data refit (what actually serves). Both are valid rollback targets; only the `dev` one has honest test metrics attached, so they are not interchangeable for reporting.
+- **The gate measures one artifact and promotes another.** Phase 7's promotion decision is computed on the `dev`-scope version's sealed-test PR-AUC and Brier; the `champion` alias is then pointed at the `full`-scope refit that `refit.py` produced from the same frozen spec. The refit can never pass the gate on its own — it was trained on the test set, so its test metrics exist, look excellent, and mean nothing. Log the two events distinctly: `model_promoted` (a comparison happened) vs. `champion_refit` (none did).
+- **Do not overload `challenger` to mean "the dev-set model."** `challenger`/`champion` denote *incumbent versus contender for the same slot*. A dev-fit and a full-fit of one frozen spec are not rivals — they are the same model at two data volumes. Phase 10's weekly retrain uses `challenger` for a genuinely new candidate; reusing the word for the dev model would make the registry's history unreadable.
+- **`models/refit.py` must not import `data.split`.** It reads `datasets/processed/features.parquet` in full, so the *test set touched once* invariant holds literally. The consequence is real, though: after the refit, the test set's information lives inside the champion and no clean holdout remains anywhere in the project. This is why Phase 10's promotion gate cannot re-score it — see the open question in `PROJECT_PLAN.md` Phase 10.
+
+- **Logged artifacts per run (every training cycle, Phase 5+):** model (pyfunc), `feature_space.txt`, `feature_columns.txt`, `preprocessing.pkl`, `training_manifest.json`.
   - `feature_space.txt` — full **feature space**: every column `build_feature_df` produced before selection (the complete output of the Phase 4 feature pipeline).
   - `feature_columns.txt` — **model input space**: the subset that survived `select.py` and entered the `ColumnTransformer`. The diff between `feature_space.txt` and `feature_columns.txt` is what selection dropped for that run — a per-run audit trail that requires no git lookup.
   - `preprocessing.pkl` — fitted `ColumnTransformer`; encodes the exact transformations applied to the model input space at training time.
   - `training_manifest.json` — **engineering audit trail**: git SHA, DVC data hash, model family, full hyperparameters, `feature_space`/`feature_columns`, CV PR-AUC, the paired-Δ vs LogReg with its full bootstrap CI, and `tuning_summary` (trial counts, selected vs. raw-best trial number/score, 1-SE standard error and band floor — the diagnostics behind the `selection_rule` pick).
-- **`model_card.json` — written once, at champion promotion (Phase 7 `register.py`), not at every registration.** Stakeholder-facing narrative: intended use, known limitations, performance summary vs. LogReg, fixed-recall profile, fairness/robustness flags. It is not populated at Phase 5 challenger registration — at that point the model is uncalibrated, un-thresholded, and untested on the sealed set, so a "known limitations" section would just be a disclaimer about an unfinished product. No hyperparameters, hashes, or raw statistical detail either way — that lives in `training_manifest.json`.
+- **`model_card.json` — written once, at champion promotion (Phase 7 `register.py`), not at Phase 6 challenger registration.** Stakeholder-facing narrative: intended use, known limitations, performance summary vs. LogReg, fixed-recall profile, fairness/robustness flags. It is not populated when `calibrate.py` registers the challenger — at that point the model is calibrated but un-thresholded and untested on the sealed set, so a "known limitations" section would still be a disclaimer about an unfinished product. No hyperparameters, hashes, or raw statistical detail either way — that lives in `training_manifest.json`.
 
 ## Data Handling
 
 - **`datasets/raw/` is read-only.** Never modify, overwrite, or delete any file there.
-- **Datasets are tracked by DVC, not Git** (set up in Phase 8). After `dvc init`, the CSV files are gitignored and stored in the DVC remote (local cache → S3 in Phase 12).
-- **`datasets/processed/telco_churn_processed.csv`** is an intermediate artifact — it will be replaced by the DVC `features` stage output (Parquet to `datasets/processed/`).
+- **The raw CSV is committed to Git; DVC owns only derived artifacts.** DVC lists `datasets/raw/*.csv` as a stage **`dep`** (hashed into `dvc.lock`, re-runs the DAG on change), not an **`out`** (cached, gitignored, remote-backed). A dep may be any path in the repo. The file is 977 KB, static, and read-only — none of DVC's reasons to own raw data apply, and gitignoring it would break fresh-clone reproducibility and Phase 11's CI. `datasets/processed/` is gitignored; DVC owns it as stage output.
+- **No DVC remote is required before Phase 12.** A local cache is the full configuration. Phase 12 *adds* an S3 remote for shared caching; it is not a migration, and nothing depends on it.
+- **Postgres is a materialised cache of the CSV, never a source of truth.** Its contents are fully determined by the raw CSV + `sql/schema/` + `data/ingest.py`. It cannot be a DVC `out` (outs are files); the `ingest` stage emits `reports/ingest_receipt.json` instead. A hand-edited `customers_raw` is invisible to `dvc repro` — rebuild with `dvc repro --force`.
+- **`datasets/processed/telco_churn_processed.csv`** is an intermediate artifact — it will be replaced by the DVC `features` stage output (`telco_churn_features.parquet`). Read it through `features/io.py::load_features()`, never by constructing the path inline.
 - **TotalCharges gotcha:** the raw CSV has `TotalCharges` as a string with whitespace for 11 zero-tenure customers. Coerce to numeric first, then impute with median — never drop.
 - **Target column** is always named `churn` (binary: 0/1).
 - **Class imbalance handling is required** — never train a model without it.
@@ -67,6 +82,7 @@ docker compose up -d                    # start full local stack (Phase 9+)
 These are written policy — not notebook conventions — and must be preserved in all `src/` code:
 
 - **Test set touched once.** `X_test` / `y_test` are imported and used in exactly one place: `models/evaluate.py`. No other module may access the test split. Under continuous retraining (Phase 10), the sealed test set is **not** reused for challenger-vs-champion comparisons — that erodes it; use a rolling holdout instead.
+- **`evaluate.py` resolves its model by explicit `run_id` or version number, never by alias.** An alias is a moving pointer. Once `models/refit.py` exists, a re-run or mis-ordered pipeline can leave `challenger` on the `full`-scope refit — a model trained on the test set — and evaluating *that* reports excellent sealed-test metrics with nothing raised and nothing logged. This is the contamination guard; module ordering is not. Log the resolved version into `reports/metrics.json` so metrics are attributable to a specific artifact. A refactor to `models:/telco-churn-pipeline@challenger` is a correctness regression, not a simplification.
 - **One metric drives selection.** PR-AUC (average precision) is the sole criterion for model selection, Optuna tuning, and champion promotion. All other metrics (recall, precision, F1, ROC-AUC) are reported as diagnostics only. If two metrics point in different directions, PR-AUC wins — mixing selection signals introduces cherry-picking risk.
 
 ## Project Structure (target — being built phase by phase)
@@ -184,9 +200,9 @@ Lifecycle-ordered. Tests are written alongside each module — there is no dedic
 | 2 | Data validation (Pandera + 5 gates) | `data/schema.py` + `data/checks.py` + `data/validate.py` + `tests/unit/test_checks.py` + `tests/unit/test_validate.py` |
 | 3 | EDA notebook (slim rewrite) | `notebooks/01-eda.ipynb` importing from `src/`; original archived |
 | 4 | Feature engineering (SQL + Python) | `sql/features/*.sql` + `features/sql_features.py` + `features/build.py` |
-| 5 | Model training (LightGBM + Optuna + MLflow) | `models/train/` + `configs/{model,training}/*.yaml`; challenger registered |
+| 5 | Model training (LightGBM + Optuna + MLflow) | `models/train/` + `configs/{model,training}/*.yaml`; logged only, no registration |
 | 6 | Calibration + cost-sensitive threshold | `models/calibrate.py` + `models/threshold.py` |
-| 7 | Evaluation + error analysis + registry promotion | `models/evaluate.py` + `models/register.py` + `notebooks/05-error-analysis.ipynb` |
+| 7 | Evaluation + error analysis + full-data refit + registry promotion | `models/evaluate.py` + `models/refit.py` + `models/register.py` + `notebooks/05-error-analysis.ipynb` |
 | 8 | DVC pipeline wrap | `dvc.yaml` with 5 stages; reproducible end-to-end |
 | 9 | Serving + UI | FastAPI (`/predict`, `/health`, `/metrics`) + Streamlit + Dockerfiles |
 | 10 | Orchestration | Prefect retrain flow (weekly) + drift check flow (daily) |

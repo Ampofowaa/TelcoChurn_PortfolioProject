@@ -17,6 +17,20 @@ flowchart TD
     K -->|re-runs| D
 ```
 
+## Data Flow — Ingestion to Training
+
+The system diagram above shows *tools*; this shows *artifacts* — what each stage actually reads and writes, and which stages touch the database at all.
+
+```mermaid
+flowchart TD
+    A["Raw CSV\ndatasets/raw/ — read-only,\nsource of truth"] -->|ingest.py| B[("Postgres\ncustomers_raw")]
+    B -->|validate.py| V["Pandera\n5 Quality Gates"]
+    V -->|"split.py\nreads only (customerid, churn)"| C["split_manifest.parquet\ncustomerid → dev/test label\n(no features, no churn column)"]
+    V -->|"features/build.py\nSQL views, ALL 7,043 customers"| D["telco_churn_processed.csv\nfull engineered feature set,\ndev + test not yet separated"]
+    C --> E["models/train/\nfile-only — no DB connection —\nmerges by customerid, keeps dev rows"]
+    D --> E
+```
+
 ## ML Workflow — a loop, not a straight line
 
 The system diagram above shows the infrastructure flow. The diagram below shows the **modelling lifecycle**, including the two feedback loops that a linear summary hides.
