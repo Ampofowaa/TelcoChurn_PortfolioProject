@@ -578,11 +578,11 @@ def reduced_set_bootstrap_test(
 
     Default is the simpler reduced set; only a materially and significantly worse
     reduced set overrides it:
-      material_full_win    — CI excludes 0 in full's favour and Δ >= threshold:
+      full_features_win    — CI excludes 0 in full's favour and Δ >= threshold:
                               adopt the full set on the evidence.
-      tie_immaterial        — CI includes 0, or excludes 0 but |Δ| < threshold:
+      tie                  — CI includes 0, or excludes 0 but |Δ| < threshold:
                               practical tie — adopt the reduced set by default.
-      material_reduced_win — CI excludes 0 in reduced's favour and Δ <= -threshold:
+      reduced_features_win — CI excludes 0 in reduced's favour and Δ <= -threshold:
                               adopt the reduced set on the evidence.
 
     Returns delta_obs, delta_ci_lower/upper, p_value (informational only — the CI
@@ -603,11 +603,11 @@ def reduced_set_bootstrap_test(
     ci_upper = float(np.percentile(bootstrap_deltas, 97.5))
 
     if ci_lower > 0 and delta_obs >= delta_threshold:
-        decision, decision_rule = "full", "material_full_win"
+        decision, decision_rule = "full", "full_features_win"
     elif ci_upper < 0 and delta_obs <= -delta_threshold:
-        decision, decision_rule = "reduced", "material_reduced_win"
+        decision, decision_rule = "reduced", "reduced_features_win"
     else:
-        decision, decision_rule = "reduced", "tie_immaterial"
+        decision, decision_rule = "reduced", "tie"
 
     return {
         "delta_obs": round(delta_obs, 3),

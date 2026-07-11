@@ -55,9 +55,9 @@ def bootstrap_comparison(
     Pairs fold i of LGBM against fold i of LogReg (same RSKF instance) so intra-fold
     variance cancels. Decision rule, evaluated on the 95% percentile bootstrap CI of
     Δ plus the materiality threshold delta_threshold:
-      material_lgbm_win — CI excludes 0 in LGBM's favour and delta_obs >= threshold.
-      kill_condition     — CI excludes 0 in LogReg's favour and |delta_obs| >= threshold.
-      tie_immaterial      — otherwise; LGBM is still adopted.
+      lgbm_win   — CI excludes 0 in LGBM's favour and delta_obs >= threshold.
+      logreg_win — CI excludes 0 in LogReg's favour and |delta_obs| >= threshold.
+      tie        — otherwise; LGBM is still adopted.
 
     Returns delta_obs, delta_ci_lower/upper, p_value (informational only — the CI is
     the test), decision ('lgbm'/'logreg'), decision_rule, n_bootstrap, and the raw
@@ -77,11 +77,11 @@ def bootstrap_comparison(
     ci_upper = float(np.percentile(bootstrap_deltas, 97.5))
 
     if ci_lower > 0 and delta_obs >= delta_threshold:
-        decision, decision_rule = "lgbm", "material_lgbm_win"
+        decision, decision_rule = "lgbm", "lgbm_win"
     elif ci_upper < 0 and delta_obs <= -delta_threshold:
-        decision, decision_rule = "logreg", "kill_condition"
+        decision, decision_rule = "logreg", "logreg_win"
     else:
-        decision, decision_rule = "lgbm", "tie_immaterial"
+        decision, decision_rule = "lgbm", "tie"
 
     return {
         "delta_obs": round(delta_obs, 3),

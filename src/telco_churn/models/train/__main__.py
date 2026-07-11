@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from telco_churn.models.train import (
     run_candidate_step,
     run_comparison_step,
-    run_registration_step,
+    run_model_logging_step,
     run_selection_step,
     run_tuning_step,
 )
@@ -39,7 +39,7 @@ try:
     if comparison["decision"] == "lgbm":
         selection = run_selection_step(X_dev, y_dev, candidate_results, cfg)
         tuning = run_tuning_step(X_dev, y_dev, selection["committed_features"], cfg)
-        run_registration_step(X_dev, y_dev, comparison, tuning, cfg)
+        run_model_logging_step(X_dev, y_dev, comparison, tuning, cfg)
     else:
         logger.warning(
             "selection_skipped_logreg_winner",

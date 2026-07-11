@@ -2,14 +2,25 @@
 
 import io
 import logging
+import os
 import sys
 from typing import cast
 
 import structlog
 
+__all__ = ["configure_logging", "get_logger"]
 
-def configure_logging(log_level: str = "INFO") -> None:
+
+def configure_logging(log_level: str = "INFO", log_format: str | None = None) -> None:
     """Configure structlog with JSON output for production and console output for development.
+
+    log_format selects the renderer: 'json' (structlog.processors.JSONRenderer, for
+    CloudWatch/Grafana ingestion in Phase 12+) or 'console' (structlog.dev.ConsoleRenderer,
+    colorized key=value pairs for a human reading a local terminal). Defaults to the
+    LOG_FORMAT env var, itself defaulting to 'console' — every __main__ entry point calls
+    configure_logging() with no arguments before Hydra config is composed, so this can't
+    be sourced from configs/config.yaml; an env var is the only signal available that early.
+    Production/CI environments set LOG_FORMAT=json explicitly (Phase 11+ CI, Phase 12 AWS).
 
     Also reconfigures stdout/stderr to UTF-8: on Windows, a console's default
     cp1252 encoding can't encode output some dependencies emit unprompted (e.g.
@@ -47,11 +58,18 @@ def configure_logging(log_level: str = "INFO") -> None:
         cache_logger_on_first_use=True,
     )
 
+    resolved_format = log_format or os.environ.get("LOG_FORMAT", "console")
+    renderer: structlog.types.Processor = (
+        structlog.processors.JSONRenderer()
+        if resolved_format == "json"
+        else structlog.dev.ConsoleRenderer()
+    )
+
     formatter = structlog.stdlib.ProcessorFormatter(
         foreign_pre_chain=shared_processors,
         processors=[
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-            structlog.processors.JSONRenderer(),
+            renderer,
         ],
     )
 

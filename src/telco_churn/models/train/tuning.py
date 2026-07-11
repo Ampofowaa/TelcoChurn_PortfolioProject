@@ -278,10 +278,11 @@ def _study_name(cfg: DictConfig, committed_features: list[str]) -> str:
     Hashes data version, frozen features, and the tuning config (search space,
     CV scheme, early-stopping settings, pruner) — everything that must stay fixed
     across a study's trials for Optuna's per-parameter distributions to stay valid,
-    plus pruner: a trial pruned under one policy and a trial that ran unpruned
-    under another aren't a fair comparison, so mixing them into one pool would let
-    1-SE selection silently compare apples to oranges. Any change to these starts a
-    fresh study instead of silently mixing incompatible trials into an old one.
+    plus pruner (including its n_warmup_steps): a trial pruned under one policy
+    and a trial that ran unpruned under another aren't a fair comparison, so
+    mixing them into one pool would let 1-SE selection silently compare apples
+    to oranges. Any change to these starts a fresh study instead of silently
+    mixing incompatible trials into an old one.
     """
     tuning_cfg = cfg.tuning
     key = {
@@ -294,6 +295,7 @@ def _study_name(cfg: DictConfig, committed_features: list[str]) -> str:
         "early_stopping_rounds": int(tuning_cfg.early_stopping_rounds),
         "es_validation_size": float(tuning_cfg.es_validation_size),
         "pruner": str(tuning_cfg.pruner),
+        "pruner_n_warmup_steps": int(tuning_cfg.pruner_n_warmup_steps),
     }
     digest = hashlib.sha256(
         json.dumps(key, sort_keys=True, default=str).encode()
@@ -319,9 +321,15 @@ def run_tuning_step(
     average_precision.
 
     A trial that raises is marked FAILED rather than aborting the study. Too
-    few completed trials (cfg.tuning.min_completed_trials) logs a warning
-    instead of blocking selection. storage defaults to a Postgres-backed study
-    (see _build_optuna_storage); pass an InMemoryStorage for tests.
+    few completed trials (cfg.tuning.min_completed_trials) logs a warning and
+    persists trial_count_below_threshold into tuning_summary and the
+    trial_count_below_threshold MLflow metric — visible after the fact, not
+    just in the log stream — but does not block selection: this step only
+    flags an untrustworthy result, it does not gate on it. (Enforcement
+    belongs at the point a tuned pipeline becomes a registered model — Phase
+    6's calibrate.py — not here; see PROJECT_PLAN.md Phase 6.) storage
+    defaults to a Postgres-backed study (see _build_optuna_storage); pass an
+    InMemoryStorage for tests.
 
     Idempotent against a study that already reached n_trials: only the trials
     still needed to reach n_trials are run, so re-running against a completed
@@ -357,7 +365,11 @@ def run_tuning_step(
 
     pruning_enabled = str(tuning_cfg.pruner) == "median"
     pruner: optuna.pruners.BasePruner = (
-        optuna.pruners.MedianPruner() if pruning_enabled else optuna.pruners.NopPruner()
+        optuna.pruners.MedianPruner(
+            n_warmup_steps=int(tuning_cfg.pruner_n_warmup_steps)
+        )
+        if pruning_enabled
+        else optuna.pruners.NopPruner()
     )
     sampler = optuna.samplers.TPESampler(
         seed=int(tuning_cfg.sampler_seed),
@@ -397,6 +409,7 @@ def run_tuning_step(
                 "sampler_seed": int(tuning_cfg.sampler_seed),
                 "n_startup_trials": int(tuning_cfg.n_startup_trials),
                 "pruner": str(tuning_cfg.pruner),
+                "pruner_n_warmup_steps": int(tuning_cfg.pruner_n_warmup_steps),
                 "selection_rule": str(tuning_cfg.selection_rule),
                 "cv_folds": int(tuning_cfg.cv_folds),
                 "n_estimators_ceiling": int(tuning_cfg.n_estimators_ceiling),
@@ -464,10 +477,11 @@ def run_tuning_step(
             for t in study.trials
             if t.state == optuna.trial.TrialState.COMPLETE
         ]
-        if (
+        trial_count_below_threshold = (
             min_completed_trials is not None
             and len(trial_summaries) < min_completed_trials
-        ):
+        )
+        if trial_count_below_threshold:
             logger.warning(
                 "tuning_too_few_completed_trials",
                 n_completed_trials=len(trial_summaries),
@@ -521,14 +535,26 @@ def run_tuning_step(
         )
         mlflow.log_metrics(
             {
-                "best_cv_pr_auc_mean": round(selected["value"], 3),
+                # "selected_" (not "best_"): this is the 1-SE-adopted trial's score,
+                # not the raw-argmax winner — "best_cv_pr_auc_mean" read as exactly
+                # the opposite of what it is on first glance in the MLflow UI.
+                "selected_cv_pr_auc_mean": round(selected["value"], 3),
                 "raw_best_cv_pr_auc_mean": round(diagnostics["raw_best_cv_pr_auc"], 3),
-                "raw_best_se": diagnostics["se"],
-                "raw_best_band_floor": diagnostics["band_floor"],
+                # "one_se_band_*" (not "raw_best_*"): these aren't a property of the
+                # raw-best trial in isolation, they're the 1-SE selection band derived
+                # from it — the mechanism that decides who counts as "close enough" to
+                # the winner. "raw_best_se" reads as "SE of the raw-best score" rather
+                # than "the band selection is judged against."
+                "one_se_band_se": diagnostics["se"],
+                "one_se_band_floor": diagnostics["band_floor"],
                 "n_completed_trials": len(trial_summaries),
                 "n_pruned_trials": n_pruned_trials,
                 "n_boundary_hits": sum(boundary_hits.values()),
                 "n_failed_trials": n_failed_trials,
+                # int(): MLflow metrics must be numeric. Surfaces the too-few-trials
+                # warning (logged above, ephemeral) as a persistent, queryable
+                # signal in the MLflow UI/API, not just a vanished log line.
+                "trial_count_below_threshold": int(trial_count_below_threshold),
             }
         )
         mlflow.log_table(
@@ -562,6 +588,8 @@ def run_tuning_step(
             "n_completed_trials": len(trial_summaries),
             "n_pruned_trials": n_pruned_trials,
             "n_failed_trials": n_failed_trials,
+            "min_completed_trials": min_completed_trials,
+            "trial_count_below_threshold": trial_count_below_threshold,
             "selection_rule": str(tuning_cfg.selection_rule),
             "selected_trial_number": selected["number"],
             "selected_cv_pr_auc": selected["value"],

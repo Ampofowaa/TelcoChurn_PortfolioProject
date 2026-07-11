@@ -54,3 +54,40 @@ def test_get_logger_exposes_standard_log_methods() -> None:
     assert callable(getattr(logger, "info", None))
     assert callable(getattr(logger, "error", None))
     assert callable(getattr(logger, "warning", None))
+
+
+def test_configure_logging_defaults_to_console_renderer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LOG_FORMAT", raising=False)
+    configure_logging()
+    handler = logging.getLogger().handlers[-1]
+    assert isinstance(handler.formatter.processors[-1], structlog.dev.ConsoleRenderer)
+
+
+def test_configure_logging_log_format_json_uses_json_renderer() -> None:
+    configure_logging(log_format="json")
+    handler = logging.getLogger().handlers[-1]
+    assert isinstance(
+        handler.formatter.processors[-1], structlog.processors.JSONRenderer
+    )
+
+
+def test_configure_logging_reads_log_format_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    configure_logging()
+    handler = logging.getLogger().handlers[-1]
+    assert isinstance(
+        handler.formatter.processors[-1], structlog.processors.JSONRenderer
+    )
+
+
+def test_configure_logging_explicit_arg_overrides_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    configure_logging(log_format="console")
+    handler = logging.getLogger().handlers[-1]
+    assert isinstance(handler.formatter.processors[-1], structlog.dev.ConsoleRenderer)

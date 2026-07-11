@@ -21,8 +21,14 @@ early_stopping_rounds: 50
 es_validation_size: 0.2
 
 search_space:
+  # low was 10 until the 1-SE tiebreak (fewest num_leaves) repeatedly landed exactly on
+  # that floor. Trial data showed near-zero correlation between num_leaves and CV PR-AUC
+  # across the full 10-200 range (r=0.065, 25/49 trials tied within the 1-SE band spanning
+  # 10-200) — the boundary hit looked like it might be masking a genuinely better, simpler
+  # model. Lowered to 5 (LightGBM's practical floor above the degenerate 2) to confirm
+  # whether the flat response continues or a real optimum was being cut off.
   num_leaves:
-    low: 10
+    low: 5
     high: 200
     type: int
   learning_rate:
@@ -65,6 +71,12 @@ n_startup_trials: 10   # random warm-up before surrogate engages
 
 # Pruner kills a trial mid-CV when clearly behind the running median; 'none' disables it — still a recorded decision either way.
 pruner: median
+
+# Folds a trial must report (0-indexed step >= this) before it's eligible for pruning.
+# 2 of cv_folds=5 means every trial runs >=3 folds before a kill decision — one fold is
+# too noisy a sample of a hyperparameter set's quality to act on, since it's a single
+# draw from fold-to-fold variance rather than a signal about the config itself.
+pruner_n_warmup_steps: 2
 
 # '1se' picks the most-regularized trial within 1 SE of the best CV score (Breiman/glmnet convention); 'argmax' picks the raw-best trial.
 selection_rule: 1se

@@ -9,7 +9,7 @@ its own internal decision — the piece that had no direct unit coverage before.
 
 from __future__ import annotations
 
-from pathlib import Path
+from collections.abc import Callable
 
 import mlflow
 import pandas as pd
@@ -27,12 +27,10 @@ _CV_REPEATS = 1
 
 
 @pytest.fixture
-def selection_mlflow_uri(tmp_path: Path) -> str:
-    """Point MLflow at a throwaway local SQLite store (see test_train_registration.py)."""
-    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
-    mlflow.set_tracking_uri(uri)
-    mlflow.set_experiment("test_run_selection_step")
-    return uri
+def selection_mlflow_uri(mlflow_test_experiment: Callable[[str], str]) -> str:
+    """Point MLflow at the shared tmp-scoped experiment (conftest.py ::
+    mlflow_test_experiment)."""
+    return mlflow_test_experiment("test_run_selection_step")
 
 
 @pytest.fixture

@@ -80,6 +80,7 @@ def test_validate_main_exits_zero_on_valid_data(
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=str(_PROJECT_ROOT),
     )
     assert (
@@ -96,6 +97,15 @@ def test_validate_main_exits_one_on_blocking_error(
     the shared seeded_engine used by the happy-path test. The out-of-range churn
     value triggers both the schema gate (ERROR) and the churn_labels gate (ERROR),
     making can_proceed False and causing sys.exit(1).
+
+    The table's own `customers_raw_churn_check` CHECK constraint (sql/schema/
+    001_create_raw.sql) already rejects churn=9 at the database level, so it is
+    dropped here first — this test is deliberately reaching past that layer to
+    prove validate.py's own gates are a real second line of defense, not dead
+    code shadowed by the DB constraint. CLAUDE.md's "a hand-edited customers_raw
+    is invisible to dvc repro" scenario is exactly a case where corrupt data can
+    land in the table outside the constraint's reach (e.g. the constraint being
+    added after older rows existed, or a direct COPY that bypassed it).
     """
     csv_path = tmp_path_factory.mktemp("bad_validate_csv") / "sample.csv"
     csv_path.write_text(_SAMPLE_CSV)
@@ -104,6 +114,11 @@ def test_validate_main_exits_one_on_blocking_error(
         engine = create_engine(pg.get_connection_url())
         ingest(csv_path, engine)
         with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE customers_raw DROP CONSTRAINT customers_raw_churn_check"
+                )
+            )
             conn.execute(
                 text(
                     "UPDATE customers_raw SET churn = 9 "
@@ -119,6 +134,7 @@ def test_validate_main_exits_one_on_blocking_error(
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             cwd=str(_PROJECT_ROOT),
         )
         engine.dispose()
