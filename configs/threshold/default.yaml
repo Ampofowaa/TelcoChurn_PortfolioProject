@@ -1,0 +1,7 @@
+# Threshold derivation configuration — see models/threshold.py.
+
+# telco-churn-pipeline version to derive the threshold for — required, e.g. `threshold.model_version=1`.
+model_version: null
+
+# argmax-EV bootstrap CI resampling seed (see costs.yaml's argmax_ev_bootstrap_n_samples for the resample count).
+random_state: 42

@@ -1,0 +1,829 @@
+"""Calibrate the tuned pipeline logged by run_model_logging_step (models/train/log_model.py).
+
+Calibration is cross-fit on the development set, so there is no separate
+validation split. CalibratedClassifierCV(ensemble=False) wraps the pipeline
+*unfitted*, so its ColumnTransformer refits inside every fold instead of
+leaking preprocessing statistics across folds.
+
+The unfitted pipeline comes from cloning the model at
+manifest["logged_model_uri"] (a models:/m-<id> URI) — not from
+runs:/<run_id>/model, which becomes ambiguous once this module logs its own
+calibrated_model onto the same run.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import matplotlib.pyplot as plt
+import mlflow
+import mlflow.artifacts
+import mlflow.sklearn
+import mlflow.tracking
+import numpy as np
+import pandas as pd
+from mlflow.models import infer_signature
+from numpy.typing import NDArray
+from omegaconf import DictConfig
+from sklearn.base import clone
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.dummy import DummyClassifier
+from sklearn.metrics import average_precision_score, brier_score_loss
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.pipeline import Pipeline
+
+from telco_churn.data.split import partition
+from telco_churn.features.accessor import load_features
+from telco_churn.features.build import TARGET_COL
+from telco_churn.models.plots import reliability_diagram_bins
+from telco_churn.utils.logging import get_logger
+from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.paths import get_project_root
+from telco_churn.utils.stats import paired_bootstrap_ci
+
+__all__ = [
+    "load_training_manifest",
+    "committed_features_from_manifest",
+    "unfitted_pipeline_from_manifest",
+    "load_dev_features",
+    "outer_cv",
+    "inner_cv",
+    "build_calibrated_pipeline",
+    "oof_uncalibrated_proba",
+    "oof_calibrated_proba",
+    "oof_dummy_proba",
+    "per_fold_average_precision",
+    "per_fold_brier",
+    "pooled_brier",
+    "brier_skill_score",
+    "expected_calibration_error",
+    "pr_auc_gate_passes",
+    "brier_switch_decision",
+    "select_calibration_method",
+    "run_calibration_step",
+]
+
+logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Step 1: build/wrap the calibrated pipeline
+# ---------------------------------------------------------------------------
+
+
+def load_training_manifest(run_id: str, cfg: DictConfig) -> dict[str, Any]:
+    """Load run_model_logging_step's training_manifest.json artifact from the tuning_study run.
+
+    Sets the MLflow tracking URI as a side effect, so this is safe to call as
+    the first MLflow-touching call in a fresh process.
+    """
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    manifest: dict[str, Any] = mlflow.artifacts.load_dict(
+        f"runs:/{run_id}/training_manifest.json"
+    )
+    return manifest
+
+
+def committed_features_from_manifest(manifest: dict[str, Any]) -> list[str]:
+    """Return run_selection_step's frozen input space — the columns the logged pipeline expects."""
+    return list(manifest["feature_selection"]["model_features"])
+
+
+def unfitted_pipeline_from_manifest(manifest: dict[str, Any]) -> Pipeline:
+    """Return a fresh, unfitted clone of the pipeline run_model_logging_step logged.
+
+    clone() strips the fitted state (LightGBM booster, fitted ColumnTransformer
+    statistics) while preserving the exact construction spec — the single
+    construction path the bridge's design contract requires; rebuilding the
+    pipeline from best_params is the failure it forbids.
+    """
+    fitted = mlflow.sklearn.load_model(manifest["logged_model_uri"])
+    pipeline: Pipeline = clone(fitted)
+    return pipeline
+
+
+def load_dev_features(committed_features: list[str]) -> tuple[pd.DataFrame, pd.Series]:
+    """Load the development-partition rows, restricted to the frozen committed feature set."""
+    df = load_features()
+    dev_df, _test_df = partition(df)
+    return dev_df[committed_features], dev_df[TARGET_COL]
+
+
+def outer_cv(cfg: DictConfig) -> StratifiedKFold:
+    """Return the outer StratifiedKFold shared by the uncalibrated baseline and every method.
+
+    Built fresh from the same fixed parameters (n_splits, shuffle, random_state)
+    on every call — with StratifiedKFold that's sufficient for identical fold
+    indices given the same (X_dev, y_dev) ordering, so oof_uncalibrated_proba
+    and every oof_calibrated_proba call are paired comparisons against the same
+    folds, not independent resamples.
+    """
+    return StratifiedKFold(
+        n_splits=int(cfg.calibration.outer_cv_folds),
+        shuffle=bool(cfg.calibration.shuffle),
+        random_state=int(cfg.calibration.random_state),
+    )
+
+
+def inner_cv(cfg: DictConfig) -> StratifiedKFold:
+    """Return the inner StratifiedKFold passed to CalibratedClassifierCV(cv=...).
+
+    Explicit shuffle+seed — the bare cv=5 default is unshuffled, and every
+    split/sampler/model in this project is seeded for reproducibility.
+    """
+    return StratifiedKFold(
+        n_splits=int(cfg.calibration.inner_cv_folds),
+        shuffle=bool(cfg.calibration.shuffle),
+        random_state=int(cfg.calibration.random_state),
+    )
+
+
+def build_calibrated_pipeline(
+    pipeline: Pipeline, method: str, cfg: DictConfig
+) -> CalibratedClassifierCV:
+    """Wrap the unfitted pipeline in CalibratedClassifierCV(ensemble=False).
+
+    ensemble=False collapses calibrated_classifiers_ to length 1, whose
+    .estimator is the base Pipeline refit on all of development — the SHAP
+    access path notebooks/05-error-analysis.ipynb depends on. pipeline must be
+    unfitted;
+    CalibratedClassifierCV.fit clones it internally per inner fold, so passing
+    the same unfitted instance to two CalibratedClassifierCV objects (e.g. one
+    per method) is safe without an extra clone() here.
+    """
+    return CalibratedClassifierCV(
+        pipeline,
+        method=method,
+        cv=inner_cv(cfg),
+        ensemble=False,
+    )
+
+
+def oof_uncalibrated_proba(
+    pipeline: Pipeline, X_dev: pd.DataFrame, y_dev: pd.Series, cfg: DictConfig
+) -> NDArray[np.float64]:
+    """Return paired uncalibrated OOF positive-class probabilities over outer_cv(cfg).
+
+    This is the baseline every calibration method's PR-AUC and Brier are
+    compared against — cross_val_predict on the same outer StratifiedKFold
+    object oof_calibrated_proba uses, so the comparison is paired or it is
+    nothing.
+    """
+    proba = cross_val_predict(
+        clone(pipeline), X_dev, y_dev, cv=outer_cv(cfg), method="predict_proba"
+    )
+    result: NDArray[np.float64] = proba[:, 1]
+    return result
+
+
+def oof_calibrated_proba(
+    pipeline: Pipeline,
+    method: str,
+    X_dev: pd.DataFrame,
+    y_dev: pd.Series,
+    cfg: DictConfig,
+) -> NDArray[np.float64]:
+    """Return paired calibrated OOF positive-class probabilities for one method.
+
+    cross_val_predict(CalibratedClassifierCV(pipeline, method=method,
+    cv=inner_cv(cfg)), cv=outer_cv(cfg)) — outer_cv(cfg) builds a fresh
+    StratifiedKFold with the same parameters as oof_uncalibrated_proba's, so
+    the fold indices (not just the fold count) match exactly.
+    """
+    calibrated = build_calibrated_pipeline(pipeline, method, cfg)
+    proba = cross_val_predict(
+        calibrated, X_dev, y_dev, cv=outer_cv(cfg), method="predict_proba"
+    )
+    result: NDArray[np.float64] = proba[:, 1]
+    return result
+
+
+def oof_dummy_proba(
+    X_dev: pd.DataFrame, y_dev: pd.Series, cfg: DictConfig
+) -> NDArray[np.float64]:
+    """Return paired OOF positive-class probabilities for DummyClassifier(strategy='prior').
+
+    The Brier Skill Score reference. Ignores every feature by construction —
+    each fold's prediction is that fold's own training-partition prevalence —
+    cross_val_predict'd over the same outer_cv(cfg) folds as every other
+    candidate, so 1 - Brier_candidate/Brier_dummy isolates genuine skill
+    rather than a fold-composition artifact.
+    """
+    proba = cross_val_predict(
+        DummyClassifier(strategy="prior"),
+        X_dev,
+        y_dev,
+        cv=outer_cv(cfg),
+        method="predict_proba",
+    )
+    result: NDArray[np.float64] = proba[:, 1]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Step 2: select the calibration method (sigmoid vs. isotonic)
+# ---------------------------------------------------------------------------
+
+
+def per_fold_average_precision(
+    proba: NDArray[np.float64], X_dev: pd.DataFrame, y_dev: pd.Series, cfg: DictConfig
+) -> list[float]:
+    """Mean-of-per-fold average precision for an OOF vector — never pooled.
+
+    Pooling mixes each fold's tie structure (or, for a calibrated vector, each
+    fold's distinct calibration map) into one ranking, which can mask a
+    per-fold ranking regression that scoring each fold separately catches.
+    Recomputes outer_cv(cfg)'s fold assignment rather than threading indices
+    through the OOF computation — same params + same (X_dev, y_dev) ordering
+    reproduces the identical folds cross_val_predict used to build proba.
+    """
+    cv = outer_cv(cfg)
+    return [
+        float(average_precision_score(y_dev.iloc[test_idx], proba[test_idx]))
+        for _, test_idx in cv.split(X_dev, y_dev)
+    ]
+
+
+def per_fold_brier(
+    proba: NDArray[np.float64], X_dev: pd.DataFrame, y_dev: pd.Series, cfg: DictConfig
+) -> list[float]:
+    """Per-outer-fold Brier score — the block-bootstrap unit for brier_switch_decision.
+
+    One value per fold, not per row: rows inside a fold share a calibrator, so
+    resampling folds (not rows) is what keeps the switch decision's bootstrap
+    CI honest.
+    """
+    cv = outer_cv(cfg)
+    return [
+        float(brier_score_loss(y_dev.iloc[test_idx], proba[test_idx]))
+        for _, test_idx in cv.split(X_dev, y_dev)
+    ]
+
+
+def pooled_brier(proba: NDArray[np.float64], y_dev: pd.Series) -> float:
+    """Pooled Brier score on an outer-OOF probability vector.
+
+    Legitimate to pool, unlike PR-AUC: Brier is a per-row proper score, so
+    pooling doesn't mix distinct ranking structures the way pooling AP does.
+    """
+    return float(brier_score_loss(y_dev, proba))
+
+
+def brier_skill_score(candidate_brier: float, reference_brier: float) -> float:
+    """BSS = 1 - Brier_candidate / Brier_reference.
+
+    Raw pooled Brier is hard to read alone — its scale is set by the class
+    base rate (Murphy's decomposition: Brier = reliability - resolution +
+    uncertainty, and uncertainty = p(1-p) is fixed by the data, not the
+    model), so the same Brier value means something different at a different
+    prevalence. BSS reframes it as skill over a reference forecast: 0 means
+    no better than the reference, 1 means perfect. reference_brier is
+    DummyClassifier(strategy='prior')'s pooled Brier — recomputed per call
+    rather than hardcoded, since it depends on y_dev's actual prevalence.
+    """
+    return 1.0 - candidate_brier / reference_brier
+
+
+def expected_calibration_error(
+    proba: NDArray[np.float64], y_dev: pd.Series, cfg: DictConfig
+) -> float:
+    """Expected Calibration Error: weighted mean |predicted − observed| across bins.
+
+    Binning is pinned in cfg.calibration.ece_n_bins/ece_strategy so the number
+    is comparable across calibration runs — ECE gates nothing here, it is
+    logged for both methods purely so the loser's numbers make the winner's
+    selection legible.
+    """
+    n_bins = int(cfg.calibration.ece_n_bins)
+    strategy = str(cfg.calibration.ece_strategy)
+    y = y_dev.to_numpy()
+    p = np.asarray(proba)
+
+    if strategy == "quantile":
+        edges = np.unique(np.quantile(p, np.linspace(0.0, 1.0, n_bins + 1)))
+    else:
+        edges = np.linspace(0.0, 1.0, n_bins + 1)
+    edges[0], edges[-1] = 0.0, 1.0
+
+    bin_ids = np.clip(np.digitize(p, edges[1:-1], right=True), 0, len(edges) - 2)
+    n = len(p)
+    ece = 0.0
+    for b in range(len(edges) - 1):
+        mask = bin_ids == b
+        if not mask.any():
+            continue
+        ece += (
+            float(mask.sum()) / n * abs(float(y[mask].mean()) - float(p[mask].mean()))
+        )
+    return float(ece)
+
+
+def pr_auc_gate_passes(
+    per_fold_ap_candidate: list[float],
+    per_fold_ap_uncalibrated: list[float],
+    cfg: DictConfig,
+) -> bool:
+    """Hard gate: candidate's per-fold mean AP must not fall more than Δ* below uncalibrated.
+
+    Applied before any Brier comparison — ranking degradation is a one-metric-
+    invariant violation no Brier improvement buys back. Uses
+    training_setup.delta_threshold (Δ*=0.005), the same materiality threshold
+    the LightGBM-vs-LogReg family decision uses.
+    """
+    delta = float(np.mean(per_fold_ap_candidate)) - float(
+        np.mean(per_fold_ap_uncalibrated)
+    )
+    return delta >= -float(cfg.training_setup.delta_threshold)
+
+
+def brier_switch_decision(
+    per_fold_brier_sigmoid: list[float],
+    per_fold_brier_isotonic: list[float],
+    cfg: DictConfig,
+) -> dict[str, Any]:
+    """Decide sigmoid vs. isotonic via a paired bootstrap CI on per-fold Brier.
+
+    Sigmoid is the incumbent; isotonic must earn the switch. Reuses
+    telco_churn.utils.stats.paired_bootstrap_ci — the same paired-bootstrap
+    idiom the LightGBM-vs-LogReg family decision uses
+    (models/train/comparison.py) — on Δ = mean(Brier_sigmoid) −
+    mean(Brier_isotonic), so a positive Δ favours isotonic (lower Brier is
+    better). No materiality threshold: Brier's scale has no analogue to
+    Δ*=0.005 on PR-AUC, so the CI excluding zero is the whole decision.
+
+    Three outcomes, mirroring bootstrap_comparison's lgbm_win/logreg_win/tie
+    split: isotonic_win (CI entirely favours isotonic), sigmoid_win (CI
+    entirely favours sigmoid), or tie (CI includes 0). Both sigmoid_win and
+    tie keep sigmoid — isotonic must earn the switch, not the reverse — but
+    are logged distinctly so downstream reporting can tell "isotonic was
+    decisively worse" apart from "the result was inconclusive."
+    """
+    result = paired_bootstrap_ci(
+        per_fold_brier_sigmoid,
+        per_fold_brier_isotonic,
+        n_bootstrap=int(cfg.calibration.brier_bootstrap_n_samples),
+        random_state=int(cfg.calibration.random_state),
+    )
+    delta_obs = result["delta_obs"]
+    ci_lower = result["delta_ci_lower"]
+    ci_upper = result["delta_ci_upper"]
+
+    if ci_lower > 0:
+        method, decision_rule = "isotonic", "isotonic_win"
+    elif ci_upper < 0:
+        method, decision_rule = "sigmoid", "sigmoid_win"
+    else:
+        method, decision_rule = "sigmoid", "tie"
+
+    return {
+        "method": method,
+        "decision_rule": decision_rule,
+        "delta_brier_obs": round(delta_obs, 4),
+        "delta_brier_ci_lower": round(ci_lower, 4),
+        "delta_brier_ci_upper": round(ci_upper, 4),
+        "n_bootstrap": result["n_bootstrap"],
+    }
+
+
+def select_calibration_method(
+    pipeline: Pipeline, X_dev: pd.DataFrame, y_dev: pd.Series, cfg: DictConfig
+) -> dict[str, Any]:
+    """Resolve cfg.calibration.method to a concrete sigmoid/isotonic choice, with diagnostics.
+
+    method: 'auto' — computes both methods, gates isotonic on PR-AUC first,
+    and only runs the Brier bootstrap if it clears the gate. Meant to run
+    once as a human-reviewed decision, then get pinned: left on 'auto' under
+    continuous retraining, the method could flip on Brier noise and silently
+    invalidate the derived threshold.
+
+    method: 'sigmoid' | 'isotonic' pinned — the normal path once 'auto' has
+    picked a winner. Computes only that method's OOF, skipping the other
+    method and the sigmoid-vs-isotonic Brier bootstrap entirely (~30 fits vs
+    ~65). Still runs pr_auc_gate_passes against the uncalibrated baseline — a
+    cheap, single-method check — so a pinned method that regresses ranking on
+    a later retrain fails loudly instead of registering silently.
+
+    Returns {"method", "diagnostics": {method_name: {...}}, "switch_decision",
+    "uncalibrated_proba", "calibrated_proba"}. switch_decision is always present
+    with the same six keys (method, decision_rule, delta_brier_obs,
+    delta_brier_ci_lower, delta_brier_ci_upper, n_bootstrap) regardless of which
+    branch produced it — a caller (run_calibration_step, any future
+    calibration_summary.json reader) never has to branch on shape. Only the
+    real Brier-bootstrap branch populates the delta_brier_*/n_bootstrap fields
+    with real values; pinned mode (decision_rule="pinned") and the
+    isotonic_disqualified_pr_auc_gate short-circuit leave them None, since no
+    bootstrap ran. Every diagnostics entry has per_fold_mean_ap, pooled_brier,
+    ece, bss — including a "dummy_prior" entry, the DummyClassifier(strategy=
+    'prior') reference BSS is computed against (its own bss is trivially 0.0,
+    included for auditability). calibrated_proba is always the winning
+    method's OOF vector — not necessarily configured_method's, when 'auto'
+    overrides it — so a caller rendering a reliability diagram from it shows
+    the method that actually gets registered, not whichever was computed
+    first.
+    """
+    configured_method = str(cfg.calibration.method)
+
+    dummy_proba = oof_dummy_proba(X_dev, y_dev, cfg)
+    dummy_per_fold_ap = per_fold_average_precision(dummy_proba, X_dev, y_dev, cfg)
+    dummy_brier = pooled_brier(dummy_proba, y_dev)
+
+    uncal_proba = oof_uncalibrated_proba(pipeline, X_dev, y_dev, cfg)
+    uncal_per_fold_ap = per_fold_average_precision(uncal_proba, X_dev, y_dev, cfg)
+    uncal_brier = pooled_brier(uncal_proba, y_dev)
+    diagnostics: dict[str, dict[str, Any]] = {
+        "dummy_prior": {
+            "per_fold_mean_ap": float(np.mean(dummy_per_fold_ap)),
+            "pooled_brier": dummy_brier,
+            "ece": expected_calibration_error(dummy_proba, y_dev, cfg),
+            "bss": brier_skill_score(dummy_brier, dummy_brier),
+        },
+        "uncalibrated": {
+            "per_fold_mean_ap": float(np.mean(uncal_per_fold_ap)),
+            "pooled_brier": uncal_brier,
+            "ece": expected_calibration_error(uncal_proba, y_dev, cfg),
+            "bss": brier_skill_score(uncal_brier, dummy_brier),
+        },
+    }
+
+    if configured_method in ("sigmoid", "isotonic"):
+        proba = oof_calibrated_proba(pipeline, configured_method, X_dev, y_dev, cfg)
+        per_fold_ap = per_fold_average_precision(proba, X_dev, y_dev, cfg)
+        candidate_brier = pooled_brier(proba, y_dev)
+        diagnostics[configured_method] = {
+            "per_fold_mean_ap": float(np.mean(per_fold_ap)),
+            "pooled_brier": candidate_brier,
+            "ece": expected_calibration_error(proba, y_dev, cfg),
+            "bss": brier_skill_score(candidate_brier, dummy_brier),
+        }
+        if not pr_auc_gate_passes(per_fold_ap, uncal_per_fold_ap, cfg):
+            raise ValueError(
+                f"Pinned calibration method {configured_method!r} failed the PR-AUC "
+                "gate against the uncalibrated baseline — its per-fold mean AP fell "
+                "more than training_setup.delta_threshold below uncalibrated. Refusing "
+                "to register a model with degraded ranking; re-run calibration.method="
+                "'auto' to re-derive the method."
+            )
+        return {
+            "method": configured_method,
+            "diagnostics": diagnostics,
+            "switch_decision": {
+                "method": configured_method,
+                "decision_rule": "pinned",
+                "delta_brier_obs": None,
+                "delta_brier_ci_lower": None,
+                "delta_brier_ci_upper": None,
+                "n_bootstrap": None,
+            },
+            "uncalibrated_proba": uncal_proba,
+            "calibrated_proba": proba,
+        }
+
+    if configured_method != "auto":
+        raise ValueError(
+            f"Unknown calibration.method {configured_method!r}; expected "
+            "'sigmoid', 'isotonic', or 'auto'."
+        )
+
+    sigmoid_proba = oof_calibrated_proba(pipeline, "sigmoid", X_dev, y_dev, cfg)
+    sigmoid_per_fold_ap = per_fold_average_precision(sigmoid_proba, X_dev, y_dev, cfg)
+    sigmoid_per_fold_brier = per_fold_brier(sigmoid_proba, X_dev, y_dev, cfg)
+    sigmoid_brier = pooled_brier(sigmoid_proba, y_dev)
+    diagnostics["sigmoid"] = {
+        "per_fold_mean_ap": float(np.mean(sigmoid_per_fold_ap)),
+        "pooled_brier": sigmoid_brier,
+        "ece": expected_calibration_error(sigmoid_proba, y_dev, cfg),
+        "bss": brier_skill_score(sigmoid_brier, dummy_brier),
+    }
+    if not pr_auc_gate_passes(sigmoid_per_fold_ap, uncal_per_fold_ap, cfg):
+        raise ValueError(
+            "Sigmoid calibration failed the PR-AUC gate against the uncalibrated "
+            "baseline in calibration.method='auto' — its per-fold mean AP fell "
+            "more than training_setup.delta_threshold below uncalibrated. Sigmoid "
+            "is the fallback auto-mode ships whenever isotonic is disqualified, so "
+            "this is refused rather than silently registering a model with "
+            "degraded ranking; investigate the fold split or upstream data before "
+            "retrying."
+        )
+
+    isotonic_proba = oof_calibrated_proba(pipeline, "isotonic", X_dev, y_dev, cfg)
+    isotonic_per_fold_ap = per_fold_average_precision(isotonic_proba, X_dev, y_dev, cfg)
+    isotonic_brier = pooled_brier(isotonic_proba, y_dev)
+    diagnostics["isotonic"] = {
+        "per_fold_mean_ap": float(np.mean(isotonic_per_fold_ap)),
+        "pooled_brier": isotonic_brier,
+        "ece": expected_calibration_error(isotonic_proba, y_dev, cfg),
+        "bss": brier_skill_score(isotonic_brier, dummy_brier),
+    }
+
+    isotonic_eligible = pr_auc_gate_passes(isotonic_per_fold_ap, uncal_per_fold_ap, cfg)
+    if not isotonic_eligible:
+        logger.info(
+            "isotonic_disqualified_pr_auc_gate",
+            isotonic_per_fold_mean_ap=diagnostics["isotonic"]["per_fold_mean_ap"],
+            uncalibrated_per_fold_mean_ap=diagnostics["uncalibrated"][
+                "per_fold_mean_ap"
+            ],
+            delta_threshold=float(cfg.training_setup.delta_threshold),
+        )
+        return {
+            "method": "sigmoid",
+            "diagnostics": diagnostics,
+            "switch_decision": {
+                "method": "sigmoid",
+                "decision_rule": "isotonic_disqualified_pr_auc_gate",
+                "delta_brier_obs": None,
+                "delta_brier_ci_lower": None,
+                "delta_brier_ci_upper": None,
+                "n_bootstrap": None,
+            },
+            "uncalibrated_proba": uncal_proba,
+            "calibrated_proba": sigmoid_proba,
+        }
+
+    isotonic_per_fold_brier = per_fold_brier(isotonic_proba, X_dev, y_dev, cfg)
+    switch_decision = brier_switch_decision(
+        sigmoid_per_fold_brier, isotonic_per_fold_brier, cfg
+    )
+    logger.info(
+        "calibration_method_selected",
+        method=switch_decision["method"],
+        decision_rule=switch_decision["decision_rule"],
+        delta_brier_obs=switch_decision["delta_brier_obs"],
+    )
+    winning_proba = (
+        sigmoid_proba if switch_decision["method"] == "sigmoid" else isotonic_proba
+    )
+    return {
+        "method": switch_decision["method"],
+        "diagnostics": diagnostics,
+        "switch_decision": switch_decision,
+        "uncalibrated_proba": uncal_proba,
+        "calibrated_proba": winning_proba,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 3: register the training cycle's single deployable artifact
+# ---------------------------------------------------------------------------
+
+
+def _save_reliability_plot(
+    uncalibrated_bins: list[dict[str, float]],
+    calibrated_bins: list[dict[str, float]],
+    uncalibrated_proba: NDArray[np.float64],
+    calibrated_proba: NDArray[np.float64],
+    method: str,
+    path: Path,
+) -> None:
+    """Render and save the before/after reliability diagram, with a fixed-width
+    density histogram of the raw OOF probabilities underneath.
+
+    The histogram uses the raw probability arrays directly, not
+    reliability_diagram_bins's quantile bins: quantile bins hold ~equal count
+    by construction, so a histogram built from them is flat and uninformative
+    regardless of the true score distribution's shape — confirmed visually
+    before switching to this approach.
+    """
+    fig, (ax_reliability, ax_hist) = plt.subplots(
+        2, 1, figsize=(6, 7.5), height_ratios=[3, 1], sharex=True
+    )
+
+    ax_reliability.plot(
+        [0, 1], [0, 1], linestyle="--", color="gray", label="perfectly calibrated"
+    )
+    ax_reliability.plot(
+        [b["mean_predicted"] for b in uncalibrated_bins],
+        [b["observed_frequency"] for b in uncalibrated_bins],
+        marker="o",
+        color="C0",
+        label="uncalibrated",
+    )
+    ax_reliability.plot(
+        [b["mean_predicted"] for b in calibrated_bins],
+        [b["observed_frequency"] for b in calibrated_bins],
+        marker="o",
+        color="C1",
+        label=f"calibrated ({method})",
+    )
+    ax_reliability.set_xlim(0, 1)
+    ax_reliability.set_ylim(0, 1)
+    ax_reliability.set_ylabel("Observed frequency")
+    ax_reliability.set_title("Reliability diagram — before vs. after calibration")
+    ax_reliability.legend()
+
+    hist_bins = np.linspace(0.0, 1.0, 21)
+    ax_hist.hist(
+        uncalibrated_proba, bins=hist_bins, color="C0", alpha=0.5, label="uncalibrated"
+    )
+    ax_hist.hist(
+        calibrated_proba,
+        bins=hist_bins,
+        color="C1",
+        alpha=0.5,
+        label=f"calibrated ({method})",
+    )
+    ax_hist.set_xlabel("Predicted probability")
+    ax_hist.set_ylabel("Count")
+    ax_hist.set_title(
+        "Predicted probability distribution — before vs. after calibration"
+    )
+    ax_hist.legend()
+
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
+    """Calibrate, select a method, and register the fitted pipeline as `challenger`.
+
+    The training cycle's single registration point — run_model_logging_step
+    only logs an uncalibrated pipeline and stops there.
+
+    Aborts before fitting anything (raises RuntimeError) if
+    tuning_summary.trial_count_below_threshold is true and
+    cfg.calibration.override_trial_count_gate is not set — a data-quality
+    gate on the tuning result, not a performance comparison.
+
+    name="calibrated_model" is load-bearing: reusing name="model" would
+    rebind runs:/<run_id>/model away from the uncalibrated pipeline, and
+    would make a second run of this function wrap a CalibratedClassifierCV
+    inside another one. serialization_format=cloudpickle is mandatory —
+    mlflow's skops default rejects CalibratedClassifierCV's internals.
+
+    Also renders and logs the pre/post-calibration reliability diagram
+    (reports/figures/reliability_diagram.png, mirrored onto the run's
+    figures/ artifacts) from the exact OOF vectors that decided the winning
+    method — not a recomputation, so the picture matches the numbers in
+    calibration_summary.json.
+
+    reports/figures/reliability_diagram.png is overwritten on every call —
+    it reflects whichever run executed this function most recently on this
+    machine, not a specific run_id. A reader who needs to know which run a
+    figure on disk corresponds to should cross-check that run's own
+    calibration_summary.json rather than trusting the file's mtime; the
+    MLflow-logged copy under that run's figures/ artifacts is the durable,
+    run-pinned reference.
+    """
+    manifest = load_training_manifest(run_id, cfg)
+
+    tuning_summary = manifest.get("tuning_summary", {})
+    trial_count_below_threshold = bool(
+        tuning_summary.get("trial_count_below_threshold", False)
+    )
+    if trial_count_below_threshold and not bool(
+        cfg.calibration.override_trial_count_gate
+    ):
+        logger.error(
+            "calibration_registration_blocked_trial_count",
+            run_id=run_id,
+            min_completed_trials=tuning_summary.get("min_completed_trials"),
+            n_completed_trials=tuning_summary.get("n_completed_trials"),
+        )
+        raise RuntimeError(
+            "Refusing to register: training_manifest.json's tuning_summary."
+            "trial_count_below_threshold is true (too few completed Optuna "
+            "trials to trust the 1-SE pick). Set "
+            "calibration.override_trial_count_gate=true to force registration "
+            "anyway."
+        )
+
+    committed_features = committed_features_from_manifest(manifest)
+    pipeline = unfitted_pipeline_from_manifest(manifest)
+    X_dev, y_dev = load_dev_features(committed_features)
+
+    selection = select_calibration_method(pipeline, X_dev, y_dev, cfg)
+    method = str(selection["method"])
+
+    n_bins = int(cfg.calibration.ece_n_bins)
+    strategy = str(cfg.calibration.ece_strategy)
+    uncalibrated_bins = reliability_diagram_bins(
+        selection["uncalibrated_proba"], y_dev.to_numpy(), n_bins, strategy
+    )
+    calibrated_bins = reliability_diagram_bins(
+        selection["calibrated_proba"], y_dev.to_numpy(), n_bins, strategy
+    )
+    figure_path = (
+        get_project_root() / str(cfg.paths.figures) / "reliability_diagram.png"
+    )
+    _save_reliability_plot(
+        uncalibrated_bins,
+        calibrated_bins,
+        selection["uncalibrated_proba"],
+        selection["calibrated_proba"],
+        method,
+        figure_path,
+    )
+
+    fitted = build_calibrated_pipeline(pipeline, method, cfg)
+    fitted.fit(X_dev, y_dev)
+
+    input_example = X_dev.head(5)
+    in_memory_preds = fitted.predict_proba(input_example)
+    signature = infer_signature(X_dev, fitted.predict_proba(X_dev))
+
+    calibration_summary: dict[str, Any] = {
+        "method": method,
+        "diagnostics": selection["diagnostics"],
+        "switch_decision": selection["switch_decision"],
+    }
+
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    mlflow.set_experiment(str(cfg.mlflow.experiment_name))
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+
+    with mlflow.start_run(run_id=run_id):
+        mlflow.log_dict(calibration_summary, "calibration_summary.json")
+        mlflow.log_artifact(str(figure_path), artifact_path="figures")
+
+        model_info = mlflow.sklearn.log_model(
+            sk_model=fitted,
+            name="calibrated_model",
+            signature=signature,
+            input_example=input_example,
+            pyfunc_predict_fn="predict_proba",
+            serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE,
+            registered_model_name=registered_model_name,
+        )
+
+    reloaded = mlflow.sklearn.load_model(model_info.model_uri)
+    reload_preds = reloaded.predict_proba(input_example)
+    parity_ok = bool(np.allclose(in_memory_preds, reload_preds, rtol=0, atol=1e-12))
+    if not parity_ok:
+        raise AssertionError(
+            "Reload parity check failed: predictions from the reloaded "
+            "calibrated model differ from the in-memory pipeline on the same "
+            "input sample — the serialized model is not safe to register."
+        )
+
+    version = str(model_info.registered_model_version)
+    client = mlflow.tracking.MlflowClient()
+    client.set_model_version_tag(registered_model_name, version, "refit_scope", "dev")
+    client.set_registered_model_alias(registered_model_name, "challenger", version)
+
+    logger.info(
+        "calibration_registered",
+        run_id=run_id,
+        method=method,
+        model_version=version,
+        model_uri=model_info.model_uri,
+        parity_ok=parity_ok,
+    )
+
+    return {
+        "run_id": run_id,
+        "method": method,
+        "model_version": version,
+        "model_uri": model_info.model_uri,
+        "parity_ok": parity_ok,
+        "calibration_summary": calibration_summary,
+    }
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pandera as pa
+    from dotenv import load_dotenv
+
+    from telco_churn.utils.logging import configure_logging
+    from telco_churn.utils.paths import compose_config
+
+    load_dotenv()
+    configure_logging()
+
+    try:
+        cfg = compose_config(overrides=sys.argv[1:] or None)
+        cli_run_id = cfg.calibration.run_id
+        if cli_run_id is None:
+            raise ValueError(
+                "calibration.run_id is required, e.g. `python -m "
+                "telco_churn.models.calibrate calibration.run_id=<tuning_study_run_id>`"
+            )
+        result = run_calibration_step(str(cli_run_id), cfg)
+        logger.info(
+            "calibration_step_done",
+            run_id=result["run_id"],
+            method=result["method"],
+            model_version=result["model_version"],
+        )
+    except FileNotFoundError as e:
+        logger.error("calibration_data_not_found", error=str(e), exc_info=True)
+        sys.exit(1)
+    except pa.errors.SchemaError as e:
+        logger.error("calibration_data_schema_invalid", error=str(e), exc_info=True)
+        sys.exit(1)
+    except ValueError as e:
+        logger.error("calibration_invalid", error=str(e), exc_info=True)
+        sys.exit(1)
+    except RuntimeError as e:
+        logger.error("calibration_blocked", error=str(e), exc_info=True)
+        sys.exit(1)
+    except AssertionError as e:
+        logger.error("calibration_parity_failed", error=str(e), exc_info=True)
+        sys.exit(1)
+    except Exception as e:
+        logger.error("calibration_failed", error=str(e), exc_info=True)
+        sys.exit(1)

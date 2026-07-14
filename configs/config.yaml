@@ -1,10 +1,12 @@
 defaults:
-  - training: lightgbm        # Phase 5 — LightGBM fixed knobs → cfg.training
-  - training@logreg: logreg   # Phase 5 — LogReg comparison params → cfg.logreg
-  - training@selection: selection  # Phase 5 Step 3 — selector hyperparams → cfg.selection
-  - tuning: optuna         # Phase 5 — Optuna study + search space → cfg.tuning
-  # - data: telco          # Phase 1 (pending)
-  # - serving: api         # Phase 9 (pending)
+  - training: lightgbm        # LightGBM fixed knobs → cfg.training
+  - training@logreg: logreg   # LogReg comparison params → cfg.logreg
+  - training@selection: selection  # selector hyperparams → cfg.selection
+  - tuning: optuna         # Optuna study + search space → cfg.tuning
+  - calibration: default  # calibration method/CV/ECE knobs → cfg.calibration
+  - threshold: default    # threshold derivation knobs → cfg.threshold
+  # - data: telco          # pending
+  # - serving: api         # pending
   - _self_
 
 random_seed: 42
@@ -15,7 +17,7 @@ training_setup:
   cv_repeats: 10                         # RSKF repeats — tightens mean PR-AUC on ~5,600 dev rows
   bootstrap_n_samples: 10000            # paired-bootstrap resamples for Δ CI
   segment_bootstrap_n_samples: 1000     # per-segment paired-bootstrap resamples (flag-only diagnostic, not the family decision — smaller for cost)
-  delta_threshold: 0.005                 # Δ*: pre-registered materiality threshold (PROJECT_PLAN.md §Step 2)
+  delta_threshold: 0.005                 # Δ*: pre-registered materiality threshold
   fixed_recall_thresholds: [0.70, 0.80, 0.90]  # recall targets for the fixed-recall profile
   class_weight: balanced                # class imbalance handling: up-weights the minority (churn) class; shared by all model families
   cv_n_jobs: -1                          # outer CV-fold parallelism (joblib, -1 = all cores); distinct from training.fixed.n_jobs (LightGBM's own internal threads, pinned to 1 for determinism) — each fold is an independent fit, so running folds concurrently changes wall-clock time only, never the result. Wired into run_selection_cv (feature_freeze.py) only — its ~850 predict_proba calls/fold comfortably amortize joblib's per-call worker-pool overhead. NOT wired into candidates.py's cv_score_candidate calls: each fold there is a single cheap fit (~0.25s), too light for process-based parallelism to pay off on Windows (spawn-based worker startup + per-task dispatch overhead measured ~2x slower than sequential for this workload).
@@ -33,6 +35,9 @@ paths:
   reports: reports
   feature_discovery_reports: ${paths.reports}/feature_discovery
   validation_reports: ${paths.reports}/validation
+  figures: ${paths.reports}/figures
+  policy: configs/policy
+  costs_config: configs/costs.yaml
 
 validation:
   min_rows: 1000

@@ -1,0 +1,30 @@
+# Cost-scenario parameters — see models/threshold.py.
+gross_margin: 0.60    # telecom benchmark 55-65%
+horizon_months: 12    # 1-year LTV evaluation horizon
+discount_months: 3    # standard retention-offer term
+
+# Average Revenue Per User (ARPU) quantile per scenario, computed from development-set churner MonthlyCharges.
+arpu_quantile:
+  conservative: 0.25
+  base: 0.50
+  optimistic: 0.75
+
+scenarios:
+  conservative:
+    outreach_cost: 5        # automated email/SMS
+    discount_rate: 0.10
+    retention_rate: 0.20    # industry benchmark — not observable in this dataset
+  base:
+    outreach_cost: 20       # call-centre agent
+    discount_rate: 0.20     # typical telecom offer
+    retention_rate: 0.30
+  optimistic:
+    outreach_cost: 50       # retention specialist
+    discount_rate: 0.30
+    retention_rate: 0.40
+
+# r-sensitivity sweep — base-scenario cost/LTV held fixed, retention_rate varied alone.
+retention_rate_sweep: [0.15, 0.20, 0.30, 0.40, 0.45]
+
+# Bootstrap resamples for the empirical argmax-EV agreement-check CI.
+argmax_ev_bootstrap_n_samples: 1_000
