@@ -62,7 +62,7 @@ search_space:
     high: 12
     type: int
 
-# Disabled — n_startup_trials handles exploration instead; a future retrain flow can populate this from the current champion's params (see PROJECT_PLAN.md).
+# Disabled — n_startup_trials handles exploration instead; a future retrain flow can populate this from the current champion's params.
 warm_start_params: null
 
 sampler: tpe

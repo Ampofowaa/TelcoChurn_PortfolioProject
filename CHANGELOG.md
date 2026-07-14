@@ -12,6 +12,149 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ---
 
+## [0.6.1] - 2026-07-14 — Phase 6 QA Pass: Test Isolation & Calibration-Selection Hardening
+
+*A QA pass over Phase 6 found the calibrate/threshold unit tests were not hermetic
+(silently falling through to real, gitignored project data instead of the synthetic
+fixtures every other test uses), the `calibration.method='auto'` decision path — the
+mode that actually produced the shipped model — had two branches with no real test
+coverage, and `calibration_summary.json`'s `switch_decision` field had three
+inconsistent shapes depending on which branch produced it. All are fixed; none change
+the currently-registered model or its documented Phase 6 numbers.*
+
+### Fixed
+- **`tests/unit/test_calibrate.py`, `tests/unit/test_threshold.py`** — `run_calibration_step`/
+  `run_threshold_step` tests called `load_dev_features()` with no override, which falls
+  through to real disk (`load_features()` → `partition()` → `load_split()`) reading the
+  gitignored `datasets/processed/` directory; passed only because that directory happened
+  to exist locally. Added a `sandboxed_dev_features` fixture (`test_calibrate.py`) and the
+  equivalent inline patch in `test_threshold.py`'s `registered_model_version` fixture,
+  redirecting both `calibrate.load_dev_features` and `threshold.py`'s separate
+  `from ... import load_dev_features` binding to the synthetic `dev_split` fixture.
+  Verified hermetic by re-running with `PROCESSED_DATA_DIR` pointed at a nonexistent path.
+- **`src/telco_churn/models/calibrate.py::select_calibration_method`** — in
+  `calibration.method='auto'` mode, only isotonic's per-fold AP was checked against
+  `pr_auc_gate_passes`; sigmoid (the fallback method whenever isotonic is disqualified)
+  was never itself gated, unlike pinned mode. Added the same gate check to sigmoid,
+  raising `ValueError` rather than silently registering a model with degraded ranking.
+- **`CLAUDE.md`** — Data Handling section referenced `features/io.py::load_features()`;
+  corrected to `features/accessor.py::load_features()`, the actual Phase 6 module name.
+
+### Added
+- **`tests/unit/test_accessor.py`** — dedicated unit tests for
+  `src/telco_churn/features/accessor.py` (previously untested directly): `features_path`
+  override behavior, `load_features` schema-validation failures (missing column, wrong
+  dtype, zero-byte file, header-only file), and `features_sha256` hash stability/content-
+  sensitivity. `features/accessor.py` now at 100% line coverage; wired into
+  `Makefile`'s `test-features` target.
+- **`tests/unit/test_calibrate.py`** — two tests closing previously-uncovered branches of
+  `select_calibration_method`'s `'auto'` mode: `isotonic_disqualified_pr_auc_gate` (real,
+  unmocked run) and the real Brier-bootstrap switch decision (isotonic forced past the
+  PR-AUC gate, everything else genuinely computed). `calibrate.py` now at 98% line
+  coverage.
+
+### Changed
+- **`src/telco_churn/models/calibrate.py::select_calibration_method`** —
+  `switch_decision` is now always present in the return value with the same six keys
+  (`method`, `decision_rule`, `delta_brier_obs`, `delta_brier_ci_lower`,
+  `delta_brier_ci_upper`, `n_bootstrap`) regardless of which branch produced it —
+  previously absent entirely in pinned mode and a 2-key dict when isotonic was
+  disqualified, versus the full 6-key dict from a real Brier-bootstrap decision.
+  `run_calibration_step` reads it via direct indexing instead of `selection.get(...)`.
+- **`ANALYSIS.md`** §5 — added a note on the sigmoid-vs-isotonic switch decision's
+  paired bootstrap CI: it resamples only `outer_cv_folds` (= 5) paired fold-level Brier
+  differences, a small effective resample space; not load-bearing for the shipped v1
+  decision since the PR-AUC gate resolved it first, but worth revisiting if a future
+  retrain's decision actually reaches the Brier bootstrap.
+
+---
+
+## [0.6.0] - 2026-07-13 — Phase 6: Calibration & Cost-Sensitive Threshold
+
+*Wraps the tuned LightGBM pipeline in sigmoid calibration (pooled Brier 0.1345, Brier
+Skill Score 0.31 — 16.5% better than uncalibrated) and derives the production decision
+threshold from a closed-form cost model (`t* = c/(r×LTV)`), not an empirical
+cost-matrix cutoff — the point where the model becomes a business decision, not just a
+ranking. Base scenario ships at `t* = 0.3941` (30.8% contact rate), agreeing with its
+empirical argmax-EV check. This phase performs the training cycle's single MLflow
+registration, pointing `challenger` at the calibrated pipeline; promotion to `champion`
+remains Phase 7's job.*
+
+### Added
+- **`src/telco_churn/models/calibrate.py`** — `CalibratedClassifierCV(ensemble=False)`
+  cross-fit on the development set; sigmoid vs. isotonic compared on paired outer-OOF
+  folds via a PR-AUC-preservation gate (isotonic disqualified: −0.0203 PR-AUC past the
+  Δ\*=0.005 materiality threshold). Registers the calibrated pipeline as
+  `telco-churn-pipeline` and points `challenger` at it — the training cycle's only
+  registration (`CLAUDE.md` § *Run artifacts vs. registry versions*).
+- **`src/telco_churn/models/threshold.py`** — closed-form operating threshold
+  `t* = c / (r × LTV)`, replacing the classical `C_FP/(C_FP+C_FN)` cost-matrix rule
+  (which treats correct decisions as free). Ships `threshold.json` /
+  `configs/policy/threshold.yaml` with per-scenario thresholds, an empirical
+  argmax-EV bootstrap-CI agreement diagnostic (`within_ci`), and the retention-rate
+  sensitivity sweep.
+- **`src/telco_churn/models/plots.py`** — reliability-diagram bins, expected-value
+  curves, and retention-sensitivity plotting helpers.
+- **`src/telco_churn/features/accessor.py`** — `load_features()`, the single accessor
+  owning the processed-features path, format, and `sha256` content hash (Phase 8's
+  CSV→Parquet swap becomes a one-function edit).
+- **`src/telco_churn/utils/mlflow.py`** — `resolve_tracking_uri()`, extracted from
+  `models/train/common.py` so `calibrate.py` shares it instead of duplicating the
+  Windows file-URI fix.
+- **`src/telco_churn/utils/stats.py::paired_bootstrap_ci`** — generic paired-bootstrap
+  CI, extracted from `models/train/comparison.py::bootstrap_comparison` and reused by
+  `threshold.py`'s argmax-EV agreement check.
+- `configs/calibration/default.yaml`, `configs/costs.yaml`, `configs/threshold/default.yaml`
+  — calibration method/CV/ECE knobs, the three cost scenarios (conservative/base/
+  optimistic), and threshold-derivation knobs.
+- `notebooks/04-calibration-and-threshold.ipynb` — reliability diagrams, cost curves,
+  threshold-by-scenario and sensitivity plots.
+- `tests/unit/test_calibrate.py`, `test_threshold.py`, `test_mlflow.py`,
+  `tests/integration/test_calibrate_subprocess.py`, `test_threshold_subprocess.py` —
+  suite now 420 passed / 38 skipped, 94.15% coverage (up from 371 tests in Phase 5).
+
+### Changed
+- **`ANALYSIS.md`** — added §5 Probability Calibration and §6 Business Impact &
+  Threshold Selection with real Phase 6 numbers, then a full accuracy/accessibility
+  pass: nested outer/inner CV mechanics clarified (the diagnostics table isn't a
+  single `CalibratedClassifierCV` call), the isotonic-overfitting explanation
+  corrected (the calibrator fits on ~4,500 pooled OOF points per fold, not ~1,120 —
+  verified by instrumenting `IsotonicRegression.fit()`), ARPU correctly identified as
+  a revenue rate rather than profit, an unverified recall/precision figure removed
+  (not reproducible from any artifact), the `r`-uniqueness claim corrected (nothing
+  but ARPU is actually derived from this dataset), and notebook cross-links added
+  throughout §1–§6. Broken `reports/figures/` image embeds (gitignored, never reach
+  GitHub) replaced with links to the notebooks that render the same figures from
+  committed outputs. §7/§8 remain flagged as the archived notebook's pass, pending
+  Phase 7's real evaluation.
+- **`notebooks/02a-feature-discovery.ipynb`** — cross-reference updated to explicitly
+  name `models/calibrate.py` / `models/threshold.py` as the home of the production
+  decision threshold.
+- **`configs/config.yaml`** — registers `calibration`/`threshold` Hydra defaults; adds
+  `paths.figures`, `paths.policy`, `paths.costs_config`.
+- **`README.md`** — results table corrected (dropped an unverified recall/precision
+  figure, added the Phase 5 model-family decision and CV PR-AUC); Data splits table
+  corrected from a fabricated three-way train/val/test split to the real dev/test
+  split `data/split.py` implements; Pipeline diagram fixed (ingestion step added,
+  registration-before-threshold order corrected, a false XGBoost-baseline claim and
+  a premature "champion" label removed); Tech Stack expanded with ingestion/feature-
+  engineering rows and phase annotations on not-yet-built components (DVC, FastAPI/
+  Streamlit, Prefect); Quick Start extended to actually run train → calibrate →
+  threshold; Project Structure expanded to the real `src/telco_churn/` layout; and
+  Project Status moved earlier in the file so scope is clear before Quick Start.
+- **`Makefile`** — `train` target now runs `python -m telco_churn.models.train`
+  (was `dvc repro`, premature before Phase 8); added `calibrate`/`threshold`
+  targets; `test-models` file list fixed (was referencing a file renamed in the
+  Phase 5→6 bridge, and missing two Phase 6 test files).
+- **`PROJECT_PLAN.md`** — Phase 6 marked done in the phase checklist.
+- **Notebooks** (`00`, `01`, `02a`, `02b`, `03c`, `04`) — "Continue to
+  `<next-notebook>`" pointers completed end-to-end from `00` through `04`; `04`'s
+  retention-sensitivity narrative corrected (`t*` is *exactly*, not roughly,
+  inversely proportional to `r`); fragmented stream outputs (a Windows/ipykernel
+  artifact) normalized via `scripts/fix_notebook_outputs.py`.
+
+---
+
 ## [0.5.4] - 2026-07-11 — Phase 5→6 Bridge: Registration Boundary Remediation
 
 *Phase 5 shipped before the registry boundary in `CLAUDE.md` § "Run artifacts vs. registry
@@ -606,7 +749,10 @@ phases build on.*
 <!-- Version comparison links: the `origin` remote (github.com/Ampofowaa/TelcoChurn_PortfolioProject)
 already exists, but no `vX.Y.Z` tags have been pushed yet, so these links would 404 if uncommented
 now. Un-comment once tags are pushed for each released version below.
-[Unreleased]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.4...v0.6.0
+[0.5.4]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.0...v0.5.1

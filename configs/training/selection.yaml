@@ -1,4 +1,4 @@
-# Permutation-importance feature selector (Phase 5 Step 3) — see features/select.py
+# Permutation-importance feature selector — see features/select.py
 # for the selection rule and rescue logic these values feed.
 
 n_repeats: 15
