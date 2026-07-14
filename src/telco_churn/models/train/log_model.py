@@ -22,9 +22,9 @@ from telco_churn.models.train.common import (
     _dvc_hash,
     _git_sha,
     _lgbm_fixed_knobs,
-    _resolve_tracking_uri,
 )
 from telco_churn.utils.logging import get_logger
+from telco_churn.utils.mlflow import resolve_tracking_uri
 
 __all__ = ["run_model_logging_step"]
 
@@ -132,7 +132,7 @@ def run_model_logging_step(
         },
     }
 
-    mlflow.set_tracking_uri(_resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     mlflow.set_experiment(cfg.mlflow.experiment_name)
 
     run_id = str(tuning_result["parent_run_id"])

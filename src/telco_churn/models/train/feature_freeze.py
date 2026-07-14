@@ -23,10 +23,10 @@ from telco_churn.features.select import (
 from telco_churn.models.train.common import (
     _dvc_hash,
     _git_sha,
-    _resolve_tracking_uri,
     lgbm_default_params,
 )
 from telco_churn.utils.logging import get_logger
+from telco_churn.utils.mlflow import resolve_tracking_uri
 
 __all__ = ["run_selection_step"]
 
@@ -219,7 +219,7 @@ def run_selection_step(
     ax_bs.legend()
     fig_bs.tight_layout()
 
-    mlflow.set_tracking_uri(_resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     mlflow.set_experiment(cfg.mlflow.experiment_name)
 
     with mlflow.start_run(run_name="feature_selection"):

@@ -1,8 +1,10 @@
 """Shared helpers for the model training pipeline.
 
-Data loading, MLflow/DVC/git metadata resolution, and the LightGBM knob builders
+Data loading, DVC/git metadata resolution, and the LightGBM knob builders
 reused across every step (candidates.py, feature_freeze.py, tuning.py,
 log_model.py) so each step's fit is representative of the one that ships.
+MLflow tracking-URI resolution lives in telco_churn.utils.mlflow — shared
+outside the training package (models/calibrate.py is the second consumer).
 """
 
 from __future__ import annotations
@@ -49,26 +51,6 @@ def _load_processed(cfg: DictConfig) -> pd.DataFrame:
     df = pd.read_csv(path)
     FeatureOutputSchema.validate(df)
     return df
-
-
-def _resolve_tracking_uri(uri: str) -> str:
-    """Resolve relative MLflow tracking URIs to absolute project-rooted file:// URIs.
-
-    Any URI with an explicit scheme (http(s)://, sqlite://, postgresql://, ...) is
-    returned unchanged — only a bare relative path like 'mlruns' needs anchoring to
-    get_project_root() so the tracking store is always written to the same
-    location regardless of the shell's working directory.
-
-    Returns a file:// URI, not a bare path — on Windows, str(path) yields
-    'C:\\...\\mlruns', and MLflow's store registry reads urlparse's scheme off
-    that string, which is 'c' for a drive letter, not a recognized backend. This
-    is the default branch for any fresh clone or CI runner (no .env, so
-    tracking_uri resolves to the bare 'mlruns' default in configs/config.yaml),
-    so it isn't a latent edge case.
-    """
-    if "://" in uri:
-        return uri
-    return (get_project_root() / uri).as_uri()
 
 
 def _git_sha() -> str:

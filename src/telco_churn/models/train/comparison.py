@@ -21,8 +21,10 @@ from telco_churn.models.diagnostics import (
     segment_bootstrap_delta,
     segment_oof_errors,
 )
-from telco_churn.models.train.common import _dvc_hash, _git_sha, _resolve_tracking_uri
+from telco_churn.models.train.common import _dvc_hash, _git_sha
 from telco_churn.utils.logging import get_logger
+from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.stats import paired_bootstrap_ci
 
 __all__ = ["bootstrap_comparison", "run_comparison_step", "run_diagnostics_step"]
 
@@ -63,18 +65,10 @@ def bootstrap_comparison(
     the test), decision ('lgbm'/'logreg'), decision_rule, n_bootstrap, and the raw
     bootstrap_deltas distribution (used for plotting by run_comparison_step).
     """
-    rng = np.random.default_rng(random_state)
-    diffs = np.array(scores_lgbm) - np.array(scores_logreg)
-    delta_obs = float(diffs.mean())
-    n = len(diffs)
-    bootstrap_deltas = np.fromiter(
-        (rng.choice(diffs, size=n, replace=True).mean() for _ in range(n_bootstrap)),
-        dtype=float,
-        count=n_bootstrap,
-    )
-    p_value = float((bootstrap_deltas <= 0).mean())
-    ci_lower = float(np.percentile(bootstrap_deltas, 2.5))
-    ci_upper = float(np.percentile(bootstrap_deltas, 97.5))
+    result = paired_bootstrap_ci(scores_lgbm, scores_logreg, n_bootstrap, random_state)
+    delta_obs = result["delta_obs"]
+    ci_lower = result["delta_ci_lower"]
+    ci_upper = result["delta_ci_upper"]
 
     if ci_lower > 0 and delta_obs >= delta_threshold:
         decision, decision_rule = "lgbm", "lgbm_win"
@@ -87,11 +81,13 @@ def bootstrap_comparison(
         "delta_obs": round(delta_obs, 3),
         "delta_ci_lower": round(ci_lower, 3),
         "delta_ci_upper": round(ci_upper, 3),
-        "p_value": round(p_value, 3),
+        "p_value": round(result["p_value"], 3),
         "decision": decision,
         "decision_rule": decision_rule,
         "n_bootstrap": n_bootstrap,
-        "bootstrap_deltas": bootstrap_deltas,  # raw distribution; used for plotting in run_comparison_step
+        "bootstrap_deltas": result[
+            "bootstrap_deltas"
+        ],  # raw distribution; used for plotting in run_comparison_step
     }
 
 
@@ -315,7 +311,7 @@ def run_comparison_step(
     ax_bs.set_title("Paired-Bootstrap Δ Distribution")
     ax_bs.legend()
 
-    mlflow.set_tracking_uri(_resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     mlflow.set_experiment(cfg.mlflow.experiment_name)
 
     with mlflow.start_run(run_name="model_comparison"):

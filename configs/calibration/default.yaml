@@ -1,0 +1,29 @@
+# Calibration study configuration — see models/calibrate.py.
+
+# sigmoid | isotonic | auto; run 'auto' once, then pin the winner here.
+method: auto
+
+# cross_val_predict(cv=outer) fold count — explicit shuffle+seed, unlike the unshuffled cv=5 default.
+outer_cv_folds: 5
+
+# CalibratedClassifierCV(cv=inner) fold count.
+inner_cv_folds: 5
+
+shuffle: true
+random_state: 42
+
+# Sigmoid-vs-isotonic gate metric — mean of per-fold AP, never pooled, against training_setup.delta_threshold.
+gate_metric: per_fold_mean_pr_auc
+
+# Block-bootstrap (by outer fold, not row) resamples for the paired ΔBrier CI.
+brier_bootstrap_n_samples: 10_000
+
+# Expected Calibration Error (ECE) binning — gates nothing, just needs to be comparable across runs.
+ece_n_bins: 10
+ece_strategy: quantile
+
+# tuning_study run_id to calibrate — required, e.g. `run_id=<id>` on the CLI. Never inferred from "latest".
+run_id: null
+
+# Force registration even if trial_count_below_threshold is true in training_manifest.json.
+override_trial_count_gate: false
