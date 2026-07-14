@@ -1,13 +1,16 @@
-"""Canonical statistical helpers shared across data.eda and features.generate."""
+"""Canonical statistical helpers shared across data.eda, features.generate, and models.*."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
+from numpy.typing import ArrayLike
 from scipy import stats as sp_stats
 from sklearn.linear_model import LinearRegression
 
-__all__ = ["abs_corr", "cramers_v", "vif_single"]
+__all__ = ["abs_corr", "cramers_v", "paired_bootstrap_ci", "vif_single"]
 
 
 def abs_corr(a: pd.Series, b: pd.Series) -> float:
@@ -37,6 +40,44 @@ def cramers_v(x: pd.Series, y: pd.Series) -> float:
     if n == 0 or min_dim == 0:
         return 0.0
     return float(np.sqrt(chi2 / (n * min_dim)))
+
+
+def paired_bootstrap_ci(
+    scores_a: ArrayLike,
+    scores_b: ArrayLike,
+    n_bootstrap: int,
+    random_state: int,
+) -> dict[str, Any]:
+    """Percentile bootstrap CI on Δ = mean(scores_a) − mean(scores_b), paired by index.
+
+    scores_a/scores_b are paired per unit (the same fold, the same row, ...) —
+    resampling draws whole units with replacement from the paired differences,
+    so the caller decides what a unit is by what it passes in: per-fold scores
+    resample folds, per-row scores resample rows. Returns delta_obs,
+    delta_ci_lower/upper (95% percentile CI), p_value (informational — the CI
+    is the decision surface, not this), n_bootstrap, and the raw
+    bootstrap_deltas distribution for plotting.
+    """
+    rng = np.random.default_rng(random_state)
+    diffs = np.asarray(scores_a) - np.asarray(scores_b)
+    delta_obs = float(diffs.mean())
+    n = len(diffs)
+    bootstrap_deltas = np.fromiter(
+        (rng.choice(diffs, size=n, replace=True).mean() for _ in range(n_bootstrap)),
+        dtype=float,
+        count=n_bootstrap,
+    )
+    p_value = float((bootstrap_deltas <= 0).mean())
+    ci_lower = float(np.percentile(bootstrap_deltas, 2.5))
+    ci_upper = float(np.percentile(bootstrap_deltas, 97.5))
+    return {
+        "delta_obs": delta_obs,
+        "delta_ci_lower": ci_lower,
+        "delta_ci_upper": ci_upper,
+        "p_value": p_value,
+        "n_bootstrap": n_bootstrap,
+        "bootstrap_deltas": bootstrap_deltas,
+    }
 
 
 def vif_single(series: pd.Series, others: pd.DataFrame) -> float:

@@ -20,40 +20,6 @@ from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.models.train.common import cv_score_candidate
 
 # ---------------------------------------------------------------------------
-# _resolve_tracking_uri
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_tracking_uri_passes_through_http() -> None:
-    """An http(s) URI (Docker / remote MLflow server) is returned unchanged."""
-    assert (
-        common._resolve_tracking_uri("http://localhost:5000") == "http://localhost:5000"
-    )
-
-
-def test_resolve_tracking_uri_passes_through_sqlite() -> None:
-    """A sqlite:// URI is a real backend scheme, not a bare relative path — must
-    not be mangled by anchoring it under the project root (regression: this used
-    to break every non-HTTP MLflow backend, including the sqlite fixture used
-    throughout the models/train/* test suite).
-    """
-    uri = "sqlite:///C:/tmp/mlflow.db"
-    assert common._resolve_tracking_uri(uri) == uri
-
-
-def test_resolve_tracking_uri_anchors_bare_relative_path() -> None:
-    """A bare relative path like 'mlruns' is anchored to the project root and
-    returned as a file:// URI — not a bare OS path, which on Windows is
-    misread as scheme 'c' (the drive letter) by MLflow's store registry.
-    """
-    from urllib.parse import urlparse
-
-    resolved = common._resolve_tracking_uri("mlruns")
-    assert urlparse(resolved).scheme == "file"
-    assert resolved == (common.get_project_root() / "mlruns").as_uri()
-
-
-# ---------------------------------------------------------------------------
 # _git_sha / _dvc_hash — audit-trail metadata resolution (QA finding #4:
 # failures are logged, not silently swallowed into an indistinguishable
 # 'unknown', since these values feed training_manifest.json's audit trail)

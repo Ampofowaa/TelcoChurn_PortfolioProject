@@ -23,12 +23,12 @@ from telco_churn.features.preprocessing import (
 from telco_churn.models.train.common import (
     _dvc_hash,
     _git_sha,
-    _resolve_tracking_uri,
     cv_score_candidate,
     lgbm_default_params,
     logreg_default_params,
 )
 from telco_churn.utils.logging import get_logger
+from telco_churn.utils.mlflow import resolve_tracking_uri
 from telco_churn.utils.paths import get_project_root
 
 __all__ = ["run_candidate_step"]
@@ -107,7 +107,7 @@ def run_candidate_step(
         ),
     }
 
-    mlflow.set_tracking_uri(_resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     exp = mlflow.set_experiment(cfg.mlflow.experiment_name)
     _client = mlflow.tracking.MlflowClient()
     _client.set_experiment_tag(

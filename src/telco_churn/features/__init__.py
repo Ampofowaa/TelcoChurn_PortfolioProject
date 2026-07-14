@@ -3,6 +3,12 @@
 import importlib
 from typing import Any
 
+from telco_churn.features.accessor import (
+    FEATURES_FILENAME,
+    features_path,
+    features_sha256,
+    load_features,
+)
 from telco_churn.features.generate import (
     CORR_THRESHOLD,
     CRAMERS_V_THRESHOLD,
@@ -78,6 +84,10 @@ __all__ = [
     "TARGET_COL",
     "CustomerFeaturesSchema",
     "FeatureOutputSchema",
+    "FEATURES_FILENAME",
+    "features_path",
+    "features_sha256",
+    "load_features",
     "CORR_THRESHOLD",
     "CRAMERS_V_THRESHOLD",
     "IMPORTANCE_NOISE_FLOOR_MARGIN",
