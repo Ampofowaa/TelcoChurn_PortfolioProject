@@ -12,6 +12,44 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ---
 
+## [0.6.2] - 2026-07-16 — Phase 7 Prerequisites: MLflow Lineage & Evidence-Persistence Fixes (Run 1)
+
+*Four logging/lineage defects found while designing Phase 7, all in already-shipped Phase 5/6
+code — none of which changes a computed number. Verified via a hard reset (Postgres volume,
+`mlruns/`, `mlflow.db`) and full rebuild: every existing number in `ANALYSIS.md` §4–§6
+reproduced identically, confirming the pipeline is deterministic and these fixes are inert.*
+
+### Added
+- `configs/config.yaml`, `src/telco_churn/utils/mlflow.py::resolve_tracking_uri` — tracking-URI
+  fallback now resolves to `sqlite:///mlflow.db` (project-rooted), not the bare `mlruns` file
+  store, which raises as of MLflow 3.14.
+- `src/telco_churn/models/train/log_model.py`, `src/telco_churn/models/calibrate.py` —
+  `logged_model_id` persisted to `training_manifest.json` and as a model-version tag, giving
+  the registry a path to the `LoggedModel` Phase 7's evaluation logging attaches metrics to.
+- `src/telco_churn/models/train/candidates.py` — logged dataset `source` now resolves through
+  `features/accessor.py::features_path()` instead of a hardcoded path.
+- `src/telco_churn/models/calibrate.py::calibration_slope` — Cox calibration slope + bootstrap
+  CI, logged in `calibration_summary.json` alongside a `calibration_spec` block and the dev-OOF
+  probability vector (`dev_oof_predictions.parquet`), previously computed and discarded.
+- `src/telco_churn/models/calibrate.py`, `src/telco_churn/models/threshold.py` — `dev_brier`/
+  `dev_bss`/`dev_ece`/`dev_per_fold_mean_ap`/`dev_calibration_slope` and
+  `t_star_{scenario}`/`implied_contact_rate_{scenario}`/`dev_ev_at_t_star_{scenario}` now logged
+  as MLflow metrics, not only inside JSON artifacts; the EV curve is persisted as
+  `ev_curve.parquet`.
+- `src/telco_churn/models/threshold.py::expected_value_at_threshold`, `costs_config_hash` — new
+  pure functions; `configs/policy/threshold.yaml` now carries no model stamp (pinned by
+  `costs_config_hash` instead), with the model-dependent half split into a new
+  `threshold_validation.json` run artifact.
+
+### Verified
+- **Run 1 reproducibility audit** — registry holds exactly one version (`refit_scope: dev`,
+  aliased `challenger`), `logged_model_id` resolves on both the manifest and the model-version
+  tag, and every family-comparison delta, frozen feature set, tuned hyperparameter, calibration
+  diagnostic, and threshold value matched `ANALYSIS.md` exactly. Clears Run 2 (the tree-count
+  scaling correction) to isolate its own effect against this baseline.
+
+---
+
 ## [0.6.1] - 2026-07-14 — Phase 6 QA Pass: Test Isolation & Calibration-Selection Hardening
 
 *A QA pass over Phase 6 found the calibrate/threshold unit tests were not hermetic

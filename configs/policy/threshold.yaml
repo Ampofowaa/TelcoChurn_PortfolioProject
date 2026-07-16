@@ -6,21 +6,10 @@ costs:
   r: 0.3
   ltv: 573.12
   arpu: 79.6
-calibration_method: sigmoid
-argmax_ev_bootstrap_ci:
-- 0.364474189672122
-- 0.5320041660922148
-implied_contact_rate: 0.307596734114306
 scenarios:
   conservative:
     scenario: conservative
     threshold: 0.2695988335048768
-    argmax_ev_threshold: 0.2672482859819286
-    argmax_ev_bootstrap_ci:
-    - 0.21197596223313658
-    - 0.3316003494805438
-    within_ci: true
-    implied_contact_rate: 0.40291089811856584
     costs:
       c: 22.0025
       r: 0.2
@@ -29,12 +18,6 @@ scenarios:
   base:
     scenario: base
     threshold: 0.39410013028103474
-    argmax_ev_threshold: 0.4427789122110829
-    argmax_ev_bootstrap_ci:
-    - 0.364474189672122
-    - 0.5320041660922148
-    within_ci: true
-    implied_contact_rate: 0.307596734114306
     costs:
       c: 67.75999999999999
       r: 0.3
@@ -43,12 +26,6 @@ scenarios:
   optimistic:
     scenario: optimistic
     threshold: 0.49680054258079737
-    argmax_ev_threshold: 0.5515383199784182
-    argmax_ev_bootstrap_ci:
-    - 0.4942012312039599
-    - 0.593234559911084
-    within_ci: true
-    implied_contact_rate: 0.24511892083777068
     costs:
       c: 134.78
       r: 0.4
@@ -60,5 +37,4 @@ retention_rate_sensitivity:
   0.3: 0.39410013028103474
   0.4: 0.29557509771077606
   0.45: 0.2627334201873565
-model_run_id: 6450decd98cc40ea96f49a6a9de56b39
-model_version: '1'
+costs_config_hash: 5fc993ef7f185802cdf40a9ac08a06e5d7df7e1834be6dab3fce377131148c81
