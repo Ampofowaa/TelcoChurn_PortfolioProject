@@ -224,6 +224,7 @@ datasets/processed/
 datasets/interim/
 mlruns/
 mlflow.db
+mlartifacts/
 reports/
 .dvc/cache/
 project_thoughts.md

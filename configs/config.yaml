@@ -23,7 +23,11 @@ training_setup:
   cv_n_jobs: -1                          # outer CV-fold parallelism (joblib, -1 = all cores); distinct from training.fixed.n_jobs (LightGBM's own internal threads, pinned to 1 for determinism) — each fold is an independent fit, so running folds concurrently changes wall-clock time only, never the result. Wired into run_selection_cv (feature_freeze.py) only — its ~850 predict_proba calls/fold comfortably amortize joblib's per-call worker-pool overhead. NOT wired into candidates.py's cv_score_candidate calls: each fold there is a single cheap fit (~0.25s), too light for process-based parallelism to pay off on Windows (spawn-based worker startup + per-task dispatch overhead measured ~2x slower than sequential for this workload).
 
 mlflow:
-  tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,mlruns}
+  # Fallback (no .env, infra profile down — fresh clone or CI) must stay a database
+  # backend: MLflow's file store is in maintenance mode as of 3.14 and raises on use.
+  # sqlite:///mlflow.db is the zero-infra fallback with the same SQLAlchemy feature
+  # surface as the served Postgres backend, so local/CI never diverges from it.
+  tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,sqlite:///mlflow.db}
   experiment_name: telco-churn-training
   registered_model_name: telco-churn-pipeline
 

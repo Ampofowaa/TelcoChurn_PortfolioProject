@@ -18,6 +18,11 @@ gate_metric: per_fold_mean_pr_auc
 # Block-bootstrap (by outer fold, not row) resamples for the paired ΔBrier CI.
 brier_bootstrap_n_samples: 10_000
 
+# Row-resample bootstrap for the dev-OOF calibration slope's CI — a diagnostic,
+# not the family-decision bootstrap, hence the smaller count (matches
+# training_setup.segment_bootstrap_n_samples' cost/precision tradeoff).
+slope_bootstrap_n_samples: 1_000
+
 # Expected Calibration Error (ECE) binning — gates nothing, just needs to be comparable across runs.
 ece_n_bins: 10
 ece_strategy: quantile

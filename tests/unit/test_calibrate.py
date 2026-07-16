@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import mlflow
+import mlflow.artifacts
 import numpy as np
 import pandas as pd
 import pytest
@@ -321,6 +322,43 @@ def test_expected_calibration_error_large_when_miscalibrated(
     assert ece == pytest.approx(0.8, abs=1e-9)
 
 
+def test_calibration_slope_perfectly_calibrated_returns_near_one() -> None:
+    """y generated as Bernoulli(p) from the exact predicted probabilities —
+    the Cox slope of a truly calibrated forecaster is 1.0, and its bootstrap
+    CI should straddle it.
+    """
+    rng = np.random.default_rng(42)
+    n = 4000
+    p_true = rng.uniform(0.05, 0.95, size=n)
+    y = rng.binomial(1, p_true)
+
+    result = calibrate.calibration_slope(
+        pd.Series(y), p_true, n_bootstrap=200, random_state=42
+    )
+
+    assert result["slope"] == pytest.approx(1.0, abs=0.15)
+    assert result["slope_ci_lower"] < result["slope"] < result["slope_ci_upper"]
+
+
+def test_calibration_slope_overconfident_returns_less_than_one() -> None:
+    """Predicted probabilities pushed toward 0/1 relative to the true
+    generating probability are systematically overconfident — the defect the
+    slope exists to catch — and must score below 1.0.
+    """
+    rng = np.random.default_rng(42)
+    n = 4000
+    p_true = rng.uniform(0.05, 0.95, size=n)
+    y = rng.binomial(1, p_true)
+    logit_true = np.log(p_true / (1 - p_true))
+    overconfident_proba = 1.0 / (1.0 + np.exp(-2.0 * logit_true))
+
+    result = calibrate.calibration_slope(
+        pd.Series(y), overconfident_proba, n_bootstrap=200, random_state=42
+    )
+
+    assert result["slope"] < 1.0
+
+
 def test_select_calibration_method_pinned_returns_proba_arrays(
     unfitted_pipeline: Pipeline,
     dev_split: tuple[pd.DataFrame, pd.Series],
@@ -541,6 +579,7 @@ def registration_cfg(calibration_mlflow_uri: str, tmp_path: Path) -> OmegaConf:
                 "shuffle": True,
                 "random_state": 42,
                 "brier_bootstrap_n_samples": 200,
+                "slope_bootstrap_n_samples": 50,
                 "ece_n_bins": 5,
                 "ece_strategy": "uniform",
                 "run_id": None,
@@ -610,13 +649,14 @@ def comparison_result() -> dict:
 def sandboxed_dev_features(
     monkeypatch: pytest.MonkeyPatch, dev_split: tuple[pd.DataFrame, pd.Series]
 ) -> None:
-    """Redirect run_calibration_step's load_dev_features() to the synthetic dev_split fixture.
+    """Redirect run_calibration_step's load_dev_features()/load_dev_customer_ids()
+    to the synthetic dev_split fixture.
 
-    Unpatched, load_dev_features() falls through to load_features() ->
-    partition() -> load_split(), all called with no path override — reading
-    the real, gitignored datasets/processed/ directory. That happens to work
-    today only because a real processed CSV + split manifest exist locally;
-    on a fresh clone (no pipeline run yet), every Step 3 test would fail with
+    Unpatched, both fall through to load_features() -> partition() ->
+    load_split(), all called with no path override — reading the real,
+    gitignored datasets/processed/ directory. That happens to work today only
+    because a real processed CSV + split manifest exist locally; on a fresh
+    clone (no pipeline run yet), every Step 3 test would fail with
     FileNotFoundError before touching any calibration logic.
     """
     X_dev, y_dev = dev_split
@@ -626,7 +666,13 @@ def sandboxed_dev_features(
     ) -> tuple[pd.DataFrame, pd.Series]:
         return X_dev[committed_features], y_dev
 
+    def _fake_load_dev_customer_ids() -> pd.Series:
+        return pd.Series(
+            [f"cust-{i:04d}" for i in range(len(y_dev))], name="customerid"
+        )
+
     monkeypatch.setattr(calibrate, "load_dev_features", _fake_load_dev_features)
+    monkeypatch.setattr(calibrate, "load_dev_customer_ids", _fake_load_dev_customer_ids)
 
 
 def _log_parent_run(
@@ -672,6 +718,11 @@ def test_run_calibration_step_registers_and_tags(
     registered_name = str(registration_cfg.mlflow.registered_model_name)
     version = client.get_model_version(registered_name, result["model_version"])
     assert version.tags["refit_scope"] == "dev"
+    # ModelVersion.model_id does not auto-populate in OSS MLflow 3.14 — without
+    # this tag the registry has no supported path to the LoggedModel Phase 7's
+    # evaluate.py attaches sealed-test metrics to.
+    assert version.tags["logged_model_id"]
+    assert mlflow.get_logged_model(version.tags["logged_model_id"]) is not None
 
     registered_model = client.get_registered_model(registered_name)
     assert str(registered_model.aliases["challenger"]) == result["model_version"]
@@ -698,8 +749,104 @@ def test_run_calibration_step_logs_reliability_diagram(
     artifact_paths = {a.path for a in client.list_artifacts(run_id, "figures")}
     assert "figures/reliability_diagram.png" in artifact_paths
 
+
+def test_run_calibration_step_logs_dev_oof_predictions(
+    registration_cfg: OmegaConf,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    comparison_result: dict,
+    tuning_result: dict,
+    sandboxed_dev_features: None,
+) -> None:
+    """The winning method's dev-OOF vector — the numbers that selected it,
+    produced its BSS, and will validate t* — is persisted as a run artifact,
+    not left for a downstream consumer to recompute (CLAUDE.md § Persist the
+    evidence, not just the conclusion).
+    """
+    _, y_dev = dev_split
+    run_id = _log_parent_run(
+        dev_split, comparison_result, tuning_result, registration_cfg
+    )
+
+    calibrate.run_calibration_step(run_id, registration_cfg)
+
+    local_path = mlflow.artifacts.download_artifacts(
+        run_id=run_id, artifact_path="dev_oof_predictions.parquet"
+    )
+    oof = pd.read_parquet(local_path)
+
+    assert list(oof.columns) == ["customerid", "y_true", "p_hat"]
+    assert len(oof) == len(y_dev)
+    assert oof["p_hat"].between(0, 1).all()
+
+
+def test_run_calibration_step_calibration_summary_has_calibration_spec(
+    registration_cfg: OmegaConf,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    comparison_result: dict,
+    tuning_result: dict,
+    sandboxed_dev_features: None,
+) -> None:
+    """calibration_summary.json's calibration_spec carries the four fields
+    that reconstruct the fitted CalibratedClassifierCV, and its method is
+    always a concrete family — never 'auto', the value that must not survive
+    into the artifact. Asserted with calibration.method='auto' rather than a
+    pinned fixture, since a pinned fixture would pass vacuously.
+    """
+    registration_cfg.calibration.method = "auto"
+    run_id = _log_parent_run(
+        dev_split, comparison_result, tuning_result, registration_cfg
+    )
+
+    result = calibrate.run_calibration_step(run_id, registration_cfg)
+
+    spec = result["calibration_summary"]["calibration_spec"]
+    assert spec["method"] == result["method"]
+    assert spec["method"] in ("sigmoid", "isotonic")
+    assert spec["inner_cv_folds"] == _INNER_FOLDS
+    assert spec["random_state"] == int(registration_cfg.calibration.random_state)
+    assert spec["ensemble"] is False
+
+    slope = result["calibration_summary"]["calibration_slope"]
+    assert {"slope", "intercept", "slope_ci_lower", "slope_ci_upper"} <= set(slope)
+
+    client = mlflow.tracking.MlflowClient()
     artifact_paths_root = {a.path for a in client.list_artifacts(run_id)}
     assert "calibration_summary.json" in artifact_paths_root
+
+
+def test_run_calibration_step_logs_dev_metrics(
+    registration_cfg: OmegaConf,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    comparison_result: dict,
+    tuning_result: dict,
+    sandboxed_dev_features: None,
+) -> None:
+    """dev_brier/dev_bss/dev_ece/dev_per_fold_mean_ap/dev_calibration_slope
+    land in the run's metrics panel, not only inside calibration_summary.json
+    — so they are plottable as a series across retraining cycles, matching
+    the winning method's own diagnostics and slope.
+    """
+    run_id = _log_parent_run(
+        dev_split, comparison_result, tuning_result, registration_cfg
+    )
+
+    result = calibrate.run_calibration_step(run_id, registration_cfg)
+
+    winning_diagnostics = result["calibration_summary"]["diagnostics"][result["method"]]
+    expected_slope = result["calibration_summary"]["calibration_slope"]["slope"]
+
+    client = mlflow.tracking.MlflowClient()
+    run = client.get_run(run_id)
+
+    assert run.data.metrics["dev_brier"] == pytest.approx(
+        winning_diagnostics["pooled_brier"]
+    )
+    assert run.data.metrics["dev_bss"] == pytest.approx(winning_diagnostics["bss"])
+    assert run.data.metrics["dev_ece"] == pytest.approx(winning_diagnostics["ece"])
+    assert run.data.metrics["dev_per_fold_mean_ap"] == pytest.approx(
+        winning_diagnostics["per_fold_mean_ap"]
+    )
+    assert run.data.metrics["dev_calibration_slope"] == pytest.approx(expected_slope)
 
 
 def test_run_calibration_step_blocks_on_low_trial_count(

@@ -20,6 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import mlflow
+import mlflow.artifacts
 import numpy as np
 import pandas as pd
 import pytest
@@ -88,6 +89,24 @@ def base_scenario() -> CostScenario:
 # ---------------------------------------------------------------------------
 # Cost/ARPU resolution
 # ---------------------------------------------------------------------------
+
+
+def test_costs_config_hash_changes_iff_costs_yaml_changes(tmp_path: Path) -> None:
+    """Same content -> same hash; any byte of difference -> a different hash.
+
+    Pins configs/policy/threshold.yaml's provenance without a model stamp:
+    same hash means the model changed, a different hash means the cost
+    assumptions did.
+    """
+    path_a = tmp_path / "costs_a.yaml"
+    path_a.write_text("gross_margin: 0.60\n", encoding="utf-8")
+    path_b = tmp_path / "costs_b.yaml"
+    path_b.write_text("gross_margin: 0.60\n", encoding="utf-8")
+    path_c = tmp_path / "costs_c.yaml"
+    path_c.write_text("gross_margin: 0.65\n", encoding="utf-8")
+
+    assert threshold.costs_config_hash(path_a) == threshold.costs_config_hash(path_b)
+    assert threshold.costs_config_hash(path_a) != threshold.costs_config_hash(path_c)
 
 
 def test_arpu_by_scenario_uses_churners_only(costs_cfg: OmegaConf) -> None:
@@ -232,6 +251,41 @@ def test_expected_value_curve_single_class_argmax_is_contact_no_one(
     assert threshold.empirical_argmax_threshold(
         proba, y, base_scenario
     ) == pytest.approx(1.0)
+
+
+def test_expected_value_at_threshold_agrees_with_curve(
+    base_scenario: CostScenario,
+) -> None:
+    """expected_value_at_threshold must agree with expected_value_curve at
+    each of the curve's own threshold points — the invariant that keeps the
+    scalar (used for dev_ev_at_t_star and by Phase 7's economics.py) from
+    drifting apart from the curve it is a single point on.
+    """
+    proba = np.array([0.9, 0.7, 0.4, 0.2])
+    y = np.array([1, 0, 1, 0])
+
+    thresholds, ev = threshold.expected_value_curve(proba, y, base_scenario)
+
+    for t, expected_ev in zip(thresholds, ev, strict=True):
+        assert threshold.expected_value_at_threshold(
+            proba, y, base_scenario, float(t)
+        ) == pytest.approx(expected_ev)
+
+
+def test_expected_value_at_threshold_hand_computed(
+    base_scenario: CostScenario,
+) -> None:
+    """Same 4-row example as test_expected_value_curve_hand_computed, evaluated
+    directly at t=0.4 rather than read off the curve: contacts rows with
+    proba >= 0.4 (0.9, 0.7, 0.4) -> y = [1, 0, 1], 2 TP + 1 FP ->
+    (2*150 - 1*100) / 4 = 50.0.
+    """
+    proba = np.array([0.9, 0.7, 0.4, 0.2])
+    y = np.array([1, 0, 1, 0])
+
+    assert threshold.expected_value_at_threshold(
+        proba, y, base_scenario, 0.4
+    ) == pytest.approx(50.0)
 
 
 def test_implied_contact_rate(base_scenario: CostScenario) -> None:
@@ -422,7 +476,14 @@ def full_cfg(threshold_mlflow_uri: str, tmp_path: Path) -> OmegaConf:
     paths.figures/paths.policy point at an absolute tmp_path — get_project_root()
     joined with an absolute path resolves to that absolute path, sandboxing
     every write away from the real reports/figures/ and configs/policy/.
+
+    paths.costs_config points at a real (placeholder) file rather than the
+    real configs/costs.yaml: load_costs_config() is monkeypatched per-test to
+    return the small costs_cfg fixture, but costs_config_hash() reads actual
+    bytes off disk and is not monkeypatched, so a real file must exist here.
     """
+    costs_config_path = tmp_path / "costs.yaml"
+    costs_config_path.write_text("gross_margin: 0.60\n", encoding="utf-8")
     return OmegaConf.create(
         {
             "random_seed": 42,
@@ -443,6 +504,7 @@ def full_cfg(threshold_mlflow_uri: str, tmp_path: Path) -> OmegaConf:
                 "shuffle": True,
                 "random_state": 42,
                 "brier_bootstrap_n_samples": 200,
+                "slope_bootstrap_n_samples": 50,
                 "ece_n_bins": 5,
                 "ece_strategy": "uniform",
                 "run_id": None,
@@ -457,7 +519,7 @@ def full_cfg(threshold_mlflow_uri: str, tmp_path: Path) -> OmegaConf:
             "paths": {
                 "figures": str(tmp_path / "figures"),
                 "policy": str(tmp_path / "policy"),
-                "costs_config": "unused-load_costs_config-is-monkeypatched",
+                "costs_config": str(costs_config_path),
             },
         }
     )
@@ -533,6 +595,12 @@ def registered_model_version(
     directory instead of this fixture's in-memory frame. The patch stays
     active for the rest of the test: monkeypatch's teardown only runs after
     the whole test function completes, not when this fixture returns.
+
+    calibrate.load_dev_customer_ids() is sandboxed the same way — unpatched,
+    run_calibration_step's dev_oof_predictions.parquet build zips this
+    fixture's small y_dev against the real, full-length customerid column,
+    which pandas rejects as a length mismatch before any calibration logic
+    runs.
     """
     X_dev, y_dev = dev_split
 
@@ -541,8 +609,14 @@ def registered_model_version(
     ) -> tuple[pd.DataFrame, pd.Series]:
         return X_dev[committed_features], y_dev
 
+    def _fake_load_dev_customer_ids() -> pd.Series:
+        return pd.Series(
+            [f"cust-{i:04d}" for i in range(len(y_dev))], name="customerid"
+        )
+
     monkeypatch.setattr(calibrate, "load_dev_features", _fake_load_dev_features)
     monkeypatch.setattr(threshold, "load_dev_features", _fake_load_dev_features)
+    monkeypatch.setattr(calibrate, "load_dev_customer_ids", _fake_load_dev_customer_ids)
 
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result = {**tuning_result, "parent_run_id": run.info.run_id}
@@ -577,6 +651,7 @@ def test_run_threshold_step_ships_all_three_scenarios(
             "argmax_ev_bootstrap_ci",
             "within_ci",
             "implied_contact_rate",
+            "dev_ev_at_t_star",
             "costs",
         }
     assert payload["scenario"] == "base"
@@ -609,6 +684,75 @@ def test_run_threshold_step_logs_three_figures(
     assert "threshold.json" in artifact_paths_root
 
 
+def test_run_threshold_step_logs_validation_json_and_ev_curve(
+    full_cfg: OmegaConf,
+    registered_model_version: str,
+    costs_cfg: OmegaConf,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """threshold_validation.json (the model-dependent half) and ev_curve.parquet
+    (the EV curve's actual points, not just its rendered pixels) are both
+    logged onto the model's run.
+    """
+    monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
+
+    result = threshold.run_threshold_step(registered_model_version, full_cfg)
+    run_id = result["threshold_payload"]["model_run_id"]
+
+    client = mlflow.tracking.MlflowClient()
+    artifact_paths_root = {a.path for a in client.list_artifacts(run_id)}
+    assert "threshold_validation.json" in artifact_paths_root
+    assert "ev_curve.parquet" in artifact_paths_root
+
+    local_path = mlflow.artifacts.download_artifacts(
+        run_id=run_id, artifact_path="ev_curve.parquet"
+    )
+    ev_curve = pd.read_parquet(local_path)
+    assert set(ev_curve.columns) == {"scenario", "threshold", "ev"}
+    assert set(ev_curve["scenario"]) == {"conservative", "base", "optimistic"}
+
+    validation = result["validation_payload"]
+    assert validation["model_run_id"] == run_id
+    assert validation["model_version"] == registered_model_version
+    assert set(validation["scenarios"]) == {"conservative", "base", "optimistic"}
+    for scenario_result in validation["scenarios"].values():
+        assert set(scenario_result) == {
+            "scenario",
+            "argmax_ev_threshold",
+            "argmax_ev_bootstrap_ci",
+            "within_ci",
+            "implied_contact_rate",
+            "dev_ev_at_t_star",
+        }
+
+
+def test_run_threshold_step_logs_scenario_metrics(
+    full_cfg: OmegaConf,
+    registered_model_version: str,
+    costs_cfg: OmegaConf,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """t_star_{scenario}, implied_contact_rate_{scenario}, and
+    dev_ev_at_t_star_{scenario} land in the metrics panel for every scenario —
+    not only inside threshold.json — so they are plottable across cycles.
+    """
+    monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
+
+    result = threshold.run_threshold_step(registered_model_version, full_cfg)
+    run_id = result["threshold_payload"]["model_run_id"]
+
+    client = mlflow.tracking.MlflowClient()
+    run = client.get_run(run_id)
+
+    for name in ("conservative", "base", "optimistic"):
+        assert f"t_star_{name}" in run.data.metrics
+        assert f"implied_contact_rate_{name}" in run.data.metrics
+        assert f"dev_ev_at_t_star_{name}" in run.data.metrics
+        assert run.data.metrics[f"t_star_{name}"] == pytest.approx(
+            result["threshold_payload"]["scenarios"][name]["threshold"]
+        )
+
+
 def test_run_threshold_step_writes_policy_file(
     full_cfg: OmegaConf,
     registered_model_version: str,
@@ -616,7 +760,8 @@ def test_run_threshold_step_writes_policy_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """configs/policy/threshold.yaml (sandboxed to tmp_path here) mirrors the
-    same payload logged to MLflow — the only phase that writes either.
+    policy-only half — no model stamp, since t* is a pure function of
+    configs/costs.yaml and must not go stale across a rollback.
     """
     monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
 
@@ -626,6 +771,40 @@ def test_run_threshold_step_writes_policy_file(
     assert policy_path.exists()
     written = OmegaConf.load(policy_path)
     assert written.threshold == pytest.approx(result["threshold_payload"]["threshold"])
+
+
+def test_run_threshold_step_policy_file_has_no_model_dependent_fields(
+    full_cfg: OmegaConf,
+    registered_model_version: str,
+    costs_cfg: OmegaConf,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The policy file must carry no model_run_id, no model_version, and no
+    other model-dependent field — asserted as an absence, since the failure
+    mode is a field creeping back in that a presence-only test would never
+    notice. costs_config_hash must be present and change iff costs.yaml does.
+    """
+    monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
+
+    threshold.run_threshold_step(registered_model_version, full_cfg)
+
+    policy_path = Path(str(full_cfg.paths.policy)) / "threshold.yaml"
+    written = OmegaConf.load(policy_path)
+
+    assert "model_run_id" not in written
+    assert "model_version" not in written
+    assert "calibration_method" not in written
+    assert "argmax_ev_threshold" not in written
+    assert "argmax_ev_bootstrap_ci" not in written
+    assert "within_ci" not in written
+    assert "implied_contact_rate" not in written
+
+    assert written.costs_config_hash == threshold.costs_config_hash(
+        Path(str(full_cfg.paths.costs_config))
+    )
+    for scenario_name in ("conservative", "base", "optimistic"):
+        scenario_fields = set(written.scenarios[scenario_name])
+        assert scenario_fields == {"scenario", "threshold", "costs"}
 
 
 def test_run_threshold_step_resolves_by_explicit_version_not_alias(

@@ -166,6 +166,12 @@ def run_model_logging_step(
         # through runs:/<run_id>/model, which becomes ambiguous once Phase 6
         # logs a second model onto this same run.
         training_manifest["logged_model_uri"] = model_info.model_uri
+        # LoggedModel.model_id — distinct from run_id. Phase 7's evaluate.py
+        # attaches sealed-test metrics to this (model, dataset) pair via
+        # log_metric(..., model_id=...); ModelVersion.model_id does not
+        # auto-populate in OSS MLflow 3.14, so this must be persisted here or
+        # the registry has no supported path to the model it points at.
+        training_manifest["logged_model_id"] = model_info.model_id
         mlflow.log_dict(training_manifest, "training_manifest.json")
 
     reloaded = mlflow.sklearn.load_model(model_info.model_uri)

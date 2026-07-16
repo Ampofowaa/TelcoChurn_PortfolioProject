@@ -193,6 +193,11 @@ def test_run_model_logging_step_training_manifest_has_expected_fields(
     assert "git_sha" in manifest
     assert "dvc_data_hash" in manifest
     assert manifest["logged_model_uri"] == result["model_uri"]
+    # LoggedModel.model_id — distinct from run_id and not auto-populated onto
+    # ModelVersion in OSS MLflow 3.14; must be persisted here or the registry
+    # has no supported path to the model it points at.
+    assert manifest["logged_model_id"]
+    assert mlflow.get_logged_model(manifest["logged_model_id"]) is not None
 
     # old flat/duplicate top-level keys must be gone, not just supplemented.
     for stale_key in (
