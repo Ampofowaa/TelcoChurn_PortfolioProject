@@ -698,3 +698,33 @@ def test_run_tuning_step_is_idempotent_against_completed_study(
         == tuning_cfg.tuning.n_trials
     )
     assert second["n_completed_trials"] == first["n_completed_trials"]
+
+
+def test_run_tuning_step_logs_dev_input_once_on_parent_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: OmegaConf,
+) -> None:
+    """Fix 6: the tuning_study parent run logs a dataset-lineage input exactly
+    once, via common.py's shared _log_dev_input — the same call that also
+    covers log_model.py's "model" and calibrate.py's "calibrated_model", since
+    both reuse this run's run_id. The source-resolution behaviour itself is
+    tested once, at the shared implementation, in test_train_common.py.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    log_dev_input_mock = Mock()
+    monkeypatch.setattr(tuning, "_log_dev_input", log_dev_input_mock)
+
+    tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        storage=optuna.storages.InMemoryStorage(),
+    )
+
+    log_dev_input_mock.assert_called_once_with(X_dev, y_dev, context="training")

@@ -21,7 +21,7 @@ from telco_churn.models.diagnostics import (
     segment_bootstrap_delta,
     segment_oof_errors,
 )
-from telco_churn.models.train.common import _dvc_hash, _git_sha
+from telco_churn.models.train.common import _dvc_hash, _git_sha, _log_dev_input
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import resolve_tracking_uri
 from telco_churn.utils.stats import paired_bootstrap_ci
@@ -223,14 +223,18 @@ def run_diagnostics_step(
 
 def run_comparison_step(
     X_dev: pd.DataFrame,
+    y_dev: pd.Series,
     candidate_results: dict[str, dict[str, Any]],
     cfg: DictConfig,
 ) -> dict[str, Any]:
     """Run the paired-bootstrap decision on candidate_results and log a comparison run.
 
     Logs a 'model_comparison' MLflow run with bootstrap metrics, decision params,
-    the comparison table/plots, and — via run_diagnostics_step inside the same
-    run — the fixed-recall/fairness/robustness diagnostics.
+    the comparison table/plots, a dataset-lineage input (the dev partition, via
+    common.py's _log_dev_input — the same accessor-resolved source
+    candidates.py's per-candidate runs already log), and — via
+    run_diagnostics_step inside the same run — the fixed-recall/fairness/
+    robustness diagnostics.
 
     Returns bootstrap_comparison's dict (see its docstring) plus a "diagnostics" key
     holding run_diagnostics_step's return value.
@@ -322,6 +326,7 @@ def run_comparison_step(
                 "dvc_data_hash": _dvc_hash(cfg),
             }
         )
+        _log_dev_input(X_dev, y_dev, context="training")
         mlflow.log_params(
             {
                 "delta_threshold": float(ts.delta_threshold),

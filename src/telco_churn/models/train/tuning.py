@@ -26,6 +26,7 @@ from telco_churn.models.train.common import (
     _dvc_hash,
     _git_sha,
     _lgbm_fixed_knobs,
+    _log_dev_input,
 )
 from telco_churn.utils.db import get_engine
 from telco_churn.utils.logging import get_logger
@@ -401,6 +402,10 @@ def run_tuning_step(
                 "dvc_data_hash": _dvc_hash(cfg),
             }
         )
+        # Also covers log_model.py's "model" and calibrate.py's "calibrated_model"
+        # LoggedModels for free — both reuse this run's run_id, and log_input
+        # attaches to the run, not to any one LoggedModel logged onto it.
+        _log_dev_input(X_dev, y_dev, context="training")
         mlflow.log_params(
             {
                 "optuna_study_name": study_name,

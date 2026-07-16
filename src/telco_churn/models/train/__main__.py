@@ -34,7 +34,7 @@ try:
     )
 
     candidate_results = run_candidate_step(X_dev, y_dev, cfg)
-    comparison = run_comparison_step(X_dev, candidate_results, cfg)
+    comparison = run_comparison_step(X_dev, y_dev, candidate_results, cfg)
 
     if comparison["decision"] == "lgbm":
         selection = run_selection_step(X_dev, y_dev, candidate_results, cfg)
