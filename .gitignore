@@ -220,7 +220,6 @@ __marimo__/
 # Project-specific
 # datasets/raw/ is committed: 977 KB, static, read-only, and the source of truth for
 # `dvc repro`. Only derived artifacts are ignored — DVC owns them as stage outputs.
-datasets/raw
 datasets/processed/
 datasets/interim/
 mlruns/
