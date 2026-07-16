@@ -183,7 +183,7 @@ datasets/                # gitignored; tracked by DVC (Phase 8)
 mlruns/                  # gitignored; MLflow local tracking store
 notebooks/               # 00–04: ingestion → EDA → feature discovery/engineering →
                          #        model selection/feature selection/hyperparameter tuning →
-                         #        calibration & threshold (05-error-analysis is Phase 7)
+                         #        calibration & threshold (05-evaluation-and-error-analysis is Phase 7)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, make commands, and PR conventions.
