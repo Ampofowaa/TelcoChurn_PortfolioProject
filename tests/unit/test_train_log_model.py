@@ -40,7 +40,12 @@ def registration_cfg() -> OmegaConf:
                     "verbose": -1,
                 },
             },
-            "tuning": {"selection_rule": "1se"},
+            "tuning": {
+                "selection_rule": "1se",
+                "cv_folds": 5,
+                "es_validation_size": 0.2,
+                "random_state": 42,
+            },
             "mlflow": {
                 "tracking_uri": "placeholder",
                 "experiment_name": "test_run_model_logging_step",
@@ -167,7 +172,10 @@ def test_run_model_logging_step_training_manifest_has_expected_fields(
     for key, value in tuning_result["tuning_summary"].items():
         assert manifest["tuning_summary"][key] == value
     assert manifest["tuning_summary"]["selected_hyperparameters"]["num_leaves"] == 15
-    assert manifest["tuning_summary"]["selected_hyperparameters"]["n_estimators"] == 20
+    # Not the raw median (20) — Fix 5 scales it by n_final_fit / n_fold_fit before
+    # shipping. See test_run_model_logging_step_scales_n_estimators below for the
+    # dedicated correctness proof against fixtures with differing fold/final sizes.
+    assert manifest["tuning_summary"]["selected_hyperparameters"]["n_estimators"] != 20
     assert manifest["tuning_summary"]["selected_cv_pr_auc"] == 0.6
 
     # training_summary: the fixed knobs applied to every fit, not tuning output.
@@ -290,3 +298,168 @@ def test_run_model_logging_step_parity_failure_raises(
         log_model.run_model_logging_step(
             X_dev, y_dev, comparison_result, tuning_result, registration_cfg
         )
+
+
+# ---------------------------------------------------------------------------
+# Fix 5: tree-count scaling correction
+# ---------------------------------------------------------------------------
+
+
+def test_run_model_logging_step_scales_n_estimators(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    registration_cfg: OmegaConf,
+    tuning_result: dict,
+    comparison_result: dict,
+) -> None:
+    """The shipped n_estimators is the scaled value, not the raw early-stopped
+    median — asserted against this fixture's real fold/final sizes (120 dev
+    rows, cv_folds=5, es_validation_size=0.2 -> n_fold_fit=77 != n_final_fit=120),
+    since a fixture where the two sizes coincide would pass either way.
+    """
+    registration_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    tuning_result["parent_run_id"] = _start_parent_run()
+
+    result = log_model.run_model_logging_step(
+        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
+    )
+    tuning_summary = result["training_manifest"]["tuning_summary"]
+
+    n_final_fit = len(y_dev)
+    cv_folds = int(registration_cfg.tuning.cv_folds)
+    es_validation_size = float(registration_cfg.tuning.es_validation_size)
+    expected_n_fold_fit = round(
+        n_final_fit * (cv_folds - 1) / cv_folds * (1 - es_validation_size)
+    )
+    expected_scale_factor = n_final_fit / expected_n_fold_fit
+    expected_n_estimators = round(
+        int(tuning_result["best_n_estimators_median"]) * expected_scale_factor
+    )
+
+    assert expected_n_fold_fit != n_final_fit, (
+        "fixture's fold and final sizes coincide — this test would pass "
+        "whether or not the scaling correction is actually applied"
+    )
+    assert tuning_summary["n_final_fit"] == n_final_fit
+    assert tuning_summary["n_fold_fit"] == expected_n_fold_fit
+    assert tuning_summary["n_estimators_scale_factor"] == pytest.approx(
+        expected_scale_factor
+    )
+    assert tuning_summary["n_estimators_es_median"] == int(
+        tuning_result["best_n_estimators_median"]
+    )
+    assert tuning_summary["n_estimators_shipped"] == expected_n_estimators
+    assert (
+        tuning_summary["selected_hyperparameters"]["n_estimators"]
+        == expected_n_estimators
+    )
+
+
+def test_run_model_logging_step_records_two_count_diagnostic(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    registration_cfg: OmegaConf,
+    tuning_result: dict,
+    comparison_result: dict,
+) -> None:
+    """cv_pr_auc_at_n_es_median / cv_pr_auc_at_n_scaled land in tuning_summary
+    and as MLflow metrics — the diagnostic confirming the scaling rule against
+    this project's own data, not just by citation.
+    """
+    registration_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    tuning_result["parent_run_id"] = _start_parent_run()
+
+    result = log_model.run_model_logging_step(
+        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
+    )
+    tuning_summary = result["training_manifest"]["tuning_summary"]
+
+    assert isinstance(tuning_summary["cv_pr_auc_at_n_es_median"], float)
+    assert isinstance(tuning_summary["cv_pr_auc_at_n_scaled"], float)
+
+    run = mlflow.get_run(result["run_id"])
+    assert run.data.metrics["cv_pr_auc_at_n_es_median"] == pytest.approx(
+        tuning_summary["cv_pr_auc_at_n_es_median"]
+    )
+    assert run.data.metrics["cv_pr_auc_at_n_scaled"] == pytest.approx(
+        tuning_summary["cv_pr_auc_at_n_scaled"]
+    )
+
+
+def test_run_model_logging_step_two_count_diagnostic_mints_no_model(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    registration_cfg: OmegaConf,
+    tuning_result: dict,
+    comparison_result: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exactly one mlflow.sklearn.log_model call per cycle — the two-count
+    diagnostic fits plain estimators in memory and must never register a
+    second candidate, regardless of which count it favours.
+    """
+    registration_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    tuning_result["parent_run_id"] = _start_parent_run()
+
+    real_log_model = log_model.mlflow.sklearn.log_model
+    call_count = 0
+
+    def _counting_log_model(*args: object, **kwargs: object) -> object:
+        nonlocal call_count
+        call_count += 1
+        return real_log_model(*args, **kwargs)
+
+    monkeypatch.setattr(log_model.mlflow.sklearn, "log_model", _counting_log_model)
+
+    log_model.run_model_logging_step(
+        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
+    )
+
+    assert call_count == 1
+
+
+def test_run_model_logging_step_warns_when_scaling_regresses(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    registration_cfg: OmegaConf,
+    tuning_result: dict,
+    comparison_result: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scaled count that scores worse than the raw median logs a warning for
+    manual investigation — the diagnostic never silently ships the textbook
+    answer on faith, but also never blocks registration by itself (Fix 5 is
+    a check, not a selection). Monkeypatches the module logger directly rather
+    than relying on caplog, since structlog isn't routed through stdlib
+    logging in the test process without configure_logging() having run.
+    """
+    registration_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    tuning_result["parent_run_id"] = _start_parent_run()
+
+    # Force the scaled count to lose regardless of the real CV scores, so this
+    # test doesn't depend on the synthetic fixture's data happening to regress.
+    scores = iter([0.70, 0.50])
+
+    def _fake_cv_pr_auc_at_n_estimators(*args: object, **kwargs: object) -> float:
+        return next(scores)
+
+    monkeypatch.setattr(
+        log_model, "_cv_pr_auc_at_n_estimators", _fake_cv_pr_auc_at_n_estimators
+    )
+
+    warning_events: list[str] = []
+    monkeypatch.setattr(
+        log_model.logger,
+        "warning",
+        lambda event, **kwargs: warning_events.append(event),
+    )
+
+    log_model.run_model_logging_step(
+        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
+    )
+
+    assert "n_estimators_scaling_regressed" in warning_events

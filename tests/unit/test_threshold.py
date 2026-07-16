@@ -497,6 +497,11 @@ def full_cfg(threshold_mlflow_uri: str, tmp_path: Path) -> OmegaConf:
                     "verbose": -1,
                 },
             },
+            "tuning": {
+                "cv_folds": 5,
+                "es_validation_size": 0.2,
+                "random_state": 42,
+            },
             "calibration": {
                 "method": "sigmoid",
                 "outer_cv_folds": _OUTER_FOLDS,

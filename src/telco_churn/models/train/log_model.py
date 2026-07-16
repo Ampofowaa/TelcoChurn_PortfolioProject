@@ -14,6 +14,8 @@ import pandas as pd
 from lightgbm import LGBMClassifier
 from mlflow.models import infer_signature
 from omegaconf import DictConfig
+from sklearn.metrics import average_precision_score
+from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 
 from telco_churn.features.build import FEATURE_SCHEMA
@@ -31,6 +33,47 @@ __all__ = ["run_model_logging_step"]
 logger = get_logger(__name__)
 
 
+def _cv_pr_auc_at_n_estimators(
+    n_estimators: int,
+    X_committed: pd.DataFrame,
+    y_dev: pd.Series,
+    lgbm_params: dict[str, Any],
+    binary: list[str],
+    multi_cat: list[str],
+    numeric: list[str],
+    cv_folds: int,
+    random_state: int,
+) -> float:
+    """Mean CV PR-AUC for the tuned spec at a fixed n_estimators — no early stopping.
+
+    Reconstructs tuning.py's outer StratifiedKFold(cv_folds, shuffle=True,
+    random_state=cfg.tuning.random_state) split by construction alone: a
+    StratifiedKFold's partition depends only on n_samples, the y labels, and
+    (shuffle, random_state) — never on X's column content — so passing the
+    same y_dev with the same three parameters reproduces tuning.py's exact
+    fold indices without threading them through tuning_result. This is the
+    two-count diagnostic (PROJECT_PLAN.md Fix 5): a confirmation that the
+    a-priori scaling rule holds on this project's own data, never a
+    selection — it fits plain estimators in memory and logs no MLflow model,
+    so it cannot mint a second registered candidate.
+    """
+    skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
+    scores: list[float] = []
+    for train_idx, val_idx in skf.split(X_committed, y_dev):
+        X_tr, X_val = X_committed.iloc[train_idx], X_committed.iloc[val_idx]
+        y_tr, y_val = y_dev.iloc[train_idx], y_dev.iloc[val_idx]
+
+        preprocessor = build_preprocessor(binary, multi_cat, numeric)
+        X_tr_t = preprocessor.fit_transform(X_tr)
+        X_val_t = preprocessor.transform(X_val)
+
+        model = LGBMClassifier(n_estimators=n_estimators, **lgbm_params)
+        model.fit(X_tr_t, y_tr)
+        proba = model.predict_proba(X_val_t)[:, 1]
+        scores.append(float(average_precision_score(y_val, proba)))
+    return float(np.mean(scores))
+
+
 def run_model_logging_step(
     X_dev: pd.DataFrame,
     y_dev: pd.Series,
@@ -41,9 +84,13 @@ def run_model_logging_step(
     """Log the tuned pipeline to the tuning_study MLflow run — do not register it.
 
     Refits [tree_preprocessor -> LightGBM] on all of development with the Step 4
-    hyperparameters (n_estimators fixed at the selected trial's median
-    early-stopped tree count — no further early stopping here). Logged onto the
-    same MLflow run as the Step 4 tuning_study parent, reopened via its run_id.
+    hyperparameters. n_estimators is not used at its raw early-stopped median —
+    that count was derived on each fold's *training* partition, smaller than
+    this final fit by construction (tuning.py carves an es_validation_size
+    slice out of every fold's training rows), so it is scaled by
+    n_final_fit / n_fold_fit before shipping (PROJECT_PLAN.md Fix 5). No
+    further early stopping happens here. Logged onto the same MLflow run as
+    the Step 4 tuning_study parent, reopened via its run_id.
 
     Logs the full Pipeline (not the bare estimator) with a probability signature +
     input example, runs a log -> reload -> predict_proba parity check (hard
@@ -54,7 +101,14 @@ def run_model_logging_step(
     fixed LightGBM knobs applied to every fit, tuned or not), and tuning_summary
     (Step 4's trial counts, 1-SE band diagnostics, and the selected
     hyperparameters, passed through from run_tuning_step plus
-    selected_hyperparameters added here). The stakeholder-facing
+    selected_hyperparameters added here — plus the tree-count scaling
+    derivation: n_estimators_es_median, n_fold_fit, n_final_fit,
+    n_estimators_scale_factor, n_estimators_shipped, and the two-count
+    diagnostic cv_pr_auc_at_n_es_median/cv_pr_auc_at_n_scaled, also logged as
+    MLflow metrics so they're plottable across cycles). The two-count
+    diagnostic never gates or selects — it only confirms the a-priori scaling
+    rule against this project's own data; a regression is logged as a warning
+    for manual investigation, not enforced here. The stakeholder-facing
     model_card.json is a Phase 7 deliverable, written once at champion promotion
     when calibration, threshold, and sealed-test results are real — not here.
 
@@ -74,13 +128,74 @@ def run_model_logging_step(
     numeric = [c for c in FEATURE_SCHEMA.numeric if c in committed_features]
 
     fixed_hyperparameters = _lgbm_fixed_knobs(cfg, random_state)
+    best_params = dict(tuning_result["best_params"])
+    X_committed = X_dev[committed_features]
+
+    # Tree-count scaling correction (PROJECT_PLAN.md Fix 5): n_estimators is an
+    # early-stopping *output*, derived on each fold's training partition after
+    # tuning.py carves out an es_validation_size slice — smaller than the final
+    # fit's row count by construction, so the raw median under-boosts the final
+    # pipeline unless corrected here.
+    n_estimators_es_median = int(tuning_result["best_n_estimators_median"])
+    cv_folds = int(cfg.tuning.cv_folds)
+    es_validation_size = float(cfg.tuning.es_validation_size)
+    n_final_fit = len(y_dev)
+    n_fold_fit = round(
+        n_final_fit * (cv_folds - 1) / cv_folds * (1 - es_validation_size)
+    )
+    n_estimators_scale_factor = n_final_fit / n_fold_fit
+    n_estimators_final = round(n_estimators_es_median * n_estimators_scale_factor)
+
+    # Two-count diagnostic: confirms the a-priori scaling rule on this
+    # project's own data rather than by citation alone — a check, never a
+    # selection. Reuses tuning.py's exact outer-fold structure
+    # (cfg.tuning.random_state, not cfg.random_seed, is the seed that
+    # actually produced those folds); fits plain estimators in memory and
+    # logs no MLflow model, so neither count can mint a second candidate.
+    diagnostic_lgbm_params = {**best_params, **fixed_hyperparameters}
+    cv_pr_auc_at_n_es_median = _cv_pr_auc_at_n_estimators(
+        n_estimators_es_median,
+        X_committed,
+        y_dev,
+        diagnostic_lgbm_params,
+        binary,
+        multi_cat,
+        numeric,
+        cv_folds,
+        int(cfg.tuning.random_state),
+    )
+    cv_pr_auc_at_n_scaled = _cv_pr_auc_at_n_estimators(
+        n_estimators_final,
+        X_committed,
+        y_dev,
+        diagnostic_lgbm_params,
+        binary,
+        multi_cat,
+        numeric,
+        cv_folds,
+        int(cfg.tuning.random_state),
+    )
+    if cv_pr_auc_at_n_scaled < cv_pr_auc_at_n_es_median:
+        logger.warning(
+            "n_estimators_scaling_regressed",
+            cv_pr_auc_at_n_es_median=cv_pr_auc_at_n_es_median,
+            cv_pr_auc_at_n_scaled=cv_pr_auc_at_n_scaled,
+            n_estimators_es_median=n_estimators_es_median,
+            n_estimators_final=n_estimators_final,
+            hint=(
+                "the scaled tree count scored worse than the raw early-stopped "
+                "median on the same CV folds — investigate the tuned "
+                "regularisation before trusting the scaling correction; do not "
+                "ship the textbook answer on faith"
+            ),
+        )
+
     selected_hyperparameters = {
-        "n_estimators": int(tuning_result["best_n_estimators_median"]),
-        **dict(tuning_result["best_params"]),
+        "n_estimators": n_estimators_final,
+        **best_params,
     }
     model_params = {**selected_hyperparameters, **fixed_hyperparameters}
 
-    X_committed = X_dev[committed_features]
     preprocessor = build_preprocessor(binary, multi_cat, numeric)
     pipeline = Pipeline(
         [
@@ -129,6 +244,16 @@ def run_model_logging_step(
         "tuning_summary": {
             **tuning_result["tuning_summary"],
             "selected_hyperparameters": selected_hyperparameters,
+            # Tree-count scaling correction provenance (Fix 5) — the derivation
+            # must be legible without re-deriving it: n_estimators is not a
+            # tuned hyperparameter, so its shipped value has no other audit trail.
+            "n_estimators_es_median": n_estimators_es_median,
+            "n_fold_fit": n_fold_fit,
+            "n_final_fit": n_final_fit,
+            "n_estimators_scale_factor": n_estimators_scale_factor,
+            "n_estimators_shipped": n_estimators_final,
+            "cv_pr_auc_at_n_es_median": cv_pr_auc_at_n_es_median,
+            "cv_pr_auc_at_n_scaled": cv_pr_auc_at_n_scaled,
         },
     }
 
@@ -139,6 +264,12 @@ def run_model_logging_step(
     with mlflow.start_run(run_id=run_id):
         mlflow.log_text("\n".join(full_feature_space), "feature_space.txt")
         mlflow.log_text("\n".join(committed_features), "feature_columns.txt")
+        mlflow.log_metrics(
+            {
+                "cv_pr_auc_at_n_es_median": cv_pr_auc_at_n_es_median,
+                "cv_pr_auc_at_n_scaled": cv_pr_auc_at_n_scaled,
+            }
+        )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             preprocessing_path = Path(tmp_dir) / "preprocessing.pkl"
