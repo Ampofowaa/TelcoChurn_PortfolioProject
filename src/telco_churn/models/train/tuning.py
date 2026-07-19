@@ -26,6 +26,7 @@ from telco_churn.models.train.common import (
     _dvc_hash,
     _git_sha,
     _lgbm_fixed_knobs,
+    _log_dev_input,
 )
 from telco_churn.utils.db import get_engine
 from telco_churn.utils.logging import get_logger
@@ -401,6 +402,10 @@ def run_tuning_step(
                 "dvc_data_hash": _dvc_hash(cfg),
             }
         )
+        # Also covers log_model.py's "model" and calibrate.py's "calibrated_model"
+        # LoggedModels for free — both reuse this run's run_id, and log_input
+        # attaches to the run, not to any one LoggedModel logged onto it.
+        _log_dev_input(X_dev, y_dev, context="training")
         mlflow.log_params(
             {
                 "optuna_study_name": study_name,
@@ -464,6 +469,21 @@ def run_tuning_step(
                 "tuning_trials_failed",
                 n_failed_trials=n_failed_trials,
                 n_total_trials=len(study.trials),
+            )
+        # catch=(Exception,) above lets one bad hyperparameter combination fail
+        # without killing the study, but that same breadth would also swallow a
+        # systematic bug (bad search-space config, a typo in the objective) as
+        # a per-trial FAIL — which n_failed_trials only warns about, and a
+        # resumed study with pre-existing completed trials could dodge the
+        # min_completed_trials floor entirely. Every submitted trial failing is
+        # never a legitimate per-trial fluke, so it raises instead of warning.
+        if n_remaining_trials > 0 and n_failed_trials == n_remaining_trials:
+            raise RuntimeError(
+                f"All {n_remaining_trials} trials submitted this run failed — "
+                "this is not an expected per-trial failure rate and indicates a "
+                "systematic bug (search-space config, objective code) rather than "
+                "an unlucky hyperparameter draw. Inspect the study's failed trial "
+                "exceptions before re-running."
             )
 
         trial_summaries = [

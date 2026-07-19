@@ -452,6 +452,74 @@ def test_run_selection_cv_fits_selector_once_per_fold(
     assert call_count == cv.get_n_splits()
 
 
+def test_run_selection_cv_uses_distinct_seed_per_fold(
+    synthetic_data: tuple[pd.DataFrame, pd.Series],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each fold's selector gets its own child seed, not a shared random_state —
+    otherwise the decoy draw and every group's permutation shuffle repeat
+    identically on every fold, weakening the noise-floor estimate's independence.
+    Determinism is still required: re-running with the same base random_state
+    must reproduce the same per-fold seeds.
+    """
+    import telco_churn.features.select as select_module
+
+    X, y = synthetic_data
+    cv = RepeatedStratifiedKFold(n_splits=2, n_repeats=2, random_state=42)
+
+    original_init = select_module.PermutationImportanceSelector.__init__
+
+    def _record_seed(seeds: list[int]):  # type: ignore[no-untyped-def]
+        def _init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            seeds.append(kwargs["random_state"])
+            return original_init(self, *args, **kwargs)
+
+        return _init
+
+    seeds_run1: list[int] = []
+    monkeypatch.setattr(
+        select_module.PermutationImportanceSelector,
+        "__init__",
+        _record_seed(seeds_run1),
+    )
+    run_selection_cv(
+        X,
+        y,
+        cv,
+        binary=_BINARY,
+        multi_cat=_MULTI_CAT,
+        numeric=_NUMERIC,
+        estimator_params=_FAST_ESTIMATOR_PARAMS,
+        n_repeats=10,
+        noise_floor_margin=0.005,
+        random_state=42,
+    )
+
+    assert len(seeds_run1) == cv.get_n_splits()
+    assert len(set(seeds_run1)) == len(seeds_run1)
+
+    seeds_run2: list[int] = []
+    monkeypatch.setattr(
+        select_module.PermutationImportanceSelector,
+        "__init__",
+        _record_seed(seeds_run2),
+    )
+    run_selection_cv(
+        X,
+        y,
+        cv,
+        binary=_BINARY,
+        multi_cat=_MULTI_CAT,
+        numeric=_NUMERIC,
+        estimator_params=_FAST_ESTIMATOR_PARAMS,
+        n_repeats=10,
+        noise_floor_margin=0.005,
+        random_state=42,
+    )
+
+    assert seeds_run2 == seeds_run1
+
+
 def test_run_selection_cv_returns_one_score_and_survivor_list_per_fold(
     synthetic_data: tuple[pd.DataFrame, pd.Series],
 ) -> None:

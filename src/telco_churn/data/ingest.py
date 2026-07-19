@@ -8,6 +8,7 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from telco_churn.data.checks import MAX_NULL_RATE, MIN_ROWS
 from telco_churn.data.schema import RawSchema
 from telco_churn.data.validate import ValidationError, validate_raw
 from telco_churn.utils.db import get_engine
@@ -100,16 +101,32 @@ def _merge_from_staging(update_cols: list[str], engine: Engine) -> int:
     Column names in update_cols come from load_raw_csv() — not user input —
     so the f-string SET clause is not a SQL injection risk.
 
+    The INSERT names its columns explicitly on both the target and the SELECT
+    side rather than relying on `INSERT INTO customers_raw SELECT * FROM
+    customers_raw_staging`, which Postgres maps positionally: it would insert
+    correctly only by coincidence, as long as the staging table's column
+    order (inherited from the CSV header) happened to match customers_raw's
+    declared DDL order. Several columns share an identical type with no
+    distinguishing CHECK constraint (e.g. has_partner/dependents/
+    phoneservice/paperlessbilling, all VARCHAR(3) Yes/No flags), so a
+    positional drift between the two orderings would silently swap values
+    between them instead of raising. Naming both column lists makes the
+    mapping order-independent — a future DDL or CSV-header reorder becomes a
+    no-op, and a genuinely missing column raises immediately instead of
+    shifting values into its neighbor.
+
     Returns the DB-reported row count (inserts + updates) from the merge
     statement — not the CSV row count, which can differ if the source file
     is partial or if CHECK constraints reject rows mid-transaction.
     """
+    all_cols = ["customerid", *update_cols]
+    col_list = ", ".join(all_cols)
     set_clause = ", ".join(f"{col} = EXCLUDED.{col}" for col in update_cols)
     with engine.begin() as conn:
         result = conn.execute(
             text(
-                f"INSERT INTO customers_raw "
-                f"SELECT * FROM customers_raw_staging "
+                f"INSERT INTO customers_raw ({col_list}) "
+                f"SELECT {col_list} FROM customers_raw_staging "
                 f"ON CONFLICT (customerid) DO UPDATE SET {set_clause}"
             )
         )
@@ -117,7 +134,12 @@ def _merge_from_staging(update_cols: list[str], engine: Engine) -> int:
     return int(result.rowcount)
 
 
-def ingest(path: Path, engine: Engine | None = None) -> int:
+def ingest(
+    path: Path,
+    engine: Engine | None = None,
+    min_rows: int = MIN_ROWS,
+    max_null_rate: float = MAX_NULL_RATE,
+) -> int:
     """Load the raw Telco CSV into the customers_raw Postgres table.
 
     Uses the industry-standard staging table pattern:
@@ -128,11 +150,18 @@ def ingest(path: Path, engine: Engine | None = None) -> int:
     This mirrors the dbt incremental model pattern used in production warehouses
     (Snowflake / BigQuery MERGE). The main table's PRIMARY KEY is never dropped;
     the merge is fully atomic. Returns the number of rows loaded.
+
+    min_rows/max_null_rate feed validate_raw's gate-5 thresholds and default to
+    the same checks.py constants validate_raw itself falls back to, so a direct
+    call — a unit test, a one-off script — needs no config. The __main__ entry
+    point below overrides both from config: validation.min_rows /
+    validation.max_null_rate, so an operator-tunable value in configs/config.yaml
+    actually reaches the ingest path, not just validate.py's own CLI.
     """
     if engine is None:
         engine = get_engine()
     df = load_raw_csv(path)
-    validate_raw(df, strict=True)
+    validate_raw(df, strict=True, min_rows=min_rows, max_null_rate=max_null_rate)
     setup_schema(engine)
     update_cols = [c for c in df.columns if c != "customerid"]
     csv_rows = len(df)
@@ -160,7 +189,7 @@ if __name__ == "__main__":
     configure_logging()
 
     cfg = load_config()
-    default_csv = Path(cfg.paths.raw_data)
+    default_csv = get_project_root() / cfg.paths.raw_data
 
     parser = argparse.ArgumentParser(description="Ingest raw Telco CSV into Postgres.")
     parser.add_argument(
@@ -172,7 +201,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        ingest(path=args.csv_path)
+        ingest(
+            path=args.csv_path,
+            min_rows=int(cfg.validation.min_rows),
+            max_null_rate=float(cfg.validation.max_null_rate),
+        )
     except ValueError as e:
         logger.error("ingest_schema_mismatch", error=str(e), exc_info=True)
         sys.exit(1)

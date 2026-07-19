@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 
 import mlflow
@@ -12,6 +13,7 @@ from sklearn.dummy import DummyClassifier
 from sklearn.model_selection import RepeatedStratifiedKFold
 
 import telco_churn.models.train.comparison as comparison
+from telco_churn.features.accessor import features_path
 from telco_churn.models.train.common import cv_score_candidate
 
 # ---------------------------------------------------------------------------
@@ -371,10 +373,10 @@ def test_run_comparison_step_returns_bootstrap_and_diagnostics_keys(
 ) -> None:
     """The returned dict is bootstrap_comparison's contract plus a 'diagnostics' key."""
     comparison_cfg.mlflow.tracking_uri = comparison_mlflow_uri
-    X_dev, _ = dev_split
+    X_dev, y_dev = dev_split
 
     result = comparison.run_comparison_step(
-        X_dev, diagnostics_candidate_results, comparison_cfg
+        X_dev, y_dev, diagnostics_candidate_results, comparison_cfg
     )
 
     assert set(result) == {
@@ -408,11 +410,11 @@ def test_run_comparison_step_decision_matches_bootstrap_comparison(
     would fail this even though it would pass the "returns valid keys" test above.
     """
     comparison_cfg.mlflow.tracking_uri = comparison_mlflow_uri
-    X_dev, _ = dev_split
+    X_dev, y_dev = dev_split
     ts = comparison_cfg.training_setup
 
     result = comparison.run_comparison_step(
-        X_dev, diagnostics_candidate_results, comparison_cfg
+        X_dev, y_dev, diagnostics_candidate_results, comparison_cfg
     )
 
     expected = comparison.bootstrap_comparison(
@@ -439,9 +441,11 @@ def test_run_comparison_step_logs_comparison_and_diagnostics_artifacts(
     artifacts, all on the *same* run (not scattered across separate ones).
     """
     comparison_cfg.mlflow.tracking_uri = comparison_mlflow_uri
-    X_dev, _ = dev_split
+    X_dev, y_dev = dev_split
 
-    comparison.run_comparison_step(X_dev, diagnostics_candidate_results, comparison_cfg)
+    comparison.run_comparison_step(
+        X_dev, y_dev, diagnostics_candidate_results, comparison_cfg
+    )
 
     client = mlflow.tracking.MlflowClient()
     experiment = client.get_experiment_by_name("test_run_comparison_step")
@@ -487,9 +491,11 @@ def test_run_comparison_step_tags_stage_git_sha_and_dvc_hash(
     Phase 5 step run carries (candidates.py, feature_freeze.py, tuning.py).
     """
     comparison_cfg.mlflow.tracking_uri = comparison_mlflow_uri
-    X_dev, _ = dev_split
+    X_dev, y_dev = dev_split
 
-    comparison.run_comparison_step(X_dev, diagnostics_candidate_results, comparison_cfg)
+    comparison.run_comparison_step(
+        X_dev, y_dev, diagnostics_candidate_results, comparison_cfg
+    )
 
     client = mlflow.tracking.MlflowClient()
     experiment = client.get_experiment_by_name("test_run_comparison_step")
@@ -498,3 +504,35 @@ def test_run_comparison_step_tags_stage_git_sha_and_dvc_hash(
     assert run.data.tags["stage"] == "comparison"
     assert "git_sha" in run.data.tags
     assert "dvc_data_hash" in run.data.tags
+
+
+def test_run_comparison_step_logs_dataset_source_via_accessor(
+    comparison_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    diagnostics_candidate_results: dict[str, dict],
+    comparison_cfg: OmegaConf,
+) -> None:
+    """The run's logged dataset input (Fix 6) resolves through
+    features/accessor.py::features_path() — the same canonical source
+    candidates.py's per-candidate runs already log — not a second,
+    hand-assembled copy that could silently go stale.
+    """
+    comparison_cfg.mlflow.tracking_uri = comparison_mlflow_uri
+    X_dev, y_dev = dev_split
+
+    comparison.run_comparison_step(
+        X_dev, y_dev, diagnostics_candidate_results, comparison_cfg
+    )
+
+    client = mlflow.tracking.MlflowClient()
+    experiment = client.get_experiment_by_name("test_run_comparison_step")
+    run = client.get_run(
+        client.search_runs(
+            [experiment.experiment_id], filter_string="tags.stage = 'comparison'"
+        )[0].info.run_id
+    )
+
+    dataset_inputs = run.inputs.dataset_inputs
+    assert len(dataset_inputs) == 1
+    source = json.loads(dataset_inputs[0].dataset.source)
+    assert source["uri"] == str(features_path())

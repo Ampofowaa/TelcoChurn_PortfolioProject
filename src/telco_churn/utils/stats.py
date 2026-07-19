@@ -10,7 +10,66 @@ from numpy.typing import ArrayLike
 from scipy import stats as sp_stats
 from sklearn.linear_model import LinearRegression
 
-__all__ = ["abs_corr", "cramers_v", "paired_bootstrap_ci", "vif_single"]
+__all__ = [
+    "abs_corr",
+    "benjamini_hochberg",
+    "cramers_v",
+    "paired_bootstrap_ci",
+    "pool_adjusted_p_values",
+    "vif_single",
+]
+
+
+def benjamini_hochberg(p_values: ArrayLike) -> np.ndarray:
+    """Benjamini-Hochberg FDR-adjusted p-values, in the input's original order.
+
+    For m tests with p-values sorted ascending p_(1) <= ... <= p_(m), the
+    adjusted value at rank i is min_{j>=i}(p_(j) * m / j) — the running
+    minimum enforces monotonicity (a lower-ranked test's adjusted p-value can
+    never exceed a higher-ranked one's). Controls the expected proportion of
+    false discoveries among rejected hypotheses, unlike Bonferroni (which
+    controls the probability of *any* false positive and is overly
+    conservative once more than a handful of tests are run) — the standard
+    correction for a many-feature screen whose p-values are not individually
+    load-bearing for a decision. Returns an empty array for empty input.
+    """
+    p = np.asarray(p_values, dtype=float)
+    m = len(p)
+    order = np.argsort(p)
+    ranks = np.arange(1, m + 1)
+    adjusted_sorted = np.minimum.accumulate((p[order] * m / ranks)[::-1])[::-1]
+    adjusted_sorted = np.clip(adjusted_sorted, 0, 1)
+    adjusted = np.empty(m, dtype=float)
+    adjusted[order] = adjusted_sorted
+    return adjusted
+
+
+def pool_adjusted_p_values(*p_value_groups: ArrayLike) -> list[np.ndarray]:
+    """Benjamini-Hochberg correction applied jointly across multiple p-value groups.
+
+    Concatenates every group into one family before calling benjamini_hochberg,
+    then splits the adjusted values back out in each group's original order —
+    for screens that should share one false-discovery-rate budget (e.g.
+    categorical and numeric feature tests against the same target, run via two
+    different test statistics) rather than being corrected independently.
+    Independent per-group correction understates each group's true
+    multiple-testing burden by ignoring the other groups' tests; which test
+    statistic produced a p-value has no bearing on how it should be pooled —
+    Benjamini-Hochberg operates on the p-values alone. Returns one array per
+    input group, same order, same length; an empty argument list returns [].
+    """
+    if not p_value_groups:
+        return []
+    arrays = [np.asarray(g, dtype=float) for g in p_value_groups]
+    lengths = [len(a) for a in arrays]
+    pooled = np.concatenate(arrays)
+    adjusted = benjamini_hochberg(pooled)
+    out = []
+    start = 0
+    for n in lengths:
+        out.append(adjusted[start : start + n])
+        start += n
+    return out
 
 
 def abs_corr(a: pd.Series, b: pd.Series) -> float:

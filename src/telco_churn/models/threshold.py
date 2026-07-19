@@ -17,6 +17,9 @@ reaches into models.calibrate for those arrays.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,10 +35,9 @@ from omegaconf import DictConfig, OmegaConf
 
 from telco_churn.models.calibrate import (
     committed_features_from_manifest,
+    load_dev_customer_ids,
     load_dev_features,
     load_training_manifest,
-    oof_calibrated_proba,
-    unfitted_pipeline_from_manifest,
 )
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import resolve_tracking_uri
@@ -44,17 +46,20 @@ from telco_churn.utils.paths import get_project_root
 __all__ = [
     "CostScenario",
     "load_costs_config",
+    "costs_config_hash",
     "arpu_by_scenario",
     "resolve_scenario",
     "resolve_all_scenarios",
     "closed_form_threshold",
     "expected_value_curve",
+    "expected_value_at_threshold",
     "empirical_argmax_threshold",
     "argmax_bootstrap_ci",
     "implied_contact_rate",
     "r_sensitivity_sweep",
     "derive_threshold",
     "load_calibration_summary",
+    "load_dev_oof_predictions",
     "run_threshold_step",
 ]
 
@@ -85,6 +90,28 @@ def load_costs_config(path: Path | None = None) -> DictConfig:
     cfg = OmegaConf.load(resolved)
     assert isinstance(cfg, DictConfig)
     return cfg
+
+
+def costs_config_hash(path: Path | None = None) -> str:
+    """Return the sha256 content hash of configs/costs.yaml's resolved values.
+
+    configs/policy/threshold.yaml carries no model stamp — t* = c / (r × LTV)
+    is a pure function of costs.yaml, model-independent by construction — so
+    its provenance is pinned by this hash instead: same hash means the model
+    changed, a different hash means the cost assumptions did. path defaults
+    to the canonical project location; pass an explicit path in tests.
+
+    Hashes the *resolved* config values (via OmegaConf, JSON-encoded with
+    sorted keys), not the file's raw bytes: a purely cosmetic edit — a
+    comment, re-indentation, a CRLF/LF line-ending change from checking the
+    file out on a different OS — must not look like a cost-assumption
+    change, or it becomes a false provenance mismatch against the hash
+    already pinned in configs/policy/threshold.yaml. Same idiom as
+    tuning.py's _study_name content-addressing.
+    """
+    content = OmegaConf.to_container(load_costs_config(path), resolve=True)
+    encoded = json.dumps(content, sort_keys=True, default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def arpu_by_scenario(
@@ -193,6 +220,31 @@ def expected_value_curve(
     return thresholds, ev
 
 
+def expected_value_at_threshold(
+    proba: NDArray[np.float64], y: NDArray[np.int_], scenario: CostScenario, t: float
+) -> float:
+    """Realized per-customer expected value of "contact iff proba >= t", at one threshold t.
+
+    Same ev(t) = [TP(t)·(r·LTV − c) − FP(t)·c] / n formula
+    expected_value_curve sweeps over every distinct threshold — this
+    evaluates it directly at a single t instead of reading it off the curve.
+    The one implementation both call: Phase 7's economics.py imports this
+    function rather than redefining p·r·LTV − c a second time, since two
+    implementations would agree only until one of them changed.
+    """
+    contacted = proba >= t
+    n = len(y)
+    tp = int(np.sum(contacted & (y == 1)))
+    fp = int(np.sum(contacted & (y == 0)))
+    return float(
+        (
+            tp * (scenario.retention_rate * scenario.ltv - scenario.cost)
+            - fp * scenario.cost
+        )
+        / n
+    )
+
+
 def empirical_argmax_threshold(
     oof_proba: NDArray[np.float64], y_dev: NDArray[np.int_], scenario: CostScenario
 ) -> float:
@@ -270,7 +322,9 @@ def derive_threshold(
 
     No conflation: t* is *derived* from cost parameters and *validated* here
     against development OOF probabilities; final cost/recall on the sealed
-    test is evaluate.py's job, not this module's.
+    test is evaluate.py's job, not this module's. dev_ev_at_t_star is a
+    diagnostic, not the headline figure — economics.py computes the sealed-
+    test EV at t* separately, which is what the README quotes.
     """
     t_star = closed_form_threshold(scenario)
     argmax_t = empirical_argmax_threshold(oof_proba, y_dev, scenario)
@@ -284,6 +338,9 @@ def derive_threshold(
         "argmax_ev_bootstrap_ci": [ci_lower, ci_upper],
         "within_ci": ci_lower <= t_star <= ci_upper,
         "implied_contact_rate": implied_contact_rate(oof_proba, t_star),
+        "dev_ev_at_t_star": expected_value_at_threshold(
+            oof_proba, y_dev, scenario, t_star
+        ),
         "costs": {
             "c": scenario.cost,
             "r": scenario.retention_rate,
@@ -307,6 +364,24 @@ def load_calibration_summary(run_id: str, cfg: DictConfig) -> dict[str, Any]:
         f"runs:/{run_id}/calibration_summary.json"
     )
     return summary
+
+
+def load_dev_oof_predictions(run_id: str, cfg: DictConfig) -> pd.DataFrame:
+    """Load calibrate.py's persisted dev_oof_predictions.parquet artifact.
+
+    Columns: customerid, y_true, p_hat — the winning calibration method's
+    exact leak-free OOF vector, the one calibrate.py's own method selection
+    and t* validation rested on. Read here rather than recomputed
+    (CLAUDE.md § Persist the evidence, not just the conclusion): a
+    recomputation is only sound while the dataset is static and CV folds are
+    seeded, and silently diverges from the vector that cycle's decisions
+    actually used once either stops holding (e.g. under Phase 10 retraining).
+    """
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    local_path = mlflow.artifacts.download_artifacts(
+        artifact_uri=f"runs:/{run_id}/dev_oof_predictions.parquet"
+    )
+    return pd.read_parquet(local_path)
 
 
 def _save_sensitivity_plot(
@@ -379,20 +454,23 @@ def _save_scenario_threshold_plot(
 
 
 def _save_scenario_ev_curve_plot(
-    oof_proba: NDArray[np.float64],
-    y_dev: NDArray[np.int_],
+    ev_curves: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]],
     scenarios: dict[str, CostScenario],
     path: Path,
 ) -> None:
     """Render and save each scenario's expected-value curve overlaid, with its
     closed-form t* marked — where EV actually peaks vs. where the cost model
     says to cut, for all three scenarios at once.
+
+    ev_curves is precomputed once by the caller and reused for both this plot
+    and the persisted ev_curve.parquet artifact — not recomputed here, so the
+    picture can never silently diverge from the logged evidence (CLAUDE.md §
+    Persist the evidence, not just the conclusion).
     """
     fig, ax = plt.subplots(figsize=(7, 5))
-    for name, scenario in scenarios.items():
-        thresholds, ev = expected_value_curve(oof_proba, y_dev, scenario)
+    for name, (thresholds, ev) in ev_curves.items():
         (line,) = ax.plot(thresholds, ev, label=name)
-        t_star = closed_form_threshold(scenario)
+        t_star = closed_form_threshold(scenarios[name])
         ax.axvline(t_star, color=line.get_color(), linestyle=":", alpha=0.6)
     ax.set_xlabel("Threshold (t)")
     ax.set_ylabel("Expected value per customer ($)")
@@ -411,21 +489,43 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     re-calibration invalidates a previously-derived threshold, and an alias
     is a moving pointer that could later point at a different version.
 
-    Recomputes the same leak-free OOF probabilities calibrate.py's method
-    selection used (oof_calibrated_proba, over the method recorded in
-    calibration_summary.json) — this module never sees a fitted estimator or
-    the raw data split directly.
+    Loads the same leak-free OOF probabilities calibrate.py's method
+    selection used, from its persisted dev_oof_predictions.parquet artifact
+    (over the method recorded in calibration_summary.json) rather than
+    recomputing them — this module never sees a fitted estimator or the raw
+    data split directly, and never re-derives the OOF vector calibrate.py
+    already logged.
 
-    threshold.json is logged onto the model's source run and mirrored to
-    configs/policy/threshold.yaml — the only phase that writes either.
+    threshold.json (the full, unsplit bundle — every scenario's complete
+    diagnostic set, model stamp included) is logged onto the model's run as
+    the audit-trail copy. What gets mirrored to disk splits along the line
+    the closed form already draws, because the two halves have different
+    lifetimes:
+      - configs/policy/threshold.yaml — the policy: threshold/costs/
+        retention_rate_sensitivity, pure functions of configs/costs.yaml
+        (t* = c / (r × LTV) is model-independent by construction). Pinned by
+        a costs_config_hash, carries no model_run_id/model_version — a file
+        whose content is model-independent must not carry a model stamp, or
+        an emergency rollback to a different champion leaves it silently
+        describing the wrong model.
+      - threshold_validation.json — the model-dependent half (argmax-EV
+        threshold, its bootstrap CI, within_ci, implied contact rate,
+        dev_ev_at_t_star, calibration_method), logged only as an artifact on
+        this model's run — same rule as drift_reference.json: an artifact
+        describing a specific version travels with that version, never sits
+        at a fixed path a rollback could leave stale.
 
-    Every scenario's full diagnostic bundle (argmax-EV threshold, its
-    bootstrap CI, within_ci, implied contact rate, resolved costs) ships in
-    threshold_payload["scenarios"], not just its t* — conservative and
-    optimistic are equally auditable, not merely stored numbers nobody can
-    validate later. base is still the only scenario that drives the
-    top-level threshold/within_ci warning: it is the shipped operating
-    point, the others are reference alternatives.
+    Every scenario's full diagnostic bundle ships in both threshold_payload
+    (unsplit) and validation_payload (model-dependent half only) — not just
+    its t* — conservative and optimistic are equally auditable, not merely
+    stored numbers nobody can validate later. base is still the only
+    scenario that drives the top-level threshold/within_ci warning: it is
+    the shipped operating point, the others are reference alternatives.
+
+    Logs t_star_{scenario}, implied_contact_rate_{scenario}, and
+    dev_ev_at_t_star_{scenario} as MLflow metrics for every scenario, and
+    persists the EV-curve points themselves as ev_curve.parquet — the curve
+    exists today only as pixels in expected_value_by_scenario.png.
 
     Three figures are logged onto the run's figures/ artifacts and mirrored
     to reports/figures/: threshold_sensitivity.png (base's t* vs. retention
@@ -436,7 +536,7 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
 
     Like reports/figures/reliability_diagram.png, these three are overwritten
     on every call — the copy on disk reflects the most recent local run, not
-    a specific run_id. configs/policy/threshold.yaml is self-describing
+    a specific run_id. threshold_validation.json is self-describing
     (model_run_id, model_version), so that is the right place to confirm
     provenance, not the PNGs' mtimes.
     """
@@ -450,11 +550,27 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     method = str(calibration_summary["method"])
 
     committed_features = committed_features_from_manifest(manifest)
-    pipeline = unfitted_pipeline_from_manifest(manifest)
     X_dev, y_dev = load_dev_features(committed_features)
 
-    oof_proba = oof_calibrated_proba(pipeline, method, X_dev, y_dev, cfg)
+    # Aligned by customerid rather than trusted positionally: dev_oof and
+    # X_dev/y_dev are two independent loads (an MLflow artifact fetch and a
+    # features.parquet read), and only their row order happening to match by
+    # construction is not something a silent misalignment would ever surface.
+    customerid = load_dev_customer_ids()
+    dev_oof = load_dev_oof_predictions(run_id, cfg).set_index("customerid")
+    aligned = dev_oof.reindex(customerid)
+    assert aligned["p_hat"].notna().all(), (
+        "dev_oof_predictions.parquet is missing rows for one or more "
+        "dev-partition customerids — it no longer matches the current "
+        "features.parquet (was it logged against a different dev partition?)."
+    )
+    oof_proba = aligned["p_hat"].to_numpy()
     y_dev_arr = y_dev.to_numpy()
+    assert np.array_equal(aligned["y_true"].to_numpy(dtype=int), y_dev_arr), (
+        "dev_oof_predictions.parquet's y_true does not match the current "
+        "y_dev — the persisted OOF artifact is stale relative to the "
+        "current dev partition."
+    )
 
     costs_cfg = load_costs_config(get_project_root() / str(cfg.paths.costs_config))
     scenarios = resolve_all_scenarios(X_dev["monthlycharges"], y_dev, costs_cfg)
@@ -505,10 +621,18 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     )
     _save_scenario_threshold_plot(results, scenario_threshold_path)
 
+    # Computed once, shared by the plot and the persisted artifact — a second
+    # recomputation is exactly the risk CLAUDE.md's "persist the evidence"
+    # rule exists to close off.
+    ev_curves = {
+        name: expected_value_curve(oof_proba, y_dev_arr, scenario)
+        for name, scenario in scenarios.items()
+    }
+
     ev_curve_path = (
         get_project_root() / str(cfg.paths.figures) / "expected_value_by_scenario.png"
     )
-    _save_scenario_ev_curve_plot(oof_proba, y_dev_arr, scenarios, ev_curve_path)
+    _save_scenario_ev_curve_plot(ev_curves, scenarios, ev_curve_path)
 
     threshold_payload: dict[str, Any] = {
         "threshold": base["threshold"],
@@ -524,15 +648,75 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         "model_version": str(model_version),
     }
 
+    costs_hash = costs_config_hash(get_project_root() / str(cfg.paths.costs_config))
+    policy_payload: dict[str, Any] = {
+        "threshold": base["threshold"],
+        "scenario": "base",
+        "rule": "closed_form_c_over_r_ltv",
+        "costs": base["costs"],
+        "scenarios": {
+            name: {
+                "scenario": name,
+                "threshold": result["threshold"],
+                "costs": result["costs"],
+            }
+            for name, result in results.items()
+        },
+        "retention_rate_sensitivity": sweep,
+        "costs_config_hash": costs_hash,
+    }
+    validation_payload: dict[str, Any] = {
+        "model_run_id": run_id,
+        "model_version": str(model_version),
+        "calibration_method": method,
+        "argmax_ev_threshold": base["argmax_ev_threshold"],
+        "argmax_ev_bootstrap_ci": base["argmax_ev_bootstrap_ci"],
+        "within_ci": base["within_ci"],
+        "implied_contact_rate": base["implied_contact_rate"],
+        "scenarios": {
+            name: {
+                "scenario": name,
+                "argmax_ev_threshold": result["argmax_ev_threshold"],
+                "argmax_ev_bootstrap_ci": result["argmax_ev_bootstrap_ci"],
+                "within_ci": result["within_ci"],
+                "implied_contact_rate": result["implied_contact_rate"],
+                "dev_ev_at_t_star": result["dev_ev_at_t_star"],
+            }
+            for name, result in results.items()
+        },
+    }
+
     with mlflow.start_run(run_id=run_id):
         mlflow.log_dict(threshold_payload, "threshold.json")
+        mlflow.log_dict(validation_payload, "threshold_validation.json")
         mlflow.log_artifact(str(figure_path), artifact_path="figures")
         mlflow.log_artifact(str(scenario_threshold_path), artifact_path="figures")
         mlflow.log_artifact(str(ev_curve_path), artifact_path="figures")
 
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ev_curve_data_path = Path(tmp_dir) / "ev_curve.parquet"
+            ev_curve_df = pd.concat(
+                [
+                    pd.DataFrame({"scenario": name, "threshold": thresholds, "ev": ev})
+                    for name, (thresholds, ev) in ev_curves.items()
+                ],
+                ignore_index=True,
+            )
+            ev_curve_df.to_parquet(ev_curve_data_path, index=False)
+            mlflow.log_artifact(str(ev_curve_data_path))
+
+        scenario_metrics: dict[str, float] = {}
+        for name, result in results.items():
+            scenario_metrics[f"t_star_{name}"] = result["threshold"]
+            scenario_metrics[f"implied_contact_rate_{name}"] = result[
+                "implied_contact_rate"
+            ]
+            scenario_metrics[f"dev_ev_at_t_star_{name}"] = result["dev_ev_at_t_star"]
+        mlflow.log_metrics(scenario_metrics)
+
     policy_path = get_project_root() / str(cfg.paths.policy) / "threshold.yaml"
     policy_path.parent.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(OmegaConf.create(threshold_payload), policy_path)
+    OmegaConf.save(OmegaConf.create(policy_payload), policy_path)
 
     logger.info(
         "threshold_derived",
@@ -544,7 +728,11 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         implied_contact_rate=base["implied_contact_rate"],
     )
 
-    return {"threshold_payload": threshold_payload}
+    return {
+        "threshold_payload": threshold_payload,
+        "policy_payload": policy_payload,
+        "validation_payload": validation_payload,
+    }
 
 
 if __name__ == "__main__":

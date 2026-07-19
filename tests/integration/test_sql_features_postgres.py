@@ -29,6 +29,13 @@ pytestmark = pytest.mark.integration
 _FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 _RAW_COUNT = 13
 
+# Deliberately unreachable: port 1 on loopback refuses the connection almost
+# instantly (ECONNREFUSED) rather than timing out, and connect_timeout bounds
+# the worst case. Used to trigger a real, deterministic connection failure
+# without depending on whether another test in this module has already
+# seeded customers_raw.
+_BAD_POSTGRES_URL = "postgresql://baduser:badpass@127.0.0.1:1/nonexistentdb?connect_timeout=2"  # pragma: allowlist secret
+
 
 @pytest.fixture(scope="module")
 def sql_dir() -> Path:
@@ -121,6 +128,7 @@ def test_charge_per_service_fiber_optic_counts_as_internet(
                 "WHERE customerid = :id"
             ).bindparams(id="fiber-optic-1")
         ).scalar()
+    assert val is not None
     assert float(val) == pytest.approx(30.00)
 
 
@@ -135,6 +143,7 @@ def test_charge_per_service_no_internet_excluded_from_flag(
                 "WHERE customerid = :id"
             ).bindparams(id="no-internet-1")
         ).scalar()
+    assert val is not None
     assert float(val) == pytest.approx(19.90)
 
 
@@ -157,6 +166,7 @@ def test_charge_per_service_value_correctness(
                 "WHERE customerid = :id"
             ).bindparams(id=customerid)
         ).scalar()
+    assert val is not None
     assert float(val) == pytest.approx(expected)
 
 
@@ -309,3 +319,83 @@ def test_build_main_cli_composition(
         + 2
     )  # + customerid + churn
     assert df.shape == (_RAW_COUNT, expected_cols)
+
+
+def test_build_main_cli_exits_one_on_connection_failure() -> None:
+    """build.py __main__ exits 1 when the database is unreachable.
+
+    CLAUDE.md requires both the exit-0 and exit-1 paths covered per CLI entry
+    point; test_build_main_cli_composition above only ever exercised exit-0.
+    An unreachable POSTGRES_URL fails inside build_sql_features's
+    engine.begin(), which build.py's __main__ catches as SQLAlchemyError.
+    """
+    env = {**os.environ, "POSTGRES_URL": _BAD_POSTGRES_URL}
+    result = subprocess.run(
+        [sys.executable, "-m", "telco_churn.features.build"],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=str(get_project_root()),
+    )
+    assert result.returncode == 1, (
+        f"build CLI should exit 1 on an unreachable DB:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# sql_features.py __main__ CLI composition: load_dotenv → OmegaConf.load →
+#   get_engine → build_sql_features → sys.exit
+#
+# Not exercised by test_build_main_cli_composition above — that test calls
+# build_sql_features() as a shared function from within build.py's own
+# __main__, never sql_features.py's own CLI body (its own cfg load, its own
+# get_engine() call, its own try/except sys.exit(1)).
+# ---------------------------------------------------------------------------
+
+
+def test_sql_features_main_cli_exits_zero(seeded_engine: Engine, pg_url: str) -> None:
+    """sql_features.py __main__ exits 0 and (re)creates both feature views.
+
+    Runs against the already-seeded module container; CREATE OR REPLACE VIEW
+    makes rerunning the CLI idempotent, so this validates the CLI's own
+    composition path end-to-end without needing a second container.
+    """
+    env = {**os.environ, "POSTGRES_URL": pg_url}
+    result = subprocess.run(
+        [sys.executable, "-m", "telco_churn.features.sql_features"],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=str(get_project_root()),
+    )
+    assert result.returncode == 0, (
+        f"sql_features CLI exited non-zero:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    with seeded_engine.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM customer_features")).scalar()
+    assert count == _RAW_COUNT
+
+
+def test_sql_features_main_cli_exits_one_on_connection_failure() -> None:
+    """sql_features.py __main__ exits 1 when the database is unreachable.
+
+    Fails inside build_sql_features's engine.begin(), before any SQL file is
+    read — deterministic and independent of ingestion order in this module.
+    """
+    env = {**os.environ, "POSTGRES_URL": _BAD_POSTGRES_URL}
+    result = subprocess.run(
+        [sys.executable, "-m", "telco_churn.features.sql_features"],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=str(get_project_root()),
+    )
+    assert result.returncode == 1, (
+        f"sql_features CLI should exit 1 on an unreachable DB:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )

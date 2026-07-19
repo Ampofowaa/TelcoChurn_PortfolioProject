@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import chi2_contingency, mannwhitneyu
 
-from telco_churn.utils.stats import vif_single
+from telco_churn.utils.stats import pool_adjusted_p_values, vif_single
 
 __all__ = [
     "CAT_FEATURES",
@@ -27,6 +27,7 @@ __all__ = [
     "churn_rate_by_group",
     "compute_chi2_tests",
     "compute_mann_whitney",
+    "compute_significance_screen",
     "compute_vif",
     "encoded_correlation_matrix",
     "correlation_with_target",
@@ -213,6 +214,18 @@ def compute_chi2_tests(
     ``pd.crosstab`` handles integer columns (e.g. ``seniorcitizen`` 0/1) without
     pre-encoding.
 
+    This runs one test per feature — up to 16 by default — against the same
+    target, so raw ``p_value`` alone is exploratory, not confirmatory: at the
+    conventional α=0.05, a screen this size has a substantial chance of at
+    least one false-positive "significant" result even if no feature has a
+    real association. See ``compute_significance_screen``, which runs this
+    alongside ``compute_mann_whitney`` and pools both into one
+    Benjamini-Hochberg-corrected family — call that instead of this function
+    directly when the correction matters, since neither p-value column gates
+    anything downstream (``cramers_v`` is the effect-size read this function
+    exists to produce; feature selection is driven by cross-validated
+    permutation importance in ``features/select.py``).
+
     Args:
         df: DataFrame with categorical columns and a binary *target*.
         cat_features: Columns to test; defaults to ``CAT_FEATURES + BINARY_INT_FEATURES``.
@@ -287,6 +300,13 @@ def compute_mann_whitney(
     ``r = 2U / (n₁ · n₀) − 1`` and quantifies the effect size
     (positive ⇒ churners score *higher* on that feature; negative ⇒ churners score *lower*).
 
+    One test per feature against the same target — only 3 by default here,
+    but see ``compute_chi2_tests``'s docstring for why raw ``p_value`` alone
+    is exploratory rather than confirmatory at this scale, and
+    ``compute_significance_screen`` for the Benjamini-Hochberg correction
+    pooled jointly with ``compute_chi2_tests``'s features. ``rank_biserial_r``
+    remains the effect-size read this function exists to produce.
+
     Args:
         df: DataFrame with numeric columns and a binary *target*.
         num_features: Columns to test; defaults to ``NUM_FEATURES``.
@@ -294,7 +314,7 @@ def compute_mann_whitney(
 
     Returns:
         DataFrame with columns: feature, rank_biserial_r, U_stat, p_value,
-        mean_churners, mean_non_churners.  Sorted by |rank_biserial_r| desc.
+        mean_churners, mean_non_churners. Sorted by |rank_biserial_r| desc.
     """
     if num_features is None:
         num_features = list(NUM_FEATURES)
@@ -308,9 +328,9 @@ def compute_mann_whitney(
                 stacklevel=2,
             )
             continue
-        result = mannwhitneyu(g1, g0, alternative="two-sided")
-        U = float(result.statistic)
-        p = float(result.pvalue)
+        mw_result = mannwhitneyu(g1, g0, alternative="two-sided")
+        U = float(mw_result.statistic)
+        p = float(mw_result.pvalue)
         r = (2.0 * U) / (len(g1) * len(g0)) - 1.0
         rows.append(
             {
@@ -338,6 +358,48 @@ def compute_mann_whitney(
         .sort_values("rank_biserial_r", key=abs, ascending=False)
         .reset_index(drop=True)
     )
+
+
+def compute_significance_screen(
+    df: pd.DataFrame,
+    cat_features: list[str] | None = None,
+    num_features: list[str] | None = None,
+    target: str = TARGET,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run compute_chi2_tests and compute_mann_whitney as one joint significance screen.
+
+    Both tables test the same underlying question — does this feature show a
+    raw association with *target*? — against the same target, in the same
+    screening pass. Which test statistic applies (chi-squared for categorical,
+    Mann-Whitney U for numeric) is an implementation detail with no bearing on
+    what "family" of simultaneous tests they belong to for false-discovery-rate
+    purposes, so ``adjusted_p_value`` here is corrected jointly across every
+    feature from both tables combined (``pool_adjusted_p_values``) rather than
+    independently per table — correcting them independently would understate
+    each table's true multiple-testing burden by ignoring the other's tests.
+
+    Neither p-value column gates anything downstream: ``cramers_v`` and
+    ``rank_biserial_r`` are the effect-size reads these two functions exist to
+    produce, and feature selection is driven by cross-validated permutation
+    importance in ``features/select.py``.
+
+    Args:
+        df: DataFrame with categorical/numeric columns and a binary *target*.
+        cat_features: Passed to compute_chi2_tests; defaults to
+            ``CAT_FEATURES + BINARY_INT_FEATURES``.
+        num_features: Passed to compute_mann_whitney; defaults to ``NUM_FEATURES``.
+        target: Binary target column name.
+
+    Returns:
+        (chi2_df, mwu_df) — each function's own columns plus a jointly-pooled
+        ``adjusted_p_value``.
+    """
+    chi2_df = compute_chi2_tests(df, cat_features=cat_features, target=target)
+    mwu_df = compute_mann_whitney(df, num_features=num_features, target=target)
+    chi2_adj, mwu_adj = pool_adjusted_p_values(chi2_df["p_value"], mwu_df["p_value"])
+    chi2_df = chi2_df.assign(adjusted_p_value=chi2_adj)
+    mwu_df = mwu_df.assign(adjusted_p_value=mwu_adj)
+    return chi2_df, mwu_df
 
 
 def compute_vif(

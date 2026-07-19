@@ -13,16 +13,19 @@ import subprocess
 import time
 from typing import Any
 
+import mlflow
 import numpy as np
 import pandas as pd
 import yaml
 from joblib import Parallel, delayed
+from mlflow.data.pandas_dataset import from_pandas as mlflow_from_pandas
 from omegaconf import DictConfig
 from sklearn.base import clone
 from sklearn.metrics import average_precision_score
 from sklearn.model_selection import RepeatedStratifiedKFold
 
 from telco_churn.data.split import partition
+from telco_churn.features.accessor import features_path
 from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.features.schema import FeatureOutputSchema
 from telco_churn.utils.logging import get_logger
@@ -103,6 +106,29 @@ def _load_dev_features(cfg: DictConfig) -> tuple[pd.DataFrame, pd.Series]:
     df = _load_processed(cfg)
     dev_df, _test_df = partition(df)
     return dev_df[_FEATURE_COLS], dev_df[TARGET_COL]
+
+
+def _log_dev_input(X_dev: pd.DataFrame, y_dev: pd.Series, context: str) -> None:
+    """Log the dev-partition dataset as an MLflow run input — call from inside an active run.
+
+    Shared by comparison.py, feature_freeze.py, and tuning.py (candidates.py builds
+    its own per-candidate copy since each of its three candidate runs needs its own
+    log_input call, not one shared across runs). source resolves through
+    features/accessor.py's canonical path, the same single-owner rule candidates.py
+    already follows, so this can't go stale at Phase 8's CSV->parquet rename. The
+    dataset's digest is content-based (from_pandas), so this is purely lineage
+    metadata — it records what data this run touched, never something a computed
+    number depends on.
+    """
+    dev_df = X_dev.copy()
+    dev_df[TARGET_COL] = y_dev.values
+    dataset = mlflow_from_pandas(
+        dev_df,
+        source=str(features_path()),
+        name="telco_churn_dev",
+        targets=TARGET_COL,
+    )
+    mlflow.log_input(dataset, context=context)
 
 
 def _fit_and_score_fold(

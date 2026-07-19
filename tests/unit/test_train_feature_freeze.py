@@ -9,6 +9,7 @@ its own internal decision — the piece that had no direct unit coverage before.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 
 import mlflow
@@ -19,6 +20,7 @@ from sklearn.dummy import DummyClassifier
 from sklearn.model_selection import RepeatedStratifiedKFold
 
 import telco_churn.models.train.feature_freeze as feature_freeze
+from telco_churn.features.accessor import features_path
 from telco_churn.features.build import FEATURE_SCHEMA
 from telco_churn.models.train.common import cv_score_candidate
 
@@ -296,3 +298,31 @@ def test_run_selection_step_tags_stage_git_sha_and_dvc_hash(
     assert run.data.tags["stage"] == "selection"
     assert "git_sha" in run.data.tags
     assert "dvc_data_hash" in run.data.tags
+
+
+def test_run_selection_step_logs_dataset_source_via_accessor(
+    selection_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    full_candidate_results: dict[str, dict],
+    selection_cfg: OmegaConf,
+) -> None:
+    """The run's logged dataset input (Fix 6) resolves through
+    features/accessor.py::features_path() — the same canonical source
+    candidates.py's per-candidate runs already log — not a second,
+    hand-assembled copy that could silently go stale.
+    """
+    selection_cfg.mlflow.tracking_uri = selection_mlflow_uri
+    X_dev, y_dev = dev_split
+
+    feature_freeze.run_selection_step(
+        X_dev, y_dev, full_candidate_results, selection_cfg
+    )
+
+    client = mlflow.tracking.MlflowClient()
+    experiment = client.get_experiment_by_name("test_run_selection_step")
+    run = client.get_run(client.search_runs([experiment.experiment_id])[0].info.run_id)
+
+    dataset_inputs = run.inputs.dataset_inputs
+    assert len(dataset_inputs) == 1
+    source = json.loads(dataset_inputs[0].dataset.source)
+    assert source["uri"] == str(features_path())

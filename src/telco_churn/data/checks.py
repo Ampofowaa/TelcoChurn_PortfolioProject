@@ -14,6 +14,8 @@ from telco_churn.data.schema import CleanedSchema, RawSchema
 __all__ = [
     "Severity",
     "CheckResult",
+    "MIN_ROWS",
+    "MAX_NULL_RATE",
     "check_schema",
     "check_duplicate_ids",
     "check_churn_labels",
@@ -62,8 +64,8 @@ _NULL_CHECKED_COLS: Final[frozenset[str]] = frozenset(
     if not col_schema.nullable and col_name != "customerid"
 )
 
-_MIN_ROWS: Final[int] = 1_000
-_MAX_NULL_RATE: Final[float] = 0.05
+MIN_ROWS: Final[int] = 1_000
+MAX_NULL_RATE: Final[float] = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -228,8 +230,8 @@ def check_totalcharges_nulls(df: pd.DataFrame) -> CheckResult:
 
 def check_distribution_sanity(
     df: pd.DataFrame,
-    min_rows: int = _MIN_ROWS,
-    max_null_rate: float = _MAX_NULL_RATE,
+    min_rows: int = MIN_ROWS,
+    max_null_rate: float = MAX_NULL_RATE,
 ) -> list[CheckResult]:
     """Gate 5 — row count and per-column null-rate bounds.
 

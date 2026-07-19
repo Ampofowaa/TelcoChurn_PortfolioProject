@@ -23,6 +23,7 @@ from telco_churn.features.select import (
 from telco_churn.models.train.common import (
     _dvc_hash,
     _git_sha,
+    _log_dev_input,
     lgbm_default_params,
 )
 from telco_churn.utils.logging import get_logger
@@ -230,6 +231,7 @@ def run_selection_step(
                 "dvc_data_hash": _dvc_hash(cfg),
             }
         )
+        _log_dev_input(X_dev, y_dev, context="training")
         mlflow.log_params(
             {
                 "n_repeats": int(sel.n_repeats),

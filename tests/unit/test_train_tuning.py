@@ -543,6 +543,34 @@ def test_run_tuning_step_warns_on_too_few_completed_trials(
     assert tuning_summary["trial_count_below_threshold"] is True
 
 
+def test_run_tuning_step_raises_when_every_trial_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: OmegaConf,
+) -> None:
+    """A systematic bug (bad config, objective typo) fails every trial and must raise
+    loudly, not just log a warning that a resumed study or unset min_completed_trials
+    could let slip past unnoticed."""
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    def _always_fails(*args: Any, **kwargs: Any) -> float:
+        raise ValueError("simulated systematic objective failure")
+
+    monkeypatch.setattr(tuning, "_tuning_objective", _always_fails)
+
+    with pytest.raises(RuntimeError, match="All 3 trials submitted this run failed"):
+        tuning.run_tuning_step(
+            X_dev,
+            y_dev,
+            committed_features,
+            tuning_cfg,
+            storage=optuna.storages.InMemoryStorage(),
+        )
+
+
 def test_run_tuning_step_no_warning_when_completed_trials_meet_floor(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
@@ -698,3 +726,33 @@ def test_run_tuning_step_is_idempotent_against_completed_study(
         == tuning_cfg.tuning.n_trials
     )
     assert second["n_completed_trials"] == first["n_completed_trials"]
+
+
+def test_run_tuning_step_logs_dev_input_once_on_parent_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: OmegaConf,
+) -> None:
+    """Fix 6: the tuning_study parent run logs a dataset-lineage input exactly
+    once, via common.py's shared _log_dev_input — the same call that also
+    covers log_model.py's "model" and calibrate.py's "calibrated_model", since
+    both reuse this run's run_id. The source-resolution behaviour itself is
+    tested once, at the shared implementation, in test_train_common.py.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    log_dev_input_mock = Mock()
+    monkeypatch.setattr(tuning, "_log_dev_input", log_dev_input_mock)
+
+    tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        storage=optuna.storages.InMemoryStorage(),
+    )
+
+    log_dev_input_mock.assert_called_once_with(X_dev, y_dev, context="training")

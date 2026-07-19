@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from telco_churn.data.checks import CheckResult, Severity
+from telco_churn.data.checks import MAX_NULL_RATE, MIN_ROWS, CheckResult, Severity
 from telco_churn.data.validate import (
     ValidationError,
     ValidationResult,
@@ -15,6 +16,7 @@ from telco_churn.data.validate import (
     validate_clean,
     validate_raw,
 )
+from telco_churn.utils.paths import load_config
 
 # ---------------------------------------------------------------------------
 # ValidationResult properties
@@ -57,6 +59,47 @@ def test_validation_result_warnings_filters_correctly() -> None:
     warn = CheckResult("w", Severity.WARNING, passed=False, message="y")
     result = ValidationResult(checks=[err, warn])
     assert result.warnings == [warn]
+
+
+# ---------------------------------------------------------------------------
+# Gate-5 threshold defaults
+# ---------------------------------------------------------------------------
+
+
+def test_validate_raw_defaults_match_checks_gate_constants() -> None:
+    """validate_raw's min_rows/max_null_rate defaults must equal checks.py's.
+
+    Regression guard for the two literals drifting apart again: this reads
+    the *bound default* off the live function signature, so it fails the
+    moment either side hardcodes a value instead of importing the other's
+    constant — not just when someone edits this test's own expectation.
+    """
+    params = inspect.signature(validate_raw).parameters
+    assert params["min_rows"].default == MIN_ROWS
+    assert params["max_null_rate"].default == MAX_NULL_RATE
+
+
+def test_validate_clean_defaults_match_checks_gate_constants() -> None:
+    """validate_clean's min_rows/max_null_rate defaults must equal checks.py's."""
+    params = inspect.signature(validate_clean).parameters
+    assert params["min_rows"].default == MIN_ROWS
+    assert params["max_null_rate"].default == MAX_NULL_RATE
+
+
+def test_config_yaml_validation_matches_checks_gate_constants() -> None:
+    """configs/config.yaml's validation.* must equal checks.py's gate constants.
+
+    Every real entry point (ingest.py, validate.py __main__) reads min_rows/
+    max_null_rate from config.yaml rather than relying on checks.py's defaults,
+    so those defaults only take effect for direct/programmatic calls (tests,
+    library use with no Hydra context). This guards the two from silently
+    drifting apart — a config.yaml edit with no matching checks.py update, or
+    vice versa, would otherwise change gate behaviour only for wired entry
+    points while leaving unwired callers on the stale value.
+    """
+    cfg = load_config()
+    assert int(cfg.validation.min_rows) == MIN_ROWS
+    assert float(cfg.validation.max_null_rate) == MAX_NULL_RATE
 
 
 # ---------------------------------------------------------------------------

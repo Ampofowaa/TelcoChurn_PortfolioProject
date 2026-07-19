@@ -56,4 +56,10 @@ repos:
     hooks:
       - id: detect-secrets
         args: ['--baseline', '.secrets.baseline']
-        exclude: .secrets.baseline
+        # configs/policy/threshold.yaml is machine-generated (OmegaConf.save, no
+        # comments preserved) and always carries a costs_config_hash sha256 hex
+        # digest by design — a false-positive high-entropy-string hit on every
+        # regeneration, not a secret. An inline `pragma: allowlist secret` would
+        # be silently wiped by the next `threshold.py` run, so it's excluded here
+        # instead.
+        exclude: \.secrets\.baseline|configs/policy/threshold\.yaml

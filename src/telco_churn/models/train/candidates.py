@@ -15,6 +15,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.pipeline import Pipeline
 
+from telco_churn.features.accessor import features_path
 from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.features.preprocessing import (
     build_linear_preprocessor,
@@ -29,7 +30,6 @@ from telco_churn.models.train.common import (
 )
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import resolve_tracking_uri
-from telco_churn.utils.paths import get_project_root
 
 __all__ = ["run_candidate_step"]
 
@@ -134,9 +134,7 @@ def run_candidate_step(
     dev_df[TARGET_COL] = y_dev.values
     _dev_dataset = mlflow_from_pandas(
         dev_df,
-        source=str(
-            get_project_root() / cfg.paths.processed_data / "telco_churn_processed.csv"
-        ),
+        source=str(features_path()),
         name="telco_churn_dev",
         targets=TARGET_COL,
     )

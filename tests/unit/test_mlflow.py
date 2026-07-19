@@ -31,3 +31,34 @@ def test_resolve_tracking_uri_anchors_bare_relative_path() -> None:
     resolved = resolve_tracking_uri("mlruns")
     assert urlparse(resolved).scheme == "file"
     assert resolved == (get_project_root() / "mlruns").as_uri()
+
+
+def test_resolve_tracking_uri_anchors_relative_sqlite_path() -> None:
+    """A relative sqlite:/// path contains '://' like any other scheme, but the
+    path after the prefix is CWD-relative, not scheme-anchored — the same
+    failure mode this function exists to prevent for a bare 'mlruns' path,
+    reintroduced through a different scheme. It must be anchored to the
+    project root, not passed through.
+    """
+    resolved = resolve_tracking_uri("sqlite:///mlflow.db")
+    expected = "sqlite:///" + (get_project_root() / "mlflow.db").as_posix()
+    assert resolved == expected
+
+
+def test_resolve_tracking_uri_passes_through_unix_absolute_sqlite() -> None:
+    """A Unix-style absolute sqlite path (sqlite:////abs/path) is already
+    anchored and must not be re-rooted under the project.
+    """
+    uri = "sqlite:////tmp/mlflow.db"
+    assert resolve_tracking_uri(uri) == uri
+
+
+def test_config_default_tracking_uri_never_resolves_to_a_file_store() -> None:
+    """Regression guard for the failure mode nobody sees locally: without
+    .env or the infra profile up, configs/config.yaml's fallback must resolve
+    to a database backend (sqlite), never MLflow's file store — which is in
+    maintenance mode as of MLflow 3.14 and raises on use.
+    """
+    default_uri = "sqlite:///mlflow.db"
+    resolved = resolve_tracking_uri(default_uri)
+    assert urlparse(resolved).scheme == "sqlite"

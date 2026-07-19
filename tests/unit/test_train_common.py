@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import Mock
 
+import mlflow
 import pandas as pd
 import pandera as pa
 import pytest
@@ -15,7 +18,8 @@ from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.pipeline import Pipeline
 
 import telco_churn.models.train.common as common
-from telco_churn.features.build import FEATURE_SCHEMA
+from telco_churn.features.accessor import features_path
+from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.models.train.common import cv_score_candidate
 
@@ -229,6 +233,66 @@ def test_load_dev_features_never_touches_test_partition(
     monkeypatch.setattr(common, "partition", lambda df: (dev_df, _PoisonFrame()))
 
     common._load_dev_features(cfg=None)  # raises AssertionError if test_df is touched
+
+
+# ---------------------------------------------------------------------------
+# _log_dev_input (Fix 6: dataset lineage shared by comparison.py,
+# feature_freeze.py, and tuning.py — candidates.py builds its own copy since
+# each of its three candidate runs needs its own log_input call)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def dev_input_mlflow_uri(mlflow_test_experiment: Callable[[str], str]) -> str:
+    """Point MLflow at the shared tmp-scoped experiment (conftest.py ::
+    mlflow_test_experiment)."""
+    return mlflow_test_experiment("test_log_dev_input")
+
+
+def test_log_dev_input_source_resolves_to_accessor_canonical_path(
+    dev_input_mlflow_uri: str, dev_split: tuple[pd.DataFrame, pd.Series]
+) -> None:
+    """The logged dataset's source resolves to features_path() — the
+    accessor's single canonical location — not a hand-assembled copy that
+    could silently go stale at Phase 8's CSV -> parquet rename. This is the
+    one test of the shared implementation; comparison.py/feature_freeze.py/
+    tuning.py's own tests only need to confirm they call this, not re-prove
+    the source resolution themselves.
+    """
+    mlflow.set_tracking_uri(dev_input_mlflow_uri)
+    X_dev, y_dev = dev_split
+
+    with mlflow.start_run() as run:
+        common._log_dev_input(X_dev, y_dev, context="training")
+
+    full_run = mlflow.get_run(run.info.run_id)
+    dataset_inputs = full_run.inputs.dataset_inputs
+    assert len(dataset_inputs) == 1
+    assert dataset_inputs[0].dataset.name == "telco_churn_dev"
+    source = json.loads(dataset_inputs[0].dataset.source)
+    assert source["uri"] == str(features_path())
+
+    input_tags = {t.key: t.value for t in dataset_inputs[0].tags}
+    assert input_tags.get("mlflow.data.context") == "training"
+
+
+def test_log_dev_input_dataset_includes_target_column(
+    dev_input_mlflow_uri: str, dev_split: tuple[pd.DataFrame, pd.Series]
+) -> None:
+    """The logged dataset's schema carries the target column, not features only —
+    matching candidates.py's own dev_df[TARGET_COL] = y_dev.values construction.
+    """
+    mlflow.set_tracking_uri(dev_input_mlflow_uri)
+    X_dev, y_dev = dev_split
+
+    with mlflow.start_run() as run:
+        common._log_dev_input(X_dev, y_dev, context="training")
+
+    full_run = mlflow.get_run(run.info.run_id)
+    schema = full_run.inputs.dataset_inputs[0].dataset.schema
+    column_names = {col["name"] for col in json.loads(schema)["mlflow_colspec"]}
+    assert TARGET_COL in column_names
+    assert set(X_dev.columns) <= column_names
 
 
 # ---------------------------------------------------------------------------

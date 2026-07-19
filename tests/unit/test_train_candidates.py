@@ -9,6 +9,7 @@ import pytest
 from omegaconf import OmegaConf
 
 import telco_churn.models.train.candidates as candidates
+from telco_churn.features.accessor import features_path
 
 # ---------------------------------------------------------------------------
 # _assert_dummy_canary (B3b)
@@ -159,3 +160,81 @@ def test_run_candidate_step_logs_metric_contract(
             "cv_train_time_s",
             "cv_predict_time_s",
         } <= set(metrics)
+
+
+def test_run_candidate_step_dataset_source_uses_accessor_canonical_path(
+    monkeypatch: pytest.MonkeyPatch,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """The mlflow.data dataset's source resolves to features_path() — the
+    accessor's single canonical location — not a second, hand-assembled copy
+    of it. A hardcoded inline path silently goes stale at any rename of the
+    processed-artifact location (e.g. Phase 8's CSV -> parquet swap).
+    """
+    X_dev, y_dev = dev_split
+    cfg = OmegaConf.create(
+        {
+            "random_seed": 42,
+            "training_setup": {
+                "cv_folds": 2,
+                "cv_repeats": 1,
+                "class_weight": "balanced",
+            },
+            "logreg": {
+                "Cs": 2,
+                "cv_folds": 2,
+                "max_iter": 50,
+                "solver": "lbfgs",
+                "l1_ratio": 0.0,
+            },
+            "training": {
+                "candidate": {
+                    "n_estimators": 10,
+                    "num_leaves": 5,
+                    "min_child_samples": 3,
+                },
+                "fixed": {
+                    "subsample_freq": 1,
+                    "deterministic": True,
+                    "force_row_wise": True,
+                    "n_jobs": 1,
+                    "verbose": -1,
+                },
+            },
+            "mlflow": {"tracking_uri": "placeholder", "experiment_name": "test"},
+            "paths": {"processed_data": "."},
+        }
+    )
+    run_counter = iter(range(100))
+    captured_sources: list[str] = []
+
+    def _fake_from_pandas(df: pd.DataFrame, **kwargs: object) -> MagicMock:
+        captured_sources.append(str(kwargs["source"]))
+        return MagicMock()
+
+    monkeypatch.setattr(candidates.mlflow, "set_tracking_uri", lambda uri: None)
+    monkeypatch.setattr(
+        candidates.mlflow, "set_experiment", lambda name: MagicMock(experiment_id="0")
+    )
+    monkeypatch.setattr(
+        candidates.mlflow.tracking,
+        "MlflowClient",
+        lambda: MagicMock(set_experiment_tag=lambda *a, **k: None),
+    )
+    monkeypatch.setattr(
+        candidates.mlflow,
+        "start_run",
+        lambda run_name: _FakeRun(f"run-{next(run_counter)}"),
+    )
+    monkeypatch.setattr(candidates.mlflow, "set_tags", lambda tags: None)
+    monkeypatch.setattr(candidates.mlflow, "log_input", lambda *a, **k: None)
+    monkeypatch.setattr(candidates.mlflow, "log_params", lambda params: None)
+    monkeypatch.setattr(candidates.mlflow, "log_metrics", lambda metrics: None)
+    monkeypatch.setattr(candidates.mlflow, "log_metric", lambda *a, **k: None)
+    monkeypatch.setattr(candidates, "mlflow_from_pandas", _fake_from_pandas)
+    monkeypatch.setattr(candidates, "_git_sha", lambda: "deadbeef")
+    monkeypatch.setattr(candidates, "_dvc_hash", lambda cfg: "unknown")
+
+    candidates.run_candidate_step(X_dev, y_dev, cfg)
+
+    assert captured_sources == [str(features_path())]

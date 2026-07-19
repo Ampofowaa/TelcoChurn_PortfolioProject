@@ -410,6 +410,15 @@ def run_selection_cv(
     the same mechanism as Step 2's candidate comparison).
     """
     fold_indices = list(cv.split(X, y))
+    # Each fold gets its own child seed (spawned from one SeedSequence) rather
+    # than reusing random_state — otherwise the decoy-column draw and every
+    # group's permutation shuffle repeat identically on every fold, so the
+    # noise-floor estimate isn't actually averaging over independent draws.
+    # Still fully deterministic given random_state.
+    fold_seeds = [
+        int(s.generate_state(1)[0])
+        for s in np.random.SeedSequence(random_state).spawn(len(fold_indices))
+    ]
     fold_results = Parallel(n_jobs=n_jobs)(
         delayed(_fit_and_score_selection_fold)(
             X.iloc[train_idx],
@@ -424,9 +433,11 @@ def run_selection_cv(
             noise_floor_margin,
             correlated_groups,
             inner_val_size,
-            random_state,
+            fold_seed,
         )
-        for train_idx, val_idx in fold_indices
+        for (train_idx, val_idx), fold_seed in zip(
+            fold_indices, fold_seeds, strict=True
+        )
     )
 
     fold_scores = [r[0] for r in fold_results]
