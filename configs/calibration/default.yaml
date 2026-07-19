@@ -1,7 +1,8 @@
 # Calibration study configuration — see models/calibrate.py.
 
-# sigmoid | isotonic | auto; run 'auto' once, then pin the winner here.
-method: auto
+# sigmoid | isotonic | auto — pinned to the resolved winner (isotonic_disqualified_pr_auc_gate;
+# ANALYSIS.md §5). Re-run 'auto' and re-pin if the tuned pipeline changes materially.
+method: sigmoid
 
 # cross_val_predict(cv=outer) fold count — explicit shuffle+seed, unlike the unshuffled cv=5 default.
 outer_cv_folds: 5

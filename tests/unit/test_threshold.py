@@ -92,7 +92,8 @@ def base_scenario() -> CostScenario:
 
 
 def test_costs_config_hash_changes_iff_costs_yaml_changes(tmp_path: Path) -> None:
-    """Same content -> same hash; any byte of difference -> a different hash.
+    """Same resolved content -> same hash; a resolved-value difference -> a
+    different hash.
 
     Pins configs/policy/threshold.yaml's provenance without a model stamp:
     same hash means the model changed, a different hash means the cost
@@ -107,6 +108,30 @@ def test_costs_config_hash_changes_iff_costs_yaml_changes(tmp_path: Path) -> Non
 
     assert threshold.costs_config_hash(path_a) == threshold.costs_config_hash(path_b)
     assert threshold.costs_config_hash(path_a) != threshold.costs_config_hash(path_c)
+
+
+def test_costs_config_hash_ignores_cosmetic_formatting(tmp_path: Path) -> None:
+    """A comment, re-indentation, or a CRLF/LF line-ending swap must not change
+    the hash — only a resolved-value change may, or checking the same
+    costs.yaml out on a different OS becomes a false provenance mismatch
+    against the hash already pinned in configs/policy/threshold.yaml.
+    """
+    path_plain = tmp_path / "costs_plain.yaml"
+    path_plain.write_text("gross_margin: 0.60\nhorizon_months: 12\n", encoding="utf-8")
+    path_commented = tmp_path / "costs_commented.yaml"
+    path_commented.write_text(
+        "# gross margin assumption\n"
+        "gross_margin: 0.60\n"
+        "\n"
+        "horizon_months: 12  # months\n",
+        encoding="utf-8",
+    )
+    path_crlf = tmp_path / "costs_crlf.yaml"
+    path_crlf.write_bytes(b"gross_margin: 0.60\r\nhorizon_months: 12\r\n")
+
+    plain_hash = threshold.costs_config_hash(path_plain)
+    assert threshold.costs_config_hash(path_commented) == plain_hash
+    assert threshold.costs_config_hash(path_crlf) == plain_hash
 
 
 def test_arpu_by_scenario_uses_churners_only(costs_cfg: OmegaConf) -> None:
@@ -601,11 +626,13 @@ def registered_model_version(
     active for the rest of the test: monkeypatch's teardown only runs after
     the whole test function completes, not when this fixture returns.
 
-    calibrate.load_dev_customer_ids() is sandboxed the same way — unpatched,
-    run_calibration_step's dev_oof_predictions.parquet build zips this
-    fixture's small y_dev against the real, full-length customerid column,
-    which pandas rejects as a length mismatch before any calibration logic
-    runs.
+    load_dev_customer_ids() is sandboxed the same way, on both bindings too —
+    unpatched, run_calibration_step's dev_oof_predictions.parquet build zips
+    this fixture's small y_dev against the real, full-length customerid
+    column (a pandas length-mismatch before any calibration logic runs), and
+    run_threshold_step's own load_dev_customer_ids() call (used to align the
+    persisted dev_oof_predictions.parquet back onto X_dev/y_dev's row order)
+    would do the same against the fake X_dev/y_dev built here.
     """
     X_dev, y_dev = dev_split
 
@@ -622,6 +649,7 @@ def registered_model_version(
     monkeypatch.setattr(calibrate, "load_dev_features", _fake_load_dev_features)
     monkeypatch.setattr(threshold, "load_dev_features", _fake_load_dev_features)
     monkeypatch.setattr(calibrate, "load_dev_customer_ids", _fake_load_dev_customer_ids)
+    monkeypatch.setattr(threshold, "load_dev_customer_ids", _fake_load_dev_customer_ids)
 
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result = {**tuning_result, "parent_run_id": run.info.run_id}

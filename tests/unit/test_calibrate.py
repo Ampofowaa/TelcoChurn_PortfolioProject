@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import mlflow
 import mlflow.artifacts
@@ -207,6 +207,36 @@ def test_calibration_improves_pooled_brier_on_miscalibrated_classifier(
     assert calibrate.pooled_brier(cal_proba, y) < calibrate.pooled_brier(uncal_proba, y)
 
 
+def test_calibration_slope_closer_to_one_after_calibration_on_miscalibrated_classifier(
+    miscalibrated_pipeline: Pipeline,
+    miscalibrated_data: tuple[pd.DataFrame, pd.Series],
+    calibration_cfg: OmegaConf,
+) -> None:
+    """The calibration slope numerically confirms what a reliability diagram
+    can only show visually: a classifier that is overconfident by
+    construction has a slope measurably below 1.0 on its raw OOF
+    probabilities, and calibration pulls it back toward 1.0 — the same
+    (y, proba) pairing run_calibration_step uses to log calibration_slope
+    and uncalibrated_calibration_slope side by side.
+    """
+    X, y = miscalibrated_data
+    uncal_proba = calibrate.oof_uncalibrated_proba(
+        miscalibrated_pipeline, X, y, calibration_cfg
+    )
+    cal_proba = calibrate.oof_calibrated_proba(
+        miscalibrated_pipeline, "sigmoid", X, y, calibration_cfg
+    )
+
+    uncal_slope = calibrate.calibration_slope(
+        y, uncal_proba, n_bootstrap=200, random_state=42
+    )
+    cal_slope = calibrate.calibration_slope(
+        y, cal_proba, n_bootstrap=200, random_state=42
+    )
+
+    assert abs(cal_slope["slope"] - 1.0) < abs(uncal_slope["slope"] - 1.0)
+
+
 def test_calibration_pr_auc_within_delta_of_uncalibrated(
     miscalibrated_pipeline: Pipeline,
     miscalibrated_data: tuple[pd.DataFrame, pd.Series],
@@ -322,6 +352,77 @@ def test_expected_calibration_error_large_when_miscalibrated(
     assert ece == pytest.approx(0.8, abs=1e-9)
 
 
+def test_expected_calibration_error_constant_proba_detects_miscalibration(
+    calibration_cfg: OmegaConf,
+) -> None:
+    """A fully-constant, badly wrong probability vector must not report ~0 ECE.
+
+    Regression guard: quantile binning of an all-identical p collapses
+    np.unique's edges to a single point, and edges[0], edges[-1] = 0.0, 1.0
+    on a 1-element array silently drops it to zero valid bins — skipping the
+    summation loop entirely and returning 0.0 regardless of y. Flooring at
+    one bin spanning [0, 1] is what makes this actually measure the gap.
+    """
+    calibration_cfg.calibration.ece_strategy = "quantile"
+    proba = np.full(20, 0.10)
+    y = pd.Series([1] * 18 + [0] * 2)  # observed frequency 0.90, predicted 0.10
+
+    ece = calibrate.expected_calibration_error(proba, y, calibration_cfg)
+
+    assert ece == pytest.approx(0.8, abs=1e-9)
+
+
+def test_expected_calibration_error_warns_on_quantile_bin_collapse(
+    calibration_cfg: OmegaConf, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tied probabilities that collapse the quantile bin count below
+    cfg.calibration.ece_n_bins must be flagged, not silently absorbed into a
+    smaller-than-configured ECE.
+    """
+    calibration_cfg.calibration.ece_strategy = "quantile"
+    warning_mock = Mock()
+    monkeypatch.setattr(calibrate.logger, "warning", warning_mock)
+
+    proba = np.full(20, 0.10)
+    y = pd.Series([1] * 2 + [0] * 18)
+
+    calibrate.expected_calibration_error(proba, y, calibration_cfg)
+
+    collapse_calls = [
+        call
+        for call in warning_mock.call_args_list
+        if call.args[0] == "ece_bins_collapsed"
+    ]
+    assert len(collapse_calls) == 1
+    assert collapse_calls[0].kwargs["configured_n_bins"] == int(
+        calibration_cfg.calibration.ece_n_bins
+    )
+    assert collapse_calls[0].kwargs["effective_n_bins"] == 1
+
+
+def test_expected_calibration_error_no_warning_without_collapse(
+    calibration_cfg: OmegaConf, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Distinct, evenly-spread probabilities reach the configured bin count —
+    no collapse warning should fire."""
+    calibration_cfg.calibration.ece_strategy = "quantile"
+    warning_mock = Mock()
+    monkeypatch.setattr(calibrate.logger, "warning", warning_mock)
+
+    rng = np.random.default_rng(42)
+    proba = rng.uniform(0.01, 0.99, size=500)
+    y = pd.Series(rng.integers(0, 2, size=500))
+
+    calibrate.expected_calibration_error(proba, y, calibration_cfg)
+
+    collapse_calls = [
+        call
+        for call in warning_mock.call_args_list
+        if call.args[0] == "ece_bins_collapsed"
+    ]
+    assert collapse_calls == []
+
+
 def test_calibration_slope_perfectly_calibrated_returns_near_one() -> None:
     """y generated as Bernoulli(p) from the exact predicted probabilities —
     the Cox slope of a truly calibrated forecaster is 1.0, and its bootstrap
@@ -357,6 +458,135 @@ def test_calibration_slope_overconfident_returns_less_than_one() -> None:
     )
 
     assert result["slope"] < 1.0
+
+
+def test_calibration_slope_redraws_degenerate_bootstrap_resample() -> None:
+    """A small, heavily-imbalanced sample makes a single-class bootstrap
+    resample likely — sklearn's LogisticRegression can't fit one, and
+    np.fromiter's eager consumption means one unlucky draw among many would
+    otherwise crash the whole bootstrap. Must complete and return a full
+    n_bootstrap-length CI instead.
+
+    n=10 with one positive is chosen because it reliably provokes at least
+    one degenerate draw across 200 bootstrap resamples at random_state=42
+    (a resample missing the sole positive has ~35% probability per draw) —
+    this is a regression guard for that redraw path, not merely a small-N
+    smoke test.
+    """
+    y = np.array([1.0] + [0.0] * 9)
+    p = np.array([0.6] + [0.2] * 9)
+
+    result = calibrate.calibration_slope(y, p, n_bootstrap=200, random_state=42)
+
+    assert result["slope_ci_lower"] <= result["slope_ci_upper"]
+    assert np.isfinite(result["slope_ci_lower"])
+    assert np.isfinite(result["slope_ci_upper"])
+
+
+def test_calibration_slope_raises_on_genuinely_single_class_input() -> None:
+    """y_true with only one class can't fit even the point estimate — this
+    must still fail fast (not hang retrying an unwinnable redraw), since no
+    bootstrap resample of single-class data can ever be two-class either.
+    """
+    y = np.zeros(10)
+    p = np.full(10, 0.2)
+
+    with pytest.raises(ValueError, match="at least 2 classes"):
+        calibrate.calibration_slope(y, p, n_bootstrap=200, random_state=42)
+
+
+def test_calibration_slope_analytic_ci_well_ordered() -> None:
+    """The analytic (Wald) CI is centered on the point estimate with a
+    strictly positive standard error, regardless of the bootstrap draw —
+    a basic sanity check that holds before comparing it to anything else.
+    """
+    rng = np.random.default_rng(0)
+    n = 1000
+    p_true = rng.uniform(0.05, 0.95, size=n)
+    y = rng.binomial(1, p_true)
+
+    result = calibrate.calibration_slope(
+        pd.Series(y), p_true, n_bootstrap=50, random_state=42
+    )
+
+    assert result["slope_se_analytic"] > 0.0
+    assert (
+        result["slope_ci_lower_analytic"]
+        < result["slope"]
+        < result["slope_ci_upper_analytic"]
+    )
+
+
+def test_calibration_slope_analytic_matches_finite_difference_hessian() -> None:
+    """Independent proof the Fisher-information formula is implemented
+    correctly: the analytic standard error must match a numerical
+    finite-difference Hessian of the same logistic log-likelihood, computed
+    with no shared code path — this is what makes the analytic CI trustworthy
+    as a cross-check on the bootstrap, rather than a second thing to doubt.
+    """
+    rng = np.random.default_rng(0)
+    n = 4000
+    p_true = rng.uniform(0.05, 0.95, size=n)
+    y = rng.binomial(1, p_true)
+
+    result = calibrate.calibration_slope(y, p_true, n_bootstrap=10, random_state=42)
+    slope, intercept = result["slope"], result["intercept"]
+
+    p = np.clip(p_true, 1e-6, 1 - 1e-6)
+    logit_p = np.log(p / (1 - p))
+
+    def _neg_loglik(beta: np.ndarray) -> float:
+        b0, b1 = beta
+        eta = b0 + b1 * logit_p
+        return float(-np.sum(y * eta - np.log1p(np.exp(eta))))
+
+    eps = 1e-4
+    beta0 = np.array([intercept, slope])
+    hess = np.zeros((2, 2))
+    for i in range(2):
+        for j in range(2):
+            e_i = np.zeros(2)
+            e_i[i] = eps
+            e_j = np.zeros(2)
+            e_j[j] = eps
+            hess[i, j] = (
+                _neg_loglik(beta0 + e_i + e_j)
+                - _neg_loglik(beta0 + e_i - e_j)
+                - _neg_loglik(beta0 - e_i + e_j)
+                + _neg_loglik(beta0 - e_i - e_j)
+            ) / (4 * eps * eps)
+
+    se_finite_diff = float(np.sqrt(np.linalg.inv(hess)[1, 1]))
+
+    assert result["slope_se_analytic"] == pytest.approx(se_finite_diff, rel=1e-4)
+
+
+def test_calibration_slope_analytic_and_bootstrap_ci_agree_on_well_behaved_data() -> (
+    None
+):
+    """On a large, well-behaved sample, the analytic and bootstrap CIs should
+    closely agree — this is the actual cross-check value: close agreement is
+    cheap evidence the percentile bootstrap isn't misbehaving on this kind of
+    data, since nothing had independently verified that before this test.
+    """
+    rng = np.random.default_rng(0)
+    n = 4000
+    p_true = rng.uniform(0.05, 0.95, size=n)
+    y = rng.binomial(1, p_true)
+
+    result = calibrate.calibration_slope(y, p_true, n_bootstrap=1000, random_state=42)
+
+    bootstrap_width = result["slope_ci_upper"] - result["slope_ci_lower"]
+    analytic_width = (
+        result["slope_ci_upper_analytic"] - result["slope_ci_lower_analytic"]
+    )
+    bootstrap_center = (result["slope_ci_upper"] + result["slope_ci_lower"]) / 2
+    analytic_center = (
+        result["slope_ci_upper_analytic"] + result["slope_ci_lower_analytic"]
+    ) / 2
+
+    assert analytic_width == pytest.approx(bootstrap_width, rel=0.25)
+    assert analytic_center == pytest.approx(bootstrap_center, abs=0.02)
 
 
 def test_select_calibration_method_pinned_returns_proba_arrays(
@@ -814,6 +1044,11 @@ def test_run_calibration_step_calibration_summary_has_calibration_spec(
     slope = result["calibration_summary"]["calibration_slope"]
     assert {"slope", "intercept", "slope_ci_lower", "slope_ci_upper"} <= set(slope)
 
+    uncalibrated_slope = result["calibration_summary"]["uncalibrated_calibration_slope"]
+    assert {"slope", "intercept", "slope_ci_lower", "slope_ci_upper"} <= set(
+        uncalibrated_slope
+    )
+
     client = mlflow.tracking.MlflowClient()
     artifact_paths_root = {a.path for a in client.list_artifacts(run_id)}
     assert "calibration_summary.json" in artifact_paths_root
@@ -852,6 +1087,46 @@ def test_run_calibration_step_logs_dev_metrics(
         winning_diagnostics["per_fold_mean_ap"]
     )
     assert run.data.metrics["dev_calibration_slope"] == pytest.approx(expected_slope)
+
+    summary = result["calibration_summary"]
+    assert run.data.metrics["dev_uncalibrated_calibration_slope"] == pytest.approx(
+        summary["uncalibrated_calibration_slope"]["slope"]
+    )
+    assert run.data.metrics["dev_mean_p_hat_calibrated"] == pytest.approx(
+        summary["mean_p_hat_calibrated"]
+    )
+    assert run.data.metrics["dev_mean_p_hat_uncalibrated"] == pytest.approx(
+        summary["mean_p_hat_uncalibrated"]
+    )
+    assert run.data.metrics["dev_observed_churn_rate"] == pytest.approx(
+        summary["observed_churn_rate"]
+    )
+
+
+def test_run_calibration_step_calibration_summary_has_mean_p_hat_fields(
+    registration_cfg: OmegaConf,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    comparison_result: dict,
+    tuning_result: dict,
+    sandboxed_dev_features: None,
+) -> None:
+    """mean_p_hat_calibrated/mean_p_hat_uncalibrated/observed_churn_rate are
+    persisted in calibration_summary.json — the "calibration-in-the-large"
+    evidence a slope near 1 alone can hide (a large intercept shows up here
+    as a mean p_hat far from the observed rate), not left to a notebook's
+    own .mean() call over an already-persisted OOF vector.
+    """
+    _, y_dev = dev_split
+    run_id = _log_parent_run(
+        dev_split, comparison_result, tuning_result, registration_cfg
+    )
+
+    result = calibrate.run_calibration_step(run_id, registration_cfg)
+    summary = result["calibration_summary"]
+
+    assert 0.0 <= summary["mean_p_hat_calibrated"] <= 1.0
+    assert 0.0 <= summary["mean_p_hat_uncalibrated"] <= 1.0
+    assert summary["observed_churn_rate"] == pytest.approx(y_dev.mean())
 
 
 def test_run_calibration_step_blocks_on_low_trial_count(

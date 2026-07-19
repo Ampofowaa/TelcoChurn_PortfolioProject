@@ -18,6 +18,7 @@ reaches into models.calibrate for those arrays.
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,10 +35,9 @@ from omegaconf import DictConfig, OmegaConf
 
 from telco_churn.models.calibrate import (
     committed_features_from_manifest,
+    load_dev_customer_ids,
     load_dev_features,
     load_training_manifest,
-    oof_calibrated_proba,
-    unfitted_pipeline_from_manifest,
 )
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import resolve_tracking_uri
@@ -59,6 +59,7 @@ __all__ = [
     "r_sensitivity_sweep",
     "derive_threshold",
     "load_calibration_summary",
+    "load_dev_oof_predictions",
     "run_threshold_step",
 ]
 
@@ -92,18 +93,25 @@ def load_costs_config(path: Path | None = None) -> DictConfig:
 
 
 def costs_config_hash(path: Path | None = None) -> str:
-    """Return the sha256 content hash of configs/costs.yaml.
+    """Return the sha256 content hash of configs/costs.yaml's resolved values.
 
     configs/policy/threshold.yaml carries no model stamp — t* = c / (r × LTV)
     is a pure function of costs.yaml, model-independent by construction — so
     its provenance is pinned by this hash instead: same hash means the model
     changed, a different hash means the cost assumptions did. path defaults
     to the canonical project location; pass an explicit path in tests.
+
+    Hashes the *resolved* config values (via OmegaConf, JSON-encoded with
+    sorted keys), not the file's raw bytes: a purely cosmetic edit — a
+    comment, re-indentation, a CRLF/LF line-ending change from checking the
+    file out on a different OS — must not look like a cost-assumption
+    change, or it becomes a false provenance mismatch against the hash
+    already pinned in configs/policy/threshold.yaml. Same idiom as
+    tuning.py's _study_name content-addressing.
     """
-    resolved = (
-        path if path is not None else get_project_root() / "configs" / "costs.yaml"
-    )
-    return hashlib.sha256(resolved.read_bytes()).hexdigest()
+    content = OmegaConf.to_container(load_costs_config(path), resolve=True)
+    encoded = json.dumps(content, sort_keys=True, default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def arpu_by_scenario(
@@ -358,6 +366,24 @@ def load_calibration_summary(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     return summary
 
 
+def load_dev_oof_predictions(run_id: str, cfg: DictConfig) -> pd.DataFrame:
+    """Load calibrate.py's persisted dev_oof_predictions.parquet artifact.
+
+    Columns: customerid, y_true, p_hat — the winning calibration method's
+    exact leak-free OOF vector, the one calibrate.py's own method selection
+    and t* validation rested on. Read here rather than recomputed
+    (CLAUDE.md § Persist the evidence, not just the conclusion): a
+    recomputation is only sound while the dataset is static and CV folds are
+    seeded, and silently diverges from the vector that cycle's decisions
+    actually used once either stops holding (e.g. under Phase 10 retraining).
+    """
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    local_path = mlflow.artifacts.download_artifacts(
+        artifact_uri=f"runs:/{run_id}/dev_oof_predictions.parquet"
+    )
+    return pd.read_parquet(local_path)
+
+
 def _save_sensitivity_plot(
     sweep: dict[float, float], shipped_threshold: float, path: Path
 ) -> None:
@@ -463,10 +489,12 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     re-calibration invalidates a previously-derived threshold, and an alias
     is a moving pointer that could later point at a different version.
 
-    Recomputes the same leak-free OOF probabilities calibrate.py's method
-    selection used (oof_calibrated_proba, over the method recorded in
-    calibration_summary.json) — this module never sees a fitted estimator or
-    the raw data split directly.
+    Loads the same leak-free OOF probabilities calibrate.py's method
+    selection used, from its persisted dev_oof_predictions.parquet artifact
+    (over the method recorded in calibration_summary.json) rather than
+    recomputing them — this module never sees a fitted estimator or the raw
+    data split directly, and never re-derives the OOF vector calibrate.py
+    already logged.
 
     threshold.json (the full, unsplit bundle — every scenario's complete
     diagnostic set, model stamp included) is logged onto the model's run as
@@ -522,11 +550,27 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     method = str(calibration_summary["method"])
 
     committed_features = committed_features_from_manifest(manifest)
-    pipeline = unfitted_pipeline_from_manifest(manifest)
     X_dev, y_dev = load_dev_features(committed_features)
 
-    oof_proba = oof_calibrated_proba(pipeline, method, X_dev, y_dev, cfg)
+    # Aligned by customerid rather than trusted positionally: dev_oof and
+    # X_dev/y_dev are two independent loads (an MLflow artifact fetch and a
+    # features.parquet read), and only their row order happening to match by
+    # construction is not something a silent misalignment would ever surface.
+    customerid = load_dev_customer_ids()
+    dev_oof = load_dev_oof_predictions(run_id, cfg).set_index("customerid")
+    aligned = dev_oof.reindex(customerid)
+    assert aligned["p_hat"].notna().all(), (
+        "dev_oof_predictions.parquet is missing rows for one or more "
+        "dev-partition customerids — it no longer matches the current "
+        "features.parquet (was it logged against a different dev partition?)."
+    )
+    oof_proba = aligned["p_hat"].to_numpy()
     y_dev_arr = y_dev.to_numpy()
+    assert np.array_equal(aligned["y_true"].to_numpy(dtype=int), y_dev_arr), (
+        "dev_oof_predictions.parquet's y_true does not match the current "
+        "y_dev — the persisted OOF artifact is stale relative to the "
+        "current dev partition."
+    )
 
     costs_cfg = load_costs_config(get_project_root() / str(cfg.paths.costs_config))
     scenarios = resolve_all_scenarios(X_dev["monthlycharges"], y_dev, costs_cfg)

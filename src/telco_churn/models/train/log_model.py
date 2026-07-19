@@ -56,6 +56,15 @@ def _cv_pr_auc_at_n_estimators(
     a-priori scaling rule holds on this project's own data, never a
     selection — it fits plain estimators in memory and logs no MLflow model,
     so it cannot mint a second registered candidate.
+
+    Preprocessing regime deliberately differs from a tuning trial's: with no
+    early stopping here, there is no es_validation_size slice to carve out of
+    X_tr, so the preprocessor is fit on the *full* fold-training rows —
+    whereas a trial fits it on the smaller X_fit slice (X_tr minus the ES
+    slice; see tuning.py's _tuning_objective). This function's absolute score
+    is therefore not expected to reproduce a trial's logged cv_pr_auc_mean at
+    the same n_estimators; only the two counts compared *against each other*
+    here (same folds, same preprocessing regime for both) are meaningful.
     """
     skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
     scores: list[float] = []

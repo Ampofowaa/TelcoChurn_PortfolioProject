@@ -75,6 +75,12 @@ logger = get_logger(__name__)
 # apart into "what was fit" vs. "what the manifest says was fit".
 _CALIBRATION_ENSEMBLE = False
 
+# calibration_slope's bootstrap redraw ceiling per resample (see its docstring):
+# generous relative to the actual retry counts a real minority class needs, so
+# it only ever bites the true "not enough of one class to bootstrap at all"
+# case, not a merely-rare-but-viable one.
+_MAX_BOOTSTRAP_RESAMPLE_ATTEMPTS = 1000
+
 
 # ---------------------------------------------------------------------------
 # Step 1: build/wrap the calibrated pipeline
@@ -327,6 +333,15 @@ def expected_calibration_error(
     is comparable across calibration runs — ECE gates nothing here, it is
     logged for both methods purely so the loser's numbers make the winner's
     selection legible.
+
+    Under ece_strategy="quantile", tied probabilities can collapse the
+    requested bin count (np.unique drops duplicate quantile edges) — logged
+    as a warning rather than left silent, since a smaller effective bin
+    count breaks the cross-run comparability this pinning exists for. Full
+    collapse (every probability identical) is floored at one bin spanning
+    [0, 1] rather than zero: zero bins would skip the summation loop
+    entirely and return 0.0 regardless of y — silently reporting "perfectly
+    calibrated" for what could be a confidently wrong constant prediction.
     """
     n_bins = int(cfg.calibration.ece_n_bins)
     strategy = str(cfg.calibration.ece_strategy)
@@ -335,6 +350,27 @@ def expected_calibration_error(
 
     if strategy == "quantile":
         edges = np.unique(np.quantile(p, np.linspace(0.0, 1.0, n_bins + 1)))
+        if len(edges) < 2:
+            edges = np.array([0.0, 1.0])
+        n_bins_effective = len(edges) - 1
+        if n_bins_effective < n_bins:
+            # np.unique silently drops duplicate quantile edges when many
+            # rows share the same p (coarse leaf outputs, a near-constant
+            # score) — the configured n_bins is what makes ECE comparable
+            # across calibration runs, so a silent drop below it must be
+            # visible, not just absorbed into a smaller ECE.
+            logger.warning(
+                "ece_bins_collapsed",
+                configured_n_bins=n_bins,
+                effective_n_bins=n_bins_effective,
+                hint=(
+                    "quantile bin edges collapsed below the configured "
+                    "ece_n_bins because many probabilities are tied — this "
+                    "ECE is not comparable to a run where collapse didn't "
+                    "happen; investigate why so many predictions are tied "
+                    "before comparing across runs."
+                ),
+            )
     else:
         edges = np.linspace(0.0, 1.0, n_bins + 1)
     edges[0], edges[-1] = 0.0, 1.0
@@ -374,7 +410,30 @@ def calibration_slope(
     dev-OOF calibration screen both call; only the (y_true, proba) pair and
     n_bootstrap differ between those two call sites.
 
-    Returns {"slope", "intercept", "slope_ci_lower", "slope_ci_upper"}.
+    A resample that happens to miss one class entirely can't fit a logistic
+    regression (sklearn raises) — an artifact of resampling a small or
+    imbalanced set, not a property of the real data, since the point
+    estimate above already proved both classes exist in y_true. Such a draw
+    is redrawn rather than allowed to crash the whole bootstrap, up to
+    _MAX_BOOTSTRAP_RESAMPLE_ATTEMPTS retries per draw — this only matters
+    at call sites smaller than today's full dev-OOF partition (a fairness
+    slice, a smaller sealed-test slice), where a single unlucky draw among
+    many bootstrap iterations shouldn't be able to take down the whole
+    calibration screen.
+
+    Also reports an analytic (Wald) CI: the asymptotic covariance of the
+    logistic-regression MLE is (X^T W X)^-1, W = diag(p_hat(1-p_hat))
+    evaluated at the auxiliary regression's own fitted probabilities — a
+    closed form, no resampling. This is a cross-check on the bootstrap CI,
+    not a replacement for it: a percentile bootstrap has no guaranteed
+    coverage in general (small samples or a skewed sampling distribution can
+    make it misbehave), and nothing in this project had independently
+    verified it behaves well *here* until this was added. Close agreement
+    between the two is cheap evidence the bootstrap isn't misbehaving on this
+    data; the bootstrap CI remains the one the gate reads.
+
+    Returns {"slope", "intercept", "slope_ci_lower", "slope_ci_upper",
+    "slope_se_analytic", "slope_ci_lower_analytic", "slope_ci_upper_analytic"}.
     """
     y = np.asarray(y_true, dtype=float)
     p = np.clip(np.asarray(proba, dtype=float), 1e-6, 1 - 1e-6)
@@ -391,12 +450,40 @@ def calibration_slope(
 
     slope, intercept = _fit(y, logit_p)
 
+    # Analytic Wald CI — (X^T W X)^-1 is the standard logistic-regression
+    # asymptotic covariance (the same quantity statsmodels/GLM report as
+    # each coefficient's standard error); index 1 is the slope term, index 0
+    # the intercept.
+    design = np.hstack([np.ones((len(y), 1)), logit_p])
+    fitted_logit = intercept + slope * logit_p.ravel()
+    p_hat = 1.0 / (1.0 + np.exp(-fitted_logit))
+    w = p_hat * (1.0 - p_hat)
+    fisher_info = design.T @ (design * w.reshape(-1, 1))
+    cov = np.linalg.inv(fisher_info)
+    slope_se_analytic = float(np.sqrt(cov[1, 1]))
+    z_975 = 1.959963984540054  # scipy.stats.norm.ppf(0.975), inlined to avoid a scipy dependency
+    slope_ci_lower_analytic = slope - z_975 * slope_se_analytic
+    slope_ci_upper_analytic = slope + z_975 * slope_se_analytic
+
     rng = np.random.default_rng(random_state)
     n = len(y)
+
+    def _two_class_resample_idx() -> NDArray[np.intp]:
+        for _ in range(_MAX_BOOTSTRAP_RESAMPLE_ATTEMPTS):
+            idx = rng.integers(0, n, size=n)
+            if len(np.unique(y[idx])) >= 2:
+                return idx
+        raise RuntimeError(
+            "calibration_slope: could not draw a two-class bootstrap "
+            f"resample in {_MAX_BOOTSTRAP_RESAMPLE_ATTEMPTS} attempts — the "
+            "minority class is too rare relative to n for this bootstrap "
+            "to be meaningful."
+        )
+
     boot_slopes = np.fromiter(
         (
             _fit(y[idx], logit_p[idx])[0]
-            for idx in (rng.integers(0, n, size=n) for _ in range(n_bootstrap))
+            for idx in (_two_class_resample_idx() for _ in range(n_bootstrap))
         ),
         dtype=float,
         count=n_bootstrap,
@@ -407,6 +494,9 @@ def calibration_slope(
         "intercept": intercept,
         "slope_ci_lower": float(np.percentile(boot_slopes, 2.5)),
         "slope_ci_upper": float(np.percentile(boot_slopes, 97.5)),
+        "slope_se_analytic": slope_se_analytic,
+        "slope_ci_lower_analytic": slope_ci_lower_analytic,
+        "slope_ci_upper_analytic": slope_ci_upper_analytic,
     }
 
 
@@ -755,12 +845,19 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     recomputed by a downstream consumer (Phase 7's drift reference,
     dev-OOF veto surface, and calibration screen). calibration_summary.json
     additionally carries calibration_slope (the dev-OOF Cox slope, with a
-    bootstrap CI) and calibration_spec (method/inner_cv_folds/random_state/
-    ensemble — the four fields Phase 7's refit.py needs to rebuild an
-    identical CalibratedClassifierCV without re-deriving it).
+    bootstrap CI), uncalibrated_calibration_slope (the same statistic on
+    the pre-calibration OOF vector, paired for comparison — a reliability
+    diagram's bin-level scatter can't by itself distinguish genuine
+    miscalibration from sampling noise, and this pairing is what turns that
+    visual ambiguity into two comparable numbers), and calibration_spec
+    (method/inner_cv_folds/random_state/ensemble — the four fields Phase 7's
+    refit.py needs to rebuild an identical CalibratedClassifierCV without
+    re-deriving it).
 
     Also logs dev_brier/dev_bss/dev_ece/dev_per_fold_mean_ap/
-    dev_calibration_slope as MLflow metrics (not just JSON fields), so they
+    dev_calibration_slope/dev_uncalibrated_calibration_slope/
+    dev_mean_p_hat_calibrated/dev_mean_p_hat_uncalibrated/
+    dev_observed_churn_rate as MLflow metrics (not just JSON fields), so they
     are plottable as a series across retraining cycles.
 
     reports/figures/reliability_diagram.png is overwritten on every call —
@@ -851,12 +948,40 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
         n_bootstrap=int(cfg.calibration.slope_bootstrap_n_samples),
         random_state=int(cfg.calibration.random_state),
     )
+    # Paired against the winning method's slope above, computed on the same
+    # already-in-memory selection["uncalibrated_proba"] (no extra CV refit —
+    # select_calibration_method already produced it). A reliability diagram
+    # can only show bin-level scatter, which is ambiguous between "genuinely
+    # miscalibrated" and "noisy bins, calibration is actually fine"; the
+    # uncalibrated slope is what turns that ambiguity into a number: a
+    # consistently one-directional diagram (the uncalibrated case) shows up
+    # here as a slope measurably below 1, whereas the calibrated method's
+    # bidirectional scatter shows up as a slope near 1 — confirming the
+    # visual story instead of merely asserting it.
+    uncalibrated_slope = calibration_slope(
+        y_dev,
+        selection["uncalibrated_proba"],
+        n_bootstrap=int(cfg.calibration.slope_bootstrap_n_samples),
+        random_state=int(cfg.calibration.random_state),
+    )
 
     calibration_summary: dict[str, Any] = {
         "method": method,
         "diagnostics": selection["diagnostics"],
         "switch_decision": selection["switch_decision"],
         "calibration_slope": slope,
+        "uncalibrated_calibration_slope": uncalibrated_slope,
+        # Mean predicted probability, calibrated vs. uncalibrated, against the
+        # observed dev-partition churn rate — the "calibration-in-the-large"
+        # evidence a slope near 1 can hide: a large intercept (see
+        # uncalibrated_calibration_slope above) shows up here as a mean
+        # p_hat far from the observed rate, which is what a reliability
+        # diagram's visible overconfidence is actually a symptom of, not the
+        # slope. Persisted rather than left to a notebook's own .mean() call
+        # (CLAUDE.md § Persist the evidence, not just the conclusion).
+        "mean_p_hat_calibrated": float(np.mean(selection["calibrated_proba"])),
+        "mean_p_hat_uncalibrated": float(np.mean(selection["uncalibrated_proba"])),
+        "observed_churn_rate": float(y_dev.mean()),
         # The four fields that reconstruct the fitted CalibratedClassifierCV
         # from this run alone — Phase 7's refit.py rebuilds the identical
         # estimator from this block instead of re-deriving it, and its
@@ -889,6 +1014,14 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
                 "dev_ece": winning_diagnostics["ece"],
                 "dev_per_fold_mean_ap": winning_diagnostics["per_fold_mean_ap"],
                 "dev_calibration_slope": slope["slope"],
+                "dev_uncalibrated_calibration_slope": uncalibrated_slope["slope"],
+                "dev_mean_p_hat_calibrated": calibration_summary[
+                    "mean_p_hat_calibrated"
+                ],
+                "dev_mean_p_hat_uncalibrated": calibration_summary[
+                    "mean_p_hat_uncalibrated"
+                ],
+                "dev_observed_churn_rate": calibration_summary["observed_churn_rate"],
             }
         )
 
