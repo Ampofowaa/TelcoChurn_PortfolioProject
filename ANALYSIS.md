@@ -124,6 +124,8 @@ The gate has two regimes, because the registry is empty the first time it runs.
 >
 > The dev-OOF slope (n = 5,634) is the complement: **higher-powered but mildly optimistic**, because the calibration *method* (sigmoid vs. isotonic, §6) was itself selected using those very OOF probabilities. So the two fail in opposite directions and neither can certify a model — but **each can damn one**, which is all a veto-only guardrail ever needs to do. A model that fails on dev-OOF is failing on the surface *biased in its favour*; a model that fails on test is failing despite a CI wide enough to hide most problems. Either is disqualifying.
 
+**The band's width, `[0.80, 1.25]`, is itself a policy choice, not something derived from this project's data or an external citation.** Nothing here claims those specific edges were fitted, benchmarked, or validated by simulation — they are pre-registered exactly as stated, and that is the full extent of their justification. What *has* been validated is the measurement compared against the band: `calibrate.py::calibration_slope`'s percentile-bootstrap CI has been independently cross-checked against a closed-form analytic (Wald) CI, and the two agree closely — so the number is trustworthy. Whether `0.80`/`1.25` are the right edges for *this* number remains open; see §9's limitation on this point (including the cross-check citation) for the follow-up that would actually settle it.
+
 #### The champion is not the model the gate measured — and its calibration needs its own check
 
 The four criteria above are evaluated on the **`dev`-scope model**: fitted on development, scored on the sealed test set. But the artifact that actually serves is the **`full`-scope refit** (§8), fitted on all 7,043 rows. The gate measures one artifact and promotes another — a deliberate design, and sound, because the two are *the same frozen spec at two data volumes*.
@@ -260,7 +262,7 @@ Only `totalcharges` has nulls — 11 rows (0.16 %), all with `tenure = 0` (brand
 
 ### Bivariate analysis & effect sizes
 
-Chi-squared + Cramér's V for categorical features (V > 0.30 = strong, 0.10–0.30 = moderate, < 0.10 = weak); Mann-Whitney U + rank-biserial r for numeric features. With n = 7,043, p-values are near zero for any real effect — **effect size magnitude, not p-value, drives the ordering below.**
+Chi-squared + Cramér's V for categorical features (V > 0.30 = strong, 0.10–0.30 = moderate, < 0.10 = weak); Mann-Whitney U + rank-biserial r for numeric features. With n = 7,043, p-values are near zero for any real effect — **effect size magnitude, not p-value, drives the ordering below.** The two non-predictors below are cited by `p_adj` rather than the raw p-value — a Benjamini-Hochberg correction across the 19 categorical and numeric features tested against the same target, correcting for running that many simultaneous tests.
 
 | Feature | Method | Effect size | Key finding |
 |---|---|---|---|
@@ -279,8 +281,8 @@ Chi-squared + Cramér's V for categorical features (V > 0.30 = strong, 0.10–0.
 | SeniorCitizen | Cramér's V | 0.15 | ~42 % churn vs ~24 % — likely mediated by contract type and internet service |
 | Partner | Cramér's V | 0.15 | Without a partner: above-average churn |
 | MultipleLines | Cramér's V | 0.04 | Statistically significant but practically negligible |
-| **PhoneService** | Cramér's V | **0.01** (p = 0.32) | **Non-predictor** |
-| **Gender** | Cramér's V | **0.0086** (p = 0.47) | **Non-predictor** |
+| **PhoneService** | Cramér's V | **0.01** (p_adj = 0.33) | **Non-predictor** |
+| **Gender** | Cramér's V | **0.0086** (p_adj = 0.47) | **Non-predictor** |
 
 **Interpretive notes:**
 
@@ -423,12 +425,12 @@ LightGBM and LogisticRegressionCV are compared on PR-AUC: threshold-free, aligne
 | Candidate | CV PR-AUC | ± std | Train s/fold |
 |---|---|---|---|
 | `dummy_prior` | 0.265 | 0.001 | 0.00 |
-| `logreg_cv` | 0.651 | 0.033 | 0.89 |
+| `logreg_cv` | 0.651 | 0.033 | 0.90 |
 | `lgbm_default` | 0.658 | 0.035 | 0.25 |
 
 **Safeguard check passed:** the dummy classifier scored 0.265, matching the dev-set churn rate (0.265) — confirming the real candidates' higher scores reflect genuine predictive signal, not a broken eval harness or leaked target.
 
-LightGBM leads by ~0.007 PR-AUC points; ROC-AUC is close and non-contradictory (0.844 for both candidates). LogReg is markedly more expensive to train here (`LogisticRegressionCV`'s inner 5-fold search over 10 `C` values costs ~3.6× LightGBM's single fit per outer fold — 0.89s vs. 0.25s) — a genuine simplicity-vs-cost tradeoff LogReg does *not* win on, despite its interpretability appeal.
+LightGBM leads by ~0.007 PR-AUC points; ROC-AUC is close and non-contradictory (0.844 for both candidates). LogReg is markedly more expensive to train here (`LogisticRegressionCV`'s inner 5-fold search over 10 `C` values costs ~3.6× LightGBM's single fit per outer fold — 0.90s vs. 0.25s) — a genuine simplicity-vs-cost tradeoff LogReg does *not* win on, despite its interpretability appeal.
 
 #### Precision/F1-at-fixed-recall profile
 
@@ -554,7 +556,7 @@ Two checks guard against this method misleading:
 
 **SHAP audit (diagnostic only).** A second, different lens on the same 20 features: `compute_shap_audit` fits one more default-config LightGBM and measures each feature's average contribution to individual predictions — not the performance drop from removing it, like permutation importance measures. It never decides keep/drop; it's a cross-check only. The two methods mostly agree on *which* features matter, but not completely: 9 of the 10 permutation-importance survivors occupy 9 of the top 10 SHAP ranks. The exception is `streamingtv`, the thinnest survivor (real importance 0.006, barely above the 0.005 floor), which falls to 12th by SHAP (mean |SHAP| 0.105) — behind two features that failed the decoy floor outright: `charge_per_service` (8th, 0.167) and `paperlessbilling` (11th, 0.113). Among the features both methods agree on, ordering still reshuffles: `contract_type` and `tenure` swap the top two spots (SHAP rates `contract_type` more than double `tenure`'s score — 1.115 vs. 0.465 — the reverse of permutation importance's order, 0.084 vs. 0.088), and `paymentmethod` jumps from a modest 7th-of-10 permutation-importance rank (0.013) to 3rd by SHAP (0.351) — plausibly because SHAP credits its role in individual predictions more than one shuffle-and-measure pass captures.
 
-**Tradeoff and future consideration.** The full set's edge costs something too: 10 extra columns to validate and monitor, for a ~1.4% relative PR-AUC gain — a team prioritizing simplicity or a smaller fairness-audit surface (e.g. dropping `gender`) could reasonably prefer the reduced set instead, with a different Δ\* set in advance rather than a different reading of the same evidence. A finer-grained method like `RFECV` could identify exactly which 1-2 features are safe to drop individually, but isn't worth adopting now: run naively it reintroduces the stepwise-selection bias the single pre-registered test avoids, and run correctly (nested CV, to avoid that bias) it costs meaningfully more compute — either way, for a marginal payoff at this feature-set size. Worth revisiting only if serving cost or audit-surface reduction becomes a real priority.
+**Tradeoff and future consideration.** The full set's edge costs something too: 10 extra columns to validate and monitor, for a ~1.5% relative PR-AUC gain — a team prioritizing simplicity or a smaller fairness-audit surface (e.g. dropping `gender`) could reasonably prefer the reduced set instead, with a different Δ\* set in advance rather than a different reading of the same evidence. A finer-grained method like `RFECV` could identify exactly which 1-2 features are safe to drop individually, but isn't worth adopting now: run naively it reintroduces the stepwise-selection bias the single pre-registered test avoids, and run correctly (nested CV, to avoid that bias) it costs meaningfully more compute — either way, for a marginal payoff at this feature-set size. Worth revisiting only if serving cost or audit-surface reduction becomes a real priority.
 
 The full feature-selection walkthrough — permutation importance, the fluke and correlated-credit checks, and the full-vs-reduced bootstrap decision — is in [`notebooks/03b-feature-selection.ipynb`](notebooks/03b-feature-selection.ipynb).
 
@@ -586,7 +588,7 @@ Study configuration:
 
 1. **Pruning** — MedianPruner adopted; **47 of 50 trials completed, 3 pruned** mid-CV, saving the budget for configurations plausibly competitive with the running median.
 2. **Boundary-hit check** — none of the 8 selected hyperparameters sit on its searched range's edge (all `False`); the widened ranges above comfortably contain the optimum.
-3. **Selection rule** — raw argmax (trial 13, CV PR-AUC 0.6668) is **not** adopted. The 1-SE rule picks **trial 10** (CV PR-AUC 0.6621, within one SE = 0.0060 of trial 13) for far fewer `num_leaves` (6 vs. 151) and about 60% of the trees (94 vs. 161) — `num_leaves` is LightGBM's documented main complexity control under leaf-wise growth, though this particular study's own fANOVA ranking (now seeded for reproducibility) doesn't reflect that theoretical primacy: `max_depth` dominates at 22.5% of total importance, with `num_leaves` mid-pack at 9.9%. Net effect: a ~0.0047 PR-AUC sacrifice for a materially simpler configuration.
+3. **Selection rule** — raw argmax (trial 13, CV PR-AUC 0.6668) is **not** adopted. The 1-SE rule picks **trial 10** (CV PR-AUC 0.6621, within one SE = 0.0060 of trial 13) for far fewer `num_leaves` (6 vs. 151) and about 91% of the trees (147 vs. 161) — `num_leaves` is LightGBM's documented main complexity control under leaf-wise growth, though this particular study's own fANOVA ranking (now seeded for reproducibility) doesn't reflect that theoretical primacy: `max_depth` dominates at 22.5% of total importance, with `num_leaves` mid-pack at 9.9%. Net effect: a ~0.0047 PR-AUC sacrifice for a materially simpler configuration — `num_leaves` carries essentially all of that simplicity gain, since the tree count itself is barely reduced.
 4. **Convergence** — the running-best curve is flat from trial 13 onward (every trial from 14 through 50 lands at or below it — a wide plateau, not a narrow cutoff); the study is not still climbing at the 50-trial budget.
 
 **Selected hyperparameters (trial 10, 1-SE rule; MLflow run `tuning_study` → nested `trial_009`) vs. LightGBM defaults:**
@@ -601,7 +603,13 @@ Study configuration:
 | `max_depth` | −1 (unbounded) | 4 |
 | `reg_alpha` | 0.0 | 0.7404 |
 | `reg_lambda` | 0.0 | 3.5847 |
-| `n_estimators` | 100 | 94 (median over folds) |
+| `n_estimators` | 100 | 147 (median over folds, scaled to the final-fit row count) |
+
+#### Tree-count scaling for the final fit
+
+`n_estimators` is not searched directly — each Optuna trial's value is the median early-stopped tree count across its own 5 CV folds, measured on a per-fold training partition of 3,606 rows. The full-development refit trains on 5,634 rows, large enough to earn more boosting rounds before early stopping would trigger, so the raw median (94) is scaled by `n_final_fit / n_fold_fit ≈ 1.5624` to a shipped count of **147**.
+
+A two-count diagnostic checks this scaling against the model's own data rather than trusting the formula alone: refitting the tuned spec at both counts on the same CV folds gives CV PR-AUC 0.6669 at 94 trees versus **0.6684** at 147 — scaling improves the score, not just changes it.
 
 #### Full → reduced → tuned bias/variance progression
 
@@ -611,20 +619,20 @@ Three bias/variance reads chain across the decide→optimize boundary: ① the f
 |---|---:|---:|---:|
 | ① Full (20 features, default) | 0.7945 | 0.6583 | 0.1362 |
 | ② Reduced (20 features, default) | 0.7945 | 0.6583 | 0.1362 |
-| ③ Tuned (20 features, 1-SE) | 0.6944 | 0.6690 | **0.0254** |
+| ③ Tuned (20 features, 1-SE) | 0.7045 | 0.6701 | **0.0343** |
 
-Selection alone (①→②) shows no movement this cycle, since Feature Selection (§4b) retained the full set — confirming feature count was never the primary overfit lever here. Tuning (②→③) is what does the work: the gap **shrinks 81%** (0.1362 → 0.0254) while CV PR-AUC simultaneously **improves** (0.6583 → 0.6690) — the default model was overfitting, fitting the training data (0.7945) far better than it generalized to unseen data (0.6583). Tuning deliberately gives up some of that training fit (down to 0.6944) to curb the overfitting, and it pays off: performance on unseen data still goes up (0.6583 → 0.6690) rather than just holding steady. (The tuned CV PR-AUC here, 0.6690, is computed on the 10×10 RSKF scheme for this comparison and differs slightly from the Optuna study's own reported 0.6621, which is a single 5-fold value from a different fold assignment — not a discrepancy, a different measuring instrument.)
+Selection alone (①→②) shows no movement this cycle, since Feature Selection (§4b) retained the full set — confirming feature count was never the primary overfit lever here. Tuning (②→③) is what does the work: the gap **shrinks 75%** (0.1362 → 0.0343) while CV PR-AUC simultaneously **improves** (0.6583 → 0.6701) — the default model was overfitting, fitting the training data (0.7945) far better than it generalized to unseen data (0.6583). Tuning deliberately gives up some of that training fit (down to 0.7045) to curb the overfitting, and it pays off: performance on unseen data still goes up (0.6583 → 0.6701) rather than just holding steady. (The tuned CV PR-AUC here, 0.6701, is computed on the 10×10 RSKF scheme for this comparison and differs slightly from the Optuna study's own reported 0.6621, which is a single 5-fold value from a different fold assignment — not a discrepancy, a different measuring instrument.)
 
 #### Model logging (not registered)
 
-The tuned pipeline (`tree_preprocessor` + LightGBM at the 1-SE hyperparameters above, `n_estimators=94` fixed — no further early stopping on this final fit) is refit on all of development and logged as one `Pipeline` — not the bare estimator — onto the *same* MLflow run as the `tuning_study` parent (`run_id 6450decd98cc40ea96f49a6a9de56b39`), per the packaging checklist below:
+The tuned pipeline (`tree_preprocessor` + LightGBM at the 1-SE hyperparameters above, `n_estimators=147` fixed — no further early stopping on this final fit) is refit on all of development and logged as one `Pipeline` — not the bare estimator — onto the *same* MLflow run as the `tuning_study` parent (`run_id 4865b9f96dac4cfaba673f37a4c6b59b`), per the packaging checklist below:
 
 | Check | Result |
 |---|---|
 | Model signature + input example | Logged (`mlflow.sklearn.log_model`) |
 | Log → reload → predict parity | **Passed** — reloaded pipeline's predictions match the in-memory model exactly on a 5-row dev sample |
 | `training_manifest.json` | Populated: git SHA, DVC data hash, hyperparameters, `feature_space` (20) / `feature_columns` (20), CV PR-AUC, paired-Δ vs LogReg with full bootstrap CI, and `tuning_summary` — the engineering audit trail |
-| Registered | **Not at this stage** — logged only (`models:/m-30fc7b1c87c844ff98d6545d79277104`), no `registered_model_name`, no alias |
+| Registered | **Not at this stage** — logged only (`models:/m-e76b0cb546c8471eab6d52efdc08c5a1`), no `registered_model_name`, no alias |
 
 **This logged pipeline is the raw tuned model** — uncalibrated, un-thresholded, and not evaluated on the sealed test set. Nothing downstream should serve it directly: model calibration (`models/calibrate.py`) performs the training cycle's *single* registration — pointing the `challenger` alias at the calibrated artifact, not this one — Phase 7 evaluates on the sealed test once and promotes `champion`, and only `champion` is ever loaded by serving (Phase 9). Registering an intermediate, uncalibrated artifact here would leave two versions per cycle with no way to tell which is the valid rollback target — every registered version must be a valid one, and an uncalibrated intermediate is not.
 
@@ -645,11 +653,11 @@ The winning method is then refit once more, on all of development, to produce wh
 | Method | Per-fold mean PR-AUC | Pooled Brier | ECE | BSS |
 |---|---|---|---|---|
 | Dummy prior (BSS reference) | 0.2654 | 0.1949 | 0.0000 | 0.0000 |
-| Uncalibrated | 0.6669 | 0.1611 | 0.1446 | 0.1735 |
-| **Sigmoid (selected)** | **0.6669** | **0.1345** | **0.0217** | **0.3098** |
-| Isotonic | 0.6466 | 0.1339 | 0.0112 | 0.3131 |
+| Uncalibrated | 0.6684 | 0.1604 | 0.1402 | 0.1770 |
+| **Sigmoid (selected)** | **0.6684** | **0.1343** | **0.0222** | **0.3111** |
+| Isotonic | 0.6474 | 0.1342 | 0.0122 | 0.3117 |
 
-**Selection: sigmoid, via `isotonic_disqualified_pr_auc_gate`.** Isotonic has the best Brier score and Expected Calibration Error (ECE) of the three, but its per-fold mean PR-AUC (0.6466) falls 0.0203 below uncalibrated — past the pre-registered materiality gate (Δ\* = 0.005) — so it's disqualified regardless of its calibration edge. Sigmoid leaves PR-AUC untouched by construction while still recovering most of isotonic's calibration gain.
+**Selection: sigmoid, via `isotonic_disqualified_pr_auc_gate`.** Isotonic has the best Brier score and Expected Calibration Error (ECE) of the three, but its per-fold mean PR-AUC (0.6474) falls 0.0210 below uncalibrated — past the pre-registered materiality gate (Δ\* = 0.005) — so it's disqualified regardless of its calibration edge. Sigmoid leaves PR-AUC untouched by construction while still recovering most of isotonic's calibration gain.
 
 **The PR-AUC gate decided this outright — the Brier-bootstrap switch test (`brier_switch_decision`) never ran.** That matters for how much weight to put on that test if a future retrain reaches it: it resamples only `outer_cv_folds` (= 5) paired fold-level Brier differences, and a 10,000-draw percentile bootstrap over just 5 original values has a small effective resample space (5⁵ = 3,125 distinct draws) — its CI is directionally sound but coarser than a bootstrap built from more units. It isn't live for the shipped v1 decision, since the PR-AUC gate resolved things first; it would only bind if a future retrain's isotonic candidate clears that gate and the choice actually comes down to the Brier bootstrap — worth raising `outer_cv_folds` at that point for a less noisy read.
 
@@ -691,21 +699,43 @@ Three scenarios bracket realistic business assumptions, resolved from the develo
 | **Total intervention cost `c`** = `outreach_cost + discount offer` | **$22.00** | **$67.76** | **$134.78** |
 | `retention_rate` `r` (industry benchmark — not observable in this dataset) | 20% | 30% | 40% |
 
+#### Net benefit per catch and margin ratio
+
+Two more figures fall out of the same cost table, and they matter for reading the expected-value comparison below correctly. **Net benefit per catch** (`retention rate × LTV − cost`) prices a single hit — a customer who was genuinely about to churn, got contacted, and stayed — netting the retention payoff against the cost of that one contact. It says nothing about the customers contacted at the same threshold who were never going to churn in the first place: those **wasted contacts** still cost `c` each but return $0, since there's no churn for the offer to prevent. **Margin ratio** (`payoff ÷ cost`, where payoff = `r × LTV`) restates the same trade-off as a multiple — how many times over a successful catch pays back what it cost to attempt.
+
+| Scenario | Net benefit per catch | Margin ratio |
+|---|---|---|
+| Conservative | $59.61 | 3.71× |
+| **Base** | **$104.18** | **2.54×** |
+| Optimistic | $136.52 | 2.01× |
+
+Optimistic has the largest net benefit per catch of the three but the thinnest margin — its cost scales with both a higher assumed ARPU and a higher discount rate, so the cost side grows faster than the payoff does. Conservative is the reverse: the smallest net benefit, but the fattest margin. This is the piece that explains why a bigger per-catch payoff doesn't automatically win in aggregate, below.
+
 ### Derived thresholds
 
 Each scenario's threshold is checked two ways. The **closed form** calculates it directly from the cost math above (`c/(r·LTV)`) — pure arithmetic, no data involved. The **empirical check** goes the other direction: it tries every possible cutoff on real, calibrated probabilities to find which one would actually have performed best historically, then resamples that estimate thousands of times to build a plausible range (a 95% confidence interval), since a single historical best is noisy. The question that matters: does the closed-form answer fall inside that range?
 
 | Scenario | `t*` (closed form) | Empirical argmax-EV | 95% bootstrap CI | Within CI? | Implied contact rate |
 |---|---|---|---|---|---|
-| Conservative | 0.2696 | 0.2672 | [0.212, 0.332] | ✓ | 40.3% |
-| **Base (shipped)** | **0.3941** | 0.4428 | [0.364, 0.532] | ✓ | 30.8% |
-| Optimistic | 0.4968 | 0.5515 | [0.494, 0.593] | ✓ | 24.5% |
+| Conservative | 0.2696 | 0.2497 | [0.2106, 0.2586] | ✗ | 40.3% |
+| **Base (shipped)** | **0.3941** | 0.4150 | [0.3913, 0.5084] | ✓ | 30.9% |
+| Optimistic | 0.4968 | 0.5474 | [0.4849, 0.6076] | ✓ | 24.1% |
 
-All three scenarios' closed-form `t*` falls inside the bootstrap CI of the empirical argmax-EV threshold — the theoretical cost-derived cutoff agrees with where realized expected value actually peaks on held-out data, for every scenario, not just the shipped one.
+Base and optimistic's closed-form `t*` fall inside their empirical argmax-EV bootstrap CI — the theoretical cost-derived cutoff agrees with where realized expected value actually peaks on held-out data. **Conservative is the exception:** its closed-form threshold (0.2696) falls just outside the empirical CI's upper edge (0.2586) — a real disagreement (≈0.011, about a fifth of the CI's width), not sampling noise. It does not affect the shipped policy, since base is what ships and base still agrees. Nor does it indicate broken calibration: the calibration slope (§5, ≈1.01) is an aggregate summary across the whole probability range and can pass comfortably while one narrow slice (roughly 0.25–0.27) is locally a little off — exactly the kind of local wobble an aggregate slope is built to miss. `threshold.py` logs this as a diagnostic warning; nothing is blocked.
 
 **Base is the shipped operating point** (`t* = 0.3941`) — the other two are stored reference alternatives, not automatically-active fallbacks.
 
 Neither extreme pays: contacting everyone costs money outright (sharply for base/optimistic, less so for conservative's cheaper contacts), and contacting no one gives up on every customer who could have been talked into staying. Between those extremes, expected value stays close to its best across a **broad plateau** of cutoffs before dropping to $0 near `t = 1` — nearby thresholds perform almost as well as the peak, so a slightly-off `t*` costs little, which is why each scenario's `t*` doesn't need to sit exactly at the empirical peak to be a good choice.
+
+### Expected value at the shipped thresholds
+
+| Scenario | `t*` | EV at `t*` ($/customer) |
+|---|---|---|
+| Conservative | 0.2696 | $8.51 |
+| **Base** | **0.3941** | **$10.45** |
+| Optimistic | 0.4968 | $9.62 |
+
+Base outperforms optimistic in aggregate despite optimistic's larger net benefit per catch ($136.52 vs. base's $104.18, above) — the margin-ratio table explains the reversal: optimistic's margin (2.01×) is the thinnest of the three, and its cost per false alarm ($134.78, vs. base's $67.76) is the highest. A thinner margin and a costlier miss combine with a lower contact rate (24.1% vs. base's 30.9%) to pull optimistic's whole-base average below base's, even though its per-success dollar figure is the largest. A bigger per-catch payoff does not guarantee a bigger aggregate return once contact volume and margin are both in play — the reason base, not optimistic, is the better policy despite scoring lower on the single number ($136.52) that looks most impressive in isolation.
 
 ### Retention-rate sensitivity (base scenario, cost/LTV held fixed)
 
@@ -1021,7 +1051,7 @@ mlflow.sklearn.load_model("models:/telco-churn-pipeline@champion")
 
 8. **Feature discovery redundancy screen has a mixed-type gap.** Screen 2 in the lap framework checks numeric-vs-numeric relationships (Pearson) and categorical-vs-categorical (Cramér's V) but has no branch for categorical-derived-from-numeric (e.g. `tenure_cohort` vs `tenure`). Screen 4 — permutation importance given all adopted features — is the empirical backstop: a feature that adds no marginal signal because the model already has the underlying numeric column is identified and rejected regardless of type. On the dev-partition run, `tenure_cohort` (Lap 5) was redundant enough to fail earlier, directly at Screen 3 (PR-AUC fell −0.0041) — Screen 2 raised no flag, since it has no cross-type branch, but the feature never reached Screen 4. `two_year_fiber` (Lap 1) demonstrates the Screen 4 backstop directly on this run: Screen 2 passed (max_corr 0.389), Screen 3 passed (+0.0017 PR-AUC), and Screen 4 correctly rejected it (importance 0.0001, below the 0.0054 floor) once measured against the full adopted context.
 
-9. **Learning curve had not plateaued at Phase 5 Step 2c.** CV PR-AUC was still rising at the maximum training size in the Steps 2c/2d generative diagnostic loop (0.613 → 0.655 from 20%→100% of the dev-training folds) — more historical data would plausibly still improve ranking quality. Not acted on in Phase 5 (no feature was engineered in response); flagged as a Phase 10 retrain / data-acquisition consideration. **This is the empirical justification for the Phase 7 full-data refit** (`models/refit.py`): on this project's own evidence the extra 1,409 rows are still buying ranking quality, so the refit is not a ritual.
+9. **Learning curve had not plateaued at Phase 5 Step 2c.** CV PR-AUC was still rising at the maximum training size available to any single CV fold in the Steps 2c/2d generative diagnostic loop (0.610 → 0.652 from 20%→100% of the dev-training folds) — more historical data would plausibly still improve ranking quality, and a fold's training partition is itself smaller than the eventual full-development refit. That same gap is why an early-stopped tree count measured on a smaller training partition (3,606 rows) needs scaling for a final fit trained on more rows (5,634): §4c derives and measures the correction (94 → 147 trees, +0.0015 CV PR-AUC on the two-count diagnostic). Not acted on with a new feature in Phase 5 (no feature was engineered in response); flagged as a Phase 10 retrain / data-acquisition consideration. **This is the empirical justification for the Phase 7 full-data refit** (`models/refit.py`): on this project's own evidence the extra 1,409 rows are still buying ranking quality, so the refit is not a ritual — and by the same logic, whatever tree count `refit.py` starts from will need this same scaling logic applied for its own (larger again) row count.
 
 10. **The sealed test set is too small to support subgroup conclusions, so the shipping veto is decided on development-set evidence.** Phase 7 reports disaggregated PR-AUC on the sealed test set — per contract type, tenure cohort, internet service, and the four protected/quasi-protected axes — because that is what a model card requires and what the published metrics of record should cover. But 1,409 test rows do not divide into seven axes and leave usable support: the two-year `contract_type` tier churns under 3 %, so it carries on the order of **ten churners**, and a PR-AUC estimated on ten positives has a CI wide enough to be uninformative. The consequence is stated plainly: **the human review that can veto promotion decides on the dev-OOF slices** (5,634 rows, roughly four times the churners per slice), and the test-set slices are *reported* alongside rather than acted on. What is therefore never verified on held-out data is whether the model's **subgroup** behaviour generalises — only its aggregate performance is. This is a deliberate trade (a held-out estimate too noisy to trust is worth less than an in-development estimate that is estimable), not an oversight, and it is a limitation of the dataset's size, not of the method. It would dissolve on any realistically-sized production dataset, where every slice has thousands of positives and the question does not arise. **Downstream consequence:** Phase 10's `performance_check.py` compares realised per-segment performance against the *test-set* baselines (the published numbers), so a thin-support segment cannot support a tight degradation alert — its alert band must be derived from its baseline CI, not a fixed global threshold.
 
@@ -1040,6 +1070,12 @@ mlflow.sklearn.load_model("models:/telco-churn-pipeline@champion")
     **The mitigation is a proxy, and it is honest about being one.** `refit.py` runs `cross_val_predict` of the champion's frozen spec over all 7,043 rows and computes the slope on the resulting OOF probabilities — every row scored by a model that did not train on it. It is **veto-only**: it can abort the promotion (same rule as §0's guardrail — the 95 % CI lying entirely outside [0.80, 1.25]), and it can never admit. It is also **conservative by construction**: no fold trains on all 7,043, so it measures a model slightly smaller than the champion, and calibration improves with `n`. The error therefore runs toward pessimism, which is the safe direction for a veto.
 
     **What remains genuinely unverified:** the champion's calibration on data drawn from a distribution it has never seen. A cross-validated estimate is not a held-out one, and the gap is not closable on a static snapshot — it is the same wall as #12. **This is the sharpest price the full-data refit charges**, and it is worth stating next to the refit's benefit (#9): the extra 1,409 rows buy ranking quality that the learning curve says is real, and they cost the ability to ever again check the serving artifact against data it has not seen. The trade was made deliberately, not by omission.
+
+14. **The calibration-slope guardrail's band, `[0.80, 1.25]`, is asserted policy, not derived or validated.** *(Structural.)* The method itself — the Cox calibration slope, regress `y` on `logit(p)` — is standard practice in clinical prediction modelling and directly analogous cost-based decision-rule settings (credit risk, insurance underwriting), where a probability feeds a real decision the way `t*` does here. But the specific numeric width of the veto band has no citation and no project-specific derivation: nobody has checked, by simulation or otherwise, what degree of true miscalibration the band actually catches, or whether `[0.80, 1.25]` is well-matched to this dataset's scale. What **has** been validated is the *measurement* inside the band, not the band itself: `calibrate.py::calibration_slope`'s percentile-bootstrap CI has been independently cross-checked against a closed-form analytic (Wald) CI, confirmed correct via a finite-difference Hessian check in `tests/unit/test_calibrate.py`, and the two agree closely on this run's actual data (§2 "Bootstrap vs. analytic (Wald) CI cross-check", `notebooks/04-calibration-and-threshold.ipynb`) — so the number being compared against the band is trustworthy. Whether `0.80`/`1.25` are the right edges for that number remains open.
+
+    **A related, sharper finding surfaced while building that cross-check.** The calibration slope alone can be a misleading summary: the *uncalibrated* dev-OOF probabilities already have a slope near 1.0 (0.98), even though the reliability diagram shows them clearly, one-directionally overconfident. The actual defect is in the **intercept** (≈ −0.98, vs. ≈0.00 after calibration) — the uncalibrated mean predicted probability (≈41%) sits far above the observed dev churn rate (≈26.5%), a "calibration-in-the-large" distortion the slope is largely blind to by construction (it measures relative spread, not overall level). `calibrate.py` now persists `uncalibrated_calibration_slope`, `mean_p_hat_calibrated`, `mean_p_hat_uncalibrated`, and `observed_churn_rate` alongside the existing `calibration_slope`, so this comparison is available every cycle rather than a one-off notebook observation. **The consequence for the guardrail:** a model whose intercept is badly off but whose slope happens to sit inside `[0.80, 1.25]` would clear this specific check despite being clearly miscalibrated in aggregate — the slope catches one specific failure mode (bad relative discrimination), not every way a model's probabilities can be dishonest.
+
+    **The concrete follow-up, not yet done:** a coverage/sensitivity simulation — insert a known degree of miscalibration (varying both slope and intercept independently) into synthetic data shaped like this dataset, and check where the veto rule actually starts firing, and whether that threshold corresponds to a miscalibration severity that would meaningfully distort `t*` in practice.
 
 ---
 
