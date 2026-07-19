@@ -46,7 +46,7 @@ if __name__ == "__main__":
 
     from telco_churn.utils.db import get_engine
     from telco_churn.utils.logging import configure_logging
-    from telco_churn.utils.paths import load_config
+    from telco_churn.utils.paths import get_project_root, load_config
 
     load_dotenv()
     configure_logging()
@@ -54,7 +54,9 @@ if __name__ == "__main__":
     cfg = load_config()
 
     try:
-        build_sql_features(get_engine(), sql_dir=Path(cfg.paths.sql_features))
+        build_sql_features(
+            get_engine(), sql_dir=get_project_root() / cfg.paths.sql_features
+        )
     except Exception as e:
         logger.error("sql_features failed", error=str(e), exc_info=True)
         sys.exit(1)

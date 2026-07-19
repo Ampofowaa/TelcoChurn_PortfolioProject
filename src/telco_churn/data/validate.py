@@ -8,6 +8,8 @@ from pathlib import Path
 import pandas as pd
 
 from telco_churn.data.checks import (
+    MAX_NULL_RATE,
+    MIN_ROWS,
     CheckResult,
     Severity,
     check_churn_labels,
@@ -170,8 +172,8 @@ def validate_raw(
     df: pd.DataFrame,
     strict: bool = True,
     reports_dir: Path = _REPORTS_DIR,
-    min_rows: int = 1_000,
-    max_null_rate: float = 0.05,
+    min_rows: int = MIN_ROWS,
+    max_null_rate: float = MAX_NULL_RATE,
 ) -> ValidationResult:
     """Run the five EDA data-quality gates against raw telco data.
 
@@ -204,8 +206,8 @@ def validate_clean(
     df: pd.DataFrame,
     strict: bool = True,
     reports_dir: Path = _REPORTS_DIR,
-    min_rows: int = 1_000,
-    max_null_rate: float = 0.05,
+    min_rows: int = MIN_ROWS,
+    max_null_rate: float = MAX_NULL_RATE,
 ) -> ValidationResult:
     """Run the five EDA data-quality gates after totalcharges imputation.
 

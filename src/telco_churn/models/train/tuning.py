@@ -470,6 +470,21 @@ def run_tuning_step(
                 n_failed_trials=n_failed_trials,
                 n_total_trials=len(study.trials),
             )
+        # catch=(Exception,) above lets one bad hyperparameter combination fail
+        # without killing the study, but that same breadth would also swallow a
+        # systematic bug (bad search-space config, a typo in the objective) as
+        # a per-trial FAIL — which n_failed_trials only warns about, and a
+        # resumed study with pre-existing completed trials could dodge the
+        # min_completed_trials floor entirely. Every submitted trial failing is
+        # never a legitimate per-trial fluke, so it raises instead of warning.
+        if n_remaining_trials > 0 and n_failed_trials == n_remaining_trials:
+            raise RuntimeError(
+                f"All {n_remaining_trials} trials submitted this run failed — "
+                "this is not an expected per-trial failure rate and indicates a "
+                "systematic bug (search-space config, objective code) rather than "
+                "an unlucky hyperparameter draw. Inspect the study's failed trial "
+                "exceptions before re-running."
+            )
 
         trial_summaries = [
             {

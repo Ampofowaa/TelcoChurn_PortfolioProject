@@ -185,7 +185,12 @@ if __name__ == "__main__":
     try:
         engine = get_engine()
         df = pd.read_sql_table(_RAW_TABLE, engine)
-        validate_raw(df, strict=True)
+        validate_raw(
+            df,
+            strict=True,
+            min_rows=int(cfg.validation.min_rows),
+            max_null_rate=float(cfg.validation.max_null_rate),
+        )
         manifest = make_split(
             ids=df["customerid"],
             labels=df["churn"],

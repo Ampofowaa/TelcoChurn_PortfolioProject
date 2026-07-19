@@ -13,12 +13,14 @@ from telco_churn.data.eda import (
     churn_rate_by_group,
     compute_chi2_tests,
     compute_mann_whitney,
+    compute_significance_screen,
     compute_vif,
     correlation_with_target,
     detect_outliers,
     encoded_correlation_matrix,
     inspect_missing,
 )
+from telco_churn.utils.stats import benjamini_hochberg, pool_adjusted_p_values
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -425,6 +427,82 @@ def test_compute_mann_whitney_skips_empty_group(eda_df: pd.DataFrame) -> None:
 def test_compute_mann_whitney_wrong_dtype_raises(eda_df: pd.DataFrame) -> None:
     with pytest.raises(TypeError, match="ufunc.*not supported"):
         compute_mann_whitney(eda_df, num_features=["contract_type"])
+
+
+# ---------------------------------------------------------------------------
+# compute_significance_screen
+# ---------------------------------------------------------------------------
+
+
+def test_compute_significance_screen_returns_both_tables(eda_df: pd.DataFrame) -> None:
+    chi2_df, mwu_df = compute_significance_screen(eda_df)
+    assert len(chi2_df) == len(CAT_FEATURES) + len(BINARY_INT_FEATURES)
+    assert len(mwu_df) == len(NUM_FEATURES)
+
+
+def test_compute_significance_screen_adds_adjusted_p_value_to_both(
+    eda_df: pd.DataFrame,
+) -> None:
+    chi2_df, mwu_df = compute_significance_screen(eda_df)
+    assert "adjusted_p_value" in chi2_df.columns
+    assert "adjusted_p_value" in mwu_df.columns
+    assert (chi2_df["adjusted_p_value"] >= chi2_df["p_value"] - 1e-12).all()
+    assert (mwu_df["adjusted_p_value"] >= mwu_df["p_value"] - 1e-12).all()
+
+
+def test_compute_significance_screen_preserves_source_columns_and_order(
+    eda_df: pd.DataFrame,
+) -> None:
+    """The two tables keep their own functions' columns, sort order, and values.
+
+    compute_significance_screen must only add adjusted_p_value — everything
+    else (cramers_v, chi2, dof, rank_biserial_r, U_stat, means, sort order) is
+    exactly what the underlying calls alone already produce.
+    """
+    chi2_alone = compute_chi2_tests(eda_df)
+    mwu_alone = compute_mann_whitney(eda_df)
+    chi2_df, mwu_df = compute_significance_screen(eda_df)
+    pd.testing.assert_frame_equal(
+        chi2_df.drop(columns=["adjusted_p_value"]), chi2_alone
+    )
+    pd.testing.assert_frame_equal(mwu_df.drop(columns=["adjusted_p_value"]), mwu_alone)
+
+
+def test_compute_significance_screen_pools_jointly_not_independently(
+    eda_df: pd.DataFrame,
+) -> None:
+    """adjusted_p_value must come from one correction across both tables, not two separate ones.
+
+    Regression guard for the actual bug this function exists to fix: an
+    earlier version corrected compute_chi2_tests's 16 features and
+    compute_mann_whitney's 3 features independently, understating each
+    table's true multiple-testing burden. This asserts the joint result
+    matches pool_adjusted_p_values(chi2_p, mwu_p) exactly, and — the
+    regression case — differs from what independently adjusting each table's
+    own p_value column alone would have produced.
+    """
+    chi2_alone = compute_chi2_tests(eda_df)
+    mwu_alone = compute_mann_whitney(eda_df)
+    chi2_df, mwu_df = compute_significance_screen(eda_df)
+
+    expected_chi2_adj, expected_mwu_adj = pool_adjusted_p_values(
+        chi2_alone["p_value"], mwu_alone["p_value"]
+    )
+    np.testing.assert_allclose(
+        chi2_df["adjusted_p_value"].to_numpy(), expected_chi2_adj
+    )
+    np.testing.assert_allclose(mwu_df["adjusted_p_value"].to_numpy(), expected_mwu_adj)
+
+    independent_chi2_adj = benjamini_hochberg(chi2_alone["p_value"])
+    assert not np.allclose(chi2_df["adjusted_p_value"].to_numpy(), independent_chi2_adj)
+
+
+def test_compute_significance_screen_custom_features(eda_df: pd.DataFrame) -> None:
+    chi2_df, mwu_df = compute_significance_screen(
+        eda_df, cat_features=["contract_type", "gender"], num_features=["tenure"]
+    )
+    assert len(chi2_df) == 2
+    assert len(mwu_df) == 1
 
 
 # ---------------------------------------------------------------------------
