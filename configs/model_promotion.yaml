@@ -1,0 +1,15 @@
+# Promotion gate policy — ANALYSIS.md §0 "Success criterion — the promotion
+# gate". Pre-registered before the sealed test set was opened. Changing any
+# value here is a policy revision: update the rationale in ANALYSIS.md §0 in
+# the same change, and record it in CHANGELOG.md.
+#
+# Loaded directly (OmegaConf.load), never through Hydra's defaults/CLI-override
+# composition — same pattern as configs/costs.yaml, and for the same reason:
+# a bar that decides whether a model ships must not be movable by a
+# command-line override with no diff and no review.
+
+pr_auc_bar: 0.60
+recall_bar: 0.65
+calibration_slope_band: [0.80, 1.25]
+pr_auc_materiality_threshold: 0.005
+brier_non_inferiority_margin: 0.005
