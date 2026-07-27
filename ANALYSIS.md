@@ -30,179 +30,129 @@ The `src/` package implements the production-ready version of the current logic.
 
 ## 0. Problem Framing & Cost Definition
 
-This step locks the rules that govern every modelling decision in §§1–8. It is documented here — before any EDA or model results — so that the cost-sensitive threshold, the choice of recall as the headline reported metric, and the class imbalance handling all have a traceable origin.
+This section locks the rules that govern every modelling decision in §§1–8: what's predicted, what it costs to act on that prediction, and how a model earns the right to serve it. It is written before any EDA or model results, so the cost-sensitive threshold, the choice of recall as the headline business metric, and the promotion gate all have a traceable origin rather than being justified after the fact.
 
-### Prediction unit
+**In short:** each month, the model scores every customer's probability of cancelling. Above a cost-justified cutoff, that customer gets a retention offer; below it, they don't. The cutoff itself is set by a simple rule — contact a customer only when the expected savings from a successful offer outweigh what the offer costs — not by any target hit-rate. A model earns the right to serve if it ranks churners well (the one metric that decides), and doesn't fail on catch-rate, basic probabilistic skill, or having honest probabilities (three checks that can only disqualify, never promote). A human reviewer then gets one more veto, decided in advance of seeing results, so nobody can rationalize a decision after the fact.
 
-A **single customer at a scoring cycle** (default: monthly). The model produces one churn-probability score per customer per run. All metrics (Recall, Precision, P&L) are computed per customer, not per account or household.
+### Prediction unit, label, and decision
 
-### Label definition and horizon
+A **single customer at a scoring cycle** (default: monthly) — one churn-probability score per customer per run; every metric (recall, precision, EV) is computed per customer, not per household or account.
 
-`Churn = 1` if the customer cancelled service **within the current billing cycle** (approximately 30 days). The label is derived directly from the IBM Telco dataset's `Churn` column (Yes/No, recoded to 1/0). It is a **binary, point-in-time label** — there is no survival horizon to tune and no soft-churn intermediate class in this dataset.
+`Churn = 1` if the customer cancelled within the current billing cycle (~30 days) — the IBM Telco dataset's own `Churn` column, recoded 1/0. It's a binary, point-in-time label with no survival horizon and no soft-churn class, and it captures *revealed* churn (already cancelled), not predicted intent — the model learns the profile of customers who *did* leave, not ones who are merely dissatisfied.
 
-The label captures *revealed* churn (cancellation has occurred), not *predicted intent*. This means the model is trained to identify customers who have the same profile as those who eventually cancelled — not customers who are currently dissatisfied but have not yet acted.
+The score feeds one decision: include this customer in the upcoming retention cycle (discount, upgrade, service credit) or don't. Binary, per customer, per cycle — no tiered response yet (a §10 recommendation).
 
-### Decision the score feeds
+Two metric consequences follow: **PR-AUC is the sole selection and promotion metric** (§4's family comparison, the gate below) — it summarises precision/recall across every threshold, and nothing else gets a vote on which model is *better*. **Recall at the shipped threshold is the headline business number, not a second optimisation target** — it's the first question the business asks ("how many churners did we catch?"), but the threshold itself is chosen to maximise expected value (below), never to hit a recall target — a recall-only policy would just contact everyone. Recall is reported because it's legible to a non-technical audience in a way PR-AUC isn't, but always alongside the expected-value figure (§7), never instead of it — recall with no cost context can't tell a profitable campaign from an expensive one.
 
-The score feeds a **proactive retention intervention decision**: whether to include a customer in the upcoming outreach cycle (discount offer, contract upgrade, service credit). The decision is binary per customer per cycle. A contacted customer either receives an offer or does not; there is no tiered response modelled at this stage (tiered outreach is a §10 recommendation).
+### Cost structure — cost attaches to the action, not the error
 
-This framing makes the cost structure asymmetric and well-defined (see below). It has two metric consequences: **PR-AUC is the primary model selection and promotion metric** — it summarises precision-recall performance across all thresholds, and it is the metric that drives §4's family comparison and the *selection* half of the promotion gate below — the gate itself adds three veto-only guardrails, so PR-AUC is what can **admit** a model, not the whole of what decides one. **Recall at the production threshold is the headline business-facing number, not a second thing anything is optimised for** — once the model is deployed at the optimised production threshold (§6), it is the first question the business will ask ("how many churners did we catch this cycle?"), because a missed churner receives no offer and is lost. The threshold itself is chosen to maximise expected value (§6's `t* = c / (r × LTV)`), never recall — a policy that only maximised recall would contact every customer, which is exactly the "treat all" baseline the P&L-vs-baseline figure (§7) exists to beat. Recall is worth reporting because it is legible to a non-technical audience in a way PR-AUC is not, but it is read alongside that expected-value figure, never in place of it: recall with no precision/cost context cannot distinguish a profitable campaign from an expensive one.
+Contacting a customer costs money whether or not they were actually going to leave — so the decision table is over (action, true state), and the cell that matters is the **true positive**, which is *not free*. Four quantities drive it: `q` (churn probability), `r` (retention rate — the odds an offer actually works), `LTV` (customer lifetime value if retained), `c` (total intervention cost).
 
-### Cost structure — cost attaches to the *action*, not to the error
-
-The intervention is paid whenever we contact someone. We do not know whether they were going to churn at the moment we dial. So the decision table is over (action, true state), and the correct cell to interrogate is the **true positive** — which is *not* free. Four quantities drive it: `q`, the probability a customer churns; `r`, the retention rate — the probability a retention offer actually works once made; `LTV`, the customer's lifetime value if retained; and `c`, the total cost of the intervention — contacting the customer plus any discount offered.
-
-| | **contact** (spend `c`) | **do nothing** |
+| | Contact (spend `c`) | Do nothing |
 |---|---|---|
-| **churner** (prob `q`) | `−c + r·LTV` — offer works with prob `r` | `0` |
-| **non-churner** (prob `1−q`) | `−c + LTV` — offer wasted, customer stays anyway | `LTV` |
+| **Churner** (prob `q`) | `−c + r·LTV` | `0` |
+| **Non-churner** (prob `1−q`) | `−c + LTV` (offer wasted) | `LTV` |
 
-Contact if and only if `E[contact] > E[do nothing]`. The `(1−q)·LTV` terms cancel and the rule collapses to:
+Contact iff `E[contact] > E[do nothing]`. The `(1−q)·LTV` terms cancel, giving:
 
-> **Contact if and only if `q · r · LTV > c`, i.e. the operating threshold is `t* = c / (r × LTV)`.**
+> **Contact iff `q · r · LTV > c` — i.e. the operating threshold is `t* = c / (r × LTV)`.**
 
-This shifts the threshold to the right relative to the archived pass, which selected under a cost function that charged the intervention only to false positives — treating a correctly-identified churner as free to contact. Here it is not: contacting costs `c` regardless of the outcome. **The actual cost parameters, the derived thresholds for all three scenarios, and the shipped value are §6's job, not this section's** — §0 establishes the rule the numbers get plugged into, not the numbers themselves.
+This is a deliberate departure from the archived exploratory pass, which charged the intervention only to false positives (treating a correctly-caught churner as free). Here it isn't — every contact costs `c` regardless of outcome. **The actual cost figures, the derived thresholds, and the shipped value are §6's job** — this section fixes the rule, not the numbers.
 
-The familiar error-cost view is a *diagnostic*, not the decision rule:
+The familiar error-cost framing is a *diagnostic*, not the decision rule itself:
 
-| Error type | Business consequence | Cost |
+| Error | Consequence | Cost |
 |---|---|---|
-| **False Negative (FN)** | Churner not contacted. Customer cancels; the recoverable share of LTV is lost. | `r · LTV` |
-| **False Positive (FP)** | Non-churner contacted. Offer issued at cost; customer was going to stay anyway. | `c` |
+| False negative | Churner not contacted, offer never made | `r · LTV` |
+| False positive | Non-churner contacted for nothing | `c` |
 
-Whichever of `r·LTV` and `c` is larger sets which error the threshold implicitly favours avoiding — §6 reports the actual ratio per scenario, and it is not the same across scenarios (cheaper, less generous interventions and costlier, more generous ones don't move `r·LTV` and `c` proportionally). This diagnostic does **not** by itself give the threshold: `C_FP/(C_FP + C_FN)` presumes correct decisions are free, and a true positive costs `c` like any other contact. *(Selection remains governed by PR-AUC alone — which error the cost structure favours avoiding is a statement about the cost structure, not a second selection metric.)*
+Whichever of `r·LTV` and `c` is larger sets which error the threshold implicitly favours avoiding (§6 has the real ratio per scenario — it isn't constant, since cheaper/costlier interventions don't move `r·LTV` and `c` proportionally). This does **not** hand you the threshold on its own: `C_FP/(C_FP+C_FN)` assumes correct decisions are free, and a true positive costs `c` like anything else. Selection is still PR-AUC alone — which error the cost structure favours avoiding is a fact about the cost structure, not a second selection metric.
 
-#### The retention rate `r` is the dominant uncertainty — not the model
+#### The retention rate `r` is the biggest uncertainty — and it isn't the model's
 
-The operating threshold `t*` is inversely proportional to the retention rate `r`, and `r` is the one parameter that **cannot be estimated from this dataset** — it is the fraction of contacted churners the offer actually saves, and measuring it requires intervening on customers and observing what happens. The assumed value, 0.30, is an industry benchmark drawn from a literature range of 0.15–0.40, not something observable in this dataset.
+`t*` moves inversely with `r`, and `r` — the fraction of contacted churners an offer actually saves — **can't be measured from this dataset**; measuring it means intervening and observing the outcome. The shipped value, 0.30, is an industry benchmark (literature range 0.15–0.40), not something this data can tell us. A plausible range of `r` swings the operating threshold far more than any realistic PR-AUC improvement would — **the single most consequential number in this deployment is a benchmark guess, not a model output** (§6 has the full sensitivity sweep).
 
-A plausible range of `r` moves the threshold far more than any realistic improvement in PR-AUC would move the operating point. **The single most consequential number in the deployment decision is a benchmark guess, not a model output.** §6 has the full retention-rate sensitivity sweep and plot with the actual numbers.
+`r` stops being a guess once the model is live: `performance_check.py` will join who-was-contacted against who-actually-stayed, turning "what fraction did we retain?" into a measured number `t*` can be re-derived from. Until that data exists, §6's three-scenario bracket (Conservative/Base/Optimistic) shows how much the decision shifts under different plausible values of `r`, instead of presenting one falsely-precise number. The cost parameters throughout are industry-plausible estimates, not Finance-validated (§9 limitation #7).
 
-**`r` stops being a guess once the model is actually deployed and contacting customers.** From that point on, the system logs two things: who was contacted, and — once enough time has passed to know for sure — whether they actually stayed. `performance_check.py` joins the two in a `prediction_outcomes` table, which turns "of the customers we contacted, what fraction did we retain?" into a number that can be counted directly instead of assumed, and `t*` can be re-derived from that real `r` instead of a benchmark. That data doesn't exist yet — it requires live deployment and time for outcomes to mature — so until it does, the three-scenario bracket (Conservative / Base / Optimistic) in §6 exists to show how much the decision would shift under different plausible values of `r`, rather than presenting one falsely-precise number.
-
-The cost parameters are illustrative, derived from plausible telecom industry benchmarks, and not Finance-validated; see §9 Known Limitation #7 and §6 for the actual values.
-
-**`LTV` is scenario-level, not per-customer — a deliberate simplification, and the most consequential structural choice in this cost model.** `configs/costs.yaml` derives ARPU from *quantiles* of churner `MonthlyCharges` (0.25 / 0.50 / 0.75), collapsing a genuinely per-customer quantity into one constant per scenario. It was chosen for simplicity and to keep the three-scenario bracket legible — but `MonthlyCharges` is a feature on every row, so `LTV_i = MonthlyCharges_i × gross_margin × horizon_months` is available for free, and two things follow from *not* using it:
-
-1. **The prioritisation ignores customer value entirely.** With `c`, `r`, and `LTV` constant across customers, `EV_i = p_i · (r × LTV) − c` is a strictly increasing affine function of `p_i` — so ranking by expected value is *identical* to ranking by churn probability. A \$110/month fiber customer and a \$20/month DSL customer with the same churn score are treated as equally worth saving. No retention team would agree.
-2. **A per-customer `LTV` would dissolve the single-threshold framing.** `t*_i = c / (r × LTV_i)` is a *per-customer* cut; equivalently, contact iff `p_i · r · LTV_i > c`, i.e. iff `EV_i > 0`. There would be no global `t*` to ship at all — the decision mechanism changes shape, and a capacity constraint turns it into a genuine top-K-by-expected-value policy rather than a relabelled top-K-by-score.
-
-**Not retrofitted, deliberately.** Adopting it now would re-open this section's cost definition and §6's closed threshold work, and invalidate both the shipped `t* = 0.3941` and the three-scenario bracket built on it. It is the **leading v2 item**, and it pairs naturally with uplift modelling (§9 #3): *who is worth saving* and *who can be saved* are precisely the two things the current expected-value model assumes away.
+**`LTV` is one number per scenario, not per customer — the most consequential simplification in this cost model.** `configs/costs.yaml` derives it from quantiles of churner `MonthlyCharges`, even though `LTV_i = MonthlyCharges_i × gross_margin × horizon_months` is available per-row for free. Two things follow from not using it: (1) with `c`, `r`, `LTV` constant, expected value is a strictly increasing function of `p_i` alone — ranking by EV is *identical* to ranking by churn probability, so a $110/month customer and a $20/month customer at the same score are treated as equally worth saving; (2) a per-customer `LTV` would replace the single global `t*` with a per-customer cut (`p_i · r · LTV_i > c`), which under a capacity constraint becomes a genuine top-K-by-value policy rather than top-K-by-score. Adopting it now would re-open this section and §6's already-closed threshold work, invalidating the shipped `t* = 0.3941`. It's the **leading v2 item**, pairing naturally with uplift modelling (§9 #3): *who's worth saving* and *who can be saved* are exactly what the current model assumes away.
 
 ### Success criterion — the promotion gate
 
-The gate that decides whether a model is fit to serve is defined **once, here**. `models/gate.py` implements it as a pure function (`decide_promotion`); `models/evaluate.py` calls it at the moment the sealed-test metrics exist and persists the verdict, and `models/refit.py` and `models/register.py` **read** that verdict rather than recomputing it — two independent evaluations of one rule are how it becomes two rules. `PROJECT_PLAN.md` says where in the lifecycle each of those runs. None of them restates the rule, and a divergence between them and this section is a bug in them.
+The gate decides whether a model is fit to serve, defined once, here. `models/gate.py` implements it (`decide_promotion`); `evaluate.py` calls it and persists the verdict the moment sealed-test metrics exist; `refit.py`/`register.py` only **read** that verdict, never recompute it. A divergence between this section and the code is a bug in the code.
 
-**Every metric occupies exactly one of three roles, and the roles do not overlap.**
+**One metric decides which model is better; three separate checks can each block it regardless** — like a job candidate who aces the interview (PR-AUC) but still needs a clean background check on three fronts (recall, Brier, calibration). Any one disqualifying result ends it, as finally as losing the interview would. None of the three can win the job for a candidate — each can only cost them it.
 
-| Role | Metric | Power |
+| Role | Metric(s) | Power |
 |---|---|---|
-| **Selection** | PR-AUC (average precision) | The only metric that can *admit* a model. |
-| **Guardrail** | Recall at the shipped threshold `t*`; Brier skill score; **calibration slope** | Can *veto* a model that selection admitted. None can ever promote one. |
-| **Diagnostic** | ROC-AUC, precision, F1, lift/gains, expected value, per-segment and per-group PR-AUC | Reported and reviewed. Never binding on the automated gate. |
+| **Selection** | PR-AUC | The only metric that decides which model is *better*. Can admit. |
+| **Guardrail** | Recall at `t*`; Brier skill score; **calibration slope** | Can veto a model selection already admitted. Never promotes. |
+| **Diagnostic** | ROC-AUC, precision, F1, lift/gains, EV, per-segment PR-AUC | Reported only. No power over the gate. |
 
-Guardrails are not a second selection signal. They answer a different question — *"is this artifact valid at all?"* — asked only after selection has already picked a winner, and the only answer they can give is **no**. A model is never promoted *because* its Brier improved or its recall rose; those metrics have no power to move the decision in the admitting direction. This is what preserves the one-metric invariant: if PR-AUC and Brier point in different directions, PR-AUC still wins the *selection*, and Brier's only recourse is to veto the result outright on validity grounds. Mixing selection signals is what invites cherry-picking; a veto-only guardrail cannot cherry-pick, because it can only ever cost you a promotion, never buy one.
+All four checks run in one pass (`pr_auc_passed and recall_passed and brier_passed and slope_passed`) — not a staged pipeline; describing a guardrail as being "asked of" an admitted model is about what a "no" *means*, not about execution order.
 
-The gate has two regimes, because the registry is empty the first time it runs.
+**Two regimes**, because the registry starts empty:
 
-**Cold start — no `champion` alias exists.** The first promotion (Phase 7). There is nothing to compare against, so the bars are absolute. All three were fixed before the sealed test set was opened, and the final test-set results in §7 are evaluated against them exactly once.
+**Cold start (the first promotion, Phase 7) — no incumbent, so every bar is absolute,** fixed before the test set opened and checked once against §7's real results:
 
-| Criterion | Role | Bar | Rationale |
+| Criterion | Role | Bar | Why |
 |---|---|---|---|
-| PR-AUC | **selection** | ≥ 0.60 | Primary ranking metric — threshold-free and imbalance-appropriate at a 27 % positive rate. ROC-AUC is optimistic under class imbalance and is not used as a gate. |
-| Recall at the shipped threshold `t*` | guardrail | ≥ 0.65 | The business floor — the proportion of churners actually caught at the deployed operating point. A model that ranks well but catches two-thirds of nothing is not shippable, however good its PR-AUC. |
-| Brier skill score vs. the prevalence baseline | guardrail | > 0 | Overall probabilistic skill. A model that cannot beat "always predict the base rate" on Brier has achieved nothing, and its cost-derived threshold `t*` would be resting on nothing. |
-| **Calibration slope** | guardrail | Veto iff the 95 % bootstrap CI lies **entirely outside [0.80, 1.25]** | **The purity check Brier cannot provide** (see the note below). Regress `y` on `logit(p)`: a perfectly calibrated model has slope 1; slope < 1 means systematically overconfident. Binning-free, and it measures calibration *alone*. Veto only on positive evidence of material miscalibration — a CI merely *wide* enough to touch the band is not evidence of harm, consistent with the burden-of-proof rule the other guardrails follow. |
+| PR-AUC | selection | ≥ 0.60 | Threshold-free ranking metric, appropriate at 27% prevalence where ROC-AUC runs optimistic. |
+| Recall at `t*` | guardrail | ≥ 0.65 | The business floor — ranking well while catching two-thirds of nothing isn't shippable. |
+| Brier skill score | guardrail | > 0 | Basic probabilistic skill vs. the base-rate floor — without this, `t*` rests on nothing. |
+| **Calibration slope** | guardrail | CI entirely outside [0.80, 1.25] fails | Catches what Brier can miss (below): slope 1 = perfectly calibrated, < 1 = overconfident. Fails only on clear evidence, not a merely wide estimate. |
 
-**All four are evaluated on the sealed test set.** They are the metrics of record; a guardrail that vetoes must veto on honest held-out evidence, exactly as the selection metric does.
+One asymmetry: PR-AUC/recall/BSS are checked against the *point estimate*, not a confidence bound — requiring the CI to clear these bars would silently raise them (at n = 1,409, a lower-bound "≥0.60" behaves like "≥0.65"). The slope's CI-based rule runs the opposite way, making it the more *lenient* check, not stricter.
 
-**The three *bars* apply to the point estimate, not to a confidence bound.** PR-AUC, recall, and BSS are each reported with a 1,000-resample bootstrap CI (§7), but the CI is *reported, not binding*: a model passes if its PR-AUC estimate is ≥ 0.60, not if the lower bound of its CI clears 0.60. These bars were pre-registered as bars on the metric, and re-reading them as bars on a confidence bound would silently raise them — at n = 1,409 a lower bound above 0.60 needs a point estimate near 0.65 — the same category of error as lowering a pre-registered bar after seeing the data. If a lower bound does fall below its bar, that is recorded in §7 as an honest statement about the estimate's precision, not treated as a failure.
+**Why two calibration guardrails, not one.** Brier is a proper score, but `Brier = reliability − resolution + uncertainty` (Murphy's decomposition) blends calibration with *ranking* — a challenger can improve its Brier purely by ranking better while its calibration quietly degrades, sailing past a Brier-only check. That matters here specifically because `t* = c/(r×LTV)` is only Bayes-optimal against honest posteriors — a miscalibrated model means the shipped threshold silently stops being the right rule, and no PR-AUC check would catch it, since ranking is exactly what still looks fine. ECE, the obvious alternative, is binning-dependent, improper, and estimation-biased — reported as a diagnostic, never gating. The **calibration slope** (regress `y` on `logit(p)`) is binning-free, parameter-free, and can't be bought with better ranking, which is what makes it the second, gate-worthy guardrail — applied as an absolute bar in both regimes, like recall, because "are these posteriors honest" has a right answer independent of the incumbent. It's computed in `evaluate.py` on the sealed test set (not in `calibrate.py` on dev-OOF, which only needs to pick sigmoid vs. isotonic and answers that on Brier alone) and checked twice — once at n=5,634 (dev, higher-powered but slightly optimistic, since it informed the calibration-method choice) and once at n=1,409 (test, honest but only powered to catch gross miscalibration). Neither certifies calibration on its own; either can disqualify, which is all a veto needs.
 
-**The calibration slope is the deliberate exception, and it is the lenient one.** Its rule is stated on the CI (*veto iff the interval lies entirely outside the band*) because it is not a bar to be cleared but a **tolerance region with an evidentiary rule** — the guardrail vetoes only on *positive evidence of material miscalibration*, never on a merely imprecise estimate. Using the CI here makes a veto **harder**, not easier, so it does not smuggle in a raised bar; it enforces the same burden-of-proof-on-the-accuser principle the Brier guardrail follows.
+**The band's edges are pre-registered policy, not derived from this data** (§9 limitation #14 has the validation status).
 
-> **A note on power, and why the slope is also checked on development data first.** The test-set slope is honest but **low-powered**: at n = 1,409 its CI is wide, and a "veto only if the whole interval falls outside [0.80, 1.25]" rule will therefore only catch *gross* miscalibration. That is an acceptable thing for a guardrail to do — but it means a passing test slope is weak evidence of good calibration, not strong evidence.
->
-> The dev-OOF slope (n = 5,634) is the complement: **higher-powered but mildly optimistic**, because the calibration *method* (sigmoid vs. isotonic, §6) was itself selected using those very OOF probabilities. So the two fail in opposite directions and neither can certify a model — but **each can damn one**, which is all a veto-only guardrail ever needs to do. A model that fails on dev-OOF is failing on the surface *biased in its favour*; a model that fails on test is failing despite a CI wide enough to hide most problems. Either is disqualifying.
+#### The champion isn't the model the gate measured
 
-**The band's width, `[0.80, 1.25]`, is itself a policy choice, not something derived from this project's data or an external citation.** Nothing here claims those specific edges were fitted, benchmarked, or validated by simulation — they are pre-registered exactly as stated, and that is the full extent of their justification. What *has* been validated is the measurement compared against the band: `calibrate.py::calibration_slope`'s percentile-bootstrap CI has been independently cross-checked against a closed-form analytic (Wald) CI, and the two agree closely — so the number is trustworthy. Whether `0.80`/`1.25` are the right edges for *this* number remains open; see §9's limitation on this point (including the cross-check citation) for the follow-up that would actually settle it.
+The four criteria are measured on the **dev-scope model** (fit on development, scored on the sealed test set). The artifact that actually serves is the **full-scope refit** (§8), fit on all 7,043 rows — the same frozen spec at full data volume. That's sound for *ranking*: `t*`'s value has no model term, so the refit can't move it. It is not automatically sound for calibration: thresholding a *miscalibrated* model at 0.3941 is thresholding at an arbitrary number, and nothing in the gate checks the refit's own calibration, since every measurement above is taken on the dev model.
 
-#### The champion is not the model the gate measured — and its calibration needs its own check
-
-The four criteria above are evaluated on the **`dev`-scope model**: fitted on development, scored on the sealed test set. But the artifact that actually serves is the **`full`-scope refit** (§8), fitted on all 7,043 rows. The gate measures one artifact and promotes another — a deliberate design, and sound, because the two are *the same frozen spec at two data volumes*.
-
-It is sound **for ranking**. It is not automatically sound for the **threshold**, and the distinction matters:
-
-- **The *value* of `t*` transfers trivially.** `t* = c/(r × LTV)` contains no model term. The refit cannot move it.
-- **The *optimality* of thresholding at `t*` does not transfer for free.** The closed form is Bayes-optimal against **honest posteriors**. Thresholding a *miscalibrated* model at 0.3941 is thresholding at an arbitrary number. So the rule survives the refit only if the champion is calibrated as well as the dev model was — and **nothing in the gate above checks that**, because every calibration measurement in this project is taken on the `dev` model. The champion trained on the test set; no held-out data survives to measure *its* slope.
-
-Left there, the design would be: measure calibration on model A, ship model B, apply model A's threshold to model B, and never look.
-
-**So a fifth check exists, and it is deliberately *not* a fifth gate criterion.** It applies to a different artifact, at a different moment, on different evidence, and conflating it with the four above would make the gate's scope unreadable.
+So a fifth check exists — deliberately *not* a fifth gate criterion, since it applies to a different artifact at a different moment:
 
 | | The four gate criteria | The champion calibration check |
 |---|---|---|
-| **Artifact** | `dev`-scope model | `full`-scope refit (the champion) |
-| **When** | `evaluate.py`, before the refit exists | `refit.py`, after the refit is fitted |
-| **Evidence** | Sealed test set (n = 1,409, held out) | Cross-validated OOF over all 7,043 rows |
-| **Power** | Decides promotion | **Veto only** — can abort, can never admit |
+| Artifact | dev-scope model | full-scope refit (the champion) |
+| When | `evaluate.py`, before the refit exists | `refit.py`, after the refit is fit |
+| Evidence | Sealed test set (n=1,409) | CV OOF over all 7,043 rows |
+| Power | Decides promotion | Veto only |
 
-**The check:** run `cross_val_predict` of the champion's frozen spec over all 7,043 rows and compute the calibration slope on the resulting OOF probabilities. Every row is scored by a model that did not train on it. It is the same procedure §5 already runs on development, at full `n` — and *better powered* than the dev-OOF slope, since each fold trains on 5,634 rows rather than 4,507. **Veto with the same rule as the gate's slope guardrail**: abort the promotion iff the 95 % CI lies entirely outside [0.80, 1.25].
+`refit.py` runs `cross_val_predict` on the champion's frozen spec over all 7,043 rows and vetoes iff the resulting slope's 95% CI lies entirely outside [0.80, 1.25] — better-powered than the dev-OOF slope (5,634 training rows per fold vs. 4,507), and conservative by construction, since no fold ever trains on the full 7,043: calibration improves with `n`, so this proxy errs toward pessimism. It doesn't breach *test set touched once* — it never imports `data.split`, and the invariant exists to keep the test set out of **selection**, while this check runs after the gate has already fired and can only reject. Running the dev-OOF screen first costs no test data; it's a screen that can reject early and cannot approve, while the sealed-test slope remains the actual gate.
 
-**It is a conservative proxy, and the direction of its error is known.** No fold ever trains on all 7,043, so it estimates the calibration of a model slightly *smaller* than the champion. Calibration improves with `n` — a sigmoid's two parameters are estimated more precisely with more data — so the proxy errs toward pessimism. A model that passes this check would pass a hypothetical exact one; a model that fails it has failed on the surface biased in its favour. That asymmetry is exactly what a veto-only guardrail needs, and it is the same logic the dev-OOF screen rests on.
+**Comparative regime (every promotion after the first, Phase 10's weekly retrain) — selection becomes comparative, guardrails stay absolute.** Here uncertainty must bind: a naked `challenger > champion` point-estimate comparison has no notion of materiality, fires on noise roughly half the time when the two are genuinely equivalent, and each such promotion refits on 100% of the data and becomes the next cycle's incumbent — ratcheting the baseline upward on favourable noise while true performance stands still.
 
-**It does not breach *test set touched once*.** It reads the full feature table and never imports `data.split` — structurally identical to `refit.py`, which the invariant already permits on that construction. And on the substance: the invariant exists so the test set cannot inform **selection**, whereas this check runs *after* the gate has fired and can only ever **reject**. No information can leak in the admitting direction. The seal is spent regardless — `refit.py` has already trained on those rows, which is the whole reason this check is necessary.
->
-> The practical consequence, and the reason §7 runs the dev-OOF check first: **it costs no test data.** A champion that is already outside the band on development evidence must be re-calibrated, and it is far better to discover that with the seal intact than after spending it. The dev-OOF check is a **screen that can reject early and cannot approve**; the sealed-test slope remains the gate.
+The fix is a **paired bootstrap with a pre-registered materiality threshold** — the same surface §4's model-family choice already uses. Pairing (both models scored on the same rows) cancels shared uncertainty, so the CI on the *difference* is far tighter than either model's own marginal CI — §4's full-vs-reduced comparison resolved a CI of [0.0050, 0.0110] (±0.003) against marginal CIs an order of magnitude wider.
 
-**Incumbent exists — a `champion` is already serving.** Every subsequent promotion (Phase 10's weekly retrain). Selection becomes comparative; the guardrails stay absolute. **Here the uncertainty does bind** — and it must, because the alternative is a system that promotes on noise. A naked point-estimate comparison (`challenger PR-AUC > champion PR-AUC`) contains no notion of materiality: it fires on Δ = +0.0001 exactly as readily as on Δ = +0.05. When challenger and champion are genuinely equivalent — the *normal* case on a static snapshot where nothing upstream moved — Δ is a mean-zero noise draw, and such a rule promotes roughly half the time. The damage is not cosmetic: each promotion refits on 100 % of the data and *becomes the next cycle's incumbent*, so the baseline ratchets upward on favourable noise draws while true performance stands still, and the registry accumulates `model_promoted` events asserting comparisons that never happened.
-
-So the comparative rule is a **paired bootstrap over the shared evaluation rows**, with a pre-registered materiality threshold — the same decision surface §4 already uses for the model-family choice. Pairing is what makes this tractable at this data scale: two models scored on the *same* rows make highly correlated errors, and that shared uncertainty cancels in the difference. The CI on Δ is therefore far tighter than the CI on either model's marginal metric — §4's full-vs-reduced comparison resolved Δ = 0.0100 with a CI of [0.0060, 0.0140], roughly ±0.004, against marginal CIs an order of magnitude wider.
-
-| Criterion | Role | Rule | Rationale |
+| Criterion | Role | Rule | Why |
 |---|---|---|---|
-| PR-AUC | **selection** | Promote iff the 95 % paired-bootstrap CI on Δ = AP(challenger) − AP(champion) excludes 0 in the challenger's favour **and** Δ\_obs ≥ **0.005** | Exactly the decision surface of §4's model-family rule: the CI is the test, the materiality threshold Δ\* stops a statistically-detectable-but-trivial gain from moving a production alias. Otherwise: no promotion, incumbent stays. |
-| Recall at `t*` | guardrail | Veto iff recall < 0.65 — *absolute, not relative, on the point estimate* | A business floor does not move. If the incumbent has drifted below 0.65, that is a reason to alert, not a reason to lower the bar its successor must clear. |
-| **Calibration slope** | guardrail | Veto iff the 95 % bootstrap CI lies **entirely outside [0.80, 1.25]** — *absolute, not relative*, exactly as for recall | Calibration quality is an **absolute property of the probabilities**, not a competition: the question "are these posteriors honest?" has a right answer independent of what the incumbent did. If the champion has drifted to slope 0.6, that is a reason to alarm, not a reason to accept 0.65 from its successor. This is also what closes the Brier hole in the comparative regime — a challenger that ranks better and calibrates worse improves its Brier and would sail past a Brier-only guardrail; it does not sail past this one. |
-| Brier | guardrail | Veto iff the 95 % paired-bootstrap CI on Δ = Brier(challenger) − Brier(champion) lies **entirely above +0.005** | **Non-inferiority, and the burden of proof sits with the accuser.** The guardrail vetoes only on positive evidence of *material* calibration harm — not on a failure to prove harmlessness. This is deliberately *not* textbook non-inferiority (which would demand the CI's upper bound fall below the margin, putting the burden on the challenger): a guardrail that blocks promotions for want of evidence would reintroduce, in the veto direction, precisely the promote-on-noise failure this section exists to prevent. A challenger that ranks materially better and calibrates negligibly worse is still the better model. |
+| PR-AUC | selection | Promote iff the CI on Δ = AP(challenger) − AP(champion) excludes 0 in the challenger's favour **and** Δ ≥ 0.005 | Mirrors §4: the CI is the test, the materiality threshold stops a real-but-trivial gain from moving a production alias. |
+| Recall at `t*` | guardrail | Veto iff recall < 0.65, absolute | A business floor doesn't move — a drifted incumbent is a reason to alert, not to lower the bar. |
+| **Calibration slope** | guardrail | Veto iff CI entirely outside [0.80, 1.25], absolute | Calibration honesty doesn't depend on what the incumbent did — also closes the same Brier hole above: a challenger that ranks better and calibrates worse can't sail past this one. |
+| Brier | guardrail | Veto iff the CI on Δ = Brier(challenger) − Brier(champion) lies entirely **above +0.005** | Non-inferiority with the burden of proof on the accuser: vetoes only on positive evidence of material harm, not on failing to prove harmlessness — a challenger that ranks materially better and calibrates negligibly worse is still the better model. |
 
-**Structural requirement, both regimes:** no test-set information is used before final evaluation — `t*` is derived from out-of-fold development predictions only (§6). This preserves the *test set touched once* invariant (§7).
+Structurally, in both regimes: no test-set information is used before final evaluation — `t*` comes from dev-only out-of-fold predictions (§6), preserving *test set touched once*.
 
-> **Why there are two calibration guardrails, not one.** Brier is a *proper* score and catches gross probabilistic failure, but it is **not a pure calibration metric**. Under Murphy's decomposition, `Brier = reliability − resolution + uncertainty` — it blends calibration quality (reliability) with **ranking** quality (resolution). The consequence is precise and bad: a challenger can **improve its Brier purely by ranking better while its calibration degrades**, and a Brier-only guardrail — whose entire job is to catch a calibration regression — would wave it through.
->
-> That is not a hypothetical for this project. §9 limitation #11 establishes that `t* = c / (r × LTV)` is Bayes-optimal **only against honest posteriors**. A quietly miscalibrated champion means the shipped threshold is being applied to numbers that no longer mean what it assumes — the decision rule silently stops being the right decision rule — and **no PR-AUC check would ever surface it**, because ranking is exactly the thing that still looks fine.
->
-> **The obvious pure alternative, ECE, makes a bad gate.** It is not a proper scoring rule, its value depends on the binning scheme, and it carries estimation bias. A metric you can move by changing `n_bins` is not one to hang a production promotion on. So ECE is *reported*, never gating.
->
-> **The calibration slope is the metric that is both pure and gate-worthy.** Regress `y` on `logit(p)` (Cox calibration; standard in clinical prediction modelling): a perfectly calibrated model has slope 1, and slope < 1 means systematically overconfident. It is **binning-free**, has no tuneable parameters, and measures calibration *alone* — it cannot be bought with better ranking. So the two guardrails divide the work cleanly: **Brier catches overall probabilistic degradation; the calibration slope catches the specific failure Brier is blind to.** The slope is applied as an **absolute** bar in both regimes — like the recall floor, and unlike Brier — because "are these posteriors honest?" has a right answer that does not depend on what the incumbent happened to do.
->
-> ECE, the reliability diagram, and Murphy's decomposition are reported alongside as diagnostics: they are what make a slope veto *explicable* ("the model is overconfident in the top two deciles") rather than merely a failed number.
+### The human veto
 
-### The human veto — pre-registered rejection criteria
+The automated gate is necessary, not sufficient — aggregate metrics hide subgroup collapse, and a model can post excellent PR-AUC while exploiting an artifact. So the first promotion also requires a human review (the error-analysis notebook) that can reject a model the gate admitted — on **one pre-registered, binding criterion (V3)**, fixed before the test set was opened. A veto whose criteria are chosen *after* seeing the results isn't a veto, it's a rationalisation — exactly the cherry-picking risk the one-metric rule exists to prevent, reintroduced through the side door.
 
-The automated gate above is necessary, not sufficient. Aggregate metrics hide subgroup collapse, and a model can post an excellent PR-AUC while exploiting an artifact. So the first champion promotion additionally requires a human review (the error-analysis notebook, Phase 7) that **can reject a model the automated gate admitted**.
-
-**A veto whose criteria are chosen after seeing the numbers is not a veto — it is a rationalisation.** An unspecified review, conducted with the results already on screen, will find a reason to approve a model somebody wants approved and a reason to reject one they don't. That is exactly the cherry-picking risk the one-metric invariant exists to prevent, reintroduced through the side door. So the rejection criteria are fixed here, before the test set is opened, with the same status as the bars above.
-
-Each criterion names its evidence surface. Robustness and fairness are decided on **dev-OOF** slices — 5,634 rows, roughly four times the churners per slice — because a veto is a decision and decisions want power; the test-set slices are *reported* alongside but are too thin on the low-churn tiers to decide anything (§9 limitation #10).
+Three more checks (V1, V2, V2b) are computed and reported to the reviewer and the model card, but do not gate: the sealed test set is too thin to power a subgroup conclusion at all (dev-OOF carries ~4× the churners per slice, and the test set's two-year `contract_type` tier alone has on the order of ten churners), and mixing dev-set evidence into an otherwise test-set-centered decision would break the same discipline the gate enforces everywhere else. Their ongoing enforcement moves to continuous production monitoring (Phase 10/13) instead.
 
 | # | Criterion | Surface | Action if triggered |
 |---|---|---|---|
-| V1 | **Segment collapse.** Any robustness segment (`contract_type`, `tenure_cohort`, `internetservice`) whose PR-AUC 95 % CI **lower bound falls below that segment's own churn-rate floor** — i.e. within that cohort the model is not distinguishable from random. | dev OOF | **Automatic veto.** A model that is useless inside a real cohort is not shippable on the strength of its average. |
-| V2 | **Fairness disparity — measured at the decision, not at the ranking.** Across `gender`, `seniorcitizen`, `has_partner`, `dependents`, computed **at the shipped `t*`**: (a) **equal-opportunity difference** — the max FNR gap between groups — exceeds **0.10**; or (b) **demographic-parity difference** — the max selection-rate gap — exceeds **0.10**; either with a paired-bootstrap CI on the gap excluding 0. Per-group PR-AUC is *reported* but does **not** trigger V2. | dev OOF | **Mandatory documented sign-off**, not an automatic veto — a disparity is a normative question, not a statistical one, and the right answer depends on what it *means* here (allocation of a retention benefit, not denial of credit). Unresolved or un-signed-off ⇒ veto. Record the decision and its reasoning in §7. |
-| V2b | **Per-group calibration.** Any group whose calibration slope CI falls **entirely outside [0.80, 1.25]**, on any of the four axes. | dev OOF | **Mandatory documented sign-off**, as V2. `t*` is applied uniformly and is Bayes-optimal *only* against honest posteriors — so a group the model is miscalibrated for is a group the decision rule is systematically wrong for, in a direction no aggregate slope reveals. |
-| V3 | **Direction sanity.** Any top-5 SHAP feature whose effect direction **contradicts the established EDA relationship** (§2) — e.g. longer tenure pushing predictions *toward* churn, or a two-year contract raising risk. | test set (SHAP global) | **Automatic veto.** A sign flip on a feature this influential means the model is fitting an artifact, and no aggregate metric will reveal it. |
+| V1 | **Segment collapse** — any robustness segment (`contract_type`, `tenure_cohort`, `internetservice`) whose PR-AUC CI lower bound falls below that segment's own churn-rate floor. | dev OOF | Reported only — feeds the model card and ongoing per-segment monitoring. |
+| V2 | **Fairness disparity, at the decision** — across `gender`, `seniorcitizen`, `has_partner`, `dependents`, at the shipped `t*`: equal-opportunity gap (max FNR difference) or demographic-parity gap (max selection-rate difference) exceeds 0.10, with the CI excluding 0. | dev OOF | Reported only — a disparity is a normative question (this allocates a benefit, not a denial of credit), reasoned about in §7 and carried into ongoing monitoring. |
+| V2b | **Per-group calibration** — any group's calibration-slope CI entirely outside [0.80, 1.25]. | dev OOF | Reported only, same reasoning as V2. |
+| V3 | **Direction sanity** — any top-8 SHAP feature (cutoff chosen at the natural elbow in mean-\|SHAP\|, `configs/error_analysis/default.yaml`) whose effect direction contradicts the established EDA relationship (§2) — e.g. longer tenure raising predicted risk. | test set (SHAP) | **Automatic veto.** A sign flip this influential means the model fit an artifact, and no aggregate metric would reveal it. |
 
-> **Why V2 moved from PR-AUC to threshold-dependent rates.** An earlier draft triggered V2 on a *per-group PR-AUC gap*, which **cannot detect the harm the criterion exists to prevent.** PR-AUC is threshold-free and measures *ranking quality within a group*. But nobody is harmed by a ranking — they are harmed by a **decision**, and the decision is `p ≥ t*`. Two groups can post identical per-group PR-AUC while receiving very different **selection rates** and **false-negative rates** at that shared threshold, because their score distributions and base rates differ. Equal ranking quality does not imply equal treatment, and every standard fairness criterion (equal opportunity, equalized odds, demographic parity) is threshold-dependent for exactly this reason.
->
-> This model **allocates a benefit** — a retention offer. The concrete question is therefore *"is one group systematically less likely to be offered help it would have responded to?"*, which is the FNR gap (equal opportunity), and *"is one group contacted less often overall?"*, which is the selection-rate gap (demographic parity). Neither is visible in a PR-AUC comparison. Per-group PR-AUC remains **reported** — it is a useful diagnostic for *why* a gap exists — but it no longer triggers the criterion.
+**Why V2 is measured at the decision, not the ranking.** An earlier draft tested per-group PR-AUC — but nobody is harmed by a ranking, they're harmed by a *decision* (`p ≥ t*`), and two groups can share identical PR-AUC while receiving very different selection rates and false-negative rates at the same cutoff. Since this model allocates a benefit (a retention offer), the right questions are "is one group less likely to be offered help it would have used?" (equal opportunity) and "is one group contacted less overall?" (demographic parity) — neither visible in a PR-AUC comparison. Per-group PR-AUC is still reported, as a diagnostic for *why* a gap exists.
 
-**The review is veto-only. It may reject the model; it may not iterate on it.** Permitted outcomes are exactly two: approve, or reject. If the false-negative inspection reveals something that genuinely demands a feature change, the correct response is to reject, return to feature engineering, and **record that the sealed test set is spent** — not to quietly engineer a fix and re-evaluate against a test set the model has now effectively seen. The temptation to iterate is at its maximum precisely at this step, which is why the rule is written down rather than assumed. The *generative* error analysis — profiling errors in order to improve the model — is a training-time activity and lives in §3a and §4, on development data only.
+**The review is veto-only — approve or reject, never iterate.** If an error-analysis finding genuinely demands a feature change, the correct response is reject → return to feature engineering → record that the seal is spent, not quietly fix and re-evaluate against a test set the model has now effectively seen. The verdict is stamped onto `reports/promotion_decision.json`; `refit.py` will not run without it.
 
-The verdict is stamped onto `reports/promotion_decision.json`, and `models/refit.py` will not run without it.
-
-> **The pairing unit differs by metric, and this is not a detail.** Brier is a mean of per-row squared errors, so it is row-decomposable: the paired bootstrap resamples rows and differences the per-row losses directly. **PR-AUC is not.** There is no "average precision of row *i*" to difference — AP is a property of a whole ranked set. Its paired bootstrap must therefore resample *row indices* and **recompute AP for both models over the same resampled rows** on every iteration, differencing the two set-level scores. The two comparisons cannot share one implementation, and a helper written for the row-decomposable case will silently produce nonsense if pointed at PR-AUC.
->
-> **What the comparative regime is scored *over* is still open.** This section fixes the *rule* — what is measured, what may veto, and how uncertainty binds. It deliberately does not name the rows. After Phase 7's full-data refit the sealed test set lives inside the champion, and `customers_raw` will never grow to supply another holdout, so the evaluation set for weekly promotions must come from somewhere else (`prediction_outcomes`, a rolling holdout, or an explicit declaration that the gate is demonstrative). That is a Phase 10 decision; see `PROJECT_PLAN.md` Phase 10. The rule above is well-defined the moment an evaluation set exists.
+> **Implementation note.** PR-AUC's paired bootstrap can't reuse Brier's machinery: Brier is a per-row mean, so its bootstrap resamples rows and differences per-row losses directly, while PR-AUC is a property of a whole ranked set — its bootstrap must resample row indices and recompute AP for *both* models on each resample. And what the comparative regime is scored *over* is still an open question for Phase 10: after the full-data refit the sealed test set lives inside the champion, so weekly promotions need a different evaluation surface (`prediction_outcomes`, a rolling holdout, or an explicit demonstrative-only declaration) — see `PROJECT_PLAN.md` Phase 10. This section fixes the rule; it doesn't yet name the rows.
 
 ---
 
@@ -425,12 +375,12 @@ LightGBM and LogisticRegressionCV are compared on PR-AUC: threshold-free, aligne
 | Candidate | CV PR-AUC | ± std | Train s/fold |
 |---|---|---|---|
 | `dummy_prior` | 0.265 | 0.001 | 0.00 |
-| `logreg_cv` | 0.651 | 0.033 | 0.90 |
-| `lgbm_default` | 0.658 | 0.035 | 0.25 |
+| `logreg_cv` | 0.651 | 0.033 | 1.31 |
+| `lgbm_default` | 0.658 | 0.035 | 0.35 |
 
 **Safeguard check passed:** the dummy classifier scored 0.265, matching the dev-set churn rate (0.265) — confirming the real candidates' higher scores reflect genuine predictive signal, not a broken eval harness or leaked target.
 
-LightGBM leads by ~0.007 PR-AUC points; ROC-AUC is close and non-contradictory (0.844 for both candidates). LogReg is markedly more expensive to train here (`LogisticRegressionCV`'s inner 5-fold search over 10 `C` values costs ~3.6× LightGBM's single fit per outer fold — 0.90s vs. 0.25s) — a genuine simplicity-vs-cost tradeoff LogReg does *not* win on, despite its interpretability appeal.
+LightGBM leads by ~0.007 PR-AUC points; ROC-AUC is close and non-contradictory (0.844 for both candidates). LogReg is markedly more expensive to train here (`LogisticRegressionCV`'s inner 5-fold search over 10 `C` values costs ~3.7× LightGBM's single fit per outer fold — 1.31s vs. 0.35s) — a genuine simplicity-vs-cost tradeoff LogReg does *not* win on, despite its interpretability appeal.
 
 #### Precision/F1-at-fixed-recall profile
 
@@ -525,7 +475,7 @@ Two checks guard against this method misleading:
 1. **Fluke check.** Refit across all 100 CV folds and track each feature's survival rate. 8 of the 10 all-dev survivors are selected in at least 70 of 100 folds (`tenure`/`contract_type` every time), but `streamingtv` — the thinnest all-dev survivor — is picked in only 5 of 100 folds, and `paymentmethod` in just 33. Two dropped features cross over the other way: `paperlessbilling` (55/100) and `charge_per_service` (46/100) are both selected more often than either `streamingtv` or `paymentmethod`, despite failing the all-dev floor outright.
 2. **Correlated-credit check.** Shuffling correlated features one at a time can under-count shared signal, so each correlated cluster is re-tested together before accepting an individual failure. The `tenure`/`totalcharges`/`monthlycharges` trio all clear the floor alone (no rescue needed; `tenure`–`totalcharges` correlate at 0.89, the strongest pair in the trio). The 7-feature `internetservice` add-on cluster (VIF = ∞, §8b `01-eda.ipynb`) has 4 individual survivors (`internetservice`, `onlinesecurity`, `techsupport`, `streamingtv`), but the other 3 (`onlinebackup`, `deviceprotection`, `streamingmovies`) didn't need rescuing either — credit-splitting never dragged a real signal under the floor.
 
-**Deciding keep vs. reduce, and the outcome.** Same mechanism as the model-family decision above: refit the full and reduced (10-feature) candidates on the same 100 folds, then bootstrap Δ = mean(AP_full) − mean(AP_reduced), paired fold by fold. Result: reduced **0.6490** vs. full **0.6580** — Δ = **0.0100**, 95% CI **[0.0060, 0.0140]**, p < 0.0001, full wins 65 of 100 folds — clears the materiality bar, so **`full_features_win`** fires: **the full set is retained, 20 of 20 kept**. Below, 10 of 20 features individually clear their own decoy floor; the other 10 — including all four protected/quasi-protected attributes (see below) — stay anyway, since this aggregate test, not the per-feature table, governs adoption. That table is a diagnostic audit trail only; it never touches the sealed test set.
+**Deciding keep vs. reduce, and the outcome.** Same mechanism as the model-family decision above: refit the full and reduced (10-feature) candidates on the same 100 folds, then bootstrap Δ = mean(AP_full) − mean(AP_reduced), paired fold by fold. Result: reduced **0.6490** vs. full **0.6580** — Δ = **0.0080**, 95% CI **[0.0050, 0.0110]**, p < 0.0001, full wins 69 of 100 folds — clears the materiality bar, so **`full_features_win`** fires: **the full set is retained, 20 of 20 kept**. Below, 10 of 20 features individually clear their own decoy floor; the other 10 — including all four protected/quasi-protected attributes (see below) — stay anyway, since this aggregate test, not the per-feature table, governs adoption. That table is a diagnostic audit trail only; it never touches the sealed test set.
 
 | Feature | Real importance | Decoy floor | Survived (all-dev) | Per-fold stability |
 |---|---:|---:|:---:|---:|
@@ -759,212 +709,119 @@ The full threshold derivation — the per-scenario cost breakdown, the closed-fo
 
 ## 7. Final Test-Set Results
 
-> **⚠ Archived pass — this whole section, including its Error Analysis and SHAP Explainability subsections, describes the pre-Phase-6 notebook's own evaluation of `best_pipe`/`cal_pipe` at threshold 0.2956, not this project's real pipeline.** None of the numbers below come from the actual `telco-churn-pipeline` registry, the real calibrated `challenger`, or the closed-form threshold derived in §6. They are kept as the historical record of the archived pass — the archive is a comparison notebook, not a bar current work must clear. This entire section is rewritten once Phase 7's `evaluate.py` and `05-evaluation-and-error-analysis.ipynb` run for real against the sealed test set and the actual champion.
+One-time evaluation on the sealed test set (n = 1,409; 374 churners), scored once by `evaluate.py` and diagnosed once by `error_analysis.py` — the same 1,409 customers held out since the original split, untouched by feature engineering, training, tuning, or calibration. Model version 1 evaluated cold-start (no incumbent champion to compare against). **Gate result: pass.** **Human review: approved** (Richlove Frimpong, 2026-07-27).
 
-One-time evaluation on the sealed test set (n = 1,409; 374 churners). No modelling decisions were made after seeing these numbers.
+### Promotion gate — the four criteria
 
-### Classification metrics
+| Criterion | Role | Value | Bar / band | 95% CI |
+|---|---|---|---|---|
+| PR-AUC | selection | **0.670** | ≥ 0.60 | [0.619, 0.714] |
+| Recall (base threshold) | guardrail | **0.698** | ≥ 0.65 | [0.651, 0.743] |
+| Brier skill score | guardrail | **0.301** | > 0 | — |
+| Calibration slope | guardrail | **0.992** | [0.80, 1.25] | [0.891, 1.100] |
 
-| Metric | Value |
+Only PR-AUC can promote; recall, BSS, and calibration slope can only veto a model PR-AUC already admitted. All four pass, and none are borderline — PR-AUC clears its bar by 0.07, recall by 0.05 (with the whole CI above 0.65), and the calibration slope sits within 0.008 of the 1.0 ideal.
+
+### Ranking — PR-AUC vs. ROC-AUC
+
+PR-AUC **0.670** (95% CI [0.619, 0.714]) against a **0.265** dummy-prior floor (the score of guessing the churn rate for everyone). ROC-AUC — reported as a diagnostic only, never gated — is **0.848** (95% CI [0.828, 0.868]): the ~27% churn prevalence lets ROC-AUC look strong while still missing real churners, since false positives are always a small fraction of the much larger non-churner class. PR-AUC doesn't share that blind spot, which is why it drives the decision.
+
+#### Classification performance at the three shipped thresholds
+
+| Scenario | Threshold | Recall | Precision | F1 | TP | FP | FN | TN | Contact rate |
+|---|---|---|---|---|---|---|---|---|---|
+| Conservative | 0.270 | 0.789 [0.747, 0.829] | 0.526 | 0.631 | 295 | 266 | 79 | 769 | 39.8% |
+| **Base (shipped)** | **0.394** | **0.698 [0.651, 0.743]** | 0.593 | 0.641 | 261 | 179 | 113 | 856 | 31.2% |
+| Optimistic | 0.497 | 0.575 [0.525, 0.626] | 0.623 | 0.598 | 215 | 130 | 159 | 905 | 24.5% |
+
+Base is what's shipped: it flags 261 of 374 churners for outreach while missing 113, and separately contacts 179 non-churners for nothing. Its recall — the number the gate's guardrail actually checks — clears 0.65 with its entire CI above the bar. Optimistic's recall would **not** have cleared the guardrail even at the top of its own CI (0.626 < 0.65), had it been shipped as the base scenario instead. F1 stays flat across all three (0.60–0.64) because the shipped threshold is chosen to maximize expected value, not F1.
+
+A fixed-recall sweep of the same underlying curve shows what more aggressive targeting would cost: 70% recall (precision 0.59) lands almost exactly on base; 80% needs precision 0.52; 90% needs precision 0.47 — roughly a coin flip on every flagged customer.
+
+#### Calibration
+
+| Quantity | Value |
 |---|---|
-| Production threshold | 0.2956 (OOF cost-optimised) |
-| **Recall** | **0.7861** |
-| **Precision** | 0.5241 |
-| **F1** | 0.6289 |
-| **ROC-AUC** | **0.8413** |
-| PR-AUC | 0.6511 |
-| Brier Score | 0.1383 |
-| Brier Skill Score | 0.2907 |
-| KS | 0.5310 at 39.6 % of ranked population |
+| Brier (candidate) | 0.1363 |
+| Brier (dummy-prior floor) | 0.1950 |
+| Brier skill score | 0.301 |
+| ECE (diagnostic, not gated) | 0.0346 |
+| Calibration slope | 0.992 [0.891, 1.100] |
 
-**Confusion matrix (threshold = 0.2956, n = 1,409):**
+Murphy's decomposition (Brier = reliability − resolution + uncertainty) shows the 0.301 BSS is earned honestly: reliability (calibration error) is tiny at 0.0020, resolution (discrimination) does almost all the work at 0.0598, and uncertainty (0.1950) is fixed by the data, not the model. The calibration slope — binning-free and immune to being bought by better ranking, unlike Brier — sits almost exactly at the 1.0 ideal with room on both sides of its CI before the [0.80, 1.25] guardrail band. The reliability diagram (10 quantile bins, ~141 rows each) tracks the diagonal closely; the largest single gap (predicted 0.62 vs. observed 0.52 in one bin, the model mildly overconfident) is offset by the opposite pattern in the top bin (predicted 0.72 vs. observed 0.77, mildly underconfident) — errors that cancel rather than compound in one direction.
 
-|  | Predicted No | Predicted Yes |
-|---|---|---|
-| **Actual No** | TN = 768 | FP = 267 |
-| **Actual Yes** | FN = 80 | TP = 294 |
+### Ranking diagnostics — gains, lift, and the decile table
 
-561 customers contacted (39.8 % of test set).
-
-### Train / val / test metric trajectory
-
-| Split | Recall | Precision | F1 | ROC-AUC | PR-AUC |
+| Decile | Churn rate | Lift | Cumulative capture | Perfect-ranker ceiling | Headroom |
 |---|---|---|---|---|---|
-| Train | 0.8015 | 0.5264 | 0.6354 | 0.8508 | 0.6638 |
-| Val | 0.8000 | 0.5310 | 0.6383 | 0.8560 | 0.6845 |
-| **Test** | **0.7861** | **0.5241** | **0.6289** | **0.8413** | **0.6511** |
-| Val → Test Δ | −0.0139 | −0.0069 | −0.0094 | −0.0147 | −0.0334 |
+| 1 (top 10%) | 76.6% | 2.89× | 28.9% | 37.7% | 8.8pp |
+| 2 | 51.8% | 1.95× | 48.4% | 75.4% | 27.0pp |
+| 3 (~top 30%) | 50.4% | 1.90× | 67.4% | 100% | 32.6pp |
+| 4 | 30.5% | 1.15× | 78.9% | 100% | 21.1pp |
+| 5 | 26.2% | 0.99× | 88.8% | 100% | 11.2pp |
+| 6–10 | ≤ 12.1% | ≤ 0.45× | 93.3% → 100% | 100% | ≤ 6.7pp |
 
-All metrics decline uniformly Val → Test; no rank-order reversals; Train ≈ Val confirms overfitting remediation was successful.
+A perfect ranker would already hold every churner by decile 3 (base churn rate ≈27%, so the top 30% has room for all of them). At that same decile 3, random targeting would capture ~30%, the model captures **67.4%**, and the ceiling is 100% — more than double random, with headroom shrinking from 32.6pp at decile 3 to under 1pp by decile 8. Lift drops below 1.0 starting at decile 5, and deciles 6–10 combined add only 42 more churners out of 374 — exactly the flat-tail shape a well-ranking model should produce. `mean_predicted` tracks `churn_rate` decile-by-decile with the same mild, offsetting over/under-confidence already seen in the reliability diagram, not a directional bias.
 
-### Lift & gains (test set — definitive)
+### Business impact — expected value across three cost scenarios
 
-| Decile | Churn rate | Lift | Cumulative gain |
-|---|---|---|---|
-| Top 10 % | 72.3 % | **2.73×** | 27.3 % of all churners |
-| Top 20 % | 61.7 % | 2.32× | 50.5 % |
-| Top 30 % | 43.3 % | 1.63× | 66.8 % |
-| Top 40 % (production budget) | 31.2 % | 1.18× | 78.6 % |
-| Deciles 5–10 | Declining | < 1.0× | Below baseline |
+| Scenario | Threshold | Contacted | Campaign cost | Retained revenue | EV (95% CI) | EV vs. treat-all | Break-even retention |
+|---|---|---|---|---|---|---|---|
+| Conservative | 0.270 | 561 (39.8%) | $12,343 | $24,076 | **$11,732** [$9,496, $13,719] | −$479 | 10.3% |
+| Base (shipped) | 0.394 | 440 (31.2%) | $29,814 | $44,875 | **$15,061** [$11,215, $18,604] | −$31,170 | 19.9% |
+| Optimistic | 0.497 | 345 (24.5%) | $46,499 | $58,329 | **$11,830** [$6,794, $16,578] | −$88,440 | 31.9% |
 
-The model delivers **+27 percentage-point improvement** over random targeting at the same 40 % budget.
+All three scenarios beat both baselines — `treat-all` is negative throughout, `treat-none` is $0 by construction. Cost and revenue both scale up together across scenarios (~4× from conservative to optimistic), yet EV stays in a narrow **$11.7k–$15.1k** band — a range narrower than sampling noise: the cross-scenario spread ($3,329) is smaller than the widest single scenario's own bootstrap CI width ($9,784, optimistic), so the ranking between scenarios is not a confident signal even though all three clear both baselines.
 
-### Business impact (test set)
+A ±20% sensitivity sweep shows `retention_rate` and `ltv` as the two biggest swing factors (±$12.74 per customer around a $10.69 base — they enter the EV formula as a product, so an equal percentage miss on either moves revenue by the same amount); `cost` moves EV less (±$8.46) — even a 20% cost overrun leaves EV solidly positive. At the base scenario's true cost per contact ($67.76, not just the $20 labor component), break-even sits at 19.9% retention against a 30% assumption — real room for error before the campaign stops paying off.
 
-**Model vs random (same 561-contact budget):**
-- Random targeting would recover 149 churners by chance (base rate × budget)
-- Model recovers 294 — **+145 more (+97 %)**
+**Bottom line: deploy at the base scenario.** All three scenarios are profitable, but base is the only one both financially comfortable (a real margin to its break-even rate) and operationally executable (440 contacts fits under the 500-contact operational capacity; conservative's 561 does not).
 
-**P&L by scenario:**
+### Disaggregated results — robustness & fairness
 
-| Scenario | Model P&L | Random P&L | P&L Uplift |
-|---|---|---|---|
-| Conservative | $11,296 | −$362 | **$11,658** |
-| Base | $12,567 | −$12,446 | **$25,012** |
-| Optimistic | $4,233 | −$35,207 | **$39,440** |
+Sliced two ways on the sealed test set: **robustness** (`contract_type`, `tenure_cohort`, `internetservice`) and **protected/quasi-protected** axes (`gender`, `seniorcitizen`, `has_partner`, `dependents`). Neither surface gates promotion at this stage — reported for the model card and for production monitoring, with a companion check on the larger dev-OOF sample (below) for anything the thinner test-set slices can't distinguish from noise.
 
-> Note: Optimistic P&L is lower than Base despite higher LTV because $135 per contact × 267 FPs = $36,045 in outreach spend nearly offsets the gains. Intervention cost is the binding constraint in the high-cost scenario.
+Among robustness axes, the model is strongest exactly where the campaign spends its budget: month-to-month contracts (PR-AUC 0.704) and 0–12-month tenure (0.782) rank confidently, while two-year contracts (0.157, 2.7% churn rate) and 65+-month tenure (0.371) carry wide CIs from thin churner counts, not worse ranking. Among protected axes, `gender` is nearly identical (0.678 female vs. 0.667 male); `seniorcitizen`, `has_partner`, and `dependents` all show real ranking gaps, but in the direction of the group that churns more (e.g. seniors rank *better*, 0.758 vs. 0.639).
 
-**Annualised projection (scaled to full 7,045-customer base, 12 cycles/year):**
+At the shipped threshold, `dependents` shows the largest fairness gap: customers without dependents are contacted more than twice as often (37.5% vs. 15.7%) and missed less often (28.0% vs. 45.8% FNR — a 35.1pp equal-opportunity gap) than customers with dependents. `has_partner` (19.4pp) and `seniorcitizen` (12.3pp, in the opposite direction — seniors are contacted *more* and missed *less*) show smaller versions of the same pattern; `gender`'s gaps stay small (≤3.8pp). Translated to dollars, the `dependents` split is starkest: customers without dependents net $14,499 EV vs. just $561 for customers with dependents, whose missed revenue ($5,502) exceeds what's retained ($3,611). Every slice's calibration-slope CI overlaps the [0.80, 1.25] band except two-year contracts (2.294, from only ~9 churners — a thin-support artifact, not real miscalibration, and one that never reaches an outreach decision since two-year contracts sit at a 0% selection rate anyway).
 
-| Scenario | Per run (full base) | Annual |
-|---|---|---|
-| Conservative | $56,462 | **$677,544** |
-| Base | $62,817 | **$753,806** |
-| Optimistic | $21,159 | **$253,908** |
+These gaps track real, pre-existing differences in who churns (§2 EDA: seniors churn at ~42% vs. ~24%; no-partner at ~33% vs. ~20%; no-dependents at ~31% vs. ~16%) — a risk-targeted campaign contacting a higher-risk group more and missing fewer of its churners is doing what it should, not exhibiting an unexplained preference. The choice of a single EV-maximizing threshold accepting this as the cost of uneven risk (vs. deliberately subsidizing outreach to lower-risk groups) is a policy question for the business to revisit each retrain cycle, not a modelling defect.
 
-### Segment breakdown (test set)
+### Dev-OOF diagnostics — reported, non-gating
 
-**By contract type:**
+Re-run on the 5,634-row development OOF set (~4× the test set's churners) for statistical power the sealed test set can't offer on thin segments. **Segment collapse** (a segment's PR-AUC CI falling below its own churn-rate floor): 0 flagged. **Per-group calibration collapse** (a group's slope CI entirely outside [0.80, 1.25]): 0 flagged. **Fairness disparity** (>10pp equal-opportunity or demographic-parity gap): 3 axes flagged — `seniorcitizen`, `has_partner`, `dependents` — consistent with the test-set finding above and, again, explained by genuine risk differences rather than proxy discrimination. None of these three checks can promote or reject the model; only the direction sanity check below can veto.
 
-| Contract | n | n_churn | Recall | FP rate |
-|---|---|---|---|---|
-| Month-to-month | 773 | 329 | 0.891 | 0.601 |
-| **One year** | **300** | **36** | **0.028** | **0.000** |
-| **Two year** | **336** | **9** | **0.000** | **0.000** |
+### Error analysis — where, how, and what it costs
 
-**By internet service:**
+**Missed churners (false negatives) cluster on two distinct blind spots.** The dominant one is long tenure plus a long-term contract: 92.8% FN rate at 61–72 months, 99.2% on one-year contracts, 100% on two-year — a near-absolute "long tenure + long contract = safe" prior. This alone misses 169 real churners (130 one-year, 39 two-year), and they are not low-value: one/two-year churners average $85–87/month, more than the $73/month average for the month-to-month churners the model does catch. A second, separate blind spot is low monthly charges (75% FN rate in the cheapest bin) and no internet service (90%) — customers who never trigger the high-charges signal the model otherwise relies on.
 
-| InternetService | n | n_churn | Recall | FP rate |
-|---|---|---|---|---|
-| Fiber optic | 613 | 252 | 0.885 | 0.540 |
-| DSL | 484 | 97 | 0.619 | 0.129 |
-| None | 312 | 25 | 0.440 | 0.077 |
+**False positives cluster on two different patterns.** New sign-ups on flexible terms (51.2% FP rate at 0–6 months tenure, overwhelmingly month-to-month and paying by electronic check) and moderate-tenure customers paying more per month who simply stay anyway (fiber optic, no add-ons, high charges — 27–51% FP rate). Both patterns are a consequence of the same structural gap: no feature in this dataset measures loyalty or satisfaction directly, so nothing cleanly separates a genuinely at-risk customer from one who merely looks like one on paper.
 
-**By tenure band:**
+**Most errors are confident, not borderline.** At `t* = 0.3941 ± 0.0586`, only 9.7% of false negatives and 12.8% of false positives fall inside that near-miss band — the rest are confident failures a threshold change cannot fix. Missed churners scatter thinly across the entire low-score range (many near 0); false alarms bunch tightly around 0.55–0.65, comfortably above the cutoff, not barely over it. Both are feature problems, not threshold problems.
 
-| Tenure | n | n_churn | Recall | FP rate |
-|---|---|---|---|---|
-| 0–12 months | 449 | 215 | 0.884 | 0.543 |
-| 13–24 months | 206 | 60 | 0.850 | 0.384 |
-| **25+ months** | **754** | **99** | **0.535** | **0.128** |
+**Errors are not evenly distributed by customer value.** Splitting by `MonthlyCharges` decile (a ~5.5× revenue-at-risk gap between the cheapest and priciest tenth), the FN rate is high at both ends and low in the middle: the two cheapest deciles miss 73–86% of churners (each miss cheap), but the FN rate climbs back to 54.8% in the single most expensive decile (~$108/month) after a healthy 15.8–18.2% in deciles 6–9 — the model's highest-value blind spot is concentrated, not a general degradation at high value.
 
-### Full model performance history
+### Model explainability — SHAP
 
-| Stage | Threshold | Recall | Precision | F1 | ROC-AUC |
-|---|---|---|---|---|---|
-| Baseline LightGBM (val) | 0.35 | 0.900 | 0.495 | 0.638 | 0.867 |
-| Tuned LightGBM (val) | 0.35 | 0.940 | 0.405 | 0.566 | 0.855 |
-| Calibrated (val) | 0.35 | 0.760 | 0.576 | 0.655 | 0.856 |
-| Calibrated + OOF threshold (val) | 0.2956 | 0.800 | 0.531 | 0.638 | 0.856 |
-| **Final test set** | **0.2956** | **0.7861** | **0.5241** | **0.6289** | **0.8413** |
+**Global importance.** Two features carry over a third of total signal: `Contract Type: Month-to-month` (mean |SHAP| 0.647) and `Tenure` (0.431). A second tier — Monthly Charges, Tech Support: No, Contract Type: Two year, Online Security: No, Internet Service: Fiber optic, Payment Method: Electronic check (0.17–0.22 each) — brings the top 8 to 73% of total signal. `SeniorCitizen`, `Gender`, `Dependents`, and `Partner` all rank below every commercial feature except Paperless Billing, keeping demographic signal marginal by construction, not by post-hoc filtering.
 
-### Error Analysis
+**Direction sanity check — the one check in this section that can veto.** All 8 top-ranked features' observed SHAP direction agree with the established EDA relationship (`observed_direction` all correctly signed, 0 violations): month-to-month, high monthly charges, no tech support, no online security, and fiber optic all push toward churn; a two-year contract and long tenure both push away from it. No sign flip means the model didn't learn a backwards relationship on any feature this influential — **check passed.**
 
-All analysis is on the **tuned `best_pipe`** on the val set (threshold = 0.35). Calibration preserves rank order but cannot be used for SHAP (see the SHAP Explainability subsection below).
+**Signed cohort SHAP** explains the two error types as opposite failure modes. False negatives are a **dilution** problem: the same features that argue "churn" strongly for true positives (Month-to-month +0.70, Tenure +0.45) argue it only weakly for missed churners (+0.12, barely positive) — the signal goes quiet rather than reversing. False positives are a **collision** problem: the same features argue "churn" for false alarms almost as strongly as for real churners (+0.68 vs. +0.70) — these customers look like real churners on every feature the model relies on most. Neither is fixable by moving the threshold. A closer look at the annual-contract false negatives specifically shows Monthly Charges *does* react in the right direction (median $100 for missed churners vs. $61 for true negatives on the same contract type, Mann-Whitney p = 6×10⁻¹⁰) — it's just outvoted roughly 2:1 by Contract Type's opposing pull, a weighting problem fixable via an interaction feature or reweighted refit, not a missing-signal problem like the tenure/loyalty gap.
 
-#### Missed churners — profile (9 FNs, 6.0 % FN rate)
+**What this means going forward:** closing the false-negative/false-positive overlap needs a genuine loyalty or satisfaction signal this dataset doesn't have — not a different threshold. Two nearer-term, cheaper fixes exist without new data: manually flag long-contract, high-bill customers for outreach today (a targeting rule), and engineer a spend × contract-length interaction feature or reweight the next refit (a modelling fix). Phone-only customers with no internet service are a separate, smaller blind spot needing new feature engineering, since almost every warning signal the model has is internet-service-based.
 
-| Dimension | Missed churners (FN) | Caught churners (TP) | Gap |
-|---|---|---|---|
-| Mean tenure | 42.22 months | 17.42 months | +24.80 months |
-| Mean MonthlyCharges | $58.30 | $78.80 | −$20.50 |
-| Mean TotalCharges | $2,932 | $1,536 | +$1,396 |
+#### Business takeaways
 
-**Contract split:** All 9 missed churners hold non-month-to-month contracts (6 × One year, 3 × Two year, 0 × Month-to-month).
+- **Today, no model change needed:** manually flag long-contract (one/two-year) customers whose monthly bill sits in the top 25% for retention outreach — a spreadsheet filter. The model already reacts to their spend, just not strongly enough to outweigh Contract Type's pull toward "safe."
+- **Front-load retention effort into a customer's first few months.** Tenure produces the single widest score swing of any feature — a 1-month customer can be pushed further toward risk than almost anyone else in the dataset — so early tenure is where a fixed outreach budget buys the most risk reduction per customer.
+- **Next cycle, a modelling fix:** an engineered spend × contract-length interaction feature, or a reweighted refit, would let the model catch these annual-contract, high-bill customers itself rather than relying on a manual filter.
+- **Longer-term, needs new data, not a targeting rule:** phone-only customers with no internet service are nearly invisible to the model, since almost every signal it relies on is internet-service-based — this is a feature-engineering gap, not a threshold one.
+- **The root structural gap:** nothing in this dataset measures loyalty or satisfaction directly. That single missing signal explains both failure types at once — quietly-leaving long-tenure customers the model reads as safe, and new sign-ups who look risky but were never leaving — and closing it would do more for both error rates than any threshold or calibration change.
 
-**Structural blind spot:** The dominant learned signal is *short tenure + high charges + month-to-month contract*. Customers who churn after years of lower-cost service break this pattern entirely. The model applies a near-irrefutable "committed customer" prior to annual-contract, long-tenure holders.
+### Human review & promotion decision
 
-**Score distribution:**
-- 6 near-miss FNs with scores 0.242–0.338 (just below the 0.35 threshold — a threshold problem)
-- 3 deep-miss FNs with scores 0.148–0.184 (a feature problem — the model is actively confidently wrong)
-
-#### False positive profile (207 FPs, 50 % FP rate)
-
-FPs have a nearly identical feature profile to actual churners: 80.7 % month-to-month, 53 % fiber optic, 69 % no online security. There is no clean spatial boundary separating FPs from true negatives — the model cannot distinguish the minority who share the risk profile but remain loyal. Resolving this requires loyalty or satisfaction signals not present in the current feature set.
-
-#### Subgroup FN rates
-
-| Subgroup | FN rate | Interpretation |
-|---|---|---|
-| Contract = Two year | 1.000 | Near-total blind spot |
-| Contract = One year | 0.538 | Major blind spot |
-| tenure 49–72 months | Highest by band | Highest-LTV customers; hardest to anticipate |
-| DSL / No internet | Above average | Model under-serves lower-cost segments |
-| Fiber optic | Lowest | Classic risk profile — thoroughly learned |
-| SeniorCitizen = 1 | Low (similar to non-seniors) | No systematic age-based under-service — positive fairness result |
-
-### SHAP Explainability
-
-Using `shap.TreeExplainer` on `best_pipe` (exact tree values, not kernel approximation). Analysis conducted on both val and test sets; top-10 ranking is identical across both — confirming pipeline consistency.
-
-#### Global feature importance (mean |SHAP| — top 10)
-
-| Rank | Feature | Direction | Key pattern |
-|---|---|---|---|
-| 1 | `Contract_Month-to-month` | Positive | Mean |SHAP| ~3× the next feature; drives churn for nearly all customers |
-| 2 | `OnlineSecurity_No` | Positive | Bimodal — subscribers cluster left (protective), non-subscribers right (risky) |
-| 3 | `InternetService_Fiber optic` | Positive | Compounding risk with MonthlyCharges confirmed |
-| 4 | `tenure` | Negative | Clean monotone: short tenure → high risk; steeper effect for month-to-month (interaction) |
-| 5 | `TechSupport_No` | Positive | Same bimodal pattern as OnlineSecurity |
-| 6 | `MonthlyCharges` | Positive | Effect moderated by contract type and internet tier |
-| 7 | `PaymentMethod_Electronic check` | Positive | Independent signal beyond contract type |
-| 8 | `Contract_Two year` | Negative | Strong protective — near-irrefutable commitment signal |
-| 9 | `StreamingMovies_Yes` | Positive | Small but consistent marginal value |
-| 10 | `TotalCharges` | Negative | Retained despite high VIF — billing history non-redundancy confirmed |
-
-**`gender` and `SeniorCitizen` rank #23 and #40 respectively** (mean |SHAP| ≈ 0.000). Churn scores are driven entirely by behavioral and contractual features, not demographic proxies. Safe to document in a model card as non-influential.
-
-#### Key interactions confirmed by dependence plots
-
-- **tenure × Contract:** Month-to-month customers retain high positive SHAP even at moderate tenure — the contract type sustains churn risk regardless of seniority.
-- **MonthlyCharges × Fiber optic:** Fiber optic customers show systematically higher SHAP at the same charge level — two risk factors compound rather than add.
-
-#### Individual explanations (waterfall plots)
-
-**High-confidence churner (score = 0.790):** month-to-month + 1-month tenure + fiber optic + no online security + no tech support — every feature points in the same direction.
-
-**High-confidence non-churner (score = 0.148):** Not month-to-month = largest single protective factor; reinforced by two-year contract, 70-month tenure, $19.80/month, security and tech support subscribed.
-
-**Most convincingly missed churner (FN, score = 0.025):** Holds no month-to-month contract flag (SHAP −0.62); two-year contract (−0.13); tenure = 55 months (−0.07). The model's "annual contract = committed customer" heuristic overpowers all other signals.
-
-#### EDA vs SHAP agreement
-
-| Feature | EDA rank | SHAP rank | Divergence |
-|---|---|---|---|
-| Contract | 1 | 1 | Agreement |
-| tenure | 2 | 4 | OnlineSecurity ranks above tenure in SHAP — marginal contribution in conditional context |
-| OnlineSecurity | 3 | 2 | Elevated vs bivariate rank |
-| TechSupport | 4 | 5 | Agreement |
-| InternetService | 5 | 3 | Agreement |
-| gender | Non-significant | #23 (≈0) | Agreement |
-| SeniorCitizen | Confounded | #40 (≈0) | Agreement — mediation confirmed |
-
-#### SHAP on the test set
-
-SHAP is applied to the LightGBM base estimator extracted from fold 0 of `cal_pipe`. Top-10 feature ranking on the sealed test set is **identical** to the validation-set ranking — zero rank shifts across the top 10. SHAP base value: **−0.3009** (log-odds space).
-
-> **⚠ "Fold 0" is an artefact of the archived `ensemble=True` calibrator and must not be carried into `src/`.** Under Phase 6's `ensemble=False` there is one base estimator, not five, and the access path is `calibrated.calibrated_classifiers_[0].estimator` — no fold indexing, no averaging, no `best_pipe` kept alongside. See the note in §5. Phase 7's error analysis is written against that path.
-
-**Protected attributes:**
-
-| Attribute | Mean \|SHAP\| | Rank of 40 | Assessment |
-|---|---|---|---|
-| `Gender: Male` | 0.0000 | #23 | Negligible |
-| `Partner: Yes` | 0.0000 | #21 | Negligible |
-| `SeniorCitizen` | 0.0000 | #40 | Negligible (last) |
-
-All three protected attributes contribute zero marginal signal at the individual prediction level — consistent with the validation-set finding.
+Every automated criterion above passed; the direction sanity check found no violations; segment and per-group calibration collapse were both clean. The one flagged item — the fairness-disparity gap on `seniorcitizen`/`has_partner`/`dependents` — was reviewed and judged consistent with genuinely higher churn risk in these groups rather than proxy discrimination, and is tracked for ongoing monitoring rather than treated as a blocker. **Verdict: approved** (Richlove Frimpong, 2026-07-27), clearing the model for the full-data refit and registration in §8.
 
 ---
 
@@ -1031,19 +888,19 @@ mlflow.sklearn.load_model("models:/telco-churn-pipeline@champion")
 
 ## 9. Known Limitations
 
-> **Two kinds of entry live here, and they are marked.** Items tagged **⚠ UNVERIFIED** are empirical claims *inherited from the exploratory pass* — measured on a different model, at a superseded threshold (0.2956, now `t* = 0.3941`), under a different calibration. They are **not** established facts about the shipped champion, and they are recorded as open questions rather than findings. **Phase 7's error analysis re-derives every one of them against the real model and rewrites or retires it.** Until then, do not cite them as results.
+> **Two kinds of entry live here, and they are marked.** Items tagged **⚠ UNVERIFIED** were empirical claims *inherited from the exploratory pass* — measured on a different model, at a superseded threshold (0.2956, now `t* = 0.3941`), under a different calibration. They were **not** established facts about the shipped champion, and were recorded as open questions rather than findings until Phase 7's error analysis re-derived each one against the real model. **All four have since been rewritten or retired against that evidence; none remain tagged.**
 >
-> Everything untagged is structural — true of this problem and this dataset regardless of which model is fitted — and stands on its own evidence. *(Two former entries have been removed: "no re-contact suppression" was a roadmap item, not a limitation, and already appears under §10's short-term recommendations; "production monitoring not yet deployed" was a phase status, and is superseded by #11, which makes the sharper point.)*
+> Everything else is structural — true of this problem and this dataset regardless of which model is fitted — and stands on its own evidence. *(Two former entries have been removed: "no re-contact suppression" was a roadmap item, not a limitation, and already appears under §10's short-term recommendations; "production monitoring not yet deployed" was a phase status, and is superseded by #11, which makes the sharper point.)*
 
-1. **⚠ UNVERIFIED — Annual/multi-year contract churners may be a near-total blind spot.** The exploratory pass measured FN rates of 0.972 (one-year) and 1.000 (two-year), suggesting the model had learned "annual contract = committed customer" as a near-irrefutable heuristic. **Unconfirmed on the champion, and the direction of any error is not reassuring:** FN rate is threshold-dependent, and the shipped threshold *rose* (0.2956 → 0.3941), which flags fewer customers and would push false negatives **up**, not down. If this survives re-measurement it is a candidate **V1 segment-collapse veto** (§0) — a cohort the model catches essentially nothing in.
+1. **Annual/multi-year contract churners are a near-total blind spot at the shipped threshold — confirmed on the champion.** The model misses 129 of 130 dev-OOF churners on one-year contracts (99.2% FN rate) and all 39 on two-year contracts (100%), measured at `t* = 0.3941` — close to the archived pass's 0.972/1.000. This is a threshold-placement effect, not a ranking collapse: two-year contracts' PR-AUC (0.063, 95% CI [0.041, 0.104]) still clears its own churn-rate floor (0.029), so V1 does not fire — the model ranks that segment's churners above its non-churners well enough, it simply never predicts a probability above `t*` for any of them. The "annual contract = committed customer" heuristic the archived pass suspected is real and persists through recalibration.
 
-2. **⚠ UNVERIFIED — Long-tenure segment may be under-served.** The exploratory pass measured a 0.465 FN rate in the 25+ month tenure band. Long tenure is treated as a loyalty signal, but duration can be a lagging indicator for quietly disengaging customers. Same threshold-dependence caveat as #1; same V1 exposure.
+2. **Long-tenure customers are under-served, in the same direction as the archived estimate but not a like-for-like number.** The archived pass measured a 0.465 FN rate across a single 25+ month band; the current champion's finer quantile bins show 72.1% (39–61 months, 132 of 183 missed) and 92.8% (61–72 months, 64 of 69 missed) at the shipped threshold. The pattern — longer tenure, worse miss rate — is confirmed and the magnitude is starker, though the different binning means this isn't a direct replication. As with contract type, it's a threshold effect rather than a ranking collapse: the overlapping `tenure_cohort` bands (49–65m, 65+m) both clear their PR-AUC floor comfortably, so V1 does not fire here either.
 
 3. **No uplift / persuadability modelling.** *(Structural.)* The model identifies *who will churn*, not *who will respond to a retention offer*. Without A/B test data it cannot separate persuadables from lost causes — and this is what the retention rate `r` (§0) papers over: the expected-value calculation assumes contacted churners are retainable at a benchmark rate rather than modelling who actually is. The EV is therefore a model of a model.
 
-4. **⚠ UNVERIFIED — Residual calibration gap at high scores.** The exploratory pass found the calibrated model under-predicting churn probability for high-scoring customers by up to ~10 pp above score ≈ 0.58, which would understate financial exposure exactly where it matters most. **This is directly contradicted by §6's account of the shipped sigmoid model**, whose residuals are described as small and bidirectional — the signature of a well-calibrated model. Both cannot be true. **The dispute is settled by one number:** the **calibration slope** (regress `y` on `logit(p)`; 1.0 is perfect). Compute it on the dev-OOF probabilities `calibrate.py` already produces, *before* Phase 7 opens the test set — because if this limitation is real, the champion fails §0's calibration-slope guardrail and must be re-calibrated, and you would rather learn that with the seal intact.
+4. **Retired — the archived high-score calibration gap does not hold for the shipped champion.** The exploratory pass found the calibrated model under-predicting churn probability for high-scoring customers by up to ~10 pp above score ≈ 0.58, which would understate financial exposure exactly where it matters most. The dispute is settled: the champion's sealed-test **calibration slope is 0.992** (95 % CI **[0.891, 1.100]**), comfortably inside §0's [0.80, 1.25] guardrail band, and the reliability diagram's largest residuals — both in the same high-score region the archived pass flagged — point in *opposite* directions (mildly overconfident at predicted ≈0.62, observed 0.52; mildly underconfident at predicted ≈0.72, observed 0.77), cancelling rather than compounding into a one-directional under-prediction. The champion's high-score posteriors are honest enough for `t* = c/(r × LTV)` to remain the right threshold.
 
-5. **⚠ UNVERIFIED — Feature set may not reduce FPs for loyal high-risk-profile customers.** The exploratory pass found ~50 % of non-churners sharing the fiber-optic + month-to-month + no-add-on profile were incorrectly flagged. The *structural* half of this is real regardless of model: no loyalty, satisfaction, or recency-of-service-change signals exist in the IBM feature set, so nothing distinguishes a contented customer with a risky profile from a genuine pre-churner. The *magnitude* is unverified.
+5. **Non-churners sharing a risky profile are still over-flagged — confirmed on the champion, but the headline magnitude does not replicate.** The exploratory pass found ~50 % of non-churners sharing the fiber-optic + month-to-month + no-add-on profile were incorrectly flagged; at the shipped threshold (`t* = 0.3941`) the champion's overall sealed-test FP rate is far lower — 179 of 1,035 non-churners (17.3 %) — so the blanket "half of look-alikes get flagged" estimate does not carry over. What does replicate, and sharper than the archived single profile, is the *structural* claim underneath it: the dev-OOF cohort scan resolves the false alarms into two distinct clusters rather than one — new sign-ups on flexible terms (51.2 % FPR at 0–6 months tenure, 40.1 % month-to-month, 42.4 % electronic check) and moderate-tenure premium subscribers who simply stay (30–51 % FPR in the high-charges bins, 36.1 % fiber optic, 27–37 % across the no-add-on features). Both clusters are the same underlying failure the archived pass named — no loyalty, satisfaction, or recency-of-service-change signal exists in the IBM feature set, so nothing distinguishes a contented customer with a risky profile from a genuine pre-churner — but a single "~50 %, fiber + month-to-month + no-add-on" profile understated how heterogeneous the false-alarm population actually is.
 
 6. **Contact capacity is unknown, and until Phase 7 it was not even a parameter.** *(Structural.)* The expected-value calculation assumed **unlimited capacity**: `t*` flags a fraction of the base, the EV sums over all of them, and nothing asked whether the retention team can actually make that many calls. An assumption that is not written down cannot be checked, and this one was invisible. `configs/costs.yaml` now carries `contact_capacity` / `campaign_budget` explicitly — but the *value* is a placeholder, not a measured operational number, and it shares `r`'s status: a business input this dataset cannot supply. **The consequence is bounded, not fatal:** the EV-vs-K curve (§7) reports expected value at *every* contact volume, so a stakeholder with a real capacity reads their own number off it without re-deriving anything. What cannot be claimed is that the headline EV is achievable — only that it is the EV *if* the implied contact volume is affordable.
 
@@ -1053,7 +910,7 @@ mlflow.sklearn.load_model("models:/telco-churn-pipeline@champion")
 
 9. **Learning curve had not plateaued at Phase 5 Step 2c.** CV PR-AUC was still rising at the maximum training size available to any single CV fold in the Steps 2c/2d generative diagnostic loop (0.610 → 0.652 from 20%→100% of the dev-training folds) — more historical data would plausibly still improve ranking quality, and a fold's training partition is itself smaller than the eventual full-development refit. That same gap is why an early-stopped tree count measured on a smaller training partition (3,606 rows) needs scaling for a final fit trained on more rows (5,634): §4c derives and measures the correction (94 → 147 trees, +0.0015 CV PR-AUC on the two-count diagnostic). Not acted on with a new feature in Phase 5 (no feature was engineered in response); flagged as a Phase 10 retrain / data-acquisition consideration. **This is the empirical justification for the Phase 7 full-data refit** (`models/refit.py`): on this project's own evidence the extra 1,409 rows are still buying ranking quality, so the refit is not a ritual — and by the same logic, whatever tree count `refit.py` starts from will need this same scaling logic applied for its own (larger again) row count.
 
-10. **The sealed test set is too small to support subgroup conclusions, so the shipping veto is decided on development-set evidence.** Phase 7 reports disaggregated PR-AUC on the sealed test set — per contract type, tenure cohort, internet service, and the four protected/quasi-protected axes — because that is what a model card requires and what the published metrics of record should cover. But 1,409 test rows do not divide into seven axes and leave usable support: the two-year `contract_type` tier churns under 3 %, so it carries on the order of **ten churners**, and a PR-AUC estimated on ten positives has a CI wide enough to be uninformative. The consequence is stated plainly: **the human review that can veto promotion decides on the dev-OOF slices** (5,634 rows, roughly four times the churners per slice), and the test-set slices are *reported* alongside rather than acted on. What is therefore never verified on held-out data is whether the model's **subgroup** behaviour generalises — only its aggregate performance is. This is a deliberate trade (a held-out estimate too noisy to trust is worth less than an in-development estimate that is estimable), not an oversight, and it is a limitation of the dataset's size, not of the method. It would dissolve on any realistically-sized production dataset, where every slice has thousands of positives and the question does not arise. **Downstream consequence:** Phase 10's `performance_check.py` compares realised per-segment performance against the *test-set* baselines (the published numbers), so a thin-support segment cannot support a tight degradation alert — its alert band must be derived from its baseline CI, not a fixed global threshold.
+10. **The sealed test set is too small to support subgroup conclusions, so subgroup/fairness scrutiny (V1/V2/V2b) is read on development-set evidence and does not gate promotion.** Phase 7 reports disaggregated PR-AUC on the sealed test set — per contract type, tenure cohort, internet service, and the four protected/quasi-protected axes — because that is what a model card requires and what the published metrics of record should cover. But 1,409 test rows do not divide into seven axes and leave usable support: the two-year `contract_type` tier churns under 3 %, so it carries on the order of **ten churners**, and a PR-AUC estimated on ten positives has a CI wide enough to be uninformative. The consequence is stated plainly: **V1/V2/V2b are computed on the dev-OOF slices** (5,634 rows, roughly four times the churners per slice) for the power they need to say anything at all, and the test-set slices are *reported* alongside rather than acted on — but neither surface gates this decision (§0). Dev-OOF is evidence too noisy in provenance to bind a test-set-centered promotion decision, and the sealed test set is too noisy in sample size to bind one either; forcing either into a veto would trade one failure mode for another. What is therefore never verified as a promotion-time gate is whether the model's **subgroup** behaviour generalises — only its aggregate performance is, via V3 and the automated gate. This is a deliberate trade (a held-out estimate too noisy to trust, paired with a dev estimate that trusts the wrong data, is worth less than moving the decision to where both problems dissolve), not an oversight, and it is a limitation of the dataset's size, not of the method. It would dissolve on any realistically-sized production dataset, where every slice has thousands of positives and the question does not arise. **Downstream consequence:** Phase 10's `performance_check.py` compares realised per-segment performance — robustness *and* fairness axes, plus per-group calibration — against the *test-set* baselines (the published numbers), so a thin-support segment cannot support a tight degradation alert — its alert band must be derived from its baseline CI, not a fixed global threshold. This is where V1/V2/V2b's enforcement actually lives: continuously, against accumulating production volume, rather than once against a single undersized snapshot.
 
 11. **Calibrated probabilities are calibrated *to development-set prevalence* — prevalence drift invalidates both the calibration and the threshold.** LightGBM trains with `class_weight='balanced'` (`models/train/common.py`), which systematically inflates scores toward the positive class. `CalibratedClassifierCV` corrects this because sklearn fits the calibrator on **unweighted** out-of-fold data, mapping the reweighted scores back to true posteriors against the real ~26.5 % dev prevalence. That is the right behaviour, and it is the mechanism that makes the closed-form threshold `t* = c/(r × LTV)` valid at all — `t*` is only Bayes-optimal against *honest* posteriors. The dependency runs both ways: if production churn prevalence shifts away from 26.5 %, the calibration map is stale, the posteriors are biased, and `t*` is being applied to numbers that no longer mean what it assumes. Neither a PR-AUC check nor a reliability diagram computed on old data will catch this. **This is the hook for Phase 13 drift monitoring:** track prevalence alongside feature PSI, and treat a sustained prevalence shift as a re-calibration trigger, not merely a retrain trigger — they are different remedies.
 

@@ -33,7 +33,7 @@ mlflow ui                        # open experiment tracking UI (localhost:5000)
 make lint                        # shortcut: ruff check + mypy
 make test                        # shortcut: pytest --cov=src
 make validate                    # shortcut: uv run python -m telco_churn.data.validate
-make train                       # shortcut: dvc repro (train + evaluate stages)
+make train                       # shortcut: uv run python -m telco_churn.models.train
 
 docker compose --profile infra up -d    # start Postgres + MLflow (Phase 1+ / Phase 5+)
 docker compose up -d                    # start full local stack (Phase 9+)
