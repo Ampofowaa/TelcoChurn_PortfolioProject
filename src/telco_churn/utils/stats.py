@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -13,8 +14,10 @@ from sklearn.linear_model import LinearRegression
 __all__ = [
     "abs_corr",
     "benjamini_hochberg",
+    "bootstrap_metric_ci",
     "cramers_v",
     "paired_bootstrap_ci",
+    "paired_bootstrap_metric_ci",
     "pool_adjusted_p_values",
     "vif_single",
 ]
@@ -136,6 +139,93 @@ def paired_bootstrap_ci(
         "p_value": p_value,
         "n_bootstrap": n_bootstrap,
         "bootstrap_deltas": bootstrap_deltas,
+    }
+
+
+def paired_bootstrap_metric_ci(
+    y_true: ArrayLike,
+    proba_a: ArrayLike,
+    proba_b: ArrayLike,
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    n_bootstrap: int,
+    random_state: int,
+) -> dict[str, Any]:
+    """Percentile bootstrap CI on Δ = metric_fn(y_true, proba_a) − metric_fn(y_true, proba_b), by row resampling.
+
+    For set-level metrics such as average precision, which have no per-row
+    decomposition to difference directly: unlike paired_bootstrap_ci (which
+    resamples pre-computed per-unit scores), this resamples row *indices*
+    with replacement and recomputes metric_fn for both models over the same
+    resampled rows each iteration — the only way to bootstrap a metric that
+    is a property of a whole ranked set rather than a mean of per-row terms.
+    A plain, unstratified row resample is correct here: prevalence jitter
+    across resamples shifts both models' metric together and cancels in the
+    paired difference. Returns the same delta_obs/delta_ci_lower/
+    delta_ci_upper/p_value/n_bootstrap/bootstrap_deltas contract as
+    paired_bootstrap_ci, so gate.py's comparative rule can consume either.
+    """
+    y = np.asarray(y_true)
+    a = np.asarray(proba_a)
+    b = np.asarray(proba_b)
+    n = len(y)
+    delta_obs = float(metric_fn(y, a) - metric_fn(y, b))
+    rng = np.random.default_rng(random_state)
+    bootstrap_deltas = np.empty(n_bootstrap, dtype=float)
+    for i in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        bootstrap_deltas[i] = metric_fn(y[idx], a[idx]) - metric_fn(y[idx], b[idx])
+    p_value = float((bootstrap_deltas <= 0).mean())
+    ci_lower = float(np.percentile(bootstrap_deltas, 2.5))
+    ci_upper = float(np.percentile(bootstrap_deltas, 97.5))
+    return {
+        "delta_obs": delta_obs,
+        "delta_ci_lower": ci_lower,
+        "delta_ci_upper": ci_upper,
+        "p_value": p_value,
+        "n_bootstrap": n_bootstrap,
+        "bootstrap_deltas": bootstrap_deltas,
+    }
+
+
+def bootstrap_metric_ci(
+    y_true: ArrayLike,
+    proba: ArrayLike,
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    n_bootstrap: int,
+    random_state: int,
+) -> dict[str, Any]:
+    """Percentile bootstrap CI for a single model's own metric, by row resampling.
+
+    Unlike paired_bootstrap_ci/paired_bootstrap_metric_ci (which bootstrap a Δ
+    between two models), this reports one model's metric with a CI — what the
+    sealed-test "metrics of record" (ANALYSIS.md §0's absolute cold-start bars)
+    are checked against. Row-index resampling, not a per-row score mean: a
+    set-level metric such as average precision has no per-row decomposition to
+    bootstrap directly, the same reason paired_bootstrap_metric_ci resamples
+    rows rather than reusing paired_bootstrap_ci's per-unit-score approach.
+    metric_fn receives the resampled (y, proba) pair each iteration, so a
+    threshold-dependent metric (recall at t*, etc.) is passed in as a closure
+    over the fixed threshold rather than this function knowing about one.
+    Returns obs, ci_lower/ci_upper (95% percentile CI), n_bootstrap, and the
+    raw bootstrap_values distribution for plotting.
+    """
+    y = np.asarray(y_true)
+    p = np.asarray(proba)
+    n = len(y)
+    obs = float(metric_fn(y, p))
+    rng = np.random.default_rng(random_state)
+    bootstrap_values = np.empty(n_bootstrap, dtype=float)
+    for i in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        bootstrap_values[i] = metric_fn(y[idx], p[idx])
+    ci_lower = float(np.percentile(bootstrap_values, 2.5))
+    ci_upper = float(np.percentile(bootstrap_values, 97.5))
+    return {
+        "obs": obs,
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
+        "n_bootstrap": n_bootstrap,
+        "bootstrap_values": bootstrap_values,
     }
 
 

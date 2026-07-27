@@ -12,7 +12,9 @@ from telco_churn.models.diagnostics import (
     fixed_recall_profile,
     generalization_gap,
     learning_curve_points,
+    segment_bootstrap_ci,
     segment_bootstrap_delta,
+    segment_decision_rates,
     segment_oof_errors,
 )
 
@@ -320,6 +322,251 @@ def test_segment_bootstrap_delta_deterministic_with_fixed_seed() -> None:
         y_true, proba_lgbm, proba_logreg, group, n_bootstrap=200, random_state=42
     )
     assert rows_a == rows_b
+
+
+# ---------------------------------------------------------------------------
+# segment_bootstrap_ci
+# ---------------------------------------------------------------------------
+
+
+def test_segment_bootstrap_ci_keys() -> None:
+    """Each row contains the six expected keys."""
+    rng = np.random.default_rng(20)
+    n = 100
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(rng.choice(["A", "B"], size=n), name="test_col")
+    rows = segment_bootstrap_ci(y_true, proba, group, n_bootstrap=200, random_state=42)
+    assert len(rows) >= 1
+    for row in rows:
+        assert {
+            "segment",
+            "value",
+            "n",
+            "pr_auc_obs",
+            "pr_auc_ci_lower",
+            "pr_auc_ci_upper",
+        } <= set(row)
+
+
+def test_segment_bootstrap_ci_segment_name() -> None:
+    """segment field matches the Series name."""
+    rng = np.random.default_rng(21)
+    n = 60
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(["X"] * 30 + ["Y"] * 30, name="my_col")
+    rows = segment_bootstrap_ci(y_true, proba, group, n_bootstrap=200, random_state=42)
+    assert all(r["segment"] == "my_col" for r in rows)
+
+
+def test_segment_bootstrap_ci_skips_small_groups() -> None:
+    """Groups with fewer than 10 samples are excluded."""
+    rng = np.random.default_rng(22)
+    n_common, n_rare = 80, 5
+    n = n_common + n_rare
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(["common"] * n_common + ["rare"] * n_rare, name="g")
+    rows = segment_bootstrap_ci(y_true, proba, group, n_bootstrap=200, random_state=42)
+    values = [r["value"] for r in rows]
+    assert "rare" not in values
+    assert "common" in values
+
+
+def test_segment_bootstrap_ci_skips_single_class_segment() -> None:
+    """A segment with only one class present is skipped — PR-AUC is undefined without both classes."""
+    y_true = [0] * 10
+    proba = [0.1 + i * 0.01 for i in range(10)]
+    group = pd.Series(["only"] * 10, name="flag")
+    rows = segment_bootstrap_ci(y_true, proba, group, n_bootstrap=200, random_state=42)
+    assert rows == []
+
+
+def test_segment_bootstrap_ci_lower_bound_clears_churn_floor_for_strong_segment() -> (
+    None
+):
+    """A segment where the model separates classes cleanly has a CI lower bound
+    comfortably above that segment's own churn-rate floor — the V1 veto condition
+    this function feeds."""
+    rng = np.random.default_rng(23)
+    n = 300
+    y_true = rng.integers(0, 2, size=n)
+    proba = np.where(y_true == 1, 0.9, 0.1) + rng.normal(0, 0.05, n)
+    group = pd.Series(["seg"] * n, name="g")
+    rows = segment_bootstrap_ci(
+        y_true.tolist(), proba.tolist(), group, n_bootstrap=500, random_state=42
+    )
+    churn_floor = float(y_true.mean())
+    assert rows[0]["pr_auc_ci_lower"] > churn_floor
+
+
+def test_segment_bootstrap_ci_flags_weak_segment_near_floor() -> None:
+    """A segment with near-random predictions has a CI lower bound close to (not
+    materially above) its own churn-rate floor — the collapse case V1 vetoes on."""
+    rng = np.random.default_rng(24)
+    n = 300
+    y_true = rng.integers(0, 2, size=n)
+    proba = rng.random(n)  # uninformative
+    group = pd.Series(["seg"] * n, name="g")
+    rows = segment_bootstrap_ci(
+        y_true.tolist(), proba.tolist(), group, n_bootstrap=500, random_state=42
+    )
+    churn_floor = float(y_true.mean())
+    assert rows[0]["pr_auc_ci_lower"] < churn_floor + 0.15
+
+
+def test_segment_bootstrap_ci_deterministic_with_fixed_seed() -> None:
+    """Same random_state reproduces byte-identical results across calls."""
+    rng = np.random.default_rng(25)
+    n = 100
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(["seg"] * n, name="g")
+    rows_a = segment_bootstrap_ci(
+        y_true, proba, group, n_bootstrap=200, random_state=42
+    )
+    rows_b = segment_bootstrap_ci(
+        y_true, proba, group, n_bootstrap=200, random_state=42
+    )
+    assert rows_a == rows_b
+
+
+def test_segment_bootstrap_ci_empty_group_returns_empty_list() -> None:
+    """An empty group Series returns an empty list, not an error."""
+    rows = segment_bootstrap_ci(
+        [], [], pd.Series([], dtype=object, name="g"), n_bootstrap=200, random_state=42
+    )
+    assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# segment_decision_rates
+# ---------------------------------------------------------------------------
+
+
+def test_segment_decision_rates_keys() -> None:
+    """Each row contains the six expected keys."""
+    rng = np.random.default_rng(30)
+    n = 100
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(rng.choice(["A", "B"], size=n), name="test_col")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert len(rows) >= 1
+    for row in rows:
+        assert {
+            "segment",
+            "value",
+            "n",
+            "selection_rate",
+            "fnr",
+            "fpr",
+            "precision",
+        } <= set(row)
+
+
+def test_segment_decision_rates_segment_name() -> None:
+    """segment field matches the Series name."""
+    rng = np.random.default_rng(31)
+    n = 60
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(["X"] * 30 + ["Y"] * 30, name="my_col")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert all(r["segment"] == "my_col" for r in rows)
+
+
+def test_segment_decision_rates_skips_small_groups() -> None:
+    """Groups with fewer than 10 samples are excluded."""
+    rng = np.random.default_rng(32)
+    n_common, n_rare = 80, 5
+    n = n_common + n_rare
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(["common"] * n_common + ["rare"] * n_rare, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    values = [r["value"] for r in rows]
+    assert "rare" not in values
+    assert "common" in values
+
+
+def test_segment_decision_rates_selection_rate_matches_manual_count() -> None:
+    """selection_rate equals the fraction of the segment scored >= threshold."""
+    y_true = [0] * 20
+    proba = [0.1] * 10 + [0.9] * 10  # exactly half above threshold
+    group = pd.Series(["seg"] * 20, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert rows[0]["selection_rate"] == pytest.approx(0.5)
+
+
+def test_segment_decision_rates_all_negatives_selected_gives_fpr_one_fnr_nan() -> None:
+    """An all-negative segment scored entirely above threshold has FPR=1.0 and an
+    undefined (NaN) FNR — there are no positives to miss."""
+    y_true = [0] * 10
+    proba = [0.9] * 10
+    group = pd.Series(["seg"] * 10, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert rows[0]["fpr"] == pytest.approx(1.0)
+    assert math.isnan(rows[0]["fnr"])
+
+
+def test_segment_decision_rates_all_positives_missed_gives_fnr_one_fpr_nan() -> None:
+    """An all-positive segment scored entirely below threshold has FNR=1.0 and an
+    undefined (NaN) FPR — there are no negatives to falsely flag."""
+    y_true = [1] * 10
+    proba = [0.1] * 10
+    group = pd.Series(["seg"] * 10, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert rows[0]["fnr"] == pytest.approx(1.0)
+    assert math.isnan(rows[0]["fpr"])
+
+
+def test_segment_decision_rates_precision_nan_when_nothing_selected() -> None:
+    """Precision is NaN, not a divide-by-zero error, when no one in the segment is
+    scored above threshold."""
+    y_true = [0] * 5 + [1] * 5
+    proba = [0.1] * 10
+    group = pd.Series(["seg"] * 10, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert math.isnan(rows[0]["precision"])
+
+
+def test_segment_decision_rates_perfect_classifier_has_zero_error_rates() -> None:
+    """A perfect classifier at the decision threshold has FNR=0, FPR=0, precision=1."""
+    y_true = [0] * 10 + [1] * 10
+    proba = [0.1] * 10 + [0.9] * 10
+    group = pd.Series(["seg"] * 20, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert rows[0]["fnr"] == pytest.approx(0.0)
+    assert rows[0]["fpr"] == pytest.approx(0.0)
+    assert rows[0]["precision"] == pytest.approx(1.0)
+
+
+def test_segment_decision_rates_detects_selection_rate_gap_across_segments() -> None:
+    """Two segments with different score distributions around the threshold show a
+    visibly different selection rate — the demographic-parity-diff signal this
+    function exists to surface."""
+    y_true = [0] * 20 + [1] * 20
+    proba_low_selected = [0.1] * 15 + [0.6] * 5  # segment A: mostly below threshold
+    proba_high_selected = [0.6] * 5 + [0.9] * 15  # segment B: mostly above threshold
+    y_a, y_b = y_true[:20], y_true[20:]
+    group = pd.Series(["A"] * 20 + ["B"] * 20, name="g")
+    rows = {
+        r["value"]: r
+        for r in segment_decision_rates(
+            y_a + y_b, proba_low_selected + proba_high_selected, group, threshold=0.5
+        )
+    }
+    assert rows["B"]["selection_rate"] > rows["A"]["selection_rate"] + 0.3
+
+
+def test_segment_decision_rates_empty_group_returns_empty_list() -> None:
+    """An empty group Series returns an empty list, not an error."""
+    rows = segment_decision_rates(
+        [], [], pd.Series([], dtype=object, name="g"), threshold=0.5
+    )
+    assert rows == []
 
 
 # ---------------------------------------------------------------------------

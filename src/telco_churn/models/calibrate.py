@@ -61,6 +61,7 @@ __all__ = [
     "pooled_brier",
     "brier_skill_score",
     "expected_calibration_error",
+    "murphy_decomposition",
     "calibration_slope",
     "pr_auc_gate_passes",
     "brier_switch_decision",
@@ -388,6 +389,67 @@ def expected_calibration_error(
     return float(ece)
 
 
+def murphy_decomposition(
+    proba: NDArray[np.float64], y_dev: pd.Series, cfg: DictConfig
+) -> dict[str, float]:
+    """Murphy's three-term decomposition: Brier = reliability - resolution + uncertainty.
+
+    Binned identically to expected_calibration_error (same
+    cfg.calibration.ece_n_bins/ece_strategy), so the two diagnostics are read
+    off the same bins rather than two independently-tuned schemes. Per bin k
+    (mean forecast p_k, observed frequency o_k, count n_k) and overall base
+    rate o-bar:
+      reliability = (1/N) sum_k n_k (p_k - o_k)^2   -- calibration error
+      resolution  = (1/N) sum_k n_k (o_k - o-bar)^2 -- discrimination ability
+      uncertainty = o-bar (1 - o-bar)               -- outcome variance alone
+
+    This is what makes a Brier movement attributable rather than a single
+    opaque number: Brier blends calibration quality with ranking quality, so
+    a model can improve its Brier purely by improving resolution (better
+    ranking) while reliability (calibration) gets worse — exactly the failure
+    the calibration-slope guardrail exists to catch independently (ANALYSIS.md
+    §0). reliability/resolution/uncertainty reconstruct the directly-computed
+    Brier only approximately for continuous forecasts (the identity is exact
+    for forecasts that are literally constant within each bin); the gap
+    shrinks as n_bins grows and is a discretization artifact, not a bug.
+    """
+    n_bins = int(cfg.calibration.ece_n_bins)
+    strategy = str(cfg.calibration.ece_strategy)
+    y = y_dev.to_numpy()
+    p = np.asarray(proba)
+    n = len(p)
+    base_rate = float(y.mean())
+
+    if strategy == "quantile":
+        edges = np.unique(np.quantile(p, np.linspace(0.0, 1.0, n_bins + 1)))
+        if len(edges) < 2:
+            edges = np.array([0.0, 1.0])
+    else:
+        edges = np.linspace(0.0, 1.0, n_bins + 1)
+    edges[0], edges[-1] = 0.0, 1.0
+    bin_ids = np.clip(np.digitize(p, edges[1:-1], right=True), 0, len(edges) - 2)
+
+    reliability = 0.0
+    resolution = 0.0
+    for b in range(len(edges) - 1):
+        mask = bin_ids == b
+        if not mask.any():
+            continue
+        n_k = float(mask.sum())
+        p_k = float(p[mask].mean())
+        o_k = float(y[mask].mean())
+        reliability += n_k / n * (p_k - o_k) ** 2
+        resolution += n_k / n * (o_k - base_rate) ** 2
+
+    uncertainty = base_rate * (1.0 - base_rate)
+    return {
+        "reliability": float(reliability),
+        "resolution": float(resolution),
+        "uncertainty": float(uncertainty),
+        "brier_reconstructed": float(reliability - resolution + uncertainty),
+    }
+
+
 def calibration_slope(
     y_true: pd.Series | NDArray[np.float64],
     proba: NDArray[np.float64],
@@ -579,11 +641,19 @@ def select_calibration_method(
     invalidate the derived threshold.
 
     method: 'sigmoid' | 'isotonic' pinned — the normal path once 'auto' has
-    picked a winner. Computes only that method's OOF, skipping the other
-    method and the sigmoid-vs-isotonic Brier bootstrap entirely (~30 fits vs
-    ~65). Still runs pr_auc_gate_passes against the uncalibrated baseline — a
-    cheap, single-method check — so a pinned method that regresses ranking on
-    a later retrain fails loudly instead of registering silently.
+    picked a winner. Still fits *both* methods' OOF every cycle — the same
+    per-fold model-fit cost as 'auto' — so calibration_summary.json always
+    carries both candidates' diagnostics, not just the pinned winner's; a
+    notebook or ANALYSIS.md citing "isotonic scored X" is never citing a
+    number this cycle didn't actually produce. What pinned mode skips is the
+    sigmoid-vs-isotonic Brier-bootstrap switch test itself — a cheap
+    resampling step, not additional fits — since deciding the method is not
+    this branch's job. Only the pinned (configured) method's diagnostics
+    gate: pr_auc_gate_passes runs against it and raises on regression, so a
+    pinned method that regresses ranking on a later retrain fails loudly
+    instead of registering silently. The unpinned method's diagnostics are
+    informational only — never gated, never able to change `method` or
+    `calibrated_proba`.
 
     Returns {"method", "diagnostics": {method_name: {...}}, "switch_decision",
     "uncalibrated_proba", "calibrated_proba"}. switch_decision is always present
@@ -645,6 +715,18 @@ def select_calibration_method(
                 "to register a model with degraded ranking; re-run calibration.method="
                 "'auto' to re-derive the method."
             )
+
+        other_method = "isotonic" if configured_method == "sigmoid" else "sigmoid"
+        other_proba = oof_calibrated_proba(pipeline, other_method, X_dev, y_dev, cfg)
+        other_per_fold_ap = per_fold_average_precision(other_proba, X_dev, y_dev, cfg)
+        other_brier = pooled_brier(other_proba, y_dev)
+        diagnostics[other_method] = {
+            "per_fold_mean_ap": float(np.mean(other_per_fold_ap)),
+            "pooled_brier": other_brier,
+            "ece": expected_calibration_error(other_proba, y_dev, cfg),
+            "bss": brier_skill_score(other_brier, dummy_brier),
+        }
+
         return {
             "method": configured_method,
             "diagnostics": diagnostics,
@@ -855,10 +937,18 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     re-deriving it).
 
     Also logs dev_brier/dev_bss/dev_ece/dev_per_fold_mean_ap/
-    dev_calibration_slope/dev_uncalibrated_calibration_slope/
-    dev_mean_p_hat_calibrated/dev_mean_p_hat_uncalibrated/
-    dev_observed_churn_rate as MLflow metrics (not just JSON fields), so they
-    are plottable as a series across retraining cycles.
+    dev_calibration_slope/dev_calibration_slope_ci_lower/
+    dev_calibration_slope_ci_upper/dev_uncalibrated_calibration_slope/
+    dev_uncalibrated_calibration_slope_ci_lower/
+    dev_uncalibrated_calibration_slope_ci_upper/dev_mean_p_hat_calibrated/
+    dev_mean_p_hat_uncalibrated/dev_observed_churn_rate as MLflow metrics (not
+    just JSON fields), so they are plottable as a series across retraining
+    cycles. The calibrated CI bounds are what let a future retrain cycle's
+    slope be read as "still inside band" vs. "genuinely drifted" without
+    opening calibration_summary.json; the uncalibrated CI bounds complete the
+    paired before/after comparison the notebook's own table already shows
+    (both rows, both with a 95% CI) rather than leaving half of that pairing
+    only in the JSON.
 
     reports/figures/reliability_diagram.png is overwritten on every call —
     it reflects whichever run executed this function most recently on this
@@ -932,8 +1022,8 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     # dataset is static and the folds are seeded, and silently diverges from
     # the vector this cycle's decisions actually rested on once either isn't
     # true (Phase 10's retraining). Segment/protected columns are joined
-    # later, by Phase 7's calibration_screen.py, where the dev-partition
-    # feature columns are in hand — this is the minimal vector.
+    # later, by Phase 7's evaluate.py, where the dev-partition feature
+    # columns are in hand — this is the minimal vector.
     dev_oof_predictions = pd.DataFrame(
         {
             "customerid": load_dev_customer_ids(),
@@ -1014,7 +1104,15 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
                 "dev_ece": winning_diagnostics["ece"],
                 "dev_per_fold_mean_ap": winning_diagnostics["per_fold_mean_ap"],
                 "dev_calibration_slope": slope["slope"],
+                "dev_calibration_slope_ci_lower": slope["slope_ci_lower"],
+                "dev_calibration_slope_ci_upper": slope["slope_ci_upper"],
                 "dev_uncalibrated_calibration_slope": uncalibrated_slope["slope"],
+                "dev_uncalibrated_calibration_slope_ci_lower": uncalibrated_slope[
+                    "slope_ci_lower"
+                ],
+                "dev_uncalibrated_calibration_slope_ci_upper": uncalibrated_slope[
+                    "slope_ci_upper"
+                ],
                 "dev_mean_p_hat_calibrated": calibration_summary[
                     "mean_p_hat_calibrated"
                 ],

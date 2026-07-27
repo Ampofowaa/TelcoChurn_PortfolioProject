@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
+from sklearn.metrics import average_precision_score
 
-from telco_churn.utils.stats import benjamini_hochberg, pool_adjusted_p_values
+from telco_churn.utils.stats import (
+    benjamini_hochberg,
+    bootstrap_metric_ci,
+    paired_bootstrap_metric_ci,
+    pool_adjusted_p_values,
+)
 
 # ---------------------------------------------------------------------------
 # benjamini_hochberg
@@ -125,3 +132,220 @@ def test_pool_adjusted_p_values_handles_empty_group() -> None:
     result_a, result_b = pool_adjusted_p_values([], [0.01, 0.5])
     assert result_a.shape == (0,)
     assert result_b.shape == (2,)
+
+
+# ---------------------------------------------------------------------------
+# paired_bootstrap_metric_ci
+# ---------------------------------------------------------------------------
+
+
+def test_paired_bootstrap_metric_ci_recovers_planted_ranking_gap() -> None:
+    """proba_a ranks by the true signal; proba_b is pure noise — Δ_obs must be
+    positive and the CI must exclude 0 in proba_a's favour."""
+    rng = np.random.default_rng(0)
+    n = 400
+    y = (rng.uniform(size=n) < 0.3).astype(int)
+    proba_a = np.clip(y * 0.7 + rng.normal(0, 0.15, size=n), 0, 1)
+    proba_b = rng.uniform(size=n)
+    result = paired_bootstrap_metric_ci(
+        y,
+        proba_a,
+        proba_b,
+        average_precision_score,
+        n_bootstrap=1000,
+        random_state=42,
+    )
+    assert result["delta_obs"] > 0
+    assert result["delta_ci_lower"] > 0
+
+
+def test_paired_bootstrap_metric_ci_identical_scores_give_zero_delta_and_straddling_ci() -> (
+    None
+):
+    """The noise case the gate must refuse: no ranking gap, CI must straddle 0."""
+    rng = np.random.default_rng(1)
+    n = 200
+    y = (rng.uniform(size=n) < 0.3).astype(int)
+    proba = rng.uniform(size=n)
+    result = paired_bootstrap_metric_ci(
+        y, proba, proba, average_precision_score, n_bootstrap=500, random_state=42
+    )
+    assert result["delta_obs"] == 0.0
+    assert result["delta_ci_lower"] <= 0.0 <= result["delta_ci_upper"]
+
+
+def test_paired_bootstrap_metric_ci_ci_contains_obs() -> None:
+    """The 95% CI must bracket the observed Δ."""
+    rng = np.random.default_rng(2)
+    n = 300
+    y = (rng.uniform(size=n) < 0.3).astype(int)
+    proba_a = np.clip(y * 0.5 + rng.normal(0, 0.2, size=n), 0, 1)
+    proba_b = np.clip(y * 0.3 + rng.normal(0, 0.2, size=n), 0, 1)
+    result = paired_bootstrap_metric_ci(
+        y,
+        proba_a,
+        proba_b,
+        average_precision_score,
+        n_bootstrap=1000,
+        random_state=7,
+    )
+    assert result["delta_ci_lower"] <= result["delta_obs"] <= result["delta_ci_upper"]
+
+
+def test_paired_bootstrap_metric_ci_return_keys() -> None:
+    """Same six-key contract as paired_bootstrap_ci, so gate.py can consume either."""
+    y = np.array([0, 1, 0, 1, 1])
+    proba = np.array([0.1, 0.9, 0.2, 0.8, 0.7])
+    result = paired_bootstrap_metric_ci(
+        y, proba, proba, average_precision_score, n_bootstrap=50, random_state=0
+    )
+    assert set(result) == {
+        "delta_obs",
+        "delta_ci_lower",
+        "delta_ci_upper",
+        "p_value",
+        "n_bootstrap",
+        "bootstrap_deltas",
+    }
+
+
+def test_paired_bootstrap_metric_ci_n_bootstrap_preserved() -> None:
+    y = np.array([0, 1, 0, 1, 1])
+    proba = np.array([0.1, 0.9, 0.2, 0.8, 0.7])
+    result = paired_bootstrap_metric_ci(
+        y, proba, proba, average_precision_score, n_bootstrap=123, random_state=0
+    )
+    assert result["n_bootstrap"] == 123
+
+
+def test_paired_bootstrap_metric_ci_deterministic_under_fixed_random_state() -> None:
+    """Same random_state must reproduce bit-identical bootstrap draws."""
+    rng = np.random.default_rng(3)
+    n = 150
+    y = (rng.uniform(size=n) < 0.3).astype(int)
+    proba_a = rng.uniform(size=n)
+    proba_b = rng.uniform(size=n)
+    result_1 = paired_bootstrap_metric_ci(
+        y,
+        proba_a,
+        proba_b,
+        average_precision_score,
+        n_bootstrap=200,
+        random_state=99,
+    )
+    result_2 = paired_bootstrap_metric_ci(
+        y,
+        proba_a,
+        proba_b,
+        average_precision_score,
+        n_bootstrap=200,
+        random_state=99,
+    )
+    np.testing.assert_array_equal(
+        result_1["bootstrap_deltas"], result_2["bootstrap_deltas"]
+    )
+    assert result_1["delta_obs"] == result_2["delta_obs"]
+
+
+# ---------------------------------------------------------------------------
+# bootstrap_metric_ci
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_metric_ci_obs_matches_direct_computation() -> None:
+    """obs equals metric_fn applied directly to the unresampled data."""
+    rng = np.random.default_rng(0)
+    n = 300
+    y = (rng.uniform(size=n) < 0.3).astype(int)
+    proba = np.clip(y * 0.6 + rng.normal(0, 0.2, size=n), 0, 1)
+    result = bootstrap_metric_ci(
+        y, proba, average_precision_score, n_bootstrap=500, random_state=42
+    )
+    assert result["obs"] == pytest.approx(average_precision_score(y, proba))
+
+
+def test_bootstrap_metric_ci_ci_contains_obs() -> None:
+    """The 95% CI must bracket the observed value."""
+    rng = np.random.default_rng(1)
+    n = 300
+    y = (rng.uniform(size=n) < 0.3).astype(int)
+    proba = np.clip(y * 0.5 + rng.normal(0, 0.2, size=n), 0, 1)
+    result = bootstrap_metric_ci(
+        y, proba, average_precision_score, n_bootstrap=1000, random_state=7
+    )
+    assert result["ci_lower"] <= result["obs"] <= result["ci_upper"]
+
+
+def test_bootstrap_metric_ci_recovers_high_pr_auc_for_strong_separator() -> None:
+    """A near-perfect separator's CI sits high and tight, well above the
+    ~0.3 base-rate floor."""
+    rng = np.random.default_rng(2)
+    n = 400
+    y = (rng.uniform(size=n) < 0.3).astype(int)
+    proba = np.where(y == 1, 0.9, 0.1) + rng.normal(0, 0.03, size=n)
+    result = bootstrap_metric_ci(
+        y, proba, average_precision_score, n_bootstrap=500, random_state=3
+    )
+    assert result["ci_lower"] > 0.7
+
+
+def test_bootstrap_metric_ci_return_keys() -> None:
+    """Result carries exactly the five documented keys."""
+    y = np.array([0, 1, 0, 1, 1])
+    proba = np.array([0.1, 0.9, 0.2, 0.8, 0.7])
+    result = bootstrap_metric_ci(
+        y, proba, average_precision_score, n_bootstrap=50, random_state=0
+    )
+    assert set(result) == {
+        "obs",
+        "ci_lower",
+        "ci_upper",
+        "n_bootstrap",
+        "bootstrap_values",
+    }
+
+
+def test_bootstrap_metric_ci_n_bootstrap_preserved() -> None:
+    y = np.array([0, 1, 0, 1, 1])
+    proba = np.array([0.1, 0.9, 0.2, 0.8, 0.7])
+    result = bootstrap_metric_ci(
+        y, proba, average_precision_score, n_bootstrap=123, random_state=0
+    )
+    assert result["n_bootstrap"] == 123
+    assert len(result["bootstrap_values"]) == 123
+
+
+def test_bootstrap_metric_ci_deterministic_under_fixed_random_state() -> None:
+    """Same random_state must reproduce bit-identical bootstrap draws."""
+    rng = np.random.default_rng(3)
+    n = 150
+    y = (rng.uniform(size=n) < 0.3).astype(int)
+    proba = rng.uniform(size=n)
+    result_1 = bootstrap_metric_ci(
+        y, proba, average_precision_score, n_bootstrap=200, random_state=99
+    )
+    result_2 = bootstrap_metric_ci(
+        y, proba, average_precision_score, n_bootstrap=200, random_state=99
+    )
+    np.testing.assert_array_equal(
+        result_1["bootstrap_values"], result_2["bootstrap_values"]
+    )
+    assert result_1["obs"] == result_2["obs"]
+
+
+def test_bootstrap_metric_ci_accepts_thresholded_metric_closure() -> None:
+    """metric_fn can be a closure over a fixed threshold — recall at t*, not
+    just a raw-probability metric like average precision."""
+    from sklearn.metrics import recall_score
+
+    y = np.array([0, 0, 1, 1, 1])
+    proba = np.array([0.1, 0.4, 0.6, 0.7, 0.9])
+    t_star = 0.5
+
+    def recall_at_threshold(y_true: np.ndarray, p: np.ndarray) -> float:
+        return float(recall_score(y_true, (p >= t_star).astype(int)))
+
+    result = bootstrap_metric_ci(
+        y, proba, recall_at_threshold, n_bootstrap=200, random_state=0
+    )
+    assert result["obs"] == pytest.approx(1.0)

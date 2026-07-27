@@ -163,13 +163,6 @@ def registered_threshold_model(
     experiment_name = str(compose_config().mlflow.experiment_name)
     tracking_uri = _sqlite_experiment(seed_root, experiment_name)
     registered_model_name = "test-threshold-subprocess-pipeline"
-    cfg = compose_config(
-        overrides=[
-            f"mlflow.tracking_uri={tracking_uri}",
-            f"mlflow.registered_model_name={registered_model_name}",
-            *_FAST_CALIBRATION_OVERRIDES,
-        ]
-    )
 
     dev_df, _test_df = partition(df, manifest)
     feature_cols = [c for c in df.columns if c not in ("customerid", "churn")]
@@ -215,12 +208,33 @@ def registered_threshold_model(
         "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
     }
 
-    with mlflow.start_run(run_name="tuning_study") as run:
-        tuning_result["parent_run_id"] = run.info.run_id
-    log_result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, cfg
-    )
-    cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
+    # calibrate.run_calibration_step (unlike log_model.run_model_logging_step,
+    # which takes X_dev/y_dev explicitly) loads dev data itself internally via
+    # load_dev_features()/load_dev_customer_ids() — both resolve
+    # cfg.paths.processed_data = ${oc.env:PROCESSED_DATA_DIR,datasets/processed/}.
+    # Composing cfg and calling calibration inside this scoped env override
+    # (rather than after, as a bare compose_config() call would do) is
+    # load-bearing: without it, this in-process call silently reads the real
+    # project's datasets/processed/ instead of this fixture's seeded data,
+    # logging dev_oof_predictions.parquet against real customerids that share
+    # no overlap with the synthetic cust-NNNN ids the subprocess below
+    # computes (via the same env var, correctly set for it) — surfacing as a
+    # dev-partition mismatch assertion failure in threshold.py, not here.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PROCESSED_DATA_DIR", str(data_dir))
+        cfg = compose_config(
+            overrides=[
+                f"mlflow.tracking_uri={tracking_uri}",
+                f"mlflow.registered_model_name={registered_model_name}",
+                *_FAST_CALIBRATION_OVERRIDES,
+            ]
+        )
+        with mlflow.start_run(run_name="tuning_study") as run:
+            tuning_result["parent_run_id"] = run.info.run_id
+        log_result = log_model.run_model_logging_step(
+            X_dev, y_dev, comparison_result, tuning_result, cfg
+        )
+        cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
 
     return (
         tracking_uri,

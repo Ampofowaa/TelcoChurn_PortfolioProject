@@ -5,6 +5,8 @@ defaults:
   - tuning: optuna         # Optuna study + search space → cfg.tuning
   - calibration: default  # calibration method/CV/ECE knobs → cfg.calibration
   - threshold: default    # threshold derivation knobs → cfg.threshold
+  - evaluate: default     # sealed-test evaluation knobs → cfg.evaluate
+  - error_analysis: default  # error-diagnosis step knobs → cfg.error_analysis
   # - data: telco          # pending
   # - serving: api         # pending
   - _self_
@@ -42,6 +44,7 @@ paths:
   figures: ${paths.reports}/figures
   policy: configs/policy
   costs_config: configs/costs.yaml
+  model_promotion_config: configs/model_promotion.yaml
 
 validation:
   min_rows: 1000

@@ -1,16 +1,23 @@
-"""Non-gating diagnostic helpers for model selection.
+"""Non-gating diagnostic helpers for model selection and evaluation.
 
-Pure, side-effect-free functions. fixed_recall_profile, segment_oof_errors, and
-segment_bootstrap_delta are reused by models/train/comparison.py; generalization_gap
-and learning_curve_points are called directly from notebooks/03a-model-selection.ipynb.
-None of these decide the model family — that is the paired-bootstrap PR-AUC gate in
+Pure, side-effect-free functions — no I/O, no config, no knowledge of which columns
+are segment axes. fixed_recall_profile, segment_oof_errors, and segment_bootstrap_delta
+are reused by models/train/comparison.py; generalization_gap and learning_curve_points
+are called directly from notebooks/03a-model-selection.ipynb. None of these decide the
+model family — that is the paired-bootstrap PR-AUC gate in
 models/train/comparison.py's bootstrap_comparison. They flag robustness/fairness
 concerns and characterize bias/variance for the analyst.
+
+segment_bootstrap_ci and segment_decision_rates are Phase 7 additions consumed by
+models/evaluate.py, which owns loading the dev-OOF/test probability vectors and joining
+the segment-axis columns onto them before calling these. Unlike the family-selection
+helpers above, their outputs feed §0's V1/V2 veto-only guardrails — but the veto
+decision itself lives in models/gate.py, never here.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -20,7 +27,9 @@ __all__ = [
     "fixed_recall_profile",
     "generalization_gap",
     "learning_curve_points",
+    "segment_bootstrap_ci",
     "segment_bootstrap_delta",
+    "segment_decision_rates",
     "segment_oof_errors",
 ]
 
@@ -116,6 +125,98 @@ def segment_oof_errors(
     return rows
 
 
+def _segment_bootstrap(
+    y_true: np.ndarray,
+    group: pd.Series,
+    score_fn: Callable[..., float],
+    arrays: tuple[np.ndarray, ...],
+    n_bootstrap: int,
+    random_state: int,
+) -> list[dict[str, object]]:
+    """Shared per-segment percentile-bootstrap scaffolding.
+
+    score_fn(y_seg, *arrays_seg) -> float computes the observed statistic from
+    row-aligned, already segment-masked arrays — a bare PR-AUC for
+    segment_bootstrap_ci, a Δ between two candidates for segment_bootstrap_delta.
+    Each resample draws row indices once per segment and applies score_fn to the
+    identical resampled rows across every array, so a paired caller's shared
+    segment-level noise cancels in its delta rather than surviving into two
+    separately-resampled CIs. Segments smaller than _MIN_SEGMENT_SIZE, or a resample
+    with only one class present, are skipped — every caller's statistic is undefined
+    either way.
+    """
+    rng = np.random.default_rng(random_state)
+    rows: list[dict[str, object]] = []
+    for value in sorted(group.unique(), key=str):
+        mask = (group == value).to_numpy()
+        n = int(mask.sum())
+        if n < _MIN_SEGMENT_SIZE:
+            continue
+        y_seg = y_true[mask]
+        if len(np.unique(y_seg)) < 2:
+            continue
+        seg_arrays = tuple(a[mask] for a in arrays)
+        obs = float(score_fn(y_seg, *seg_arrays))
+
+        stats: list[float] = []
+        for _ in range(n_bootstrap):
+            idx = rng.integers(0, n, n)
+            y_b = y_seg[idx]
+            if len(np.unique(y_b)) < 2:
+                continue
+            stats.append(float(score_fn(y_b, *(a[idx] for a in seg_arrays))))
+
+        rows.append(
+            {
+                "segment": group.name,
+                "value": value,
+                "n": n,
+                "obs": obs,
+                "ci_lower": float(np.percentile(stats, 2.5)),
+                "ci_upper": float(np.percentile(stats, 97.5)),
+            }
+        )
+    return rows
+
+
+def segment_bootstrap_ci(
+    y_true: Sequence[int],
+    proba: Sequence[float],
+    group: pd.Series,
+    n_bootstrap: int,
+    random_state: int,
+) -> list[dict[str, object]]:
+    """Single-model per-segment PR-AUC with a percentile bootstrap CI.
+
+    Promotes the inline single-model bootstrap from ANALYSIS.md §4a's OOF
+    segment-profiling table into a tested function. Feeds §0's V1 veto (a segment's
+    PR-AUC CI lower bound falling below that segment's own churn-rate floor) and the
+    sealed-test per-slice ranking diagnostic. Unlike segment_bootstrap_delta, there is
+    no second candidate to pair against — this scores one model's probabilities in
+    isolation and never decides the model family.
+    """
+    y_arr = np.asarray(y_true, dtype=float)
+    proba_arr = np.asarray(proba, dtype=float)
+
+    def _pr_auc(y: np.ndarray, p: np.ndarray) -> float:
+        return float(average_precision_score(y, p))
+
+    raw = _segment_bootstrap(
+        y_arr, group, _pr_auc, (proba_arr,), n_bootstrap, random_state
+    )
+    return [
+        {
+            "segment": row["segment"],
+            "value": row["value"],
+            "n": row["n"],
+            "pr_auc_obs": row["obs"],
+            "pr_auc_ci_lower": row["ci_lower"],
+            "pr_auc_ci_upper": row["ci_upper"],
+        }
+        for row in raw
+    ]
+
+
 def segment_bootstrap_delta(
     y_true: Sequence[int],
     proba_lgbm: Sequence[float],
@@ -138,7 +239,46 @@ def segment_bootstrap_delta(
     y_arr = np.asarray(y_true, dtype=float)
     lgbm_arr = np.asarray(proba_lgbm, dtype=float)
     logreg_arr = np.asarray(proba_logreg, dtype=float)
-    rng = np.random.default_rng(random_state)
+
+    def _delta(y: np.ndarray, lgbm: np.ndarray, logreg: np.ndarray) -> float:
+        return float(
+            average_precision_score(y, lgbm) - average_precision_score(y, logreg)
+        )
+
+    raw = _segment_bootstrap(
+        y_arr, group, _delta, (lgbm_arr, logreg_arr), n_bootstrap, random_state
+    )
+    return [
+        {
+            "segment": row["segment"],
+            "value": row["value"],
+            "n": row["n"],
+            "delta_obs": row["obs"],
+            "delta_ci_lower": row["ci_lower"],
+            "delta_ci_upper": row["ci_upper"],
+        }
+        for row in raw
+    ]
+
+
+def segment_decision_rates(
+    y_true: Sequence[int],
+    proba: Sequence[float],
+    group: pd.Series,
+    threshold: float,
+) -> list[dict[str, object]]:
+    """Per-segment decision-level rates at a fixed threshold.
+
+    PR-AUC parity cannot detect allocation harm: it is threshold-free and measures
+    ranking within a group, but a customer is affected by the decision p >= threshold,
+    not by the ranking. Returns, per segment, the selection rate (fraction contacted),
+    FNR, FPR, and precision at `threshold` — the rates §0's V2 (demographic-parity
+    diff = max selection-rate gap) and V2b veto criteria are computed from. FNR/FPR/
+    precision fall back to NaN when their denominator (n_pos/n_neg/predicted-positive
+    count) is zero in a segment, rather than raising.
+    """
+    y_arr = np.asarray(y_true, dtype=float)
+    pred_arr = (np.asarray(proba, dtype=float) >= threshold).astype(float)
 
     rows: list[dict[str, object]] = []
     for value in sorted(group.unique(), key=str):
@@ -146,36 +286,22 @@ def segment_bootstrap_delta(
         n = int(mask.sum())
         if n < _MIN_SEGMENT_SIZE:
             continue
-        y_seg = y_arr[mask]
-        if len(np.unique(y_seg)) < 2:
-            continue
-        lgbm_seg, logreg_seg = lgbm_arr[mask], logreg_arr[mask]
-        delta_obs = float(
-            average_precision_score(y_seg, lgbm_seg)
-            - average_precision_score(y_seg, logreg_seg)
-        )
-
-        deltas: list[float] = []
-        for _ in range(n_bootstrap):
-            idx = rng.integers(0, n, n)
-            y_b = y_seg[idx]
-            if len(np.unique(y_b)) < 2:
-                continue
-            deltas.append(
-                float(
-                    average_precision_score(y_b, lgbm_seg[idx])
-                    - average_precision_score(y_b, logreg_seg[idx])
-                )
-            )
+        y_seg, pred_seg = y_arr[mask], pred_arr[mask]
+        tp = float(((pred_seg == 1) & (y_seg == 1)).sum())
+        fp = float(((pred_seg == 1) & (y_seg == 0)).sum())
+        fn = float(((pred_seg == 0) & (y_seg == 1)).sum())
+        tn = float(((pred_seg == 0) & (y_seg == 0)).sum())
+        n_pos, n_neg, n_pred_pos = tp + fn, fp + tn, tp + fp
 
         rows.append(
             {
                 "segment": group.name,
                 "value": value,
                 "n": n,
-                "delta_obs": delta_obs,
-                "delta_ci_lower": float(np.percentile(deltas, 2.5)),
-                "delta_ci_upper": float(np.percentile(deltas, 97.5)),
+                "selection_rate": float(pred_seg.mean()),
+                "fnr": float(fn / n_pos) if n_pos > 0 else float("nan"),
+                "fpr": float(fp / n_neg) if n_neg > 0 else float("nan"),
+                "precision": float(tp / n_pred_pos) if n_pred_pos > 0 else float("nan"),
             }
         )
     return rows

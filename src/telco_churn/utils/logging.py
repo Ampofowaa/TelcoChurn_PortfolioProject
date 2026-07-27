@@ -44,7 +44,7 @@ def configure_logging(log_level: str = "INFO", log_format: str | None = None) ->
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S UTC", utc=True),
         structlog.processors.StackInfoRenderer(),
     ]
 

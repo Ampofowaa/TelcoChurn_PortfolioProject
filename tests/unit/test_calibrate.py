@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 import mlflow
@@ -20,7 +21,7 @@ import mlflow.artifacts
 import numpy as np
 import pandas as pd
 import pytest
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from sklearn.compose import ColumnTransformer
 from sklearn.datasets import make_classification
 from sklearn.linear_model import LogisticRegression
@@ -42,7 +43,7 @@ _INNER_FOLDS = 3
 
 
 @pytest.fixture
-def calibration_cfg() -> OmegaConf:
+def calibration_cfg() -> DictConfig:
     """Small fold counts for speed — same shape as production config, not its values."""
     return OmegaConf.create(
         {
@@ -120,7 +121,7 @@ def miscalibrated_pipeline() -> Pipeline:
 def test_build_calibrated_pipeline_preprocessor_refit_count(
     unfitted_pipeline: Pipeline,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """Leak canary: ColumnTransformer.fit_transform fires exactly inner_folds + 1
     times under ensemble=False (one per inner fold, plus the final refit on all
@@ -146,7 +147,7 @@ def test_build_calibrated_pipeline_preprocessor_refit_count(
 def test_build_calibrated_pipeline_single_calibrated_classifier(
     unfitted_pipeline: Pipeline,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """ensemble=False collapses calibrated_classifiers_ to length 1, whose
     .estimator is a Pipeline refit on all of development — the SHAP access
@@ -165,7 +166,7 @@ def test_build_calibrated_pipeline_single_calibrated_classifier(
 def test_oof_calibrated_proba_run_twice_is_deterministic(
     unfitted_pipeline: Pipeline,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """Same explicit, seeded StratifiedKFold on both calls — bit-identical OOF
     vectors, not just close ones.
@@ -190,7 +191,7 @@ def test_oof_calibrated_proba_run_twice_is_deterministic(
 def test_calibration_improves_pooled_brier_on_miscalibrated_classifier(
     miscalibrated_pipeline: Pipeline,
     miscalibrated_data: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """Calibrated outer-OOF Brier beats uncalibrated on a classifier that is
     genuinely overconfident by construction — both scored on the same pooled
@@ -210,7 +211,7 @@ def test_calibration_improves_pooled_brier_on_miscalibrated_classifier(
 def test_calibration_slope_closer_to_one_after_calibration_on_miscalibrated_classifier(
     miscalibrated_pipeline: Pipeline,
     miscalibrated_data: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """The calibration slope numerically confirms what a reliability diagram
     can only show visually: a classifier that is overconfident by
@@ -240,7 +241,7 @@ def test_calibration_slope_closer_to_one_after_calibration_on_miscalibrated_clas
 def test_calibration_pr_auc_within_delta_of_uncalibrated(
     miscalibrated_pipeline: Pipeline,
     miscalibrated_data: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """The sigmoid/isotonic gate: calibration must not degrade ranking even
     while it improves Brier — per-fold mean AP, never pooled.
@@ -271,7 +272,7 @@ def test_pr_auc_gate_passes_boundary(
     candidate_ap: list[float],
     uncalibrated_ap: list[float],
     expected: bool,
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """A candidate within Δ* = 0.005 of uncalibrated still passes; one clearly
     beyond it does not. (The exact bit-boundary at delta == -Δ* is deliberately
@@ -315,7 +316,7 @@ def test_brier_switch_decision(
     isotonic_brier: list[float],
     expected_method: str,
     expected_rule: str,
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """Three outcomes only: isotonic must decisively beat sigmoid to win — a
     tie or a sigmoid win both keep the incumbent.
@@ -328,7 +329,7 @@ def test_brier_switch_decision(
 
 
 def test_expected_calibration_error_near_zero_when_calibrated(
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """A probability vector whose predicted mean matches the observed frequency
     in its single bin has ~zero ECE."""
@@ -341,7 +342,7 @@ def test_expected_calibration_error_near_zero_when_calibrated(
 
 
 def test_expected_calibration_error_large_when_miscalibrated(
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """A confidently wrong vector (predicted 0.9, observed 0.1) has ECE ~= 0.8."""
     proba = np.full(20, 0.90)
@@ -353,7 +354,7 @@ def test_expected_calibration_error_large_when_miscalibrated(
 
 
 def test_expected_calibration_error_constant_proba_detects_miscalibration(
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """A fully-constant, badly wrong probability vector must not report ~0 ECE.
 
@@ -373,7 +374,7 @@ def test_expected_calibration_error_constant_proba_detects_miscalibration(
 
 
 def test_expected_calibration_error_warns_on_quantile_bin_collapse(
-    calibration_cfg: OmegaConf, monkeypatch: pytest.MonkeyPatch
+    calibration_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Tied probabilities that collapse the quantile bin count below
     cfg.calibration.ece_n_bins must be flagged, not silently absorbed into a
@@ -401,7 +402,7 @@ def test_expected_calibration_error_warns_on_quantile_bin_collapse(
 
 
 def test_expected_calibration_error_no_warning_without_collapse(
-    calibration_cfg: OmegaConf, monkeypatch: pytest.MonkeyPatch
+    calibration_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Distinct, evenly-spread probabilities reach the configured bin count —
     no collapse warning should fire."""
@@ -421,6 +422,80 @@ def test_expected_calibration_error_no_warning_without_collapse(
         if call.args[0] == "ece_bins_collapsed"
     ]
     assert collapse_calls == []
+
+
+# ---------------------------------------------------------------------------
+# murphy_decomposition
+# ---------------------------------------------------------------------------
+
+
+def test_murphy_decomposition_return_keys(calibration_cfg: DictConfig) -> None:
+    """Result carries exactly the four documented keys."""
+    rng = np.random.default_rng(10)
+    n = 200
+    proba = rng.uniform(0.05, 0.95, size=n)
+    y = pd.Series(rng.integers(0, 2, size=n))
+    result = calibrate.murphy_decomposition(proba, y, calibration_cfg)
+    assert set(result) == {
+        "reliability",
+        "resolution",
+        "uncertainty",
+        "brier_reconstructed",
+    }
+
+
+def test_murphy_decomposition_reconstructs_brier_to_tolerance(
+    calibration_cfg: DictConfig,
+) -> None:
+    """The load-bearing test: reliability - resolution + uncertainty must
+    reconstruct the directly-computed Brier score, to tolerance — the
+    identity that proves the decomposition is implemented correctly rather
+    than plausibly."""
+    from sklearn.metrics import brier_score_loss
+
+    rng = np.random.default_rng(11)
+    n = 5000
+    proba = rng.uniform(0.02, 0.98, size=n)
+    y = pd.Series((rng.uniform(size=n) < proba).astype(int))
+
+    result = calibrate.murphy_decomposition(proba, y, calibration_cfg)
+    direct_brier = float(brier_score_loss(y, proba))
+
+    assert result["brier_reconstructed"] == pytest.approx(direct_brier, abs=0.01)
+
+
+def test_murphy_decomposition_uncertainty_matches_base_rate_variance(
+    calibration_cfg: DictConfig,
+) -> None:
+    """uncertainty equals o-bar(1 - o-bar) for the observed base rate — the
+    term that depends only on y, never on the forecast."""
+    proba = np.full(20, 0.5)
+    y = pd.Series([1] * 8 + [0] * 12)  # base rate 0.4
+    result = calibrate.murphy_decomposition(proba, y, calibration_cfg)
+    assert result["uncertainty"] == pytest.approx(0.4 * 0.6)
+
+
+def test_murphy_decomposition_perfect_calibration_gives_near_zero_reliability(
+    calibration_cfg: DictConfig,
+) -> None:
+    """A forecast whose bin means match their bins' observed frequencies has
+    ~zero reliability (calibration error), regardless of resolution."""
+    proba = np.array([0.1] * 100 + [0.9] * 100)
+    y = pd.Series([1] * 10 + [0] * 90 + [1] * 90 + [0] * 10)  # matches proba exactly
+    result = calibrate.murphy_decomposition(proba, y, calibration_cfg)
+    assert result["reliability"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_murphy_decomposition_no_resolution_when_all_bins_match_base_rate(
+    calibration_cfg: DictConfig,
+) -> None:
+    """A forecast that discriminates nothing (every bin's observed frequency
+    equals the overall base rate) has zero resolution."""
+    proba = np.array([0.2] * 50 + [0.8] * 50)
+    # Both bins have the same 0.3 observed churn rate as the overall base rate.
+    y = pd.Series(([1] * 15 + [0] * 35) + ([1] * 15 + [0] * 35))
+    result = calibrate.murphy_decomposition(proba, y, calibration_cfg)
+    assert result["resolution"] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_calibration_slope_perfectly_calibrated_returns_near_one() -> None:
@@ -592,7 +667,7 @@ def test_calibration_slope_analytic_and_bootstrap_ci_agree_on_well_behaved_data(
 def test_select_calibration_method_pinned_returns_proba_arrays(
     unfitted_pipeline: Pipeline,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """Pinned mode returns calibrated_proba/uncalibrated_proba aligned to y_dev
     — the arrays the reliability diagram is rendered from — not just diagnostics.
@@ -617,10 +692,45 @@ def test_select_calibration_method_pinned_returns_proba_arrays(
     }
 
 
+def test_select_calibration_method_pinned_still_reports_other_method(
+    unfitted_pipeline: Pipeline,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    calibration_cfg: DictConfig,
+) -> None:
+    """Pinned mode fits the unpinned method too, purely for reporting — so
+    calibration_summary.json never carries only the winner's numbers, and a
+    notebook/ANALYSIS.md citing the other method's score is citing a number
+    this cycle actually produced. The unpinned method's diagnostics must not
+    change `method` or `calibrated_proba`.
+
+    Only exercises pinned_method="sigmoid": isotonic regression genuinely
+    fails pr_auc_gate_passes on this fixture's small synthetic dev split (3
+    outer/3 inner folds, LogisticRegression stand-in) — every other pinned-
+    mode test in this file pins sigmoid for the same reason.
+    """
+    X_dev, y_dev = dev_split
+    calibration_cfg.calibration.method = "sigmoid"
+
+    result = calibrate.select_calibration_method(
+        unfitted_pipeline, X_dev, y_dev, calibration_cfg
+    )
+
+    assert result["method"] == "sigmoid"
+    assert result["switch_decision"]["decision_rule"] == "pinned"
+    assert set(result["diagnostics"]) == {
+        "dummy_prior",
+        "uncalibrated",
+        "sigmoid",
+        "isotonic",
+    }
+    for entry in result["diagnostics"].values():
+        assert set(entry) == {"per_fold_mean_ap", "pooled_brier", "ece", "bss"}
+
+
 def test_select_calibration_method_pinned_raises_on_gate_failure(
     unfitted_pipeline: Pipeline,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A pinned method that regresses ranking on a later retrain must fail
@@ -640,7 +750,7 @@ def test_select_calibration_method_pinned_raises_on_gate_failure(
 def test_select_calibration_method_unknown_method_raises(
     unfitted_pipeline: Pipeline,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """Anything other than 'sigmoid' / 'isotonic' / 'auto' is a config typo, not
     a silently-ignored default."""
@@ -659,7 +769,7 @@ def test_select_calibration_method_unknown_method_raises(
 def test_select_calibration_method_auto_calibrated_proba_matches_winner(
     unfitted_pipeline: Pipeline,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
     monkeypatch: pytest.MonkeyPatch,
     winning_method: str,
 ) -> None:
@@ -680,7 +790,7 @@ def test_select_calibration_method_auto_calibrated_proba_matches_winner(
         method: str,
         X: pd.DataFrame,
         y: pd.Series,
-        cfg: OmegaConf,
+        cfg: DictConfig,
     ) -> np.ndarray:
         return sentinels[method]
 
@@ -714,7 +824,7 @@ def test_select_calibration_method_auto_calibrated_proba_matches_winner(
 def test_select_calibration_method_auto_disqualifies_isotonic_on_pr_auc_gate(
     miscalibrated_pipeline: Pipeline,
     miscalibrated_data: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
 ) -> None:
     """Real, unmocked 'auto' run: isotonic overfits GaussianNB's small-sample
     OOF badly enough to fail the PR-AUC gate, so sigmoid ships instead — the
@@ -745,7 +855,7 @@ def test_select_calibration_method_auto_disqualifies_isotonic_on_pr_auc_gate(
 def test_select_calibration_method_auto_runs_real_brier_bootstrap_when_isotonic_eligible(
     unfitted_pipeline: Pipeline,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    calibration_cfg: OmegaConf,
+    calibration_cfg: DictConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Force isotonic past the PR-AUC gate — every per-fold AP/Brier value and
@@ -782,7 +892,7 @@ def calibration_mlflow_uri(mlflow_test_experiment: Callable[[str], str]) -> str:
 
 
 @pytest.fixture
-def registration_cfg(calibration_mlflow_uri: str, tmp_path: Path) -> OmegaConf:
+def registration_cfg(calibration_mlflow_uri: str, tmp_path: Path) -> DictConfig:
     """Full cfg for run_calibration_step: training + calibration + mlflow + paths.
 
     paths.figures is an absolute tmp_path — get_project_root() / an absolute
@@ -831,7 +941,7 @@ def registration_cfg(calibration_mlflow_uri: str, tmp_path: Path) -> OmegaConf:
 
 
 @pytest.fixture
-def tuning_result(dev_split: tuple[pd.DataFrame, pd.Series]) -> dict:
+def tuning_result(dev_split: tuple[pd.DataFrame, pd.Series]) -> dict[str, Any]:
     """A plausible Step 4 tuning output — small n_estimators for test speed."""
     X_dev, _ = dev_split
     return {
@@ -868,7 +978,7 @@ def tuning_result(dev_split: tuple[pd.DataFrame, pd.Series]) -> dict:
 
 
 @pytest.fixture
-def comparison_result() -> dict:
+def comparison_result() -> dict[str, Any]:
     """A plausible Step 2 output — the fields run_model_logging_step reads."""
     return {
         "delta_obs": 0.01,
@@ -912,9 +1022,9 @@ def sandboxed_dev_features(
 
 def _log_parent_run(
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict,
-    tuning_result: dict,
-    cfg: OmegaConf,
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
+    cfg: DictConfig,
 ) -> str:
     """Reuse log_model.run_model_logging_step to produce a real tuning_study run
     with a valid training_manifest.json — the exact chain calibrate.py consumes
@@ -930,10 +1040,10 @@ def _log_parent_run(
 
 
 def test_run_calibration_step_registers_and_tags(
-    registration_cfg: OmegaConf,
+    registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict,
-    tuning_result: dict,
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
     """Registers exactly one version, tags refit_scope=dev, and points
@@ -964,10 +1074,10 @@ def test_run_calibration_step_registers_and_tags(
 
 
 def test_run_calibration_step_logs_reliability_diagram(
-    registration_cfg: OmegaConf,
+    registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict,
-    tuning_result: dict,
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
     """The pre/post-calibration reliability diagram is logged onto the run's
@@ -986,10 +1096,10 @@ def test_run_calibration_step_logs_reliability_diagram(
 
 
 def test_run_calibration_step_logs_dev_oof_predictions(
-    registration_cfg: OmegaConf,
+    registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict,
-    tuning_result: dict,
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
     """The winning method's dev-OOF vector — the numbers that selected it,
@@ -1015,10 +1125,10 @@ def test_run_calibration_step_logs_dev_oof_predictions(
 
 
 def test_run_calibration_step_calibration_summary_has_calibration_spec(
-    registration_cfg: OmegaConf,
+    registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict,
-    tuning_result: dict,
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
     """calibration_summary.json's calibration_spec carries the four fields
@@ -1055,10 +1165,10 @@ def test_run_calibration_step_calibration_summary_has_calibration_spec(
 
 
 def test_run_calibration_step_logs_dev_metrics(
-    registration_cfg: OmegaConf,
+    registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict,
-    tuning_result: dict,
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
     """dev_brier/dev_bss/dev_ece/dev_per_fold_mean_ap/dev_calibration_slope
@@ -1089,9 +1199,21 @@ def test_run_calibration_step_logs_dev_metrics(
     assert run.data.metrics["dev_calibration_slope"] == pytest.approx(expected_slope)
 
     summary = result["calibration_summary"]
+    assert run.data.metrics["dev_calibration_slope_ci_lower"] == pytest.approx(
+        summary["calibration_slope"]["slope_ci_lower"]
+    )
+    assert run.data.metrics["dev_calibration_slope_ci_upper"] == pytest.approx(
+        summary["calibration_slope"]["slope_ci_upper"]
+    )
     assert run.data.metrics["dev_uncalibrated_calibration_slope"] == pytest.approx(
         summary["uncalibrated_calibration_slope"]["slope"]
     )
+    assert run.data.metrics[
+        "dev_uncalibrated_calibration_slope_ci_lower"
+    ] == pytest.approx(summary["uncalibrated_calibration_slope"]["slope_ci_lower"])
+    assert run.data.metrics[
+        "dev_uncalibrated_calibration_slope_ci_upper"
+    ] == pytest.approx(summary["uncalibrated_calibration_slope"]["slope_ci_upper"])
     assert run.data.metrics["dev_mean_p_hat_calibrated"] == pytest.approx(
         summary["mean_p_hat_calibrated"]
     )
@@ -1104,10 +1226,10 @@ def test_run_calibration_step_logs_dev_metrics(
 
 
 def test_run_calibration_step_calibration_summary_has_mean_p_hat_fields(
-    registration_cfg: OmegaConf,
+    registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict,
-    tuning_result: dict,
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
     """mean_p_hat_calibrated/mean_p_hat_uncalibrated/observed_churn_rate are
@@ -1130,10 +1252,10 @@ def test_run_calibration_step_calibration_summary_has_mean_p_hat_fields(
 
 
 def test_run_calibration_step_blocks_on_low_trial_count(
-    registration_cfg: OmegaConf,
+    registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict,
-    tuning_result: dict,
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
     """A data-quality gate on the tuning result, not a performance comparison
@@ -1153,10 +1275,10 @@ def test_run_calibration_step_blocks_on_low_trial_count(
 
 
 def test_run_calibration_step_override_trial_count_gate(
-    registration_cfg: OmegaConf,
+    registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict,
-    tuning_result: dict,
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
     """override_trial_count_gate=true forces registration despite the low-trial
