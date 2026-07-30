@@ -12,6 +12,64 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ---
 
+## [0.7.4] - 2026-07-30 — Phase 7 Completion: Pre-Seal Dev-OOF Screen, Full-Refit Descoping & First Champion Promotion
+
+*Closes the gap between what `CLAUDE.md`/0.7.3 already documented as `register.py`'s contract and what the rest of the pipeline actually wrote: `evaluate.py`/`error_analysis.py` now tag the model version `eval_run_id`/`error_analysis_run_id` `register.py` resolves by. Adds Phase 6's pre-seal screen (`threshold.py` re-runs `ANALYSIS.md` §0's V1/V2/V2b dev-OOF diagnostics and the calibration-slope band check before the sealed test set is ever touched), retires the full-data-refit design (`refit.py` was never implemented and is no longer planned — `register.py` promotes the exact artifact `evaluate.py` scored), and runs the project's first real promotion: `telco-churn-pipeline` v1 → `champion`, 2026-07-30 13:00:37 UTC.*
+
+### Added
+- **`src/telco_churn/models/threshold.py`** — `run_threshold_step`'s new last step: fetches `calibrate.py`'s logged dev-OOF vector and calibration slope (never recomputes either), screens the slope against `ANALYSIS.md` §0's `[0.80, 1.25]` band via `gate.py::slope_passes`, and computes V1 (segment collapse)/V2 (fairness disparity)/V2b (per-group calibration) on that same vector. Raises `RuntimeError` (subprocess exit 1) if the slope's CI falls entirely outside the band — a hard stop before the one-time sealed-test evaluation is ever spent on a badly-calibrated candidate. Writes `reports/dev_oof_predictions.parquet`/`dev_oof_diagnostics.json`, both logged under the run's new `threshold/` artifact subpath. New `build_dev_oof_screen_frame`, `compute_dev_oof_diagnostics`; `load_policy_thresholds`/`resolve_policy_scenarios`/`resolve_policy_thresholds_by_scenario` moved here from `evaluate.py` (their writer, per CLAUDE.md's reader/writer-locality convention).
+- **`src/telco_churn/models/diagnostics.py`** — `build_segment_lookup`, `ROBUSTNESS_AXES`/`FAIRNESS_AXES`, and the V1/V2/V2b computation itself (`sliced_ranking_metrics`/`flag_segment_collapse`, `sliced_decision_rates` + `equal_opportunity_difference_by_axis`/`demographic_parity_difference_by_axis`, `sliced_calibration`/`flag_calibration_collapse`) moved here from `evaluate.py` so `threshold.py`'s dev-OOF screen and `evaluate.py`'s sealed-test reporting slices share one implementation instead of two.
+- **`src/telco_churn/utils/mlflow.py`** — `resolve_model_run_id`, `resolve_logged_model_id`, `load_model_promotion_bars` (moved from `evaluate.py`; `threshold.py` needs them too, and `evaluate.py` already imports from `threshold.py`, so a shared import-safe home avoids a circular import). `ensure_experiment_metadata`, `set_run_description`, `set_registered_model_description`, `set_logged_model_description` — MLflow experiment/run/registry/model overview-page descriptions, previously absent or hand-rolled per module (`candidates.py`'s inline experiment-tag block is now one call).
+- **`tests/unit/test_diagnostics.py`** (+274 lines), **`tests/unit/test_threshold.py`** (+246), **`tests/unit/test_calibrate.py`** (+81) — coverage for the moved V1/V2/V2b helpers and the dev-OOF screen's pass/fail paths; **`tests/integration/test_threshold_subprocess.py`** (+72), **`test_evaluate_subprocess.py`** (+49), **`test_error_analysis_subprocess.py`** (+28) — subprocess coverage for the screen's exit-1 path and the `eval_run_id`/`error_analysis_run_id` tags.
+
+### Changed
+- **`src/telco_churn/models/evaluate.py`** — no longer computes V1/V2/V2b itself; fetches `threshold.py`'s already-computed `dev_oof_diagnostics.json` by explicit `run_id` (`load_dev_oof_diagnostics`) instead of a second `load_dev_oof_with_segments` derivation. Now tags the model version `eval_run_id` — the read half of `register.py`'s tag-based resolution (`CLAUDE.md` § MLflow Model Registry) that was documented in 0.7.3 but not yet written anywhere until this pass.
+- **`src/telco_churn/models/error_analysis.py`** — reads `calibrate.py`'s dev-OOF vector via `threshold.load_dev_oof_predictions` (by `run_id`, from MLflow) instead of a local `reports/dev_oof_predictions.parquet` mirror that only reflected whichever run last executed `threshold.py` on this machine. Now tags the model version `error_analysis_run_id`, the other half of the same resolution path.
+- **`src/telco_churn/models/gate.py`** — `_slope_passes` made public (`slope_passes`); `threshold.py`'s dev-OOF screen reuses it rather than reimplementing the same band check.
+- **`src/telco_churn/models/calibrate.py`** — registers with model-version tag `training_data_scope: dev` (renamed from `refit_scope`, which implied a `full` counterpart that no longer exists — see Removed); sets registry/model/version overview descriptions via the new `mlflow.py` helpers; run/model/dev-OOF/golden-fixture artifacts now logged under a `calibration/` subpath instead of the run root.
+- **`candidates.py`, `comparison.py`, `feature_freeze.py`, `log_model.py`** (`models/train/`) — call `ensure_experiment_metadata`/`set_run_description` instead of each hand-rolling its own experiment tags; `log_model.py` additionally logs `target_column` as a run param.
+- **`configs/config.yaml`** — registers `register: default` as a Hydra defaults-list entry (`register.py` was runnable from 0.7.3 but not wired into config composition until now); **`configs/threshold/default.yaml`** gains `n_bootstrap` (dev-OOF screen resample count, distinct from the argmax-EV bootstrap); **`configs/calibration/default.yaml`** gains `golden_n_rows`.
+- **`ANALYSIS.md`** §0 — the promotion-gate table and V1–V3 review section rewritten in plainer language for the reviewer-facing audience; removed the "champion isn't the model the gate measured" dual dev/full-refit calibration subsection, now moot. §8 rewritten from the archived notebook's placeholder to the real event: `telco-churn-pipeline` v1 promoted to `champion`, 2026-07-30 13:00:37 UTC, no separate refit.
+- **`CLAUDE.md`, `PROJECT_PLAN.md`** — every `refit.py`/`refit_scope`/two-artifact-registry reference removed (the design these described was superseded before it was ever implemented); Phase 6's checklist gains the pre-seal dev-OOF screen as its last step; `register.py`'s tag-based cross-cycle resolution (`eval_run_id`, `error_analysis_run_id`) documented as the rule this pass makes real.
+- **`notebooks/04-calibration-and-threshold.ipynb`, `notebooks/05-evaluation-and-error-analysis.ipynb`** — re-executed against the pipeline above; notebook 05's closing cells now render the real promotion verdict and timestamp.
+
+### Removed
+- **The full-data-refit design (`refit.py`)** — never implemented, and descoped from Phase 7 rather than built: `register.py` promotes the exact artifact `evaluate.py` scored, with no second fit. The `refit_scope: dev | full` model-version tag is retired along with it; `training_data_scope: dev` (`calibrate.py`) replaces it and carries no `full` counterpart.
+
+---
+
+## [0.7.5] - 2026-07-30 — Docs Accuracy Pass: Phase 7 Status Sync
+
+*README.md and PROJECT_PLAN.md still described Phase 7b (registry promotion) as in progress or not started after 0.7.3 had already closed it — this pass syncs both against the actual shipped code, extends the architecture doc to cover a workflow it was missing, and clears stray root-level screenshots.*
+
+### Changed
+- **`README.md`** — Phase 7b status corrected to done; pipeline diagram's registration step updated to reflect the drift-baseline/model-card work it now includes; Project Structure listing gains `models/register.py`, `models/drift_reference.py`, `configs/register/`; the `docs/architecture.md` pointer now names all four diagrams it links to (System Architecture, ML Workflow, Data Flow, MLflow Layout — was only naming the first two); Quick Start gains the previously-undocumented `make split` and `make register` steps; test/coverage badges refreshed to 771 passed / 51 skipped, 95.31% coverage.
+- **`Makefile`**, **`CONTRIBUTING.md`** — added the missing `register` target (Phase 7b had no `make` entry point despite being fully built); `test-models` now covers `test_register.py`/`test_drift_reference.py`; both docs' workflow lists gain `make split`, previously undocumented despite being a hard prerequisite for `make train`.
+- **`PROJECT_PLAN.md`** — Phase 7 checklist row corrected from "Not started" to done.
+- **`docs/architecture.md`** — new **Emergency Rollback** diagram covering `register.py::rollback_champion`'s two triggers (automated post-flip parity failure vs. manual invocation) and `champion_history`'s append-only promotion log; this flow was previously only referenced in one prose sentence.
+- **`ANALYSIS.md` §9** — cross-checked every figure against `notebooks/_archive/EDA-original.ipynb` and this project's own artifacts (`error_analysis.json`, `metrics.json`, `calibration_summary.json`, `reports/feature_discovery/provenance.json`); one item cited an archive figure (~50% joint false-positive rate) that was never actually measured there — corrected to the archive's real single-axis rates (54.0% fiber optic, 60.1% month-to-month). Section regrouped into four subsections (Model Behaviour & Blind Spots, Business & Economic Assumptions, Methodology & Engineering Trade-offs, Data & Production-Readiness Constraints) and renumbered; fixed a pre-existing off-by-one in the section's own intro note (pointed at item #11 for a claim that's actually item #12/#13's). Every `§9 #N` citation in `PROJECT_PLAN.md` (8 instances) updated to match.
+- **`ANALYSIS.md` §10** — added a short cross-reference to §4's existing RFECV/embedded-method deferral note, rather than restating it.
+
+### Removed
+- Nine untracked root-level screenshot PNGs (`landing_page.png`, `model_registry.png`, `logged_models.png`, etc.) that were never moved into `reports/figures/`.
+
+---
+
+## [0.7.3] - 2026-07-28 — Phase 7 Completion: Registry Promotion & Drift Reference
+
+*Closes Phase 7: the promotion gate's verdict is now acted on — `register.py` flips the `champion` alias, builds the drift-monitoring baseline, and assembles the stakeholder-facing model card, completing the evaluate → gate → register cycle.*
+
+### Added
+- **`src/telco_churn/models/register.py`** — `run_registration_step`: reads the persisted gate verdict (never recomputes it), a two-phase-commit serving smoke check (pre-flip by explicit version URI, post-flip through the `champion` alias with automatic rollback on failure), and writes `drift_reference.json`/`model_card.json` onto the promoted run. `promote_to_alias`, `rollback_champion` (selects the highest `promotion_status: promoted` version, never by version arithmetic), `check_environment_parity`/`EnvironmentMismatchError` (guards the golden-parity check's floating-point tolerance against dependency drift).
+- **`src/telco_churn/models/drift_reference.py`** — `build_reference`: pure builder for the champion's drift-monitoring baseline (per-feature distributions, out-of-sample score distribution, churn prevalence), consumed by `register.py` and Phase 10/13's monitoring.
+- **`configs/register/default.yaml`** — registry promotion step configuration (`require_review`, `alias`, `golden_atol`, `environment_packages`, `drift_reference_n_bins`).
+- **`tests/unit/test_register.py`** (17 tests), **`tests/unit/test_drift_reference.py`**, **`tests/integration/test_register_subprocess.py`** (3 tests) — full step-order coverage: idempotent re-invocation, fail-fast gate-fail short-circuit, manifest/error-analysis gates, environment-mismatch vs. genuine smoke-check-failure distinction, post-flip rollback, and emergency rollback's highest-`promoted`-not-highest-version selection.
+
+### Changed
+- **`src/telco_churn/models/calibrate.py`** — the registration step now tags every newly minted version `promotion_status: pending` at mint time (the crash-safe default `register.py`'s rollback query depends on), and logs `golden_predictions.json` — customerid-pinned dev rows plus the in-memory fitted pipeline's reference scores, captured before serialization — the independent reference `register.py`'s serving-parity check verifies against. New `select_golden_rows` helper; `configs/calibration/default.yaml` gains `golden_n_rows`.
+
+---
+
 ## [0.7.2] - 2026-07-27 — Repo Hygiene: Makefile, CONTRIBUTING, and Docs
 
 *Tooling and documentation pass alongside Phase 7 — no modelling logic changed.*
@@ -45,7 +103,7 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ## [0.7.0] - 2026-07-27 — Phase 7: Sealed Test-Set Evaluation, Error Analysis & Human Review
 
-*One-time evaluation of the champion candidate against the sealed test set, closing the loop `ANALYSIS.md` §0's promotion gate defines: PR-AUC-driven selection, three veto-only guardrails, and a pre-registered human review (V1–V3). Gate result: pass (cold start); human review: approved. Full-data refit and registry promotion (`refit.py`/`register.py`) remain open, tracked in `PROJECT_PLAN.md`.*
+*One-time evaluation of the champion candidate against the sealed test set, closing the loop `ANALYSIS.md` §0's promotion gate defines: PR-AUC-driven selection, three veto-only guardrails, and a pre-registered human review (V1–V3). Gate result: pass (cold start); human review: approved. Registry promotion (`register.py`) remains open, tracked in `PROJECT_PLAN.md`; a standalone full-data refit step was subsequently descoped from Phase 7 (see 0.7.3 — `register.py` promotes the already-evaluated candidate directly, no second fit).*
 
 ### Added
 - **`src/telco_churn/models/evaluate.py`** — `run_evaluation_step`: resolves the model by explicit version (never by alias), scores the sealed test set once, computes ranking/classification/calibration/business-impact metrics plus per-slice robustness and fairness views, calls `gate.py::decide_promotion`, and logs a dedicated `evaluation` MLflow run.

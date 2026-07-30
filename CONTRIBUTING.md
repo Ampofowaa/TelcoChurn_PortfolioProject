@@ -22,13 +22,17 @@ make data                                       # download the raw CSV (skips if
 make db-up                                      # start Postgres + MLflow in Docker
 make ingest                                     # load the CSV into Postgres
 make validate                                   # run the 5 Pandera quality gates
+make split                                      # create the canonical dev/test partition
 make features                                   # build SQL feature views
 make train                                      # LightGBM + Optuna tuning; logs to MLflow
 make calibrate RUN_ID=<run_id>                  # sigmoid calibration; registers the challenger
 make threshold MODEL_VERSION=<version>          # closed-form cost-sensitive threshold
 make evaluate MODEL_VERSION=<version>           # one-time sealed-test evaluation + gate
 make error-analysis MODEL_VERSION=<version>     # SHAP explainability + error diagnosis
+make register MODEL_VERSION=<version>           # act on the gate verdict: promote or reject
 ```
+
+`make train` reads the dev/test split written by `make split` — run it once before the first `make train` (it does not need to be repeated on subsequent retrains against the same data).
 
 Each step's console output (structlog JSON) prints the `run_id` / `model_version` the next command needs.
 
