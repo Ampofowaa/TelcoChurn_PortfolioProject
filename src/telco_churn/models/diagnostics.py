@@ -9,31 +9,106 @@ models/train/comparison.py's bootstrap_comparison. They flag robustness/fairness
 concerns and characterize bias/variance for the analyst.
 
 segment_bootstrap_ci and segment_decision_rates are Phase 7 additions consumed by
-models/evaluate.py, which owns loading the dev-OOF/test probability vectors and joining
-the segment-axis columns onto them before calling these. Unlike the family-selection
-helpers above, their outputs feed §0's V1/V2 veto-only guardrails — but the veto
-decision itself lives in models/gate.py, never here.
+models/evaluate.py (sealed-test slices) and models/threshold.py's dev-OOF screen
+(dev-OOF slices), both of which own loading their respective probability vectors and use
+build_segment_lookup below to join the segment-axis columns onto them before
+calling these. Unlike the family-selection helpers above, their outputs feed §0's
+V1/V2 veto-only guardrails — but the veto decision itself lives in models/gate.py,
+never here.
+
+sliced_ranking_metrics/flag_segment_collapse (V1), sliced_decision_rates +
+equal_opportunity_difference_by_axis/demographic_parity_difference_by_axis (V2),
+and sliced_calibration/flag_calibration_collapse (V2b) are the per-axis wrappers
+both callers actually invoke — threshold.py's dev-OOF screen for the dev-OOF
+diagnostic pass it owns computing, and evaluate.py for the sealed-test reporting slices
+(which have no V1/V2/V2b flagging of their own; they are reported, not screened).
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
+from typing import cast
 
 import numpy as np
 import pandas as pd
+from omegaconf import DictConfig
 from sklearn.metrics import average_precision_score, precision_recall_curve
 
+from telco_churn.features.preprocessing import TENURE_COHORT_EDGES, TENURE_COHORT_LABELS
+from telco_churn.models.calibrate import calibration_slope, expected_calibration_error
+
 __all__ = [
+    "FAIRNESS_AXES",
+    "ROBUSTNESS_AXES",
+    "build_segment_lookup",
+    "demographic_parity_difference_by_axis",
+    "equal_opportunity_difference_by_axis",
     "fixed_recall_profile",
+    "flag_calibration_collapse",
+    "flag_segment_collapse",
     "generalization_gap",
     "learning_curve_points",
     "segment_bootstrap_ci",
     "segment_bootstrap_delta",
+    "sliced_calibration",
+    "sliced_decision_rates",
+    "sliced_ranking_metrics",
     "segment_decision_rates",
     "segment_oof_errors",
 ]
 
 _MIN_SEGMENT_SIZE = 10
+
+# Fairness/robustness slicing axes — ANALYSIS.md §0's V1/V2/V2b surface.
+# Shared by threshold.py's dev-OOF screen (dev-OOF V1/V2/V2b) and evaluate.py
+# (sealed-test reporting slices) — mirrors models.train.comparison's
+# _ROBUSTNESS_SEGMENTS/_FAIRNESS_SEGMENTS (a private, Phase-5-scoped pair,
+# used on data neither of these modules touches), duplicated rather than
+# imported for that reason.
+ROBUSTNESS_AXES: tuple[str, ...] = (
+    "contract_type",
+    "tenure_cohort",
+    "internetservice",
+)
+FAIRNESS_AXES: tuple[str, ...] = (
+    "gender",
+    "seniorcitizen",
+    "has_partner",
+    "dependents",
+)
+
+
+def build_segment_lookup(df: pd.DataFrame) -> dict[str, pd.Series]:
+    """{axis_name: Series} for every robustness/fairness axis, aligned to df's index.
+
+    tenure_cohort is derived via pd.cut over the fixed TENURE_COHORT_EDGES
+    (the same domain-constant edges models.train.comparison already uses for
+    this) rather than read as a raw column — it doesn't exist as one. The
+    other six axes are raw columns in the engineered feature space. Shared by
+    models/evaluate.py (test-partition segments) and models/threshold.py's
+    dev-OOF screen (dev-partition segments) so the two surfaces are computed
+    by identical code.
+    """
+    tenure_cohort = (
+        pd.cut(
+            df["tenure"],
+            bins=TENURE_COHORT_EDGES,
+            labels=TENURE_COHORT_LABELS,
+            include_lowest=True,
+        )
+        .astype(str)
+        .rename("tenure_cohort")
+    )
+    return {
+        "contract_type": df["contract_type"],
+        "tenure_cohort": tenure_cohort,
+        "internetservice": df["internetservice"],
+        "gender": df["gender"],
+        "seniorcitizen": df["seniorcitizen"],
+        "has_partner": df["has_partner"],
+        "dependents": df["dependents"],
+    }
 
 
 def fixed_recall_profile(
@@ -355,3 +430,181 @@ def learning_curve_points(
             }
         )
     return rows
+
+
+def sliced_ranking_metrics(
+    y_true: pd.Series,
+    proba: np.ndarray,
+    segment_lookup: dict[str, pd.Series],
+    axes: tuple[str, ...],
+    n_bootstrap: int,
+    random_state: int,
+) -> list[dict[str, object]]:
+    """Per-segment PR-AUC with a bootstrap CI and its own churn-rate floor, across
+    every named axis — the surface V1 (ANALYSIS.md §0) flags a segment collapse
+    from. Reused for both the dev-OOF diagnostic pass (threshold.py's dev-OOF
+    screen, reported, non-gating) and the sealed-test reporting pass (evaluate.py) — the
+    caller decides which by what (y_true, proba, segment_lookup) it passes in.
+
+    Attaches each row's own churn_rate_floor (the segment's y.mean()) rather
+    than requiring a second join in flag_segment_collapse: V1 fires when
+    pr_auc_ci_lower falls below this value — a model no better than the
+    segment's own base rate.
+    """
+    y = y_true.to_numpy(dtype=float)
+    p = np.asarray(proba, dtype=float)
+    rows: list[dict[str, object]] = []
+    for axis in axes:
+        group = segment_lookup[axis]
+        for row in segment_bootstrap_ci(
+            y.tolist(), p.tolist(), group, n_bootstrap, random_state
+        ):
+            mask = (group == row["value"]).to_numpy()
+            rows.append(
+                {**row, "axis": axis, "churn_rate_floor": float(y[mask].mean())}
+            )
+    return rows
+
+
+def flag_segment_collapse(
+    ranking_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """V1: rows whose PR-AUC 95% CI lower bound falls below the segment's own churn-rate floor.
+
+    Computed by threshold.py's dev-OOF screen on the dev-OOF surface
+    (ANALYSIS.md §0), non-gating — a model not distinguishable from random
+    inside a real cohort is worth flagging even though the sealed test set is
+    too thin to decide it there. Returns only the flagged rows; an empty list
+    means no segment is flagged.
+    """
+    return [
+        row
+        for row in ranking_rows
+        if cast(float, row["pr_auc_ci_lower"]) < cast(float, row["churn_rate_floor"])
+    ]
+
+
+def sliced_decision_rates(
+    y_true: pd.Series,
+    proba: np.ndarray,
+    segment_lookup: dict[str, pd.Series],
+    axes: tuple[str, ...],
+    threshold: float,
+) -> list[dict[str, object]]:
+    """Per-segment selection rate/FNR/FPR/precision at `threshold`, across every
+    named axis — the surface V2 (ANALYSIS.md §0) reads. Reused for the dev-OOF
+    diagnostic pass (threshold.py's dev-OOF screen) and the sealed-test
+    reporting pass (evaluate.py), same convention as sliced_ranking_metrics.
+    """
+    y = y_true.to_numpy(dtype=float)
+    p = np.asarray(proba, dtype=float)
+    rows: list[dict[str, object]] = []
+    for axis in axes:
+        for row in segment_decision_rates(
+            y.tolist(), p.tolist(), segment_lookup[axis], threshold
+        ):
+            rows.append({**row, "axis": axis})
+    return rows
+
+
+def equal_opportunity_difference_by_axis(
+    decision_rows: list[dict[str, object]],
+) -> dict[str, float]:
+    """Max FNR gap within each axis's own groups — ANALYSIS.md §0's V2(a), per axis.
+
+    Computed separately per axis, never pooled across axes: equal-opportunity
+    difference is conventionally within one sensitive attribute (male vs.
+    female; senior vs. non-senior), and pooling unrelated attributes' FNRs
+    into one list would mix two different questions into one number. NaN FNR
+    rows (no churners in that group) are excluded; an axis left with fewer
+    than two comparable groups returns NaN rather than a spurious 0.
+    """
+    by_axis: dict[str, list[float]] = {}
+    for row in decision_rows:
+        fnr = cast(float, row["fnr"])
+        if math.isnan(fnr):
+            continue
+        by_axis.setdefault(cast(str, row["axis"]), []).append(fnr)
+    return {
+        axis: (max(values) - min(values)) if len(values) >= 2 else float("nan")
+        for axis, values in by_axis.items()
+    }
+
+
+def demographic_parity_difference_by_axis(
+    decision_rows: list[dict[str, object]],
+) -> dict[str, float]:
+    """Max selection-rate gap within each axis's own groups — ANALYSIS.md §0's V2(b), per axis.
+
+    Same per-axis convention as equal_opportunity_difference_by_axis.
+    """
+    by_axis: dict[str, list[float]] = {}
+    for row in decision_rows:
+        by_axis.setdefault(cast(str, row["axis"]), []).append(
+            cast(float, row["selection_rate"])
+        )
+    return {
+        axis: (max(values) - min(values)) if len(values) >= 2 else float("nan")
+        for axis, values in by_axis.items()
+    }
+
+
+def sliced_calibration(
+    y_true: pd.Series,
+    proba: np.ndarray,
+    segment_lookup: dict[str, pd.Series],
+    axes: tuple[str, ...],
+    cfg: DictConfig,
+    n_bootstrap: int,
+    random_state: int,
+) -> list[dict[str, object]]:
+    """Per-segment calibration slope (with CI) and ECE, across every named axis —
+    the surface V2b (ANALYSIS.md §0) reads. A group whose slope CI falls
+    entirely outside [0.80, 1.25] is a group the shipped t* is systematically
+    wrong for, in a direction no aggregate slope reveals. Segments smaller
+    than _MIN_SEGMENT_SIZE, or with only one class present, are skipped —
+    neither a slope nor an ECE is estimable there.
+    """
+    y = y_true.to_numpy(dtype=float)
+    p = np.asarray(proba, dtype=float)
+    rows: list[dict[str, object]] = []
+    for axis in axes:
+        group = segment_lookup[axis]
+        for value in sorted(group.unique(), key=str):
+            mask = (group == value).to_numpy()
+            n = int(mask.sum())
+            if n < _MIN_SEGMENT_SIZE or len(np.unique(y[mask])) < 2:
+                continue
+            y_seg, p_seg = y[mask], p[mask]
+            slope = calibration_slope(y_seg, p_seg, n_bootstrap, random_state)
+            ece = expected_calibration_error(p_seg, pd.Series(y_seg), cfg)
+            rows.append(
+                {
+                    "axis": axis,
+                    "value": value,
+                    "n": n,
+                    "slope": slope["slope"],
+                    "slope_ci_lower": slope["slope_ci_lower"],
+                    "slope_ci_upper": slope["slope_ci_upper"],
+                    "ece": ece,
+                }
+            )
+    return rows
+
+
+def flag_calibration_collapse(
+    calibration_rows: list[dict[str, object]], band: tuple[float, float]
+) -> list[dict[str, object]]:
+    """V2b: rows whose calibration-slope CI falls entirely outside `band`.
+
+    Same pass-unless-the-CI-clears-it framing as gate.py's aggregate
+    calibration guardrail (ANALYSIS.md §0), applied per group instead of in
+    aggregate. Returns only the flagged rows; an empty list means V2b passes.
+    """
+    lower, upper = band
+    return [
+        row
+        for row in calibration_rows
+        if cast(float, row["slope_ci_upper"]) < lower
+        or cast(float, row["slope_ci_lower"]) > upper
+    ]

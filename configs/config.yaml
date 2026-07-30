@@ -4,9 +4,10 @@ defaults:
   - training@selection: selection  # selector hyperparams → cfg.selection
   - tuning: optuna         # Optuna study + search space → cfg.tuning
   - calibration: default  # calibration method/CV/ECE knobs → cfg.calibration
-  - threshold: default    # threshold derivation knobs → cfg.threshold
+  - threshold: default    # threshold derivation knobs, incl. the pre-seal dev-OOF screen → cfg.threshold
   - evaluate: default     # sealed-test evaluation knobs → cfg.evaluate
   - error_analysis: default  # error-diagnosis step knobs → cfg.error_analysis
+  - register: default     # registry promotion knobs → cfg.register
   # - data: telco          # pending
   # - serving: api         # pending
   - _self_

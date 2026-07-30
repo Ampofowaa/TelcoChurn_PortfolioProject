@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 from collections.abc import Callable
 from pathlib import Path
 
@@ -388,11 +389,17 @@ def test_derive_threshold_disagrees_on_miscalibration_near_t_star(
 
 
 def test_threshold_module_is_leak_free_by_construction() -> None:
-    """AST scan: no .fit( call, no sklearn import, no telco_churn.data.split import.
+    """AST scan: no .fit( call, no sklearn import.
 
     A module that cannot fit an estimator cannot fit on the wrong rows — this
     is the discipline the touched-once invariant gets from evaluate.py, made
     executable here rather than trusted.
+
+    This module does import telco_churn.data.split (for the dev-OOF screen's
+    segment columns via _load_dev_partition) — but only ever takes the dev
+    half; test_threshold_never_touches_test_partition asserts that
+    structurally, the same guard calibration_screen.py used to carry before
+    this module absorbed it.
     """
     source = inspect.getsource(threshold)
     tree = ast.parse(source)
@@ -417,16 +424,29 @@ def test_threshold_module_is_leak_free_by_construction() -> None:
         sklearn_imports == []
     ), "models/threshold.py must not import sklearn estimators"
 
-    split_imports = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        and node.module is not None
-        and "data.split" in node.module
-    ]
-    assert (
-        split_imports == []
-    ), "models/threshold.py must not import telco_churn.data.split"
+
+def test_threshold_never_touches_test_partition() -> None:
+    """Structural guard: threshold.py must never import the test split — it
+    runs before evaluate.py and never spends the seal, even though it now
+    imports telco_churn.data.split.partition for the dev-OOF screen's segment
+    columns (_load_dev_partition takes only the dev half)."""
+    source = inspect.getsource(threshold)
+    assert "test_ids" not in source
+    assert "load_test_features" not in source
+    assert "load_test_partition" not in source
+
+
+def test_threshold_dev_oof_screen_has_no_refit_or_reslope_machinery() -> None:
+    """Structural guard: the dev-OOF screen folded into this module never
+    recomputes the aggregate calibration slope (calibrate.calibration_slope is
+    not called at all) and imports no CV-refitting machinery — its only path
+    to a probability vector is calibrate.py's already-fitted dev-OOF artifact,
+    and its only path to the aggregate slope is reading
+    calibration_summary.json."""
+    source = inspect.getsource(threshold)
+    assert "cross_val_predict" not in source
+    assert "CalibratedClassifierCV" not in source
+    assert "calibration_slope(" not in source
 
 
 def test_inherited_contamination_canary(base_scenario: CostScenario) -> None:
@@ -495,7 +515,27 @@ def unfitted_pipeline() -> Pipeline:
 
 
 @pytest.fixture
-def full_cfg(threshold_mlflow_uri: str, tmp_path: Path) -> OmegaConf:
+def model_promotion_config_path(tmp_path: Path) -> Path:
+    path = tmp_path / "model_promotion.yaml"
+    OmegaConf.save(
+        OmegaConf.create(
+            {
+                "pr_auc_bar": 0.60,
+                "recall_bar": 0.65,
+                "calibration_slope_band": [0.80, 1.25],
+                "pr_auc_materiality_threshold": 0.005,
+                "brier_non_inferiority_margin": 0.005,
+            }
+        ),
+        path,
+    )
+    return path
+
+
+@pytest.fixture
+def full_cfg(
+    threshold_mlflow_uri: str, tmp_path: Path, model_promotion_config_path: Path
+) -> OmegaConf:
     """Cfg covering everything run_calibration_step + run_threshold_step need.
 
     paths.figures/paths.policy point at an absolute tmp_path — get_project_root()
@@ -506,6 +546,11 @@ def full_cfg(threshold_mlflow_uri: str, tmp_path: Path) -> OmegaConf:
     real configs/costs.yaml: load_costs_config() is monkeypatched per-test to
     return the small costs_cfg fixture, but costs_config_hash() reads actual
     bytes off disk and is not monkeypatched, so a real file must exist here.
+
+    paths.reports/paths.model_promotion_config and threshold.n_bootstrap are
+    needed by the dev-OOF screen folded into run_threshold_step: the screen
+    writes reports/dev_oof_predictions.parquet + reports/dev_oof_diagnostics.json
+    and checks the aggregate slope against configs/model_promotion.yaml's band.
     """
     costs_config_path = tmp_path / "costs.yaml"
     costs_config_path.write_text("gross_margin: 0.60\n", encoding="utf-8")
@@ -539,8 +584,13 @@ def full_cfg(threshold_mlflow_uri: str, tmp_path: Path) -> OmegaConf:
                 "ece_strategy": "uniform",
                 "run_id": None,
                 "override_trial_count_gate": False,
+                "golden_n_rows": 5,
             },
-            "threshold": {"model_version": None, "random_state": 42},
+            "threshold": {
+                "model_version": None,
+                "random_state": 42,
+                "n_bootstrap": 200,
+            },
             "mlflow": {
                 "tracking_uri": threshold_mlflow_uri,
                 "experiment_name": "test_run_threshold_step",
@@ -549,7 +599,9 @@ def full_cfg(threshold_mlflow_uri: str, tmp_path: Path) -> OmegaConf:
             "paths": {
                 "figures": str(tmp_path / "figures"),
                 "policy": str(tmp_path / "policy"),
+                "reports": str(tmp_path / "reports"),
                 "costs_config": str(costs_config_path),
+                "model_promotion_config": str(model_promotion_config_path),
             },
         }
     )
@@ -609,6 +661,7 @@ def comparison_result() -> dict:
 def registered_model_version(
     full_cfg: OmegaConf,
     dev_split: tuple[pd.DataFrame, pd.Series],
+    feature_df: pd.DataFrame,
     comparison_result: dict,
     tuning_result: dict,
     monkeypatch: pytest.MonkeyPatch,
@@ -633,6 +686,12 @@ def registered_model_version(
     run_threshold_step's own load_dev_customer_ids() call (used to align the
     persisted dev_oof_predictions.parquet back onto X_dev/y_dev's row order)
     would do the same against the fake X_dev/y_dev built here.
+
+    threshold._load_dev_partition (the dev-OOF screen's segment-column source,
+    folded in from calibration_screen.py) is sandboxed to feature_df directly
+    — its customerid column already uses the same "cust-{i:04d}" ordering as
+    _fake_load_dev_customer_ids below, so the screen's by-customerid join
+    lines up rather than reindexing to all-NaN.
     """
     X_dev, y_dev = dev_split
 
@@ -650,6 +709,7 @@ def registered_model_version(
     monkeypatch.setattr(threshold, "load_dev_features", _fake_load_dev_features)
     monkeypatch.setattr(calibrate, "load_dev_customer_ids", _fake_load_dev_customer_ids)
     monkeypatch.setattr(threshold, "load_dev_customer_ids", _fake_load_dev_customer_ids)
+    monkeypatch.setattr(threshold, "_load_dev_partition", lambda: feature_df)
 
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result = {**tuning_result, "parent_run_id": run.info.run_id}
@@ -708,13 +768,17 @@ def test_run_threshold_step_logs_three_figures(
     run_id = result["threshold_payload"]["model_run_id"]
 
     client = mlflow.tracking.MlflowClient()
-    artifact_paths = {a.path for a in client.list_artifacts(run_id, "figures")}
-    assert "figures/threshold_sensitivity.png" in artifact_paths
-    assert "figures/threshold_by_scenario.png" in artifact_paths
-    assert "figures/expected_value_by_scenario.png" in artifact_paths
+    artifact_paths = {
+        a.path for a in client.list_artifacts(run_id, "threshold/figures")
+    }
+    assert "threshold/figures/threshold_sensitivity.png" in artifact_paths
+    assert "threshold/figures/threshold_by_scenario.png" in artifact_paths
+    assert "threshold/figures/expected_value_by_scenario.png" in artifact_paths
 
-    artifact_paths_root = {a.path for a in client.list_artifacts(run_id)}
-    assert "threshold.json" in artifact_paths_root
+    artifact_paths_threshold = {
+        a.path for a in client.list_artifacts(run_id, "threshold")
+    }
+    assert "threshold/threshold.json" in artifact_paths_threshold
 
 
 def test_run_threshold_step_logs_validation_json_and_ev_curve(
@@ -733,12 +797,14 @@ def test_run_threshold_step_logs_validation_json_and_ev_curve(
     run_id = result["threshold_payload"]["model_run_id"]
 
     client = mlflow.tracking.MlflowClient()
-    artifact_paths_root = {a.path for a in client.list_artifacts(run_id)}
-    assert "threshold_validation.json" in artifact_paths_root
-    assert "ev_curve.parquet" in artifact_paths_root
+    artifact_paths_threshold = {
+        a.path for a in client.list_artifacts(run_id, "threshold")
+    }
+    assert "threshold/threshold_validation.json" in artifact_paths_threshold
+    assert "threshold/ev_curve.parquet" in artifact_paths_threshold
 
     local_path = mlflow.artifacts.download_artifacts(
-        run_id=run_id, artifact_path="ev_curve.parquet"
+        run_id=run_id, artifact_path="threshold/ev_curve.parquet"
     )
     ev_curve = pd.read_parquet(local_path)
     assert set(ev_curve.columns) == {"scenario", "threshold", "ev"}
@@ -878,3 +944,137 @@ def test_run_threshold_step_resolves_by_explicit_version_not_alias(
     result = threshold.run_threshold_step(registered_model_version, full_cfg)
 
     assert result["threshold_payload"]["model_run_id"] == expected_run_id
+
+
+# ---------------------------------------------------------------------------
+# Dev-OOF screen (folded in from calibration_screen.py) — slope check + V1/V2/V2b
+# ---------------------------------------------------------------------------
+
+
+def _assert_dev_oof_report_shapes(
+    frame: pd.DataFrame,
+    diagnostics: dict,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    assert set(frame.columns) == {"customerid", "y_true", "p_hat"}
+    assert len(frame) == len(dev_split[1])
+    assert frame["p_hat"].between(0, 1).all()
+    assert set(diagnostics) == {
+        "ranking",
+        "v1_flagged",
+        "decision_rates",
+        "equal_opportunity_difference_by_axis",
+        "demographic_parity_difference_by_axis",
+        "v2_equal_opportunity_flagged",
+        "v2_demographic_parity_flagged",
+        "calibration",
+        "v2b_flagged",
+    }
+
+
+def test_run_threshold_step_screens_dev_oof_slope_and_writes_reports(
+    full_cfg: OmegaConf,
+    registered_model_version: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    costs_cfg: OmegaConf,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dev-OOF screen folded into run_threshold_step reads calibrate.py's
+    already-logged calibration_slope rather than recomputing it; writes
+    reports/dev_oof_predictions.parquet (3 columns — no re-logged segment
+    join) and reports/dev_oof_diagnostics.json (V1/V2/V2b); logs
+    dev_oof_*-namespaced metrics attached to the dev model's model_id, onto
+    the same run threshold.json/threshold_validation.json already log to.
+    """
+    monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
+
+    client = mlflow.tracking.MlflowClient()
+    registered_name = str(full_cfg.mlflow.registered_model_name)
+    run_id = client.get_model_version(registered_name, registered_model_version).run_id
+
+    try:
+        result = threshold.run_threshold_step(registered_model_version, full_cfg)
+    except RuntimeError:
+        # The real sigmoid-calibrated fit on this synthetic fixture may or
+        # may not clear the band — either outcome is a valid resting state
+        # for this test; the artifact/logging contract (asserted below)
+        # holds regardless of which branch fired.
+        reports_dir = Path(str(full_cfg.paths.reports))
+        frame = pd.read_parquet(reports_dir / "dev_oof_predictions.parquet")
+        diagnostics = json.loads(
+            (reports_dir / "dev_oof_diagnostics.json").read_text(encoding="utf-8")
+        )
+        _assert_dev_oof_report_shapes(frame, diagnostics, dev_split)
+        run = client.get_run(run_id)
+        assert run.data.tags["dev_oof_screen_result"] == "fail"
+        return
+
+    reports_dir = Path(str(full_cfg.paths.reports))
+    frame = pd.read_parquet(reports_dir / "dev_oof_predictions.parquet")
+    diagnostics = json.loads(
+        (reports_dir / "dev_oof_diagnostics.json").read_text(encoding="utf-8")
+    )
+    _assert_dev_oof_report_shapes(frame, diagnostics, dev_split)
+    # NaN-safe: equal_opportunity/demographic_parity_difference_by_axis can
+    # legitimately return float("nan") for a thin axis, and NaN != NaN under
+    # Python's own semantics — comparing the JSON-serialized form (where both
+    # sides render the same NaN literal identically) instead of the parsed
+    # dicts directly is what actually verifies no silent default=str
+    # corruption crept into the round trip.
+    assert json.dumps(diagnostics, sort_keys=True) == json.dumps(
+        result["dev_oof_diagnostics"], sort_keys=True, default=str
+    )
+
+    run = client.get_run(run_id)
+    assert "dev_oof_calibration_slope" in run.data.metrics
+    assert "dev_oof_calibration_slope_ci_lower" in run.data.metrics
+    assert "dev_oof_calibration_slope_ci_upper" in run.data.metrics
+    assert run.data.tags["dev_oof_screen_result"] in {"pass", "fail"}
+    assert (run.data.tags["dev_oof_screen_result"] == "pass") == result[
+        "dev_oof_screen_passed"
+    ]
+
+    artifact_paths = {a.path for a in client.list_artifacts(run_id, "threshold")}
+    assert "threshold/dev_oof_diagnostics.json" in artifact_paths
+
+
+def test_run_threshold_step_raises_on_bad_slope_read_from_calibration_summary(
+    full_cfg: OmegaConf,
+    registered_model_version: str,
+    costs_cfg: OmegaConf,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A calibration_summary.json slope deliberately outside the band raises —
+    after logging, so the audit trail records the failing attempt. Mocking
+    load_calibration_summary (not calibrate.calibration_slope, which the
+    folded-in screen never calls) proves it reads the number rather than
+    recomputing it.
+    """
+    monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
+
+    def _bad_summary(run_id: str, cfg: object) -> dict:
+        return {
+            "method": "sigmoid",
+            "calibration_slope": {
+                "slope": 0.2,
+                "intercept": 0.0,
+                "slope_ci_lower": 0.1,
+                "slope_ci_upper": 0.3,
+            },
+        }
+
+    monkeypatch.setattr(threshold, "load_calibration_summary", _bad_summary)
+
+    with pytest.raises(RuntimeError, match="Dev-OOF calibration screen failed"):
+        threshold.run_threshold_step(registered_model_version, full_cfg)
+
+    reports_dir = Path(str(full_cfg.paths.reports))
+    assert (reports_dir / "dev_oof_predictions.parquet").exists()
+    assert (reports_dir / "dev_oof_diagnostics.json").exists()
+
+    client = mlflow.tracking.MlflowClient()
+    registered_name = str(full_cfg.mlflow.registered_model_name)
+    run_id = client.get_model_version(registered_name, registered_model_version).run_id
+    run = client.get_run(run_id)
+    assert run.data.tags["dev_oof_screen_result"] == "fail"
+    assert "dev_oof_calibration_slope" in run.data.metrics

@@ -2,13 +2,16 @@
 
 Answers the three questions aggregate performance metrics cannot: *where* are
 the errors, *how wrong* were they, and *what did they cost?* Calls explain.py
-for the SHAP work; reads reports/test_predictions.parquet and
-reports/dev_oof_predictions.parquet (both written by evaluate.py) and the
-champion model by explicit version — never by alias, never via
-telco_churn's data/split.py, so evaluate.py remains the sole importer of the
-test partition. Full raw feature values for a customer id set are recovered via
-features.accessor.load_features() (the unsplit feature table) restricted to
-the id set an upstream artifact already sealed — never a fresh split.
+for the SHAP work; reads reports/test_predictions.parquet (evaluate.py),
+calibrate.py's dev-OOF vector (threshold.load_dev_oof_predictions, fetched by
+run_id from MLflow — never threshold.py's local reports/dev_oof_predictions.parquet
+mirror, which reflects whichever run last executed threshold.py on this
+machine, not necessarily run_id), and the champion model by explicit version —
+never by alias, never via telco_churn's data/split.py, so evaluate.py remains
+the sole importer of the test partition. Full raw feature values for a
+customer id set are recovered via features.accessor.load_features() (the
+unsplit feature table) restricted to the id set an upstream artifact already
+sealed — never a fresh split.
 
 register.py aborts without this module's output — a fairness/robustness
 section retyped from a rendered notebook cell is exactly the section that
@@ -69,10 +72,7 @@ from telco_churn.models.calibrate import (
 from telco_churn.models.evaluate import (
     check_threshold_provenance,
     load_fitted_model,
-    load_policy_thresholds,
     load_threshold_validation,
-    resolve_model_run_id,
-    resolve_policy_thresholds_by_scenario,
 )
 from telco_churn.models.explain import (
     binary_feature_effects,
@@ -81,8 +81,18 @@ from telco_churn.models.explain import (
     global_importance,
     local_explanations,
 )
+from telco_churn.models.threshold import (
+    load_dev_oof_predictions,
+    load_policy_thresholds,
+    resolve_policy_thresholds_by_scenario,
+)
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.mlflow import (
+    ensure_experiment_metadata,
+    resolve_model_run_id,
+    resolve_tracking_uri,
+    set_run_description,
+)
 from telco_churn.utils.paths import get_project_root
 
 __all__ = [
@@ -96,6 +106,14 @@ __all__ = [
 ]
 
 logger = get_logger(__name__)
+
+_RUN_DESCRIPTION = (
+    "Error analysis for one evaluated model version - SHAP global "
+    "importance and values (model documentation, not error analysis), "
+    "FN/FP case inspection, and a direction-sanity check feeding the human "
+    "review stamped onto promotion_decision.json. Writes "
+    "error_analysis.json, later read into model_card.json at promotion."
+)
 
 # MLflow metric names allow only alphanumerics, underscores, dashes, periods,
 # spaces, and slashes — one-hot feature names from ColumnTransformer.
@@ -484,9 +502,9 @@ def _features_by_customer_id(customer_ids: pd.Series) -> pd.DataFrame:
     """Full raw feature rows for exactly `customer_ids`, via the unsplit
     feature table — never telco_churn's data/split.py. `customer_ids` already
     carries whatever partition membership an upstream artifact (evaluate.py's
-    test_predictions.parquet, calibrate.py's dev_oof_predictions.parquet)
-    sealed; this only joins raw columns onto that already-fixed identity set,
-    it does not re-derive a split.
+    test_predictions.parquet, calibrate.py's dev-OOF vector) sealed; this only
+    joins raw columns onto that already-fixed identity set, it does not
+    re-derive a split.
 
     Checks for a missing lookup by id membership, not by scanning the joined
     frame for any NaN: 11 zero-tenure customers carry a legitimate NaN
@@ -1177,9 +1195,10 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
     Resolves `model_version` explicitly (never an alias), checks threshold
     provenance (same guard evaluate.py applies — a stale threshold_validation.json
     would otherwise silently derive a near-miss band from the wrong model's
-    CI), loads the champion, and reads reports/test_predictions.parquet +
-    reports/dev_oof_predictions.parquet (both written by evaluate.py) — the
-    only route this module reaches evaluation data through. The error-
+    CI), loads the champion, and reads reports/test_predictions.parquet
+    (evaluate.py) + reports/dev_oof_predictions.parquet (threshold.py's
+    dev-OOF screen) — the only route this module reaches evaluation data
+    through. The error-
     confidence near-miss band is derived from threshold.py's argmax-EV
     bootstrap CI (near_miss_band_from_validation), falling back to
     error_analysis.near_miss_band only if that CI is unavailable. Computes
@@ -1240,6 +1259,7 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
     and writes reports/error_analysis.json — register.py aborts without it.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    registered_model_name = str(cfg.mlflow.registered_model_name)
 
     run_id = resolve_model_run_id(model_version, cfg)
     validation_payload = load_threshold_validation(run_id, cfg)
@@ -1250,7 +1270,13 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
 
     reports_dir = get_project_root() / str(cfg.paths.reports)
     test_predictions = pd.read_parquet(reports_dir / "test_predictions.parquet")
-    dev_oof_predictions = pd.read_parquet(reports_dir / "dev_oof_predictions.parquet")
+    # threshold.py's reports/dev_oof_predictions.parquet is a row-order-
+    # reindexed copy of calibrate.py's own MLflow artifact (both derive from
+    # the same load_dev_customer_ids() ordering) — fetched here by run_id
+    # from its true owner, calibrate.py's logged artifact, rather than a
+    # local disk path that only reflects whichever run last executed
+    # threshold.py on this machine.
+    dev_oof_predictions = load_dev_oof_predictions(run_id, cfg)
 
     test_features_df = _features_by_customer_id(test_predictions["customerid"])
     dev_features_df = _features_by_customer_id(dev_oof_predictions["customerid"])
@@ -1602,7 +1628,7 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
     _save_error_confidence_plot(confidence, error_confidence_path)
     _save_value_weighted_plot(value_weighted_rows, value_weighted_path)
 
-    mlflow.set_experiment(str(cfg.mlflow.experiment_name))
+    ensure_experiment_metadata(cfg)
     model_id = _resolve_logged_model_id(model_version, cfg)
     test_dataset = mlflow_dataset_from_pandas(
         pd.concat(
@@ -1617,7 +1643,8 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
     )
 
     with mlflow.start_run(run_name="error_analysis") as run:
-        ea_run_id = run.info.run_id
+        set_run_description(_RUN_DESCRIPTION)
+        error_analysis_run_id = run.info.run_id
         mlflow.log_input(test_dataset, context="error_analysis")
 
         scalar_metrics: dict[str, float] = {
@@ -1673,6 +1700,20 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
             shap_df.to_parquet(shap_values_path, index=False)
             mlflow.log_artifact(str(shap_values_path))
 
+    # register.py's only supported path from "the model version being
+    # registered" to this cycle's error_analysis.json — same tag pattern as
+    # calibrate.py's logged_model_id and evaluate.py's eval_run_id, since
+    # nothing else auto-populates a run-to-version link. A local reports/
+    # path is not a substitute: it only reflects whichever run last executed
+    # error_analysis.py on this machine, not necessarily this model_version's
+    # own cycle.
+    mlflow.tracking.MlflowClient().set_model_version_tag(
+        registered_model_name,
+        model_version,
+        "error_analysis_run_id",
+        error_analysis_run_id,
+    )
+
     reports_dir.mkdir(parents=True, exist_ok=True)
     with open(reports_dir / "error_analysis.json", "w", encoding="utf-8") as f:
         json.dump(error_analysis_payload, f, indent=2, default=str)
@@ -1680,13 +1721,13 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
     logger.info(
         "error_analysis_step_done",
         run_id=run_id,
-        ea_run_id=ea_run_id,
+        error_analysis_run_id=error_analysis_run_id,
         model_version=model_version,
         direction_sanity_check_passed=v3_result["passed"],
     )
 
     return {
-        "ea_run_id": ea_run_id,
+        "error_analysis_run_id": error_analysis_run_id,
         "model_version": model_version,
         "error_analysis": error_analysis_payload,
     }
@@ -1716,7 +1757,7 @@ if __name__ == "__main__":
         logger.info(
             "error_analysis_step_done",
             model_version=result["model_version"],
-            ea_run_id=result["ea_run_id"],
+            error_analysis_run_id=result["error_analysis_run_id"],
         )
     except FileNotFoundError as e:
         logger.error("error_analysis_data_not_found", error=str(e), exc_info=True)

@@ -1,19 +1,27 @@
-"""Integration tests: error_analysis.py __main__ subprocess (self-contained, no Docker).
+"""Integration tests: register.py __main__ subprocess (self-contained, no Docker).
 
 CLAUDE.md: every __main__ CLI entry point requires a subprocess integration
 test — direct function calls miss argparse/OmegaConf resolution and the
 env-var-to-engine joints that only surface at the process boundary.
 
-The full production chain up to (but not including) error_analysis.py is
-seeded once per module via direct in-process calls —
-log_model.run_model_logging_step -> calibrate.run_calibration_step ->
-threshold.run_threshold_step (which now folds in the dev-OOF screen as its
-own last step) -> evaluate.run_evaluation_step — one step further down the
-pipeline than test_evaluate_subprocess.py's own precedent. Only
-error_analysis.py itself crosses the subprocess boundary. A dev-OOF screen
-failure (a real slope outside the band on this synthetic fixture) is
-tolerated during seeding — its artifacts are written before it raises, so
-evaluate.py's read just after is unaffected either way.
+The full production chain up to (but not including) register.py is seeded
+once per module via direct in-process calls — log_model.run_model_logging_step
+-> calibrate.run_calibration_step -> threshold.run_threshold_step (which now
+folds in the dev-OOF screen as its own last step) -> evaluate.run_evaluation_step
+-> error_analysis.run_error_analysis_step -> a human review stamp via
+gate.record_review (mirroring notebook 05's own closing cell) — one step
+further down the pipeline than test_error_analysis_subprocess.py's own
+precedent. Only register.py itself crosses the subprocess boundary. A
+dev-OOF screen failure (a real slope outside the band on this synthetic
+fixture) is tolerated during seeding — its artifacts are written before it
+raises, so evaluate.py's read just after is unaffected either way.
+
+The seeded decision's gate outcome is forced to "pass" after the real chain
+runs: evaluate.py's cold-start gate on this synthetic fixture is not
+guaranteed to pass (test_evaluate_subprocess.py itself only asserts
+gate in {"pass", "fail"}), and this module's job is to test register.py's
+own behavior given a passing decision, not to re-litigate evaluate.py's gate
+logic (already covered by test_gate.py/test_evaluate.py).
 """
 
 from __future__ import annotations
@@ -22,7 +30,9 @@ import json
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import mlflow
 import numpy as np
@@ -31,7 +41,9 @@ import pytest
 from omegaconf import OmegaConf
 
 import telco_churn.models.calibrate as calibrate
+import telco_churn.models.error_analysis as error_analysis
 import telco_churn.models.evaluate as evaluate
+import telco_churn.models.gate as gate
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
@@ -46,22 +58,14 @@ _FAST_CALIBRATION_OVERRIDES = [
     "calibration.outer_cv_folds=3",
     "calibration.inner_cv_folds=3",
 ]
-
-# Small enough to keep evaluate.run_evaluation_step's many bootstrap passes
-# fast when seeding the fixture; error_analysis.py's own SHAP pass has no
-# bootstrap knob of its own.
 _FAST_EVALUATE_OVERRIDES = ["evaluate.n_bootstrap=30"]
 
 
 def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame:
     """A FeatureOutputSchema-conformant frame with every segment-axis column
-    evaluate.py's slicing needs, sized so each axis's groups clear
-    _MIN_SLICE_SIZE on both the dev and test partitions.
-
-    churn is drawn from a logistic function of contract_type/tenure/
-    monthlycharges — a real, learnable relationship — mirroring
-    test_evaluate_subprocess.py's own fixture, for the same reason: label
-    noise makes calibrate.py's PR-AUC gate flaky.
+    evaluate.py's slicing needs, mirroring test_evaluate_subprocess.py's own
+    fixture (genuine learnable signal, not label noise — see that module's
+    docstring for why).
     """
     rng = np.random.default_rng(seed)
     contract_type = rng.choice(["Month-to-month", "One year", "Two year"], size=n)
@@ -142,10 +146,7 @@ def _sqlite_experiment(tmp_path: Path, experiment_name: str) -> str:
 
 
 def _base_costs_cfg_dict() -> dict:
-    """A valid, minimal costs.yaml payload — matches configs/costs.yaml's
-    schema, including contact_capacity (evaluate.py's EV-by-budget figure
-    reads it), with a reduced bootstrap count for speed.
-    """
+    """A valid, minimal costs.yaml payload — matches configs/costs.yaml's schema."""
     return {
         "gross_margin": 0.60,
         "horizon_months": 12,
@@ -176,19 +177,19 @@ def _base_costs_cfg_dict() -> dict:
 
 
 @pytest.fixture(scope="module")
-def evaluated_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
-    """Seed a real registered, calibrated, thresholded, and evaluated model
-    once for the whole module — the production chain up to (not including)
-    error_analysis.py.
+def reviewed_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
+    """Seed a real registered, calibrated, thresholded, evaluated, error-analyzed,
+    and human-reviewed model once for the whole module — the production chain
+    up to (not including) register.py.
     """
-    seed_root = tmp_path_factory.mktemp("error_analysis_subprocess_seed")
+    seed_root = tmp_path_factory.mktemp("register_subprocess_seed")
     data_dir = seed_root / "processed"
     data_dir.mkdir()
     df, manifest = _seed_processed_data(data_dir)
 
     experiment_name = str(compose_config().mlflow.experiment_name)
     tracking_uri = _sqlite_experiment(seed_root, experiment_name)
-    registered_model_name = "test-error-analysis-subprocess-pipeline"
+    registered_model_name = "test-register-subprocess-pipeline"
 
     costs_path = seed_root / "costs.yaml"
     OmegaConf.save(OmegaConf.create(_base_costs_cfg_dict()), costs_path)
@@ -253,10 +254,6 @@ def evaluated_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, objec
         "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
     }
 
-    # calibrate/threshold/evaluate re-derive the dev/test partitions themselves
-    # (load_features() -> partition()), reading PROCESSED_DATA_DIR from the
-    # *current* environment rather than from `cfg` — same env-scoping caveat
-    # test_evaluate_subprocess.py's fixture documents.
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("PROCESSED_DATA_DIR", str(data_dir))
         with mlflow.start_run(run_name="tuning_study") as run:
@@ -277,36 +274,121 @@ def evaluated_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, objec
             # evaluate.py's read just below is unaffected either way.
             pass
         evaluate.run_evaluation_step(model_version, cfg)
+        error_analysis.run_error_analysis_step(model_version, cfg)
+
+    decision_path = reports_dir / "promotion_decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    # Force a deterministic "pass" — see module docstring.
+    decision["gate"] = "pass"
+    reviewed = gate.record_review(
+        decision,
+        verdict="approved",
+        notes="Forced pass for register.py subprocess coverage.",
+        approver="test-suite",
+        reviewed_at=datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        direction_sanity_check_fired=False,
+    )
+    decision_path.write_text(json.dumps(reviewed), encoding="utf-8")
+    # register.py resolves promotion_decision.json exclusively via the model
+    # version's eval_run_id tag now (never a local reports/ path) — the local
+    # rewrite above is a human-inspection mirror only, so the reviewed verdict
+    # must also be re-logged onto the eval run itself, exactly as notebook
+    # 05's closing cell does.
+    mlflow.tracking.MlflowClient(tracking_uri=tracking_uri).log_dict(
+        decision["eval_run_id"], reviewed, "promotion_decision.json"
+    )
 
     return {
         "tracking_uri": tracking_uri,
         "registered_model_name": registered_model_name,
         "model_version": model_version,
+        "run_id": log_result["run_id"],
         "data_dir": data_dir,
         "costs_path": costs_path,
         "policy_dir": policy_dir,
         "figures_dir": figures_dir,
         "reports_dir": reports_dir,
+        "cfg_overrides": [
+            f"mlflow.tracking_uri={tracking_uri}",
+            f"mlflow.registered_model_name={registered_model_name}",
+            f"paths.costs_config={costs_path}",
+            f"paths.figures={figures_dir}",
+            f"paths.policy={policy_dir}",
+            f"paths.reports={reports_dir}",
+            *_FAST_CALIBRATION_OVERRIDES,
+            *_FAST_EVALUATE_OVERRIDES,
+        ],
     }
 
 
-def _run_error_analysis_cli(
+def _log_and_tag_evaluation_run(
+    tracking_uri: str,
+    registered_model_name: str,
+    model_version: str,
+    *,
+    decision_model_version: str,
+    gate_result: str,
+    review: str,
+) -> str:
+    """Log a minimal promotion_decision.json + metrics.json onto a fresh
+    'evaluation' MLflow run and tag eval_run_id onto model_version —
+    mirroring evaluate.py's real behavior. register.py resolves both
+    exclusively via that tag now, never a local reports/ path, so a test
+    simulating a specific decision (e.g. gate: fail) logs one directly
+    rather than hand-editing a local JSON file register.py no longer reads.
+    """
+    mlflow.set_tracking_uri(tracking_uri)
+    metrics_payload = {"champion_version": None}
+    with mlflow.start_run(run_name="evaluation") as run:
+        eval_run_id = run.info.run_id
+        mlflow.log_dict(metrics_payload, "metrics.json")
+        mlflow.log_dict(
+            {
+                "model_version": decision_model_version,
+                "gate": gate_result,
+                "review": review,
+                "regime": "cold_start",
+                "criteria": {},
+                "metrics_content_hash": evaluate.content_hash(metrics_payload),
+            },
+            "promotion_decision.json",
+        )
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+    client.set_model_version_tag(
+        registered_model_name, model_version, "eval_run_id", eval_run_id
+    )
+    return eval_run_id
+
+
+def _mint_second_pending_version(fixture: dict[str, object]) -> str:
+    """Re-run calibrate.py's real registration against the fixture's own
+    tuning_study run_id, minting a second, independent, still-`pending`
+    version — so a test that needs to tag a version without disturbing
+    another test's already-decided one gets a genuinely separate artifact,
+    rather than depending on test execution order.
+    """
+    overrides = cast("list[str]", fixture["cfg_overrides"])
+    cfg = compose_config(overrides=overrides)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PROCESSED_DATA_DIR", str(fixture["data_dir"]))
+        cal_result = calibrate.run_calibration_step(str(fixture["run_id"]), cfg)
+    return str(cal_result["model_version"])
+
+
+def _run_register_cli(
     model_version: str | None,
     fixture: dict[str, object],
     extra_overrides: list[str] | None = None,
     timeout: int = 300,
 ) -> subprocess.CompletedProcess[str]:
-    """Invoke error_analysis.py's CLI as a real subprocess with sandboxed output paths."""
+    """Invoke register.py's CLI as a real subprocess with sandboxed output paths."""
     overrides = [
         f"mlflow.tracking_uri={fixture['tracking_uri']}",
         f"mlflow.registered_model_name={fixture['registered_model_name']}",
-        f"paths.costs_config={fixture['costs_path']}",
-        f"paths.policy={fixture['policy_dir']}",
-        f"paths.figures={fixture['figures_dir']}",
         f"paths.reports={fixture['reports_dir']}",
     ]
     if model_version is not None:
-        overrides.append(f"error_analysis.model_version={model_version}")
+        overrides.append(f"register.model_version={model_version}")
     overrides.extend(extra_overrides or [])
 
     env = {
@@ -315,7 +397,7 @@ def _run_error_analysis_cli(
         "MLFLOW_TRACKING_URI": str(fixture["tracking_uri"]),
     }
     return subprocess.run(
-        [sys.executable, "-m", "telco_churn.models.error_analysis", *overrides],
+        [sys.executable, "-m", "telco_churn.models.register", *overrides],
         env=env,
         capture_output=True,
         text=True,
@@ -325,135 +407,99 @@ def _run_error_analysis_cli(
     )
 
 
-def test_error_analysis_main_cli_exits_zero_and_writes_report(
-    evaluated_model: dict[str, object],
+def test_register_main_cli_exits_zero_and_promotes(
+    reviewed_model: dict[str, object],
 ) -> None:
-    """error_analysis.py __main__ computes SHAP on the sealed test set, scans
-    dev OOF for error concentration, and writes error_analysis.json."""
-    result = _run_error_analysis_cli(
-        str(evaluated_model["model_version"]), evaluated_model
-    )
+    """register.py __main__ flips champion onto the reviewed, passing candidate
+    and logs drift_reference.json + model_card.json onto its run."""
+    result = _run_register_cli(str(reviewed_model["model_version"]), reviewed_model)
 
     assert (
         result.returncode == 0
-    ), f"error_analysis CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    assert "error_analysis_step_done" in result.stdout
+    ), f"register CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    assert "registration_step_done" in result.stdout
 
-    reports_dir = Path(str(evaluated_model["reports_dir"]))
-    payload = json.loads(
-        (reports_dir / "error_analysis.json").read_text(encoding="utf-8")
+    tracking_uri = str(reviewed_model["tracking_uri"])
+    registered_name = str(reviewed_model["registered_model_name"])
+    model_version = str(reviewed_model["model_version"])
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+
+    model = client.get_registered_model(registered_name)
+    assert str(model.aliases["champion"]) == model_version
+
+    version = client.get_model_version(registered_name, model_version)
+    assert version.tags["promotion_status"] == "promoted"
+
+    run_id = version.run_id
+    drift_reference = mlflow.artifacts.load_dict(
+        f"runs:/{run_id}/registration/drift_reference.json"
     )
-    assert payload["model_version"] == str(evaluated_model["model_version"])
-    for key in (
-        "error_confidence",
-        "value_weighted_errors",
-        "error_concentration",
-        "shap",
-        "top_k_elbow_checks",
-        "subgroup_findings",
-        "direction_sanity_check",
-        "dev_oof_diagnostics_carried_through",
-    ):
-        assert key in payload, f"error_analysis.json missing field: {key}"
+    assert "features" in drift_reference
+    assert "score" in drift_reference
 
-    assert "passed" in payload["direction_sanity_check"]
-    assert set(payload["shap"]) >= {
-        "global_importance",
-        "top_features",
-        "dependence",
-        "cohort_shap",
-        "cohort_top_features_fp_tn",
-        "local_explanations",
-    }
-    assert set(payload["shap"]["cohort_shap"]) == {"fn", "tp", "fp", "tn"}
-    assert set(payload["top_k_elbow_checks"]) == {
-        "shap_features",
-        "cohort_gap_fn_tp",
-        "cohort_gap_fp_tn",
-    }
-    for check in payload["top_k_elbow_checks"].values():
-        assert "valid" in check
-        assert "configured_k" in check
-    assert set(payload["subgroup_findings"]) == {
-        "annual_contract_fn_vs_tn_monthlycharges"
-    }
-    assert set(payload["error_concentration"]) == {
-        "dev_oof_top_fnr_cohorts",
-        "dev_oof_top_fpr_cohorts",
-    }
+    model_card = mlflow.artifacts.load_dict(
+        f"runs:/{run_id}/registration/model_card.json"
+    )
+    assert model_card["governance"]["model_details"]["version"] == model_version
 
-    figures_dir = Path(str(evaluated_model["figures_dir"]))
-    for filename in (
-        "shap_global_importance.png",
-        "shap_beeswarm.png",
-        "shap_dependence.png",
-        "shap_cohort_fn_vs_tp.png",
-        "shap_cohort_beeswarm_fn.png",
-        "shap_cohort_beeswarm_tp.png",
-        "shap_cohort_fp_vs_tn.png",
-        "shap_cohort_beeswarm_fp.png",
-        "shap_cohort_beeswarm_tn.png",
-        "shap_cohort_dependence_tenure.png",
-        "shap_subgroup_dependence_monthlycharges_annual.png",
-        "shap_waterfall_examples.png",
-        "shap_waterfall_confident_cases.png",
-        "error_confidence.png",
-        "value_weighted_errors.png",
-    ):
-        assert (figures_dir / filename).exists(), f"missing figure: {filename}"
+    reports_dir = Path(str(reviewed_model["reports_dir"]))
+    assert (reports_dir / "drift_reference.json").exists()
+    assert (reports_dir / "model_card.json").exists()
+
+
+def test_register_main_cli_exits_one_when_model_version_missing(
+    reviewed_model: dict[str, object],
+) -> None:
+    """register.py __main__ exits 1 when register.model_version is not
+    provided — never inferred from the challenger alias."""
+    result = _run_register_cli(None, reviewed_model, timeout=60)
+
+    assert result.returncode == 1, (
+        f"register CLI should exit 1 when register.model_version is missing:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+def test_register_main_cli_exits_one_on_gate_fail(
+    reviewed_model: dict[str, object],
+) -> None:
+    """A gate: fail decision must exit 1 and tag the version rejected, never
+    flip champion.
+
+    Mints its own second version via _mint_second_pending_version rather than
+    reusing reviewed_model["model_version"] — that version may already be
+    tagged `promoted` by test_register_main_cli_exits_zero_and_promotes, and
+    these two mutating tests must not depend on execution order. Logs its own
+    'evaluation' run with gate="fail" and tags eval_run_id onto second_version
+    directly (_log_and_tag_evaluation_run) — register.py resolves
+    promotion_decision.json exclusively via that tag, never a local reports/
+    path, so no local file surgery is needed to simulate this decision.
+    """
+    second_version = _mint_second_pending_version(reviewed_model)
+    _log_and_tag_evaluation_run(
+        str(reviewed_model["tracking_uri"]),
+        str(reviewed_model["registered_model_name"]),
+        second_version,
+        decision_model_version=second_version,
+        gate_result="fail",
+        review="approved",
+    )
+
+    result = _run_register_cli(second_version, reviewed_model, timeout=60)
+
+    assert result.returncode == 0, (
+        f"register CLI should exit 0 on a clean gate:fail rejection:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "model_rejected" in result.stdout
 
     client = mlflow.tracking.MlflowClient(
-        tracking_uri=str(evaluated_model["tracking_uri"])
+        tracking_uri=str(reviewed_model["tracking_uri"])
     )
-    runs = client.search_runs(
-        experiment_ids=[
-            client.get_experiment_by_name(
-                str(compose_config().mlflow.experiment_name)
-            ).experiment_id
-        ],
-        filter_string="tags.mlflow.runName = 'error_analysis'",
-    )
-    assert len(runs) >= 1
-    assert runs[0].data.tags.get("direction_sanity_check") in {"pass", "fail"}
-
-    # register.py's only supported path to this cycle's error_analysis.json —
-    # resolved by run_id, never a local reports/ path.
     version = client.get_model_version(
-        str(evaluated_model["registered_model_name"]),
-        str(evaluated_model["model_version"]),
+        str(reviewed_model["registered_model_name"]), second_version
     )
-    assert version.tags.get("error_analysis_run_id") == runs[0].info.run_id
+    assert version.tags["promotion_status"] == "rejected"
 
-
-def test_error_analysis_main_cli_exits_one_when_model_version_missing(
-    evaluated_model: dict[str, object],
-) -> None:
-    """error_analysis.py __main__ exits 1 when error_analysis.model_version is
-    not provided — never inferred from 'latest'."""
-    result = _run_error_analysis_cli(None, evaluated_model, timeout=60)
-
-    assert result.returncode == 1, (
-        f"error_analysis CLI should exit 1 when error_analysis.model_version "
-        f"is missing:\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-
-
-def test_error_analysis_main_cli_exits_one_when_prediction_artifacts_missing(
-    evaluated_model: dict[str, object], tmp_path: Path
-) -> None:
-    """A reports/ directory without evaluate.py's prediction artifacts fails
-    loudly rather than silently reaching for the test split some other way."""
-    empty_reports_dir = tmp_path / "empty_reports"
-    empty_reports_dir.mkdir()
-    fixture_with_empty_reports = {**evaluated_model, "reports_dir": empty_reports_dir}
-
-    result = _run_error_analysis_cli(
-        str(evaluated_model["model_version"]),
-        fixture_with_empty_reports,
-        timeout=60,
-    )
-
-    assert result.returncode == 1, (
-        f"error_analysis CLI should exit 1 when test_predictions.parquet is "
-        f"absent:\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
+    model = client.get_registered_model(str(reviewed_model["registered_model_name"]))
+    assert str(model.aliases.get("champion")) != second_version

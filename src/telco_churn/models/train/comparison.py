@@ -23,12 +23,21 @@ from telco_churn.models.diagnostics import (
 )
 from telco_churn.models.train.common import _dvc_hash, _git_sha, _log_dev_input
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.mlflow import resolve_tracking_uri, set_run_description
 from telco_churn.utils.stats import paired_bootstrap_ci
 
 __all__ = ["bootstrap_comparison", "run_comparison_step", "run_diagnostics_step"]
 
 logger = get_logger(__name__)
+
+_RUN_DESCRIPTION = (
+    "Candidate comparison — Dummy / LogReg / LightGBM scored on one shared, "
+    "paired RepeatedStratifiedKFold(5x3) over the development split. Decides "
+    "model family via a pre-registered paired-bootstrap PR-AUC rule "
+    "(materiality delta*=0.005); non-gating fixed-recall and "
+    "fairness/robustness diagnostics logged alongside but never decide the "
+    "family."
+)
 
 # Flag-only characterization segments — never decide the model family (CLAUDE.md
 # one-metric invariant).
@@ -319,6 +328,7 @@ def run_comparison_step(
     mlflow.set_experiment(cfg.mlflow.experiment_name)
 
     with mlflow.start_run(run_name="model_comparison"):
+        set_run_description(_RUN_DESCRIPTION)
         mlflow.set_tags(
             {
                 "stage": "comparison",

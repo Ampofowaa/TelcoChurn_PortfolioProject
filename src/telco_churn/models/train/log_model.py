@@ -18,7 +18,7 @@ from sklearn.metrics import average_precision_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 
-from telco_churn.features.build import FEATURE_SCHEMA
+from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.models.train.common import (
     _dvc_hash,
@@ -26,11 +26,22 @@ from telco_churn.models.train.common import (
     _lgbm_fixed_knobs,
 )
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.mlflow import (
+    TRAINING_CYCLE_RUN_DESCRIPTION,
+    resolve_tracking_uri,
+    set_logged_model_description,
+    set_run_description,
+)
 
 __all__ = ["run_model_logging_step"]
 
 logger = get_logger(__name__)
+
+_MODEL_DESCRIPTION = (
+    "Uncalibrated preprocessor->LightGBM pipeline, tuned via Optuna on "
+    "PR-AUC. Logged for audit/lineage only - never registered. The servable "
+    "artifact is 'calibrated_model' on this same run."
+)
 
 
 def _cv_pr_auc_at_n_estimators(
@@ -271,6 +282,8 @@ def run_model_logging_step(
 
     run_id = str(tuning_result["parent_run_id"])
     with mlflow.start_run(run_id=run_id):
+        set_run_description(TRAINING_CYCLE_RUN_DESCRIPTION)
+        mlflow.log_param("target_column", TARGET_COL)
         mlflow.log_text("\n".join(full_feature_space), "feature_space.txt")
         mlflow.log_text("\n".join(committed_features), "feature_columns.txt")
         mlflow.log_metrics(
@@ -300,6 +313,7 @@ def run_model_logging_step(
             # per-type trust list to maintain.
             serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE,
         )
+        set_logged_model_description(model_info.model_id, _MODEL_DESCRIPTION)
 
         # models:/m-<id> under MLflow 3 — a permanent handle on this artifact.
         # calibrate.py resolves the unfitted pipeline through this field, never

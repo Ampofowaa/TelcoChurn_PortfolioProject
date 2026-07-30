@@ -1,8 +1,8 @@
 """Single accessor for the processed features table — path, format, and content hash.
 
 The DVC pipeline wrap replaces telco_churn_processed.csv with telco_churn_features.parquet; every
-consumer added after that decision (calibrate.py, evaluate.py, refit.py) reads
-through load_features() so the swap is a one-function edit instead of a rewrite
+consumer added after that decision (calibrate.py, evaluate.py, threshold.py)
+reads through load_features() so the swap is a one-function edit instead of a rewrite
 across modules.
 """
 
@@ -50,11 +50,12 @@ def load_features(path: Path | None = None) -> pd.DataFrame:
 def features_sha256(path: Path | None = None) -> str:
     """Return the sha256 content hash of the processed features file on disk.
 
-    Consumed by the evaluation and full-data refit's consistency assertion
-    (evaluate.py/refit.py) — the same
-    features file must back training, calibration, evaluation, and the full-data
-    refit within one cycle. Independent of DVC's own hash
-    (models/train/common.py's _dvc_hash), which is unavailable until the DVC
-    pipeline wrap tracks the file.
+    Not yet wired into a consistency assertion by any consumer — intended
+    for verifying the same features file backs training, calibration, and
+    evaluation within one cycle, which matters most once a Phase 10
+    recalibration flow (not yet designed) reuses a frozen feature spec
+    across cycles. Independent of DVC's own hash (models/train/common.py's
+    _dvc_hash), which is unavailable until the DVC pipeline wrap tracks the
+    file.
     """
     return hashlib.sha256(features_path(path).read_bytes()).hexdigest()

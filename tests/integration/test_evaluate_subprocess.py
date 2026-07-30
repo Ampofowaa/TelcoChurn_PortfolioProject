@@ -6,21 +6,25 @@ env-var-to-engine joints that only surface at the process boundary.
 
 The full production chain up to (but not including) evaluate.py is seeded
 once per module via direct in-process calls — log_model.run_model_logging_step
--> calibrate.run_calibration_step -> threshold.run_threshold_step — mirroring
+-> calibrate.run_calibration_step -> threshold.run_threshold_step (which now
+folds in the dev-OOF screen as its own last step) — mirroring
 test_threshold_subprocess.py's own precedent one step further down the
-pipeline. Only evaluate.py itself crosses the subprocess boundary.
+pipeline. Only evaluate.py itself crosses the subprocess boundary. A dev-OOF
+screen failure (a real slope outside the band on this synthetic fixture) is
+tolerated during seeding — its artifacts are written before it raises, so
+evaluate.py's later reads are unaffected either way.
 
 No `champion` alias exists anywhere in this throwaway registry, so every test
 here exercises the cold-start regime (ANALYSIS.md §0) — the comparative
-regime needs a promoted champion, which requires register.py (not yet
-built). Coverage for the comparative branch belongs with register.py's own
-subprocess test once that module exists.
+regime needs a promoted champion. Coverage for the comparative branch belongs
+with register.py's own subprocess test (tests/integration/test_register_subprocess.py).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -211,6 +215,7 @@ def registered_evaluation_model(
             f"paths.costs_config={costs_path}",
             f"paths.figures={figures_dir}",
             f"paths.policy={policy_dir}",
+            f"paths.reports={reports_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
         ]
     )
@@ -279,7 +284,15 @@ def registered_evaluation_model(
         cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
         model_version = str(cal_result["model_version"])
 
-        threshold.run_threshold_step(model_version, cfg)
+        try:
+            threshold.run_threshold_step(model_version, cfg)
+        except RuntimeError:
+            # A dev-OOF screen failure (the real slope on this synthetic
+            # fixture lying outside the band) is a legitimate outcome, not a
+            # setup bug — reports/dev_oof_predictions.parquet and
+            # dev_oof_diagnostics.json are written before that raise, so
+            # evaluate.py's later reads are unaffected either way.
+            pass
 
     return {
         "tracking_uri": tracking_uri,
@@ -300,7 +313,21 @@ def _run_evaluate_cli(
     extra_overrides: list[str] | None = None,
     timeout: int = 300,
 ) -> subprocess.CompletedProcess[str]:
-    """Invoke evaluate.py's CLI as a real subprocess with sandboxed output paths."""
+    """Invoke evaluate.py's CLI as a real subprocess with sandboxed output paths.
+
+    evaluate.py now reads reports/dev_oof_predictions.parquet and
+    reports/dev_oof_diagnostics.json rather than computing them — both were
+    written once, during fixture seeding, into fixture["reports_dir"]. Each
+    test here uses its own scratch `reports_dir` for output isolation, so
+    those two threshold.py dev-OOF-screen artifacts are copied in first.
+    """
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    seed_reports_dir = Path(str(fixture["reports_dir"]))
+    for name in ("dev_oof_predictions.parquet", "dev_oof_diagnostics.json"):
+        src = seed_reports_dir / name
+        if src.exists():
+            shutil.copy(src, reports_dir / name)
+
     overrides = [
         f"mlflow.tracking_uri={fixture['tracking_uri']}",
         f"mlflow.registered_model_name={fixture['registered_model_name']}",
@@ -376,6 +403,11 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
     assert set(test_predictions.columns) == {"customerid", "y_true", "p_hat"}
     assert len(test_predictions) > 0
 
+    # Written by threshold.py's folded-in dev-OOF screen (customerid, y_true,
+    # p_hat — no re-logged segment columns, since nothing downstream needs
+    # them off this file), copied into this test's scratch reports_dir by
+    # _run_evaluate_cli — evaluate.py itself only ever reads this file, never
+    # writes it.
     dev_oof_predictions = pd.read_parquet(reports_dir / "dev_oof_predictions.parquet")
     assert set(dev_oof_predictions.columns) == {"customerid", "y_true", "p_hat"}
     assert len(dev_oof_predictions) > 0
@@ -402,6 +434,9 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
     )
     for tag in ("test_pr_auc", "test_recall", "test_brier", "test_calibration_slope"):
         assert tag in version.tags, f"missing model-version tag: {tag}"
+    # register.py's only supported path to this cycle's promotion_decision.json/
+    # metrics.json — resolved by run_id, never a local reports/ path.
+    assert version.tags.get("eval_run_id") == decision["eval_run_id"]
 
 
 def test_evaluate_main_cli_exits_one_when_model_version_missing(

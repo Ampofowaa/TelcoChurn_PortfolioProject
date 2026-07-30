@@ -929,6 +929,7 @@ def registration_cfg(calibration_mlflow_uri: str, tmp_path: Path) -> DictConfig:
                 "ece_strategy": "uniform",
                 "run_id": None,
                 "override_trial_count_gate": False,
+                "golden_n_rows": 5,
             },
             "mlflow": {
                 "tracking_uri": calibration_mlflow_uri,
@@ -1046,7 +1047,7 @@ def test_run_calibration_step_registers_and_tags(
     tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
-    """Registers exactly one version, tags refit_scope=dev, and points
+    """Registers exactly one version, tags training_data_scope=dev, and points
     challenger at it — the training cycle's single registration point.
     """
     run_id = _log_parent_run(
@@ -1062,7 +1063,7 @@ def test_run_calibration_step_registers_and_tags(
     client = mlflow.tracking.MlflowClient()
     registered_name = str(registration_cfg.mlflow.registered_model_name)
     version = client.get_model_version(registered_name, result["model_version"])
-    assert version.tags["refit_scope"] == "dev"
+    assert version.tags["training_data_scope"] == "dev"
     # ModelVersion.model_id does not auto-populate in OSS MLflow 3.14 — without
     # this tag the registry has no supported path to the LoggedModel Phase 7's
     # evaluate.py attaches sealed-test metrics to.
@@ -1071,6 +1072,70 @@ def test_run_calibration_step_registers_and_tags(
 
     registered_model = client.get_registered_model(registered_name)
     assert str(registered_model.aliases["challenger"]) == result["model_version"]
+
+
+def test_run_calibration_step_tags_promotion_status_pending(
+    registration_cfg: DictConfig,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
+    sandboxed_dev_features: None,
+) -> None:
+    """Mint-time default: a freshly registered version is tagged
+    promotion_status=pending before register.py has ever seen it — the
+    fail-safe state a crash anywhere downstream leaves it in.
+    """
+    run_id = _log_parent_run(
+        dev_split, comparison_result, tuning_result, registration_cfg
+    )
+
+    result = calibrate.run_calibration_step(run_id, registration_cfg)
+
+    client = mlflow.tracking.MlflowClient()
+    registered_name = str(registration_cfg.mlflow.registered_model_name)
+    version = client.get_model_version(registered_name, result["model_version"])
+    assert version.tags["promotion_status"] == "pending"
+
+
+def test_run_calibration_step_logs_golden_predictions(
+    registration_cfg: DictConfig,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
+    sandboxed_dev_features: None,
+) -> None:
+    """golden_predictions.json is the independent reference register.py's
+    serving-parity smoke check verifies against later, in a different
+    process — so it must be self-contained (rows, not just scores), pinned
+    by customerid, and round-trip through the registered model exactly.
+    """
+    run_id = _log_parent_run(
+        dev_split, comparison_result, tuning_result, registration_cfg
+    )
+
+    result = calibrate.run_calibration_step(run_id, registration_cfg)
+    n_rows = int(registration_cfg.calibration.golden_n_rows)
+
+    golden = mlflow.artifacts.load_dict(
+        f"runs:/{run_id}/calibration/golden_predictions.json"
+    )
+
+    assert golden["purpose"] == (
+        "serving-parity fixture — reproducibility only; scores are "
+        "in-sample and are not performance evidence"
+    )
+    assert golden["customerid"] == sorted(golden["customerid"])
+    assert len(golden["customerid"]) == n_rows
+    assert len(golden["rows"]) == n_rows
+    assert len(golden["p_hat"]) == n_rows
+    assert all(0.0 <= p <= 1.0 for p in golden["p_hat"])
+
+    registered_name = str(registration_cfg.mlflow.registered_model_name)
+    reloaded = mlflow.sklearn.load_model(
+        f"models:/{registered_name}/{result['model_version']}"
+    )
+    reloaded_preds = reloaded.predict_proba(pd.DataFrame(golden["rows"]))[:, 1]
+    assert np.allclose(reloaded_preds, golden["p_hat"], rtol=0, atol=1e-9)
 
 
 def test_run_calibration_step_logs_reliability_diagram(
@@ -1091,8 +1156,10 @@ def test_run_calibration_step_logs_reliability_diagram(
     calibrate.run_calibration_step(run_id, registration_cfg)
 
     client = mlflow.tracking.MlflowClient()
-    artifact_paths = {a.path for a in client.list_artifacts(run_id, "figures")}
-    assert "figures/reliability_diagram.png" in artifact_paths
+    artifact_paths = {
+        a.path for a in client.list_artifacts(run_id, "calibration/figures")
+    }
+    assert "calibration/figures/reliability_diagram.png" in artifact_paths
 
 
 def test_run_calibration_step_logs_dev_oof_predictions(
@@ -1115,7 +1182,7 @@ def test_run_calibration_step_logs_dev_oof_predictions(
     calibrate.run_calibration_step(run_id, registration_cfg)
 
     local_path = mlflow.artifacts.download_artifacts(
-        run_id=run_id, artifact_path="dev_oof_predictions.parquet"
+        run_id=run_id, artifact_path="calibration/dev_oof_predictions.parquet"
     )
     oof = pd.read_parquet(local_path)
 
@@ -1160,8 +1227,8 @@ def test_run_calibration_step_calibration_summary_has_calibration_spec(
     )
 
     client = mlflow.tracking.MlflowClient()
-    artifact_paths_root = {a.path for a in client.list_artifacts(run_id)}
-    assert "calibration_summary.json" in artifact_paths_root
+    artifact_paths = {a.path for a in client.list_artifacts(run_id, "calibration")}
+    assert "calibration/calibration_summary.json" in artifact_paths
 
 
 def test_run_calibration_step_logs_dev_metrics(

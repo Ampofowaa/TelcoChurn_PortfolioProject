@@ -31,5 +31,11 @@ ece_strategy: quantile
 # tuning_study run_id to calibrate — required, e.g. `run_id=<id>` on the CLI. Never inferred from "latest".
 run_id: null
 
+# Rows in the golden-parity fixture (golden_predictions.json) — the lowest
+# n_rows customerid values in the dev partition, pinned for register.py's
+# serving-parity smoke check (Phase 7) and Phase 9's API parity test. Same
+# rows also serve as the logged model's signature input_example.
+golden_n_rows: 5
+
 # Force registration even if trial_count_below_threshold is true in training_manifest.json.
 override_trial_count_gate: false

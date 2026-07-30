@@ -7,16 +7,111 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
+from omegaconf import DictConfig, OmegaConf
 
 from telco_churn.models.diagnostics import (
+    build_segment_lookup,
+    demographic_parity_difference_by_axis,
+    equal_opportunity_difference_by_axis,
     fixed_recall_profile,
+    flag_calibration_collapse,
+    flag_segment_collapse,
     generalization_gap,
     learning_curve_points,
     segment_bootstrap_ci,
     segment_bootstrap_delta,
     segment_decision_rates,
     segment_oof_errors,
+    sliced_calibration,
+    sliced_decision_rates,
+    sliced_ranking_metrics,
 )
+
+_N_BOOTSTRAP = 200
+_RANDOM_STATE = 42
+
+
+@pytest.fixture
+def eval_cfg() -> DictConfig:
+    """Small bin count for speed — same shape as production config, not its values."""
+    return OmegaConf.create(
+        {"calibration": {"ece_n_bins": 5, "ece_strategy": "uniform"}}
+    )
+
+
+@pytest.fixture
+def segment_fixture() -> tuple[pd.Series, np.ndarray, dict[str, pd.Series]]:
+    """400 rows across two contract_type groups with a planted PR-AUC/FNR gap
+    between them — enough support in each group for a bootstrap CI."""
+    rng = np.random.default_rng(11)
+    n = 200
+    y_a = (rng.random(n) < 0.30).astype(int)
+    proba_a = np.clip(y_a * 0.6 + rng.normal(0.2, 0.1, size=n), 0.001, 0.999)
+    y_b = (rng.random(n) < 0.30).astype(int)
+    proba_b = np.clip(rng.random(n), 0.001, 0.999)  # no signal in group b
+
+    y = pd.Series(np.concatenate([y_a, y_b]), name="churn")
+    proba = np.concatenate([proba_a, proba_b])
+    df = pd.DataFrame(
+        {
+            "tenure": rng.integers(0, 72, size=2 * n),
+            "contract_type": ["month-to-month"] * n + ["two-year"] * n,
+            "internetservice": ["fiber optic"] * (2 * n),
+            "gender": (["male"] * n) + (["female"] * n),
+            "seniorcitizen": [0] * (2 * n),
+            "has_partner": [1, 0] * n,
+            "dependents": [0, 1] * n,
+        }
+    )
+    return y, proba, build_segment_lookup(df)
+
+
+# ---------------------------------------------------------------------------
+# build_segment_lookup
+# ---------------------------------------------------------------------------
+
+
+def test_build_segment_lookup_returns_all_seven_axes() -> None:
+    """Every robustness and fairness axis is present, including derived tenure_cohort."""
+    df = pd.DataFrame(
+        {
+            "tenure": [0, 15, 30, 50, 70],
+            "contract_type": ["month-to-month"] * 5,
+            "internetservice": ["fiber optic"] * 5,
+            "gender": ["male"] * 5,
+            "seniorcitizen": [0] * 5,
+            "has_partner": [1] * 5,
+            "dependents": [0] * 5,
+        }
+    )
+    lookup = build_segment_lookup(df)
+    assert set(lookup) == {
+        "contract_type",
+        "tenure_cohort",
+        "internetservice",
+        "gender",
+        "seniorcitizen",
+        "has_partner",
+        "dependents",
+    }
+
+
+def test_build_segment_lookup_tenure_cohort_bins_correctly() -> None:
+    """tenure_cohort assigns each row to the cohort its tenure value falls into."""
+    df = pd.DataFrame(
+        {
+            "tenure": [0, 15, 30, 50, 70],
+            "contract_type": ["a"] * 5,
+            "internetservice": ["a"] * 5,
+            "gender": ["a"] * 5,
+            "seniorcitizen": [0] * 5,
+            "has_partner": [0] * 5,
+            "dependents": [0] * 5,
+        }
+    )
+    cohorts = build_segment_lookup(df)["tenure_cohort"].tolist()
+    assert cohorts == ["0-12m", "13-24m", "25-48m", "49-65m", "65+m"]
+
 
 # ---------------------------------------------------------------------------
 # fixed_recall_profile
@@ -650,3 +745,183 @@ def test_learning_curve_points_single_repeat_std_is_zero() -> None:
 def test_learning_curve_points_empty_input() -> None:
     """No training sizes returns an empty list, not an error."""
     assert learning_curve_points([], [], []) == []
+
+
+# ---------------------------------------------------------------------------
+# sliced_ranking_metrics / flag_segment_collapse (V1)
+# ---------------------------------------------------------------------------
+
+
+def test_sliced_ranking_metrics_one_row_per_axis_value(
+    segment_fixture: tuple[pd.Series, np.ndarray, dict[str, pd.Series]],
+) -> None:
+    """One row per (axis, value) pair, tagged with its axis and churn_rate_floor."""
+    y, proba, segment_lookup = segment_fixture
+    rows = sliced_ranking_metrics(
+        y, proba, segment_lookup, ("contract_type",), _N_BOOTSTRAP, _RANDOM_STATE
+    )
+    assert len(rows) == 2
+    assert {row["axis"] for row in rows} == {"contract_type"}
+    for row in rows:
+        assert "churn_rate_floor" in row
+        assert "pr_auc_ci_lower" in row
+
+
+def test_flag_segment_collapse_flags_the_no_signal_group(
+    segment_fixture: tuple[pd.Series, np.ndarray, dict[str, pd.Series]],
+) -> None:
+    """The planted no-signal group (two-year) is flagged; the signal group is not."""
+    y, proba, segment_lookup = segment_fixture
+    rows = sliced_ranking_metrics(
+        y, proba, segment_lookup, ("contract_type",), _N_BOOTSTRAP, _RANDOM_STATE
+    )
+    flagged = flag_segment_collapse(rows)
+    flagged_values = {row["value"] for row in flagged}
+    assert "two-year" in flagged_values
+    assert "month-to-month" not in flagged_values
+
+
+def test_flag_segment_collapse_empty_when_no_rows_collapse() -> None:
+    """No flagged rows when every segment's CI lower bound clears its floor."""
+    rows = [
+        {
+            "axis": "gender",
+            "value": "male",
+            "pr_auc_ci_lower": 0.5,
+            "churn_rate_floor": 0.27,
+        },
+        {
+            "axis": "gender",
+            "value": "female",
+            "pr_auc_ci_lower": 0.45,
+            "churn_rate_floor": 0.27,
+        },
+    ]
+    assert flag_segment_collapse(rows) == []
+
+
+# ---------------------------------------------------------------------------
+# sliced_decision_rates / equal_opportunity_difference_by_axis /
+# demographic_parity_difference_by_axis (V2)
+# ---------------------------------------------------------------------------
+
+
+def test_sliced_decision_rates_one_row_per_axis_value(
+    segment_fixture: tuple[pd.Series, np.ndarray, dict[str, pd.Series]],
+) -> None:
+    """One row per (axis, value) pair, tagged with its axis."""
+    y, proba, segment_lookup = segment_fixture
+    rows = sliced_decision_rates(y, proba, segment_lookup, ("gender",), 0.3)
+    assert len(rows) == 2
+    assert {row["axis"] for row in rows} == {"gender"}
+    for row in rows:
+        assert {"selection_rate", "fnr", "fpr", "precision"} <= set(row)
+
+
+def test_equal_opportunity_difference_by_axis_computed_per_axis_not_pooled() -> None:
+    """The diff is the max-min FNR within each axis's own rows — an axis with a
+    large FNR gap does not leak into another axis's smaller one."""
+    rows = [
+        {"axis": "gender", "value": "male", "fnr": 0.20},
+        {"axis": "gender", "value": "female", "fnr": 0.24},
+        {"axis": "seniorcitizen", "value": 0, "fnr": 0.10},
+        {"axis": "seniorcitizen", "value": 1, "fnr": 0.40},
+    ]
+    diffs = equal_opportunity_difference_by_axis(rows)
+    assert diffs["gender"] == pytest.approx(0.04)
+    assert diffs["seniorcitizen"] == pytest.approx(0.30)
+
+
+def test_equal_opportunity_difference_by_axis_excludes_nan_fnr() -> None:
+    """A group with no churners (NaN FNR) is excluded rather than poisoning the max/min."""
+    rows = [
+        {"axis": "gender", "value": "male", "fnr": 0.20},
+        {"axis": "gender", "value": "female", "fnr": float("nan")},
+    ]
+    diffs = equal_opportunity_difference_by_axis(rows)
+    assert math.isnan(diffs["gender"])
+
+
+def test_demographic_parity_difference_by_axis_computed_per_axis() -> None:
+    """The diff is the max-min selection rate within each axis's own rows."""
+    rows = [
+        {"axis": "gender", "value": "male", "selection_rate": 0.30},
+        {"axis": "gender", "value": "female", "selection_rate": 0.35},
+        {"axis": "dependents", "value": 0, "selection_rate": 0.20},
+        {"axis": "dependents", "value": 1, "selection_rate": 0.50},
+    ]
+    diffs = demographic_parity_difference_by_axis(rows)
+    assert diffs["gender"] == pytest.approx(0.05)
+    assert diffs["dependents"] == pytest.approx(0.30)
+
+
+# ---------------------------------------------------------------------------
+# sliced_calibration / flag_calibration_collapse (V2b)
+# ---------------------------------------------------------------------------
+
+
+def test_sliced_calibration_one_row_per_axis_value(
+    segment_fixture: tuple[pd.Series, np.ndarray, dict[str, pd.Series]],
+    eval_cfg: DictConfig,
+) -> None:
+    """One row per (axis, value) pair meeting the minimum-support/two-class floor."""
+    y, proba, segment_lookup = segment_fixture
+    rows = sliced_calibration(
+        y,
+        proba,
+        segment_lookup,
+        ("contract_type",),
+        eval_cfg,
+        _N_BOOTSTRAP,
+        _RANDOM_STATE,
+    )
+    assert len(rows) == 2
+    for row in rows:
+        assert {"slope", "slope_ci_lower", "slope_ci_upper", "ece", "n"} <= set(row)
+
+
+def test_sliced_calibration_skips_single_class_segment(eval_cfg: DictConfig) -> None:
+    """A segment with only one class present (no calibration slope estimable) is
+    skipped; a segment with both classes and enough support is kept."""
+    rng = np.random.default_rng(13)
+    y = pd.Series([0] * 20 + ([0] * 10 + [1] * 10))
+    proba = np.concatenate([rng.random(20), rng.random(20)])
+    group = pd.Series(["single_class"] * 20 + ["mixed"] * 20)
+    rows = sliced_calibration(
+        y, proba, {"axis": group}, ("axis",), eval_cfg, _N_BOOTSTRAP, _RANDOM_STATE
+    )
+    assert {row["value"] for row in rows} == {"mixed"}
+
+
+def test_flag_calibration_collapse_flags_ci_entirely_outside_band() -> None:
+    """Only rows whose CI lies entirely outside the band are flagged."""
+    rows = [
+        {
+            "axis": "gender",
+            "value": "male",
+            "slope_ci_lower": 0.85,
+            "slope_ci_upper": 1.10,
+        },
+        {
+            "axis": "gender",
+            "value": "female",
+            "slope_ci_lower": 0.30,
+            "slope_ci_upper": 0.60,
+        },
+    ]
+    flagged = flag_calibration_collapse(rows, band=(0.80, 1.25))
+    assert {row["value"] for row in flagged} == {"female"}
+
+
+def test_flag_calibration_collapse_does_not_flag_overlapping_ci() -> None:
+    """A CI that merely overlaps the band's edge (point estimate outside, CI overlapping)
+    is not flagged — only a CI entirely outside counts."""
+    rows = [
+        {
+            "axis": "gender",
+            "value": "male",
+            "slope_ci_lower": 0.70,
+            "slope_ci_upper": 0.90,
+        },
+    ]
+    assert flag_calibration_collapse(rows, band=(0.80, 1.25)) == []

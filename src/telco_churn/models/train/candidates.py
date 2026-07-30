@@ -29,7 +29,7 @@ from telco_churn.models.train.common import (
     logreg_default_params,
 )
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.mlflow import ensure_experiment_metadata
 
 __all__ = ["run_candidate_step"]
 
@@ -107,26 +107,7 @@ def run_candidate_step(
         ),
     }
 
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    exp = mlflow.set_experiment(cfg.mlflow.experiment_name)
-    _client = mlflow.tracking.MlflowClient()
-    _client.set_experiment_tag(
-        exp.experiment_id,
-        "mlflow.note.content",
-        (
-            "Model selection — candidate comparison (Dummy / Logistic Regression / LightGBM) "
-            "and paired-bootstrap decision on the IBM Telco Customer Churn dev set. "
-            "Selection criterion: PR-AUC (average precision). "
-            "Winning family proceeds to feature selection and Optuna tuning."
-        ),
-    )
-    for _tag_key, _tag_val in {
-        "project": "telco-churn",
-        "phase": "model-selection",
-        "dataset": "ibm-telco-churn",
-        "env": "development",
-    }.items():
-        _client.set_experiment_tag(exp.experiment_id, _tag_key, _tag_val)
+    ensure_experiment_metadata(cfg)
 
     git_sha = _git_sha()
     dvc_hash = _dvc_hash(cfg)

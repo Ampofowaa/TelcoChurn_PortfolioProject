@@ -3,9 +3,9 @@
 Pure: no I/O, no MLflow, no file reads. `decide_promotion` takes numbers and
 returns a verdict; `evaluate.py` calls it the moment the sealed-test metrics
 exist and persists the result to reports/promotion_decision.json.
-`models/refit.py` and `models/register.py` **read** that persisted verdict
-rather than calling this module again — two independent evaluations of one
-rule is exactly how a rule becomes two rules.
+`models/register.py` **reads** that persisted verdict rather than calling
+this module again — two independent evaluations of one rule is exactly how
+a rule becomes two rules.
 
 The five pre-registered policy numbers (`GateBars`) live in
 configs/model_promotion.yaml, not in this module — that file is the single
@@ -25,8 +25,8 @@ below, which only writes that stamp onto an already-persisted decision — it
 does not compute V3 itself.
 
 V1 (segment collapse), V2 (fairness disparity), and V2b (per-group
-calibration) are computed in evaluate.py from dev-OOF slices via
-diagnostics.py and reported alongside the sealed-test metrics — for the model
+calibration) are computed in threshold.py's dev-OOF screen via diagnostics.py
+and reported by evaluate.py alongside the sealed-test metrics — for the model
 card and for the reviewer's notes — but they do not gate promotion. Two
 reasons, not one: the 1,409-row sealed test set cannot power a subgroup
 conclusion at all (some segments carry on the order of ten churners), and
@@ -52,6 +52,7 @@ __all__ = [
     "GateInputs",
     "decide_promotion",
     "record_review",
+    "slope_passes",
 ]
 
 
@@ -104,10 +105,12 @@ class GateInputs:
     brier_delta_ci_upper: float | None = None
 
 
-def _slope_passes(ci_lower: float, ci_upper: float, band: tuple[float, float]) -> bool:
+def slope_passes(ci_lower: float, ci_upper: float, band: tuple[float, float]) -> bool:
     """Veto iff the CI lies entirely outside `band` — a tolerance region, not a
     bar: only positive evidence of material miscalibration vetoes, never a
-    merely wide-but-overlapping estimate."""
+    merely wide-but-overlapping estimate. Public: threshold.py's dev-OOF
+    pre-seal screen reuses this exact check, rather than reimplementing the
+    same band logic a second time."""
     band_lower, band_upper = band
     entirely_outside = ci_upper < band_lower or ci_lower > band_upper
     return not entirely_outside
@@ -118,7 +121,7 @@ def _cold_start_decision(candidate: GateInputs, bars: GateBars) -> dict[str, Any
     pr_auc_passed = candidate.pr_auc >= bars.pr_auc_bar
     recall_passed = candidate.recall >= bars.recall_bar
     bss_passed = candidate.bss > 0.0
-    slope_passed = _slope_passes(
+    slope_passed = slope_passes(
         candidate.calibration_slope_ci_lower,
         candidate.calibration_slope_ci_upper,
         bars.calibration_slope_band,
@@ -187,7 +190,7 @@ def _comparative_decision(candidate: GateInputs, bars: GateBars) -> dict[str, An
         and candidate.pr_auc_delta_obs >= bars.pr_auc_materiality_threshold
     )
     recall_passed = candidate.recall >= bars.recall_bar
-    slope_passed = _slope_passes(
+    slope_passed = slope_passes(
         candidate.calibration_slope_ci_lower,
         candidate.calibration_slope_ci_upper,
         bars.calibration_slope_band,
@@ -288,8 +291,8 @@ def record_review(
     Pure: `decision` is the dict evaluate.py already wrote to
     reports/promotion_decision.json (with `review: "pending"`) — this function
     reads/writes nothing itself and returns an updated copy. The notebook's
-    closing cell owns loading and re-saving the file; `refit.py` refuses to run
-    without `review: "approved"` here.
+    closing cell owns loading and re-saving the file; `register.py` refuses
+    to run without `review: "approved"` here.
 
     `direction_sanity_check_fired` is the *outcome* of the direction sanity
     check (computed in error_analysis.py from SHAP dependence points) — True

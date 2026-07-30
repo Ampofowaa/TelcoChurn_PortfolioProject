@@ -6,10 +6,10 @@ through this module's persisted artifacts (reports/test_predictions.parquet),
 never through telco_churn.data.split directly.
 
 Resolves the model being evaluated by explicit run_id/version, never by
-alias: models:/telco-churn-pipeline@challenger is a moving pointer, and once
-refit.py exists a re-run pipeline can leave it on the full-scope refit — a
-model trained on the test set — which would then silently produce excellent,
-meaningless sealed-test metrics. This module logs the resolved version into
+alias: models:/telco-churn-pipeline@challenger is a moving pointer, and a
+future full-data retrain path could leave it pointing at a model trained on
+the test set — which would then silently produce excellent, meaningless
+sealed-test metrics. This module logs the resolved version into
 reports/metrics.json so the metrics stay attributable to a specific artifact.
 """
 
@@ -32,7 +32,7 @@ import pandas as pd
 from mlflow.data.pandas_dataset import from_pandas as mlflow_dataset_from_pandas
 from mlflow.exceptions import MlflowException
 from numpy.typing import NDArray
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from sklearn.dummy import DummyClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.pipeline import Pipeline
@@ -40,7 +40,6 @@ from sklearn.pipeline import Pipeline
 from telco_churn.data.split import partition
 from telco_churn.features.accessor import load_features
 from telco_churn.features.build import TARGET_COL
-from telco_churn.features.preprocessing import TENURE_COHORT_EDGES, TENURE_COHORT_LABELS
 from telco_churn.models.calibrate import (
     brier_skill_score,
     calibration_slope,
@@ -51,9 +50,15 @@ from telco_churn.models.calibrate import (
     pooled_brier,
 )
 from telco_churn.models.diagnostics import (
+    FAIRNESS_AXES,
+    ROBUSTNESS_AXES,
+    build_segment_lookup,
+    demographic_parity_difference_by_axis,
+    equal_opportunity_difference_by_axis,
     fixed_recall_profile,
-    segment_bootstrap_ci,
-    segment_decision_rates,
+    sliced_calibration,
+    sliced_decision_rates,
+    sliced_ranking_metrics,
 )
 from telco_churn.models.economics import (
     break_even_retention_rate,
@@ -77,10 +82,19 @@ from telco_churn.models.threshold import (
     CostScenario,
     costs_config_hash,
     load_costs_config,
-    load_dev_oof_predictions,
+    load_policy_thresholds,
+    resolve_policy_scenarios,
+    resolve_policy_thresholds_by_scenario,
 )
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.mlflow import (
+    ensure_experiment_metadata,
+    load_model_promotion_bars,
+    resolve_logged_model_id,
+    resolve_model_run_id,
+    resolve_tracking_uri,
+    set_run_description,
+)
 from telco_churn.utils.paths import get_project_root
 from telco_churn.utils.stats import (
     bootstrap_metric_ci,
@@ -92,12 +106,11 @@ __all__ = [
     "build_gate_inputs",
     "check_threshold_provenance",
     "comparative_deltas",
+    "content_hash",
     "demographic_parity_difference_by_axis",
     "equal_opportunity_difference_by_axis",
-    "flag_calibration_collapse",
-    "flag_segment_collapse",
-    "load_dev_oof_with_segments",
     "load_fitted_model",
+    "load_dev_oof_diagnostics",
     "load_incumbent_proba",
     "load_model_promotion_bars",
     "load_policy_thresholds",
@@ -106,6 +119,7 @@ __all__ = [
     "load_test_segment_lookup",
     "load_threshold_validation",
     "resolve_champion_version",
+    "resolve_logged_model_id",
     "resolve_model_run_id",
     "resolve_policy_scenarios",
     "resolve_policy_thresholds_by_scenario",
@@ -124,28 +138,26 @@ __all__ = [
     "sliced_ranking_metrics",
 ]
 
-# Fairness/robustness slicing axes — ANALYSIS.md §0's V1/V2/V2b surface.
-# Mirrors models.train.comparison's _ROBUSTNESS_SEGMENTS/_FAIRNESS_SEGMENTS
-# (a private, Phase-5-scoped pair); duplicated here rather than imported
-# since evaluate.py's slicing runs on dev-OOF and sealed-test data, neither
-# of which comparison.py touches.
-_ROBUSTNESS_AXES: tuple[str, ...] = (
-    "contract_type",
-    "tenure_cohort",
-    "internetservice",
-)
-_FAIRNESS_AXES: tuple[str, ...] = (
-    "gender",
-    "seniorcitizen",
-    "has_partner",
-    "dependents",
-)
+# ROBUSTNESS_AXES/FAIRNESS_AXES (ANALYSIS.md §0's V1/V2/V2b surface) live in
+# diagnostics.py — shared with threshold.py's dev-OOF screen, which computes
+# V1/V2/V2b on the dev-OOF surface; this module uses the same axes for its
+# own sealed-test reporting slices.
 
 # Below this many rows, or with only one class present, a segment's own
 # calibration slope isn't estimable — skipped rather than reported as noise.
 _MIN_SLICE_SIZE = 10
 
 logger = get_logger(__name__)
+
+_RUN_DESCRIPTION = (
+    "Sealed-test evaluation for one registered model version - PR-AUC, "
+    "recall/precision/F1 and confusion matrix per cost scenario, "
+    "calibration transfer (BSS/ECE/slope), business-impact and EV "
+    "sensitivity analysis, sliced fairness/robustness metrics. Computes the "
+    "promotion gate verdict via gate.py::decide_promotion and persists "
+    "promotion_decision.json. The sealed test set is touched here, and only "
+    "here."
+)
 
 # decide_promotion's `incumbent` parameter exists only to select the regime
 # via an `is None` check (gate.py's own docstring: "incumbent's own metrics
@@ -171,18 +183,6 @@ _INCUMBENT_EXISTS_MARKER = GateInputs(
 # DummyClassifier(strategy='constant', ...) baseline would.
 _CONTACT_ALL_THRESHOLD = 0.0
 _CONTACT_NONE_THRESHOLD = 1.0 + 1e-9
-
-
-def resolve_model_run_id(model_version: str, cfg: DictConfig) -> str:
-    """Resolve a registered model version to its run_id — the explicit-version rule.
-
-    Sets the MLflow tracking URI as a side effect, so this is safe to call as
-    the first MLflow-touching call in a fresh process.
-    """
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    registered_model_name = str(cfg.mlflow.registered_model_name)
-    client = mlflow.tracking.MlflowClient()
-    return str(client.get_model_version(registered_model_name, model_version).run_id)
 
 
 def load_fitted_model(model_version: str, cfg: DictConfig) -> Pipeline:
@@ -225,94 +225,37 @@ def load_test_customer_ids() -> pd.Series:
     return _load_test_partition()["customerid"].reset_index(drop=True)
 
 
-def _load_dev_partition() -> pd.DataFrame:
-    """Return the full dev-partition rows (customerid included), pre feature-subsetting.
-
-    Mirrors _load_test_partition, on the dev side — needed here because the
-    dev-OOF diagnostic slices (V1/V2/V2b — reported, non-gating) key on raw
-    segment columns (contract_type, gender, ...) that calibrate.py's own
-    committed-feature-restricted load_dev_features does not carry, since
-    feature selection can drop a
-    column this module still needs for slicing. Reading the dev partition
-    carries none of the "touched once" restriction — that invariant is about
-    X_test/y_test specifically (CLAUDE.md), and calibrate.py/threshold.py
-    already each read dev data independently.
-    """
-    df = load_features()
-    dev_df, _test_df = partition(df)
-    return dev_df
-
-
-def _build_segment_lookup(df: pd.DataFrame) -> dict[str, pd.Series]:
-    """{axis_name: Series} for every robustness/fairness axis, aligned to df's index.
-
-    tenure_cohort is derived via pd.cut over the fixed TENURE_COHORT_EDGES
-    (the same domain-constant edges models.train.comparison already uses for
-    this) rather than read as a raw column — it doesn't exist as one. The
-    other six axes are raw columns in the engineered feature space.
-    """
-    tenure_cohort = (
-        pd.cut(
-            df["tenure"],
-            bins=TENURE_COHORT_EDGES,
-            labels=TENURE_COHORT_LABELS,
-            include_lowest=True,
-        )
-        .astype(str)
-        .rename("tenure_cohort")
-    )
-    return {
-        "contract_type": df["contract_type"],
-        "tenure_cohort": tenure_cohort,
-        "internetservice": df["internetservice"],
-        "gender": df["gender"],
-        "seniorcitizen": df["seniorcitizen"],
-        "has_partner": df["has_partner"],
-        "dependents": df["dependents"],
-    }
-
-
 def load_test_segment_lookup() -> dict[str, pd.Series]:
     """The sealed-test partition's robustness/fairness segment axes, row-order-aligned
     with load_test_features/load_test_customer_ids (all three derive from the same
     _load_test_partition() call)."""
-    return _build_segment_lookup(_load_test_partition())
-
-
-def load_dev_oof_with_segments(
-    run_id: str, cfg: DictConfig
-) -> tuple[pd.Series, NDArray[np.float64], dict[str, pd.Series]]:
-    """Dev-OOF (y_true, p_hat), joined with the robustness/fairness segment axes.
-
-    Reads calibrate.py's persisted dev_oof_predictions.parquet (via
-    threshold.load_dev_oof_predictions) for this run's exact leak-free OOF
-    vector — never recomputed — and joins it to the full dev partition's raw
-    segment columns by customerid, since dev_oof_predictions.parquet itself
-    carries only customerid/y_true/p_hat. This is the surface V1/V2/V2b
-    (ANALYSIS.md §0) are computed from, distinct from the sealed-test slices
-    reported alongside them.
-    """
-    dev_oof = load_dev_oof_predictions(run_id, cfg).set_index("customerid")
-    dev_df = _load_dev_partition().set_index("customerid")
-    aligned = dev_oof.reindex(dev_df.index)
-    assert aligned["p_hat"].notna().all(), (
-        "dev_oof_predictions.parquet is missing rows for one or more "
-        "dev-partition customerids — it no longer matches the current "
-        "features.parquet (was it logged against a different dev partition?)."
-    )
-    y_true = aligned["y_true"]
-    proba = aligned["p_hat"].to_numpy(dtype=float)
-    segment_lookup = _build_segment_lookup(dev_df)
-    return y_true, proba, segment_lookup
+    return build_segment_lookup(_load_test_partition())
 
 
 def load_threshold_validation(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     """Load threshold.py's threshold_validation.json artifact — the model-dependent stamp."""
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     validation: dict[str, Any] = mlflow.artifacts.load_dict(
-        f"runs:/{run_id}/threshold_validation.json"
+        f"runs:/{run_id}/threshold/threshold_validation.json"
     )
     return validation
+
+
+def load_dev_oof_diagnostics(run_id: str, cfg: DictConfig) -> dict[str, Any]:
+    """Load threshold.py's dev_oof_diagnostics.json artifact (V1/V2/V2b) — resolved by run_id, not a local path.
+
+    A fixed local path (reports/dev_oof_diagnostics.json) is what
+    reliability_diagram.png warns against elsewhere in this codebase: it
+    reflects whichever run last executed threshold.py on this machine, not
+    necessarily run_id. Fetching by explicit run_id, same as
+    load_threshold_validation, is what makes this correct under CI or a
+    fresh checkout where no prior threshold.py run has touched local disk.
+    """
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    diagnostics: dict[str, Any] = mlflow.artifacts.load_dict(
+        f"runs:/{run_id}/threshold/dev_oof_diagnostics.json"
+    )
+    return diagnostics
 
 
 def check_threshold_provenance(
@@ -338,74 +281,6 @@ def check_threshold_provenance(
             f"version={model_version!r}) — the threshold was derived against a "
             "different calibration map. Re-run models.threshold before evaluating."
         )
-
-
-def load_policy_thresholds(cfg: DictConfig) -> DictConfig:
-    """Load the model-independent scenario thresholds from configs/policy/threshold.yaml.
-
-    Carries no model stamp by construction (t* = c/(r × LTV) is a pure
-    function of cost parameters, never of the model) — check_threshold_provenance
-    is the model-dependent half of this same guarantee, which this file
-    structurally cannot provide itself.
-    """
-    path = get_project_root() / str(cfg.paths.policy) / "threshold.yaml"
-    loaded = OmegaConf.load(path)
-    assert isinstance(loaded, DictConfig)
-    return loaded
-
-
-def resolve_policy_scenarios(policy: DictConfig) -> dict[str, CostScenario]:
-    """Reconstruct each shipped scenario's CostScenario from configs/policy/threshold.yaml.
-
-    Reads the already-resolved cost/LTV/ARPU values threshold.py persisted at
-    calibration time, rather than recomputing ARPU quantiles from dev-set
-    MonthlyCharges a second time here — the shipped threshold and the
-    sealed-test business-impact figures must rest on the identical cost
-    parameters, and a second derivation risks silently drifting from them if
-    the dev partition or configs/costs.yaml has since changed.
-    """
-    return {
-        str(name): CostScenario(
-            name=str(name),
-            arpu=float(entry.costs.arpu),
-            ltv=float(entry.costs.ltv),
-            cost=float(entry.costs.c),
-            retention_rate=float(entry.costs.r),
-        )
-        for name, entry in policy.scenarios.items()
-    }
-
-
-def resolve_policy_thresholds_by_scenario(policy: DictConfig) -> dict[str, float]:
-    """{scenario_name: t*} from configs/policy/threshold.yaml."""
-    return {
-        str(name): float(entry.threshold) for name, entry in policy.scenarios.items()
-    }
-
-
-def load_model_promotion_bars(cfg: DictConfig) -> GateBars:
-    """Load configs/model_promotion.yaml directly and construct the GateBars
-    decide_promotion applies.
-
-    Loaded by path (OmegaConf.load), never through Hydra's defaults/CLI-
-    override composition — gate.py's own module docstring: a bar that
-    decides whether a model ships must not be movable by a command-line
-    override with no diff and no review, the same reason
-    load_policy_thresholds bypasses composition for costs.yaml's derivative.
-    """
-    path = get_project_root() / str(cfg.paths.model_promotion_config)
-    loaded = OmegaConf.load(path)
-    assert isinstance(loaded, DictConfig)
-    return GateBars(
-        pr_auc_bar=float(loaded.pr_auc_bar),
-        recall_bar=float(loaded.recall_bar),
-        calibration_slope_band=(
-            float(loaded.calibration_slope_band[0]),
-            float(loaded.calibration_slope_band[1]),
-        ),
-        pr_auc_materiality_threshold=float(loaded.pr_auc_materiality_threshold),
-        brier_non_inferiority_margin=float(loaded.brier_non_inferiority_margin),
-    )
 
 
 def sealed_test_business_impact(
@@ -705,181 +580,14 @@ def sealed_test_decile_lift(
     return decile_lift_table(y_test.tolist(), proba.tolist())
 
 
-def sliced_ranking_metrics(
-    y_true: pd.Series,
-    proba: NDArray[np.float64],
-    segment_lookup: dict[str, pd.Series],
-    axes: tuple[str, ...],
-    n_bootstrap: int,
-    random_state: int,
-) -> list[dict[str, object]]:
-    """Per-segment PR-AUC with a bootstrap CI and its own churn-rate floor, across
-    every named axis — the surface V1 (ANALYSIS.md §0) flags a segment collapse
-    from. Reused for both the dev-OOF diagnostic pass (reported, non-gating)
-    and the sealed-test reporting pass — the caller decides which by what
-    (y_true, proba, segment_lookup) it passes in.
-
-    Attaches each row's own churn_rate_floor (the segment's y.mean()) rather
-    than requiring a second join in flag_segment_collapse: V1 fires when
-    pr_auc_ci_lower falls below this value — a model no better than the
-    segment's own base rate.
-    """
-    y = y_true.to_numpy(dtype=float)
-    p = np.asarray(proba, dtype=float)
-    rows: list[dict[str, object]] = []
-    for axis in axes:
-        group = segment_lookup[axis]
-        for row in segment_bootstrap_ci(
-            y.tolist(), p.tolist(), group, n_bootstrap, random_state
-        ):
-            mask = (group == row["value"]).to_numpy()
-            rows.append(
-                {**row, "axis": axis, "churn_rate_floor": float(y[mask].mean())}
-            )
-    return rows
-
-
-def flag_segment_collapse(
-    ranking_rows: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    """V1: rows whose PR-AUC 95% CI lower bound falls below the segment's own churn-rate floor.
-
-    Reported dev-OOF diagnostic (ANALYSIS.md §0), non-gating — a model not
-    distinguishable from random inside a real cohort is worth flagging even
-    though the sealed test set is too thin to decide it there. Returns only
-    the flagged rows; an empty list means no segment is flagged.
-    """
-    return [
-        row
-        for row in ranking_rows
-        if cast(float, row["pr_auc_ci_lower"]) < cast(float, row["churn_rate_floor"])
-    ]
-
-
-def sliced_decision_rates(
-    y_true: pd.Series,
-    proba: NDArray[np.float64],
-    segment_lookup: dict[str, pd.Series],
-    axes: tuple[str, ...],
-    threshold: float,
-) -> list[dict[str, object]]:
-    """Per-segment selection rate/FNR/FPR/precision at `threshold`, across every
-    named axis — the surface V2 (ANALYSIS.md §0) reads. Reused for the dev-OOF
-    diagnostic pass (reported, non-gating) and the sealed-test reporting pass,
-    same convention as sliced_ranking_metrics.
-    """
-    y = y_true.to_numpy(dtype=float)
-    p = np.asarray(proba, dtype=float)
-    rows: list[dict[str, object]] = []
-    for axis in axes:
-        for row in segment_decision_rates(
-            y.tolist(), p.tolist(), segment_lookup[axis], threshold
-        ):
-            rows.append({**row, "axis": axis})
-    return rows
-
-
-def equal_opportunity_difference_by_axis(
-    decision_rows: list[dict[str, object]],
-) -> dict[str, float]:
-    """Max FNR gap within each axis's own groups — ANALYSIS.md §0's V2(a), per axis.
-
-    Computed separately per axis, never pooled across axes: equal-opportunity
-    difference is conventionally within one sensitive attribute (male vs.
-    female; senior vs. non-senior), and pooling unrelated attributes' FNRs
-    into one list would mix two different questions into one number. NaN FNR
-    rows (no churners in that group) are excluded; an axis left with fewer
-    than two comparable groups returns NaN rather than a spurious 0.
-    """
-    by_axis: dict[str, list[float]] = {}
-    for row in decision_rows:
-        fnr = cast(float, row["fnr"])
-        if math.isnan(fnr):
-            continue
-        by_axis.setdefault(cast(str, row["axis"]), []).append(fnr)
-    return {
-        axis: (max(values) - min(values)) if len(values) >= 2 else float("nan")
-        for axis, values in by_axis.items()
-    }
-
-
-def demographic_parity_difference_by_axis(
-    decision_rows: list[dict[str, object]],
-) -> dict[str, float]:
-    """Max selection-rate gap within each axis's own groups — ANALYSIS.md §0's V2(b), per axis.
-
-    Same per-axis convention as equal_opportunity_difference_by_axis.
-    """
-    by_axis: dict[str, list[float]] = {}
-    for row in decision_rows:
-        by_axis.setdefault(cast(str, row["axis"]), []).append(
-            cast(float, row["selection_rate"])
-        )
-    return {
-        axis: (max(values) - min(values)) if len(values) >= 2 else float("nan")
-        for axis, values in by_axis.items()
-    }
-
-
-def sliced_calibration(
-    y_true: pd.Series,
-    proba: NDArray[np.float64],
-    segment_lookup: dict[str, pd.Series],
-    axes: tuple[str, ...],
-    cfg: DictConfig,
-    n_bootstrap: int,
-    random_state: int,
-) -> list[dict[str, object]]:
-    """Per-segment calibration slope (with CI) and ECE, across every named axis —
-    the surface V2b (ANALYSIS.md §0) reads. A group whose slope CI falls
-    entirely outside [0.80, 1.25] is a group the shipped t* is systematically
-    wrong for, in a direction no aggregate slope reveals. Segments smaller
-    than _MIN_SLICE_SIZE, or with only one class present, are skipped —
-    neither a slope nor an ECE is estimable there.
-    """
-    y = y_true.to_numpy(dtype=float)
-    p = np.asarray(proba, dtype=float)
-    rows: list[dict[str, object]] = []
-    for axis in axes:
-        group = segment_lookup[axis]
-        for value in sorted(group.unique(), key=str):
-            mask = (group == value).to_numpy()
-            n = int(mask.sum())
-            if n < _MIN_SLICE_SIZE or len(np.unique(y[mask])) < 2:
-                continue
-            y_seg, p_seg = y[mask], p[mask]
-            slope = calibration_slope(y_seg, p_seg, n_bootstrap, random_state)
-            ece = expected_calibration_error(p_seg, pd.Series(y_seg), cfg)
-            rows.append(
-                {
-                    "axis": axis,
-                    "value": value,
-                    "n": n,
-                    "slope": slope["slope"],
-                    "slope_ci_lower": slope["slope_ci_lower"],
-                    "slope_ci_upper": slope["slope_ci_upper"],
-                    "ece": ece,
-                }
-            )
-    return rows
-
-
-def flag_calibration_collapse(
-    calibration_rows: list[dict[str, object]], band: tuple[float, float]
-) -> list[dict[str, object]]:
-    """V2b: rows whose calibration-slope CI falls entirely outside `band`.
-
-    Same pass-unless-the-CI-clears-it framing as gate.py's aggregate
-    calibration guardrail (ANALYSIS.md §0), applied per group instead of in
-    aggregate. Returns only the flagged rows; an empty list means V2b passes.
-    """
-    lower, upper = band
-    return [
-        row
-        for row in calibration_rows
-        if cast(float, row["slope_ci_upper"]) < lower
-        or cast(float, row["slope_ci_lower"]) > upper
-    ]
+# sliced_ranking_metrics/flag_segment_collapse (V1), sliced_decision_rates +
+# equal_opportunity_difference_by_axis/demographic_parity_difference_by_axis (V2),
+# and sliced_calibration/flag_calibration_collapse (V2b) now live in diagnostics.py —
+# threshold.py's dev-OOF screen owns computing them on the dev-OOF surface; this
+# module only re-imports the five still needed for its own sealed-test slices below
+# (sliced_ranking_metrics, sliced_decision_rates, sliced_calibration,
+# equal_opportunity_difference_by_axis, demographic_parity_difference_by_axis) —
+# flag_segment_collapse/flag_calibration_collapse have no sealed-test use.
 
 
 def sliced_business_impact(
@@ -1096,37 +804,18 @@ def sealed_test_promotion_decision(
 # ---------------------------------------------------------------------------
 
 
-def _content_hash(payload: dict[str, Any]) -> str:
+def content_hash(payload: dict[str, Any]) -> str:
     """sha256 of `payload`'s JSON-sorted-keys encoding.
 
-    Embedded in promotion_decision.json so a later consumer (refit.py,
-    register.py) can detect a decision belonging to a different metrics.json
-    than the one it was computed from — same idiom as threshold.py's
-    costs_config_hash, applied to a metrics payload instead of a config file.
+    Embedded in promotion_decision.json so register.py can detect a decision
+    belonging to a different metrics.json than the one it was computed from —
+    same idiom as threshold.py's costs_config_hash, applied to a metrics
+    payload instead of a config file. Public: register.py imports this same
+    function to recompute the hash it verifies against, rather than
+    reimplementing the encoding.
     """
     encoded = json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _resolve_logged_model_id(model_version: str, cfg: DictConfig) -> str:
-    """Read the dev model version's logged_model_id tag (set by calibrate.py at
-    registration) — the hop from "the version being evaluated" to the
-    LoggedModel entity sealed-test metrics attach to via log_metric(...,
-    model_id=..., dataset=...). ModelVersion.model_id does not auto-populate
-    in OSS MLflow 3.14 (CLAUDE.md), so this tag is the only supported path.
-    """
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    registered_model_name = str(cfg.mlflow.registered_model_name)
-    client = mlflow.tracking.MlflowClient()
-    version = client.get_model_version(registered_model_name, model_version)
-    model_id = version.tags.get("logged_model_id")
-    if not model_id:
-        raise ValueError(
-            f"Model version {model_version!r} of {registered_model_name!r} has "
-            "no logged_model_id tag — calibrate.py's registration step sets "
-            "this; re-run models.calibrate before evaluating."
-        )
-    return str(model_id)
 
 
 def _save_pr_curve_plot(
@@ -1430,7 +1119,7 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     reports/metrics.json, reports/economics.json,
     reports/promotion_decision.json, and reports/test_predictions.parquet
     (mirrored onto the run as artifacts), tags the dev model version with the
-    four gate criteria (alongside its existing refit_scope: dev), and eight
+    four gate criteria (alongside its existing training_data_scope: dev), and eight
     figures into the run's figures/ artifacts: the PR curve (operating points
     and prevalence baseline marked), the ROC curve, the classification-report
     panels, the sealed-test reliability diagram, the EV-vs-budget curve (t*
@@ -1497,7 +1186,7 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         float(cfg.evaluate.tornado_pct_perturbation),
     )
 
-    all_axes = _ROBUSTNESS_AXES + _FAIRNESS_AXES
+    all_axes = ROBUSTNESS_AXES + FAIRNESS_AXES
     test_segment_lookup = load_test_segment_lookup()
     test_ranking_slices = sliced_ranking_metrics(
         y_test, proba, test_segment_lookup, all_axes, n_bootstrap, random_state
@@ -1512,12 +1201,12 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         y_test,
         proba,
         test_segment_lookup,
-        _FAIRNESS_AXES,
+        FAIRNESS_AXES,
         base_scenario,
         base_threshold,
     )
     test_fairness_decision_rows = [
-        row for row in test_decision_slices if row["axis"] in _FAIRNESS_AXES
+        row for row in test_decision_slices if row["axis"] in FAIRNESS_AXES
     ]
     test_equal_opportunity_by_axis = equal_opportunity_difference_by_axis(
         test_fairness_decision_rows
@@ -1536,49 +1225,10 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
 
     bars = load_model_promotion_bars(cfg)
 
-    y_dev_oof, proba_dev_oof, dev_segment_lookup = load_dev_oof_with_segments(
-        run_id, cfg
-    )
-    dev_ranking_slices = sliced_ranking_metrics(
-        y_dev_oof,
-        proba_dev_oof,
-        dev_segment_lookup,
-        _ROBUSTNESS_AXES,
-        n_bootstrap,
-        random_state,
-    )
-    v1_flagged = flag_segment_collapse(dev_ranking_slices)
-    dev_decision_slices = sliced_decision_rates(
-        y_dev_oof, proba_dev_oof, dev_segment_lookup, _FAIRNESS_AXES, base_threshold
-    )
-    dev_equal_opportunity_by_axis = equal_opportunity_difference_by_axis(
-        dev_decision_slices
-    )
-    dev_demographic_parity_by_axis = demographic_parity_difference_by_axis(
-        dev_decision_slices
-    )
-    v2_equal_opportunity_flagged = {
-        axis: diff
-        for axis, diff in dev_equal_opportunity_by_axis.items()
-        if diff > 0.10
-    }
-    v2_demographic_parity_flagged = {
-        axis: diff
-        for axis, diff in dev_demographic_parity_by_axis.items()
-        if diff > 0.10
-    }
-    dev_calibration_slices = sliced_calibration(
-        y_dev_oof,
-        proba_dev_oof,
-        dev_segment_lookup,
-        _FAIRNESS_AXES,
-        cfg,
-        n_bootstrap,
-        random_state,
-    )
-    v2b_flagged = flag_calibration_collapse(
-        dev_calibration_slices, bars.calibration_slope_band
-    )
+    # V1/V2/V2b are computed by threshold.py's dev-OOF screen, Phase 6's last
+    # step — fetched here by run_id from its logged MLflow artifact, unchanged,
+    # never recomputed, so the dev-OOF surface has exactly one owner.
+    dev_oof_diagnostics = load_dev_oof_diagnostics(run_id, cfg)
 
     champion_version = resolve_champion_version(cfg)
     incumbent_proba = (
@@ -1620,17 +1270,7 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
                 "equal_opportunity_diff": test_equal_opportunity_diff,
                 "demographic_parity_diff": test_demographic_parity_diff,
             },
-            "dev_oof_diagnostics": {
-                "ranking": dev_ranking_slices,
-                "v1_flagged": v1_flagged,
-                "decision_rates": dev_decision_slices,
-                "equal_opportunity_difference_by_axis": dev_equal_opportunity_by_axis,
-                "demographic_parity_difference_by_axis": dev_demographic_parity_by_axis,
-                "v2_equal_opportunity_flagged": v2_equal_opportunity_flagged,
-                "v2_demographic_parity_flagged": v2_demographic_parity_flagged,
-                "calibration": dev_calibration_slices,
-                "v2b_flagged": v2b_flagged,
-            },
+            "dev_oof_diagnostics": dev_oof_diagnostics,
         },
     }
     y_test_int = y_test.to_numpy(dtype=np.int64)
@@ -1652,7 +1292,7 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     promotion_decision_payload: dict[str, Any] = {
         **decision,
         "model_version": model_version,
-        "metrics_content_hash": _content_hash(metrics_payload),
+        "metrics_content_hash": content_hash(metrics_payload),
     }
 
     figures_dir = get_project_root() / str(cfg.paths.figures)
@@ -1693,8 +1333,8 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     )
     _save_gains_lift_plot(decile_rows, gains_lift_path)
 
-    mlflow.set_experiment(str(cfg.mlflow.experiment_name))
-    model_id = _resolve_logged_model_id(model_version, cfg)
+    ensure_experiment_metadata(cfg)
+    model_id = resolve_logged_model_id(model_version, cfg)
     test_dataset = mlflow_dataset_from_pandas(
         pd.concat(
             [X_test.reset_index(drop=True), y_test.reset_index(drop=True)], axis=1
@@ -1704,6 +1344,7 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     )
 
     with mlflow.start_run(run_name="evaluation") as run:
+        set_run_description(_RUN_DESCRIPTION)
         eval_run_id = run.info.run_id
         # Needed so a later re-log (e.g. the review notebook stamping `review`
         # onto this same payload) targets this run, not `run_id` above (the
@@ -1856,6 +1497,17 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         "test_calibration_slope",
         str(calibration_report["calibration_slope"]["slope"]),
     )
+    # register.py's only supported path from "the model version being
+    # registered" to this cycle's promotion_decision.json/metrics.json/
+    # economics.json/test_predictions.parquet — ModelVersion.model_id doesn't
+    # auto-populate in OSS MLflow 3.14, and the same is true of any other
+    # run-to-version link, so it must be persisted deliberately (mirrors
+    # calibrate.py's logged_model_id tag). A local reports/ path is not a
+    # substitute: it only reflects whichever run last executed evaluate.py on
+    # this machine, not necessarily this model_version's own cycle.
+    client.set_model_version_tag(
+        registered_model_name, model_version, "eval_run_id", eval_run_id
+    )
 
     reports_dir = get_project_root() / str(cfg.paths.reports)
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -1866,18 +1518,10 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     with open(reports_dir / "promotion_decision.json", "w", encoding="utf-8") as f:
         json.dump(promotion_decision_payload, f, indent=2, default=str)
     test_predictions.to_parquet(reports_dir / "test_predictions.parquet", index=False)
-    # A same-cycle local mirror of calibrate.py's dev_oof_predictions.parquet
-    # (already logged on the tuning-study run and re-read here via
-    # load_dev_oof_with_segments) — not a new computation, just re-exported so
-    # error_analysis.py and drift_reference.py can read both prediction
-    # artifacts uniformly from reports/ without a second MLflow artifact hop.
-    pd.DataFrame(
-        {
-            "customerid": y_dev_oof.index,
-            "y_true": y_dev_oof.to_numpy(),
-            "p_hat": proba_dev_oof,
-        }
-    ).to_parquet(reports_dir / "dev_oof_predictions.parquet", index=False)
+    # reports/dev_oof_predictions.parquet and dev_oof_diagnostics.json are not
+    # written here — threshold.py's dev-OOF screen (Phase 6's last step)
+    # already wrote both; this module only ever fetches the latter (by run_id,
+    # via load_dev_oof_diagnostics), never produces either.
 
     logger.info(
         "evaluation_step_done",

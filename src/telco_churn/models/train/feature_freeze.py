@@ -27,11 +27,18 @@ from telco_churn.models.train.common import (
     lgbm_default_params,
 )
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.mlflow import resolve_tracking_uri, set_run_description
 
 __all__ = ["run_selection_step"]
 
 logger = get_logger(__name__)
+
+_RUN_DESCRIPTION = (
+    "Feature selection — permutation importance against a noise-decoy "
+    "column, inside CV against default LightGBM. Freezes the model's input "
+    "feature space via a paired-bootstrap keep-vs-reduce test; a non-gating "
+    "SHAP audit cross-checks the result."
+)
 
 
 def run_selection_step(
@@ -224,6 +231,7 @@ def run_selection_step(
     mlflow.set_experiment(cfg.mlflow.experiment_name)
 
     with mlflow.start_run(run_name="feature_selection"):
+        set_run_description(_RUN_DESCRIPTION)
         mlflow.set_tags(
             {
                 "stage": "selection",

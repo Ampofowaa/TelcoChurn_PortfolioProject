@@ -5,3 +5,8 @@ model_version: null
 
 # argmax-EV bootstrap CI resampling seed (see costs.yaml's argmax_ev_bootstrap_n_samples for the resample count).
 random_state: 42
+
+# Dev-OOF screen (V1/V2/V2b) bootstrap resample count — a separate knob from
+# argmax_ev_bootstrap_n_samples above, since it resamples segment-sliced
+# ranking/calibration metrics, not the argmax-EV curve.
+n_bootstrap: 1000

@@ -918,7 +918,7 @@ def test_run_error_analysis_step_returns_expected_keys_and_writes_report(
     result = error_analysis.run_error_analysis_step(model_version, cfg)
 
     assert result["model_version"] == model_version
-    assert result["ea_run_id"]
+    assert result["error_analysis_run_id"]
     payload = cast(dict[str, Any], result["error_analysis"])
     for key in (
         "error_confidence",
@@ -1017,7 +1017,7 @@ def test_run_error_analysis_step_logs_mlflow_run_and_direction_tag(
     client = mlflow.tracking.MlflowClient(
         tracking_uri=str(evaluated_model["tracking_uri"])
     )
-    run = client.get_run(str(result["ea_run_id"]))
+    run = client.get_run(str(result["error_analysis_run_id"]))
     assert run.info.run_name == "error_analysis"
     assert run.data.tags.get("direction_sanity_check") in {"pass", "fail"}
 
