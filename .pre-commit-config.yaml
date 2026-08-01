@@ -24,7 +24,36 @@ repos:
       - id: mypy
         args: [--config-file=pyproject.toml, src/]
         pass_filenames: false
-        additional_dependencies: [pytest, nbformat]
+        # Needed for real import resolution now that pyproject.toml's mypy
+        # override is scoped to the handful of libraries that actually lack
+        # stubs/py.typed, not a blanket ignore_missing_imports — mypy's
+        # isolated hook env otherwise can't see any of the project's runtime
+        # deps and reports every one of them as import-not-found. Mirrors
+        # [project.dependencies]; pytest/nbformat are hook-only extras.
+        additional_dependencies:
+          [
+            pytest,
+            nbformat,
+            hydra-core,
+            lightgbm==4.6.0, # pinned: unpinned resolves a newer lightgbm whose
+            # predict_proba stub types the return as list, not ndarray, and
+            # X[:, 1] doesn't typecheck against list — a hook-env-only false
+            # positive absent under the version this project actually locks.
+            matplotlib,
+            numpy,
+            optuna,
+            pandas,
+            psycopg2-binary,
+            python-dotenv,
+            scikit-learn,
+            scipy,
+            sqlalchemy,
+            structlog,
+            pandera,
+            mlflow,
+            pyarrow,
+            shap,
+          ]
 
   - repo: https://github.com/kynan/nbstripout
     rev: 0.9.1
