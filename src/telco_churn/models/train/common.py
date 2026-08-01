@@ -13,12 +13,15 @@ import subprocess
 import time
 from typing import Any
 
+import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import pandas as pd
 import yaml
 from joblib import Parallel, delayed
+from matplotlib.figure import Figure
 from mlflow.data.pandas_dataset import from_pandas as mlflow_from_pandas
+from numpy.typing import NDArray
 from omegaconf import DictConfig
 from sklearn.base import clone
 from sklearn.metrics import average_precision_score
@@ -129,6 +132,38 @@ def _log_dev_input(X_dev: pd.DataFrame, y_dev: pd.Series, context: str) -> None:
         targets=TARGET_COL,
     )
     mlflow.log_input(dataset, context=context)
+
+
+def _plot_bootstrap_delta(
+    bootstrap_deltas: NDArray[np.float64],
+    delta_obs: float,
+    delta_threshold: float,
+    title: str,
+    xlabel: str,
+) -> Figure:
+    """Histogram of the paired-bootstrap Δ distribution against the null and the decision threshold.
+
+    Shared by comparison.py's model-family decision and feature_freeze.py's
+    full-vs-reduced feature-set decision — both plot the identical shape
+    (bootstrap_deltas histogram, Δ_obs/0/Δ* reference lines) against a
+    different Δ definition and title.
+    """
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(bootstrap_deltas, bins=50, edgecolor="none", alpha=0.75)
+    ax.axvline(delta_obs, color="C1", linestyle="--", label=f"Δ_obs = {delta_obs:.3f}")
+    ax.axvline(0.0, color="black", linestyle=":", label="Δ = 0 (null)")
+    ax.axvline(
+        delta_threshold,
+        color="C2",
+        linestyle="--",
+        label=f"Δ* = {delta_threshold}",
+    )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Bootstrap resamples")
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    return fig
 
 
 def _fit_and_score_fold(

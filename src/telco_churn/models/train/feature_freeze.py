@@ -24,6 +24,7 @@ from telco_churn.models.train.common import (
     _dvc_hash,
     _git_sha,
     _log_dev_input,
+    _plot_bootstrap_delta,
     lgbm_default_params,
 )
 from telco_churn.utils.logging import get_logger
@@ -204,28 +205,13 @@ def run_selection_step(
     ax_pr.set_title("Pooled OOF PR Curves — full vs. reduced feature set")
     fig_pr.tight_layout()
 
-    fig_bs, ax_bs = plt.subplots(figsize=(6, 4))
-    ax_bs.hist(
-        bootstrap_test["bootstrap_deltas"], bins=50, edgecolor="none", alpha=0.75
-    )
-    ax_bs.axvline(
+    fig_bs = _plot_bootstrap_delta(
+        bootstrap_test["bootstrap_deltas"],
         bootstrap_test["delta_obs"],
-        color="C1",
-        linestyle="--",
-        label=f"Δ_obs = {bootstrap_test['delta_obs']:.3f}",
-    )
-    ax_bs.axvline(0.0, color="black", linestyle=":", label="Δ = 0 (null)")
-    ax_bs.axvline(
         float(cc.delta_threshold),
-        color="C2",
-        linestyle="--",
-        label=f"Δ* = {cc.delta_threshold}",
+        title="Paired-Bootstrap Δ Distribution — full vs. reduced feature set",
+        xlabel="Δ mean-of-fold PR-AUC (full − reduced)",
     )
-    ax_bs.set_xlabel("Δ mean-of-fold PR-AUC (full − reduced)")
-    ax_bs.set_ylabel("Bootstrap resamples")
-    ax_bs.set_title("Paired-Bootstrap Δ Distribution — full vs. reduced feature set")
-    ax_bs.legend()
-    fig_bs.tight_layout()
 
     ensure_experiment_metadata(cfg)
 

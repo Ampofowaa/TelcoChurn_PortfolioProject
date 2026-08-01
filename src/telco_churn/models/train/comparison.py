@@ -21,7 +21,12 @@ from telco_churn.models.diagnostics import (
     segment_bootstrap_delta,
     segment_oof_errors,
 )
-from telco_churn.models.train.common import _dvc_hash, _git_sha, _log_dev_input
+from telco_churn.models.train.common import (
+    _dvc_hash,
+    _git_sha,
+    _log_dev_input,
+    _plot_bootstrap_delta,
+)
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import ensure_experiment_metadata, set_run_description
 from telco_churn.utils.stats import paired_bootstrap_ci
@@ -304,25 +309,13 @@ def run_comparison_step(
         )
     ax_pr.set_title("OOF Precision-Recall Curves (dev set)")
 
-    fig_bs, ax_bs = plt.subplots(figsize=(6, 4))
-    ax_bs.hist(bootstrap["bootstrap_deltas"], bins=50, edgecolor="none", alpha=0.75)
-    ax_bs.axvline(
+    fig_bs = _plot_bootstrap_delta(
+        bootstrap["bootstrap_deltas"],
         bootstrap["delta_obs"],
-        color="C1",
-        linestyle="--",
-        label=f"Δ_obs = {bootstrap['delta_obs']:.3f}",
-    )
-    ax_bs.axvline(0.0, color="black", linestyle=":", label="Δ = 0 (null)")
-    ax_bs.axvline(
         float(ts.delta_threshold),
-        color="C2",
-        linestyle="--",
-        label=f"Δ* = {ts.delta_threshold}",
+        title="Paired-Bootstrap Δ Distribution",
+        xlabel="Δ PR-AUC (LGBM − LogReg)",
     )
-    ax_bs.set_xlabel("Δ PR-AUC (LGBM − LogReg)")
-    ax_bs.set_ylabel("Bootstrap resamples")
-    ax_bs.set_title("Paired-Bootstrap Δ Distribution")
-    ax_bs.legend()
 
     ensure_experiment_metadata(cfg)
 
