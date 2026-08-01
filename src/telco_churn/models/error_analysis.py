@@ -89,6 +89,7 @@ from telco_churn.models.threshold import (
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
+    resolve_logged_model_id,
     resolve_model_run_id,
     resolve_tracking_uri,
     set_run_description,
@@ -521,27 +522,6 @@ def _features_by_customer_id(customer_ids: pd.Series) -> pd.DataFrame:
         "customer id set came from."
     )
     return df.reindex(customer_ids).reset_index()
-
-
-def _resolve_logged_model_id(model_version: str, cfg: DictConfig) -> str:
-    """Read the model version's logged_model_id tag — the hop from "the
-    version being analysed" to the LoggedModel entity this run's metrics
-    attach to. Duplicated from evaluate.py's private helper of the same
-    purpose rather than imported, since it is a one-line MLflow read and the
-    two modules should not share a private symbol across a module boundary.
-    """
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    registered_model_name = str(cfg.mlflow.registered_model_name)
-    client = mlflow.tracking.MlflowClient()
-    version = client.get_model_version(registered_model_name, model_version)
-    model_id = version.tags.get("logged_model_id")
-    if not model_id:
-        raise ValueError(
-            f"Model version {model_version!r} of {registered_model_name!r} has "
-            "no logged_model_id tag — calibrate.py's registration step sets "
-            "this; re-run models.calibrate before running error analysis."
-        )
-    return str(model_id)
 
 
 def _shap_values_for_test_rows(
@@ -1644,7 +1624,7 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
     _save_value_weighted_plot(value_weighted_rows, value_weighted_path)
 
     ensure_experiment_metadata(cfg)
-    model_id = _resolve_logged_model_id(model_version, cfg)
+    model_id = resolve_logged_model_id(model_version, cfg)
     test_dataset = mlflow_dataset_from_pandas(
         pd.concat(
             [
