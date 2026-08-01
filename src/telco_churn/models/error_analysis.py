@@ -1184,6 +1184,658 @@ def _save_value_weighted_plot(rows: list[dict[str, Any]], path: Path) -> None:
     plt.close(fig)
 
 
+def _load_error_analysis_inputs(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+    """Resolve the model's run, load test/dev-OOF predictions, and join raw feature values.
+
+    Reads reports/test_predictions.parquet (evaluate.py) + the dev-OOF vector
+    (threshold.py's dev-OOF screen, fetched by run_id from calibrate.py's
+    logged artifact) — the only route this module reaches evaluation data
+    through.
+    """
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+
+    run_id = resolve_model_run_id(model_version, cfg)
+    validation_payload = load_threshold_validation(run_id, cfg)
+    check_threshold_provenance(validation_payload, run_id, model_version)
+    manifest = load_training_manifest(run_id, cfg)
+    committed_features = committed_features_from_manifest(manifest)
+    model = load_fitted_model(model_version, cfg)
+
+    reports_dir = get_project_root() / str(cfg.paths.reports)
+    test_predictions = pd.read_parquet(reports_dir / "test_predictions.parquet")
+    dev_oof_predictions = load_dev_oof_predictions(run_id, cfg)
+
+    test_features_df = _features_by_customer_id(test_predictions["customerid"])
+    dev_features_df = _features_by_customer_id(dev_oof_predictions["customerid"])
+
+    policy = load_policy_thresholds(cfg)
+    base_threshold = resolve_policy_thresholds_by_scenario(policy)["base"]
+
+    y_test = test_predictions["y_true"].to_numpy(dtype=float)
+    proba_test = test_predictions["p_hat"].to_numpy(dtype=float)
+    y_dev = dev_oof_predictions["y_true"].to_numpy(dtype=float)
+    proba_dev = dev_oof_predictions["p_hat"].to_numpy(dtype=float)
+
+    return {
+        "registered_model_name": registered_model_name,
+        "run_id": run_id,
+        "validation_payload": validation_payload,
+        "committed_features": committed_features,
+        "model": model,
+        "reports_dir": reports_dir,
+        "test_predictions": test_predictions,
+        "test_features_df": test_features_df,
+        "dev_features_df": dev_features_df,
+        "base_threshold": base_threshold,
+        "y_test": y_test,
+        "proba_test": proba_test,
+        "y_dev": y_dev,
+        "proba_dev": proba_dev,
+    }
+
+
+def _compute_shap_diagnostics(
+    model: Any,
+    test_features_df: pd.DataFrame,
+    committed_features: list[str],
+    ea_cfg: Any,
+) -> dict[str, Any]:
+    """Compute SHAP values once, global importance, dependence, direction sanity, and binary effects.
+
+    Everything downstream that needs SHAP reads from this one bundle —
+    shap_values/feature_names/base_value/Xt_test/feature_index live across
+    nearly the whole error-analysis pass, so they travel together rather
+    than being re-threaded individually.
+    """
+    shap_values, feature_names, base_value, Xt_test = _shap_values_for_test_rows(
+        model, test_features_df[committed_features]
+    )
+    feature_index = {name: i for i, name in enumerate(feature_names)}
+
+    importance_rows = global_importance(shap_values, feature_names)
+    top_k_shap = int(ea_cfg.top_k_shap_features)
+    top_features = [cast(str, r["feature"]) for r in importance_rows[:top_k_shap]]
+    top_k_shap_elbow = _check_top_k_elbow(
+        [cast(float, r["mean_abs_shap"]) for r in importance_rows], top_k_shap
+    )
+    if not top_k_shap_elbow["valid"]:
+        logger.warning("top_k_shap_features_elbow_drifted", **top_k_shap_elbow)
+
+    dependence_by_feature = {
+        feat: dependence_points(
+            Xt_test[:, feature_index[feat]], shap_values[:, feature_index[feat]]
+        )
+        for feat in top_features
+    }
+    directions = {
+        feat: cast(float, dep["direction"])
+        for feat, dep in dependence_by_feature.items()
+    }
+    v3_result = direction_sanity_check(
+        top_features, directions, _EXPECTED_EDA_DIRECTIONS
+    )
+
+    binary_features = [name for name in feature_names if name.startswith("binary__")]
+    binary_dependence = {
+        feat: binary_feature_effects(
+            Xt_test[:, feature_index[feat]], shap_values[:, feature_index[feat]]
+        )
+        for feat in binary_features
+    }
+
+    return {
+        "shap_values": shap_values,
+        "feature_names": feature_names,
+        "base_value": base_value,
+        "Xt_test": Xt_test,
+        "feature_index": feature_index,
+        "importance_rows": importance_rows,
+        "top_features": top_features,
+        "top_k_shap_elbow": top_k_shap_elbow,
+        "dependence_by_feature": dependence_by_feature,
+        "binary_dependence": binary_dependence,
+        "v3_result": v3_result,
+    }
+
+
+def _compute_cohort_gap(
+    shap_values: NDArray[np.float64],
+    feature_names: list[str],
+    mask_a: NDArray[np.bool_],
+    mask_b: NDArray[np.bool_],
+    top_k: int,
+    elbow_warning_event: str,
+) -> dict[str, Any]:
+    """Compute cohort-A-vs-cohort-B signed SHAP and rank features by their |gap|.
+
+    Generic: called once for FN-vs-TP, once for FP-vs-TN — each axis has its
+    own plateau/elbow shape, so each gets its own top_k and its own elbow
+    check rather than sharing one.
+    """
+    shap_rows_a = cohort_shap(shap_values, mask_a, feature_names)
+    shap_rows_b = cohort_shap(shap_values, mask_b, feature_names)
+    gap_ranking = _sorted_gap_pairs(shap_rows_a, shap_rows_b)
+    top_features = [name for name, _ in gap_ranking[:top_k]]
+    elbow = _check_top_k_elbow([gap for _, gap in gap_ranking], top_k)
+    if not elbow["valid"]:
+        logger.warning(elbow_warning_event, **elbow)
+    return {
+        "shap_rows_a": shap_rows_a,
+        "shap_rows_b": shap_rows_b,
+        "gap_ranking": gap_ranking,
+        "top_features": top_features,
+        "elbow": elbow,
+    }
+
+
+def _annual_contract_subgroup_finding(
+    Xt_test: NDArray[np.float64],
+    shap_values: NDArray[np.float64],
+    feature_index: dict[str, int],
+    fn_mask: NDArray[np.bool_],
+    tn_mask: NDArray[np.bool_],
+) -> dict[str, Any]:
+    """Confirmatory follow-up on Monthly Charges within annual/two-year-contract customers.
+
+    Monthly Charges' full-cohort FN-vs-TP gap is small precisely because the
+    60% month-to-month share of false negatives dilutes it — conditioning on
+    contract type the way Contract Type's own cohort-means finding did
+    reveals what the full-cohort comparison hides.
+    """
+    not_month_to_month = (
+        Xt_test[:, feature_index["multi_cat__contract_type_Month-to-month"]] == 0
+    )
+    fn_annual_mask = fn_mask & not_month_to_month
+    tn_annual_mask = tn_mask & not_month_to_month
+    monthlycharges_col = Xt_test[:, feature_index["numeric__monthlycharges"]]
+    monthlycharges_shap_col = shap_values[:, feature_index["numeric__monthlycharges"]]
+    _, annual_monthlycharges_mwu_p = mannwhitneyu(
+        monthlycharges_col[fn_annual_mask],
+        monthlycharges_col[tn_annual_mask],
+        alternative="greater",
+    )
+    finding = {
+        "n_fn": int(fn_annual_mask.sum()),
+        "n_tn": int(tn_annual_mask.sum()),
+        "fn_median": float(np.median(monthlycharges_col[fn_annual_mask])),
+        "tn_median": float(np.median(monthlycharges_col[tn_annual_mask])),
+        "fn_mean_shap": float(monthlycharges_shap_col[fn_annual_mask].mean()),
+        "tn_mean_shap": float(monthlycharges_shap_col[tn_annual_mask].mean()),
+        "mannwhitney_p_fn_greater": float(annual_monthlycharges_mwu_p),
+    }
+    return {
+        "finding": finding,
+        "fn_annual_mask": fn_annual_mask,
+        "tn_annual_mask": tn_annual_mask,
+        "monthlycharges_col": monthlycharges_col,
+        "monthlycharges_shap_col": monthlycharges_shap_col,
+    }
+
+
+def _compute_illustrative_cases(
+    y_test: NDArray[np.float64],
+    proba_test: NDArray[np.float64],
+    base_threshold: float,
+    shap_values: NDArray[np.float64],
+    base_value: float,
+    feature_names: list[str],
+    Xt_test: NDArray[np.float64],
+    ea_cfg: Any,
+) -> dict[str, Any]:
+    """Pick illustrative FN/FP/TP/TN cases and pre-slice their waterfall rows/labels.
+
+    The offsets that carve local_explanation_rows/illustrative_labels into
+    per-outcome groups are computed once, here, and the pre-sliced groups
+    are what callers receive — never raw offsets a renderer would have to
+    re-apply. That keeps the highest-risk arithmetic in this module (which
+    row belongs to which outcome) in exactly one place.
+    """
+    illustrative = _illustrative_indices(
+        y_test, proba_test, base_threshold, int(ea_cfg.n_local_explanation_examples)
+    )
+    illustrative_indices = (
+        illustrative["fn"]
+        + illustrative["fp"]
+        + illustrative["tp"]
+        + illustrative["tn"]
+    )
+    local_explanation_rows = local_explanations(
+        shap_values,
+        base_value,
+        feature_names,
+        illustrative_indices,
+        int(ea_cfg.local_explanation_top_k),
+        feature_values=Xt_test,
+    )
+    illustrative_labels = (
+        [f"Missed churner — FN (idx={idx})" for idx in illustrative["fn"]]
+        + [f"Over-flagged non-churner — FP (idx={idx})" for idx in illustrative["fp"]]
+        + [f"Most confident churner — TP (idx={idx})" for idx in illustrative["tp"]]
+        + [f"Most confident non-churner — TN (idx={idx})" for idx in illustrative["tn"]]
+    )
+
+    n_fn_illustrative = len(illustrative["fn"])
+    n_fp_illustrative = len(illustrative["fp"])
+    fn_end = n_fn_illustrative
+    fp_end = fn_end + n_fp_illustrative
+    tp_end = fp_end + len(illustrative["tp"])
+
+    return {
+        "illustrative": illustrative,
+        "local_explanation_rows": local_explanation_rows,
+        "illustrative_labels": illustrative_labels,
+        "fn_rows": local_explanation_rows[:fn_end],
+        "fn_labels": illustrative_labels[:fn_end],
+        "fp_rows": local_explanation_rows[fn_end:fp_end],
+        "fp_labels": illustrative_labels[fn_end:fp_end],
+        "tp_row": local_explanation_rows[fp_end:tp_end][0],
+        "tp_label": illustrative_labels[fp_end:tp_end][0],
+        "tn_row": local_explanation_rows[tp_end:][0],
+        "tn_label": illustrative_labels[tp_end:][0],
+    }
+
+
+def _compute_error_profiles(
+    y_test: Any,
+    proba_test: Any,
+    base_threshold: float,
+    test_features_df: pd.DataFrame,
+    validation_payload: dict[str, Any],
+    ea_cfg: Any,
+) -> dict[str, Any]:
+    """Compute the near-miss band, error-confidence profile, and value-weighted error profile."""
+    near_miss_band = near_miss_band_from_validation(
+        validation_payload, float(ea_cfg.near_miss_band)
+    )
+    confidence = error_confidence_profile(
+        y_test, proba_test, base_threshold, near_miss_band
+    )
+    value_weighted_rows = value_weighted_error_profile(
+        y_test,
+        proba_test,
+        test_features_df["monthlycharges"].to_numpy(dtype=float),
+        base_threshold,
+        int(ea_cfg.n_value_deciles),
+    )
+    fn_rate_top_value_decile = (
+        value_weighted_rows[-1]["fn_rate"] if value_weighted_rows else float("nan")
+    )
+    return {
+        "confidence": confidence,
+        "value_weighted_rows": value_weighted_rows,
+        "fn_rate_top_value_decile": fn_rate_top_value_decile,
+    }
+
+
+def _compute_error_concentration(
+    y_dev: Any,
+    proba_dev: Any,
+    base_threshold: float,
+    dev_features_df: pd.DataFrame,
+    ea_cfg: Any,
+) -> dict[str, Any]:
+    """Run the dev-OOF error-concentration scan, once ranked by FNR and once by FPR."""
+    numeric_features = list(FEATURE_SCHEMA.numeric)
+    categorical_features = list(FEATURE_SCHEMA.binary) + list(FEATURE_SCHEMA.multi_cat)
+    concentration_scan_args = (
+        y_dev,
+        proba_dev,
+        base_threshold,
+        dev_features_df,
+        numeric_features,
+        categorical_features,
+        int(ea_cfg.n_quantile_bins),
+        int(ea_cfg.min_cohort_support),
+        int(ea_cfg.top_k_cohorts),
+    )
+    concentration_fnr_rows = error_concentration_scan(
+        *concentration_scan_args, metric="fnr"
+    )
+    concentration_fpr_rows = error_concentration_scan(
+        *concentration_scan_args, metric="fpr"
+    )
+    return {
+        "concentration_fnr_rows": concentration_fnr_rows,
+        "concentration_fpr_rows": concentration_fpr_rows,
+    }
+
+
+def _load_dev_oof_diagnostics_carrythrough(reports_dir: Path) -> dict[str, Any]:
+    """Read metrics.json's sliced.dev_oof_diagnostics, if evaluate.py has already run."""
+    metrics_path = reports_dir / "metrics.json"
+    if not metrics_path.exists():
+        return {}
+    with open(metrics_path, encoding="utf-8") as f:
+        existing_metrics = json.load(f)
+    result: dict[str, Any] = existing_metrics.get("sliced", {}).get(
+        "dev_oof_diagnostics", {}
+    )
+    return result
+
+
+def _assemble_error_analysis_payload(
+    model_version: str,
+    run_id: str,
+    base_threshold: float,
+    shap_diag: dict[str, Any],
+    fn_tp_gap: dict[str, Any],
+    fp_tn_gap: dict[str, Any],
+    subgroup: dict[str, Any],
+    illustrative_bundle: dict[str, Any],
+    error_profiles: dict[str, Any],
+    concentration: dict[str, Any],
+    dev_oof_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    """Assemble error_analysis.json from every already-computed block."""
+    return {
+        "model_version": model_version,
+        "run_id": run_id,
+        "base_threshold": base_threshold,
+        "error_confidence": error_profiles["confidence"],
+        "value_weighted_errors": {
+            "by_decile": error_profiles["value_weighted_rows"],
+            "fn_rate_top_value_decile": error_profiles["fn_rate_top_value_decile"],
+        },
+        "error_concentration": {
+            "dev_oof_top_fnr_cohorts": concentration["concentration_fnr_rows"],
+            "dev_oof_top_fpr_cohorts": concentration["concentration_fpr_rows"],
+        },
+        "shap": {
+            "global_importance": shap_diag["importance_rows"],
+            "top_features": shap_diag["top_features"],
+            "dependence": shap_diag["dependence_by_feature"],
+            "binary_dependence": shap_diag["binary_dependence"],
+            "cohort_shap": {
+                "fn": fn_tp_gap["shap_rows_a"],
+                "tp": fn_tp_gap["shap_rows_b"],
+                "fp": fp_tn_gap["shap_rows_a"],
+                "tn": fp_tn_gap["shap_rows_b"],
+            },
+            "cohort_top_features": fn_tp_gap["top_features"],
+            "cohort_top_features_fp_tn": fp_tn_gap["top_features"],
+            "cohort_gap_ranking_fn_tp": [
+                {"feature": name, "gap": gap} for name, gap in fn_tp_gap["gap_ranking"]
+            ],
+            "cohort_gap_ranking_fp_tn": [
+                {"feature": name, "gap": gap} for name, gap in fp_tn_gap["gap_ranking"]
+            ],
+            "local_explanations": illustrative_bundle["local_explanation_rows"],
+        },
+        "top_k_elbow_checks": {
+            "shap_features": shap_diag["top_k_shap_elbow"],
+            "cohort_gap_fn_tp": fn_tp_gap["elbow"],
+            "cohort_gap_fp_tn": fp_tn_gap["elbow"],
+        },
+        "subgroup_findings": {
+            "annual_contract_fn_vs_tn_monthlycharges": subgroup["finding"],
+        },
+        "direction_sanity_check": shap_diag["v3_result"],
+        "dev_oof_diagnostics_carried_through": {
+            "v1_flagged": dev_oof_diagnostics.get("v1_flagged", []),
+            "v2_equal_opportunity_flagged": dev_oof_diagnostics.get(
+                "v2_equal_opportunity_flagged", {}
+            ),
+            "v2_demographic_parity_flagged": dev_oof_diagnostics.get(
+                "v2_demographic_parity_flagged", {}
+            ),
+            "v2b_flagged": dev_oof_diagnostics.get("v2b_flagged", []),
+        },
+    }
+
+
+def _render_error_analysis_figures(
+    shap_diag: dict[str, Any],
+    fn_tp_gap: dict[str, Any],
+    fp_tn_gap: dict[str, Any],
+    masks: dict[str, NDArray[np.bool_]],
+    subgroup: dict[str, Any],
+    illustrative_bundle: dict[str, Any],
+    error_profiles: dict[str, Any],
+    cfg: DictConfig,
+) -> dict[str, Path]:
+    """Render all fifteen error-analysis figures and return their paths."""
+    shap_values, Xt_test = shap_diag["shap_values"], shap_diag["Xt_test"]
+    feature_names, feature_index = (
+        shap_diag["feature_names"],
+        shap_diag["feature_index"],
+    )
+
+    figures_dir = get_project_root() / str(cfg.paths.figures)
+    paths = {
+        "global_importance_path": figures_dir / "shap_global_importance.png",
+        "beeswarm_path": figures_dir / "shap_beeswarm.png",
+        "dependence_path": figures_dir / "shap_dependence.png",
+        "cohort_shap_path": figures_dir / "shap_cohort_fn_vs_tp.png",
+        "cohort_beeswarm_fn_path": figures_dir / "shap_cohort_beeswarm_fn.png",
+        "cohort_beeswarm_tp_path": figures_dir / "shap_cohort_beeswarm_tp.png",
+        "cohort_shap_fp_tn_path": figures_dir / "shap_cohort_fp_vs_tn.png",
+        "cohort_beeswarm_fp_path": figures_dir / "shap_cohort_beeswarm_fp.png",
+        "cohort_beeswarm_tn_path": figures_dir / "shap_cohort_beeswarm_tn.png",
+        "cohort_dependence_tenure_path": figures_dir
+        / "shap_cohort_dependence_tenure.png",
+        "subgroup_dependence_monthlycharges_path": figures_dir
+        / "shap_subgroup_dependence_monthlycharges_annual.png",
+        "waterfall_path": figures_dir / "shap_waterfall_examples.png",
+        "waterfall_confident_cases_path": figures_dir
+        / "shap_waterfall_confident_cases.png",
+        "error_confidence_path": figures_dir / "error_confidence.png",
+        "value_weighted_path": figures_dir / "value_weighted_errors.png",
+    }
+
+    _save_shap_global_importance_plot(
+        shap_diag["importance_rows"], paths["global_importance_path"]
+    )
+    _save_shap_beeswarm_plot(
+        shap_values, Xt_test, feature_names, paths["beeswarm_path"]
+    )
+    _save_dependence_plots(shap_diag["dependence_by_feature"], paths["dependence_path"])
+    _save_cohort_shap_plot(
+        fn_tp_gap["shap_rows_a"],
+        fn_tp_gap["shap_rows_b"],
+        fn_tp_gap["top_features"],
+        paths["cohort_shap_path"],
+    )
+    _save_cohort_beeswarm_plots(
+        shap_values,
+        Xt_test,
+        feature_names,
+        masks["fn_mask"],
+        masks["tp_mask"],
+        fn_tp_gap["top_features"],
+        paths["cohort_beeswarm_fn_path"],
+        paths["cohort_beeswarm_tp_path"],
+    )
+    _save_cohort_shap_plot(
+        fp_tn_gap["shap_rows_a"],
+        fp_tn_gap["shap_rows_b"],
+        fp_tn_gap["top_features"],
+        paths["cohort_shap_fp_tn_path"],
+        label_a="FP cohort",
+        label_b="TN cohort",
+        color_a="tab:orange",
+        color_b="tab:blue",
+        title="FP vs. TN cohort — signed SHAP",
+    )
+    _save_cohort_beeswarm_plots(
+        shap_values,
+        Xt_test,
+        feature_names,
+        masks["fp_mask"],
+        masks["tn_mask"],
+        fp_tn_gap["top_features"],
+        paths["cohort_beeswarm_fp_path"],
+        paths["cohort_beeswarm_tn_path"],
+    )
+    _save_cohort_dependence_plot(
+        Xt_test[:, feature_index["numeric__tenure"]],
+        shap_values[:, feature_index["numeric__tenure"]],
+        masks["fn_mask"],
+        masks["tp_mask"],
+        masks["fp_mask"],
+        masks["tn_mask"],
+        display_feature_name("numeric__tenure"),
+        paths["cohort_dependence_tenure_path"],
+    )
+    # Renders the annual-contract FN-vs-TN Monthly Charges comparison already
+    # computed and stats-tested by _annual_contract_subgroup_finding —
+    # confirmatory, not a fresh fishing trip. Needs its own restricted plot
+    # rather than reusing _save_cohort_dependence_plot's whole-cohort
+    # structure precisely because the whole-cohort view is what hides this
+    # finding in the first place.
+    _save_subgroup_dependence_plot(
+        subgroup["monthlycharges_col"],
+        subgroup["monthlycharges_shap_col"],
+        subgroup["fn_annual_mask"],
+        subgroup["tn_annual_mask"],
+        "FN (annual/two-year contract)",
+        "TN (annual/two-year contract)",
+        "tab:red",
+        "tab:blue",
+        display_feature_name("numeric__monthlycharges"),
+        "Monthly Charges — annual/two-year-contract customers only: FN vs. TN",
+        paths["subgroup_dependence_monthlycharges_path"],
+    )
+    _save_waterfall_plots(
+        illustrative_bundle["fn_rows"],
+        illustrative_bundle["fn_labels"],
+        illustrative_bundle["fp_rows"],
+        illustrative_bundle["fp_labels"],
+        paths["waterfall_path"],
+    )
+    _save_confident_case_waterfalls(
+        illustrative_bundle["tp_row"],
+        illustrative_bundle["tp_label"],
+        illustrative_bundle["tn_row"],
+        illustrative_bundle["tn_label"],
+        paths["waterfall_confident_cases_path"],
+    )
+    _save_error_confidence_plot(
+        error_profiles["confidence"], paths["error_confidence_path"]
+    )
+    _save_value_weighted_plot(
+        error_profiles["value_weighted_rows"], paths["value_weighted_path"]
+    )
+
+    return paths
+
+
+def _log_error_analysis_run(
+    model_version: str,
+    loaded: dict[str, Any],
+    shap_diag: dict[str, Any],
+    concentration: dict[str, Any],
+    error_analysis_payload: dict[str, Any],
+    figure_paths: dict[str, Path],
+    cfg: DictConfig,
+) -> str:
+    """Log every error-analysis artifact/metric onto a dedicated `error_analysis` run.
+
+    Returns error_analysis_run_id, consumed after the run context closes
+    (registry tagging).
+    """
+    test_predictions = loaded["test_predictions"]
+    committed_features = loaded["committed_features"]
+    test_features_df = loaded["test_features_df"]
+    v3_result = shap_diag["v3_result"]
+
+    ensure_experiment_metadata(cfg)
+    model_id = resolve_logged_model_id(model_version, cfg)
+    test_dataset = mlflow_dataset_from_pandas(
+        pd.concat(
+            [
+                test_features_df[committed_features].reset_index(drop=True),
+                test_predictions["y_true"].rename(TARGET_COL).reset_index(drop=True),
+            ],
+            axis=1,
+        ),
+        name="sealed_test",
+        targets=TARGET_COL,
+    )
+
+    with mlflow.start_run(run_name="error_analysis") as run:
+        set_run_description(_RUN_DESCRIPTION)
+        error_analysis_run_id = str(run.info.run_id)
+        mlflow.log_input(test_dataset, context="error_analysis")
+
+        scalar_metrics: dict[str, float] = {
+            "test_fn_near_miss_share": cast(
+                float, error_analysis_payload["error_confidence"]["fn_near_miss_share"]
+            ),
+            "test_fn_rate_top_value_decile": cast(
+                float,
+                error_analysis_payload["value_weighted_errors"][
+                    "fn_rate_top_value_decile"
+                ],
+            ),
+            "direction_sanity_check_passed": 1.0 if v3_result["passed"] else 0.0,
+        }
+        for row in shap_diag["importance_rows"]:
+            feature_key = _sanitize_metric_name(str(row["feature"]))
+            scalar_metrics[f"shap_importance_{feature_key}"] = cast(
+                float, row["mean_abs_shap"]
+            )
+        mlflow.log_metrics(scalar_metrics, model_id=model_id, dataset=test_dataset)
+
+        mlflow.set_tag(
+            "direction_sanity_check",
+            "pass" if v3_result["passed"] else "fail",
+        )
+
+        mlflow.log_dict(error_analysis_payload, "error_analysis.json")
+        mlflow.log_dict(
+            {
+                "dev_oof_top_fnr_cohorts": concentration["concentration_fnr_rows"],
+                "dev_oof_top_fpr_cohorts": concentration["concentration_fpr_rows"],
+            },
+            "slices/error_concentration.json",
+        )
+
+        for path in figure_paths.values():
+            mlflow.log_artifact(str(path), artifact_path="figures")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            shap_values_path = Path(tmp_dir) / "shap_values.parquet"
+            shap_df = pd.DataFrame(
+                shap_diag["shap_values"], columns=shap_diag["feature_names"]
+            )
+            shap_df.insert(0, "customerid", test_predictions["customerid"].to_numpy())
+            shap_df["base_value"] = shap_diag["base_value"]
+            shap_df.to_parquet(shap_values_path, index=False)
+            mlflow.log_artifact(str(shap_values_path))
+
+    return error_analysis_run_id
+
+
+def _tag_and_write_error_analysis_reports(
+    model_version: str,
+    registered_model_name: str,
+    error_analysis_run_id: str,
+    error_analysis_payload: dict[str, Any],
+    reports_dir: Path,
+) -> None:
+    """Tag the model version with error_analysis_run_id and mirror error_analysis.json to reports/.
+
+    register.py's only supported path from "the model version being
+    registered" to this cycle's error_analysis.json — same tag pattern as
+    calibrate.py's logged_model_id and evaluate.py's eval_run_id, since
+    nothing else auto-populates a run-to-version link. A local reports/
+    path is not a substitute: it only reflects whichever run last executed
+    error_analysis.py on this machine, not necessarily this model_version's
+    own cycle.
+    """
+    mlflow.tracking.MlflowClient().set_model_version_tag(
+        registered_model_name,
+        model_version,
+        "error_analysis_run_id",
+        error_analysis_run_id,
+    )
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(reports_dir / "error_analysis.json", "w", encoding="utf-8") as f:
+        json.dump(error_analysis_payload, f, indent=2, default=str)
+
+
 def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     """Run the full error-diagnosis pass and write reports/error_analysis.json.
 
@@ -1253,88 +1905,31 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
     `error_analysis` MLflow run (a sibling of evaluate.py's `evaluation` run)
     and writes reports/error_analysis.json — register.py aborts without it.
     """
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    registered_model_name = str(cfg.mlflow.registered_model_name)
-
-    run_id = resolve_model_run_id(model_version, cfg)
-    validation_payload = load_threshold_validation(run_id, cfg)
-    check_threshold_provenance(validation_payload, run_id, model_version)
-    manifest = load_training_manifest(run_id, cfg)
-    committed_features = committed_features_from_manifest(manifest)
-    model = load_fitted_model(model_version, cfg)
-
-    reports_dir = get_project_root() / str(cfg.paths.reports)
-    test_predictions = pd.read_parquet(reports_dir / "test_predictions.parquet")
-    # threshold.py's reports/dev_oof_predictions.parquet is a row-order-
-    # reindexed copy of calibrate.py's own MLflow artifact (both derive from
-    # the same load_dev_customer_ids() ordering) — fetched here by run_id
-    # from its true owner, calibrate.py's logged artifact, rather than a
-    # local disk path that only reflects whichever run last executed
-    # threshold.py on this machine.
-    dev_oof_predictions = load_dev_oof_predictions(run_id, cfg)
-
-    test_features_df = _features_by_customer_id(test_predictions["customerid"])
-    dev_features_df = _features_by_customer_id(dev_oof_predictions["customerid"])
-
-    policy = load_policy_thresholds(cfg)
-    base_threshold = resolve_policy_thresholds_by_scenario(policy)["base"]
-
-    y_test = test_predictions["y_true"].to_numpy(dtype=float)
-    proba_test = test_predictions["p_hat"].to_numpy(dtype=float)
-    y_dev = dev_oof_predictions["y_true"].to_numpy(dtype=float)
-    proba_dev = dev_oof_predictions["p_hat"].to_numpy(dtype=float)
-
+    loaded = _load_error_analysis_inputs(model_version, cfg)
+    run_id = loaded["run_id"]
+    base_threshold = loaded["base_threshold"]
+    y_test, proba_test = loaded["y_test"], loaded["proba_test"]
+    y_dev, proba_dev = loaded["y_dev"], loaded["proba_dev"]
     ea_cfg = cfg.error_analysis
-    shap_values, feature_names, base_value, Xt_test = _shap_values_for_test_rows(
-        model, test_features_df[committed_features]
-    )
-    feature_index = {name: i for i, name in enumerate(feature_names)}
 
-    importance_rows = global_importance(shap_values, feature_names)
-    top_k_shap = int(ea_cfg.top_k_shap_features)
-    top_features = [cast(str, r["feature"]) for r in importance_rows[:top_k_shap]]
-    top_k_shap_elbow = _check_top_k_elbow(
-        [cast(float, r["mean_abs_shap"]) for r in importance_rows], top_k_shap
+    shap_diag = _compute_shap_diagnostics(
+        loaded["model"],
+        loaded["test_features_df"],
+        loaded["committed_features"],
+        ea_cfg,
     )
-    if not top_k_shap_elbow["valid"]:
-        logger.warning("top_k_shap_features_elbow_drifted", **top_k_shap_elbow)
-
-    dependence_by_feature = {
-        feat: dependence_points(
-            Xt_test[:, feature_index[feat]], shap_values[:, feature_index[feat]]
-        )
-        for feat in top_features
-    }
-    directions = {
-        feat: cast(float, dep["direction"])
-        for feat, dep in dependence_by_feature.items()
-    }
-    v3_result = direction_sanity_check(
-        top_features, directions, _EXPECTED_EDA_DIRECTIONS
-    )
-
-    binary_features = [name for name in feature_names if name.startswith("binary__")]
-    binary_dependence = {
-        feat: binary_feature_effects(
-            Xt_test[:, feature_index[feat]], shap_values[:, feature_index[feat]]
-        )
-        for feat in binary_features
-    }
+    shap_values, feature_names = shap_diag["shap_values"], shap_diag["feature_names"]
 
     fn_mask = (y_test == 1) & (proba_test < base_threshold)
     tp_mask = (y_test == 1) & (proba_test >= base_threshold)
-    fn_shap_rows = cohort_shap(shap_values, fn_mask, feature_names)
-    tp_shap_rows = cohort_shap(shap_values, tp_mask, feature_names)
-    top_k_cohort_gap = int(ea_cfg.top_k_cohort_gap_features)
-    fn_tp_gap_ranking = _sorted_gap_pairs(fn_shap_rows, tp_shap_rows)
-    cohort_top_features = [name for name, _ in fn_tp_gap_ranking[:top_k_cohort_gap]]
-    cohort_gap_fn_tp_elbow = _check_top_k_elbow(
-        [gap for _, gap in fn_tp_gap_ranking], top_k_cohort_gap
+    fn_tp_gap = _compute_cohort_gap(
+        shap_values,
+        feature_names,
+        fn_mask,
+        tp_mask,
+        int(ea_cfg.top_k_cohort_gap_features),
+        "top_k_cohort_gap_features_elbow_drifted",
     )
-    if not cohort_gap_fn_tp_elbow["valid"]:
-        logger.warning(
-            "top_k_cohort_gap_features_elbow_drifted", **cohort_gap_fn_tp_elbow
-        )
 
     # Mirrors the FN-vs-TP pair for the two actual-non-churner outcomes: does a
     # false alarm's SHAP profile look like a real churner's (confident
@@ -1344,375 +1939,95 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
     # different rank, so sharing one knob would silently mis-cut one pair.
     fp_mask = (y_test == 0) & (proba_test >= base_threshold)
     tn_mask = (y_test == 0) & (proba_test < base_threshold)
-    fp_shap_rows = cohort_shap(shap_values, fp_mask, feature_names)
-    tn_shap_rows = cohort_shap(shap_values, tn_mask, feature_names)
-    top_k_cohort_gap_fp_tn = int(ea_cfg.top_k_cohort_gap_features_fp_tn)
-    fp_tn_gap_ranking = _sorted_gap_pairs(fp_shap_rows, tn_shap_rows)
-    cohort_top_features_fp_tn = [
-        name for name, _ in fp_tn_gap_ranking[:top_k_cohort_gap_fp_tn]
-    ]
-    cohort_gap_fp_tn_elbow = _check_top_k_elbow(
-        [gap for _, gap in fp_tn_gap_ranking], top_k_cohort_gap_fp_tn
-    )
-    if not cohort_gap_fp_tn_elbow["valid"]:
-        logger.warning(
-            "top_k_cohort_gap_features_fp_tn_elbow_drifted", **cohort_gap_fp_tn_elbow
-        )
-
-    # Confirmatory follow-up, not a fresh fishing trip: Monthly Charges'
-    # *full-cohort* FN-vs-TP gap is small (rank 11 of 41) precisely because
-    # the 60% month-to-month share of false negatives dilutes it — the same
-    # composition-masking Contract Type's cohort-means finding already showed
-    # one level up. Conditioning on contract type the way that finding did
-    # reveals what the full-cohort comparison hides: within
-    # annual/two-year-contract customers specifically, false negatives run
-    # far higher Monthly Charges than true negatives, and the model reacts to
-    # it (fn_mean_shap vs. tn_mean_shap below) — just not strongly enough to
-    # overcome Contract Type's suppression and cross t*.
-    not_month_to_month = (
-        Xt_test[:, feature_index["multi_cat__contract_type_Month-to-month"]] == 0
-    )
-    fn_annual_mask = fn_mask & not_month_to_month
-    tn_annual_mask = tn_mask & not_month_to_month
-    monthlycharges_col = Xt_test[:, feature_index["numeric__monthlycharges"]]
-    monthlycharges_shap_col = shap_values[:, feature_index["numeric__monthlycharges"]]
-    _, annual_monthlycharges_mwu_p = mannwhitneyu(
-        monthlycharges_col[fn_annual_mask],
-        monthlycharges_col[tn_annual_mask],
-        alternative="greater",
-    )
-    annual_contract_fn_vs_tn_monthlycharges = {
-        "n_fn": int(fn_annual_mask.sum()),
-        "n_tn": int(tn_annual_mask.sum()),
-        "fn_median": float(np.median(monthlycharges_col[fn_annual_mask])),
-        "tn_median": float(np.median(monthlycharges_col[tn_annual_mask])),
-        "fn_mean_shap": float(monthlycharges_shap_col[fn_annual_mask].mean()),
-        "tn_mean_shap": float(monthlycharges_shap_col[tn_annual_mask].mean()),
-        "mannwhitney_p_fn_greater": float(annual_monthlycharges_mwu_p),
-    }
-
-    illustrative = _illustrative_indices(
-        y_test, proba_test, base_threshold, int(ea_cfg.n_local_explanation_examples)
-    )
-    illustrative_indices = (
-        illustrative["fn"]
-        + illustrative["fp"]
-        + illustrative["tp"]
-        + illustrative["tn"]
-    )
-    local_explanation_rows = local_explanations(
+    fp_tn_gap = _compute_cohort_gap(
         shap_values,
-        base_value,
         feature_names,
-        illustrative_indices,
-        int(ea_cfg.local_explanation_top_k),
-        feature_values=Xt_test,
-    )
-    illustrative_labels = (
-        [f"Missed churner — FN (idx={idx})" for idx in illustrative["fn"]]
-        + [f"Over-flagged non-churner — FP (idx={idx})" for idx in illustrative["fp"]]
-        + [f"Most confident churner — TP (idx={idx})" for idx in illustrative["tp"]]
-        + [f"Most confident non-churner — TN (idx={idx})" for idx in illustrative["tn"]]
+        fp_mask,
+        tn_mask,
+        int(ea_cfg.top_k_cohort_gap_features_fp_tn),
+        "top_k_cohort_gap_features_fp_tn_elbow_drifted",
     )
 
-    near_miss_band = near_miss_band_from_validation(
-        validation_payload, float(ea_cfg.near_miss_band)
+    subgroup = _annual_contract_subgroup_finding(
+        shap_diag["Xt_test"], shap_values, shap_diag["feature_index"], fn_mask, tn_mask
     )
-    confidence = error_confidence_profile(
-        y_test, proba_test, base_threshold, near_miss_band
-    )
-    value_weighted_rows = value_weighted_error_profile(
+
+    illustrative_bundle = _compute_illustrative_cases(
         y_test,
         proba_test,
-        test_features_df["monthlycharges"].to_numpy(dtype=float),
         base_threshold,
-        int(ea_cfg.n_value_deciles),
-    )
-    fn_rate_top_value_decile = (
-        value_weighted_rows[-1]["fn_rate"] if value_weighted_rows else float("nan")
+        shap_values,
+        shap_diag["base_value"],
+        feature_names,
+        shap_diag["Xt_test"],
+        ea_cfg,
     )
 
-    numeric_features = list(FEATURE_SCHEMA.numeric)
-    categorical_features = list(FEATURE_SCHEMA.binary) + list(FEATURE_SCHEMA.multi_cat)
-    concentration_scan_args = (
-        y_dev,
-        proba_dev,
+    error_profiles = _compute_error_profiles(
+        y_test,
+        proba_test,
         base_threshold,
-        dev_features_df,
-        numeric_features,
-        categorical_features,
-        int(ea_cfg.n_quantile_bins),
-        int(ea_cfg.min_cohort_support),
-        int(ea_cfg.top_k_cohorts),
-    )
-    concentration_fnr_rows = error_concentration_scan(
-        *concentration_scan_args, metric="fnr"
-    )
-    concentration_fpr_rows = error_concentration_scan(
-        *concentration_scan_args, metric="fpr"
+        loaded["test_features_df"],
+        loaded["validation_payload"],
+        ea_cfg,
     )
 
-    metrics_path = reports_dir / "metrics.json"
-    dev_oof_diagnostics: dict[str, Any] = {}
-    if metrics_path.exists():
-        with open(metrics_path, encoding="utf-8") as f:
-            existing_metrics = json.load(f)
-        dev_oof_diagnostics = existing_metrics.get("sliced", {}).get(
-            "dev_oof_diagnostics", {}
-        )
-
-    error_analysis_payload: dict[str, Any] = {
-        "model_version": model_version,
-        "run_id": run_id,
-        "base_threshold": base_threshold,
-        "error_confidence": confidence,
-        "value_weighted_errors": {
-            "by_decile": value_weighted_rows,
-            "fn_rate_top_value_decile": fn_rate_top_value_decile,
-        },
-        "error_concentration": {
-            "dev_oof_top_fnr_cohorts": concentration_fnr_rows,
-            "dev_oof_top_fpr_cohorts": concentration_fpr_rows,
-        },
-        "shap": {
-            "global_importance": importance_rows,
-            "top_features": top_features,
-            "dependence": dependence_by_feature,
-            "binary_dependence": binary_dependence,
-            "cohort_shap": {
-                "fn": fn_shap_rows,
-                "tp": tp_shap_rows,
-                "fp": fp_shap_rows,
-                "tn": tn_shap_rows,
-            },
-            "cohort_top_features": cohort_top_features,
-            "cohort_top_features_fp_tn": cohort_top_features_fp_tn,
-            "cohort_gap_ranking_fn_tp": [
-                {"feature": name, "gap": gap} for name, gap in fn_tp_gap_ranking
-            ],
-            "cohort_gap_ranking_fp_tn": [
-                {"feature": name, "gap": gap} for name, gap in fp_tn_gap_ranking
-            ],
-            "local_explanations": local_explanation_rows,
-        },
-        "top_k_elbow_checks": {
-            "shap_features": top_k_shap_elbow,
-            "cohort_gap_fn_tp": cohort_gap_fn_tp_elbow,
-            "cohort_gap_fp_tn": cohort_gap_fp_tn_elbow,
-        },
-        "subgroup_findings": {
-            "annual_contract_fn_vs_tn_monthlycharges": annual_contract_fn_vs_tn_monthlycharges,
-        },
-        "direction_sanity_check": v3_result,
-        "dev_oof_diagnostics_carried_through": {
-            "v1_flagged": dev_oof_diagnostics.get("v1_flagged", []),
-            "v2_equal_opportunity_flagged": dev_oof_diagnostics.get(
-                "v2_equal_opportunity_flagged", {}
-            ),
-            "v2_demographic_parity_flagged": dev_oof_diagnostics.get(
-                "v2_demographic_parity_flagged", {}
-            ),
-            "v2b_flagged": dev_oof_diagnostics.get("v2b_flagged", []),
-        },
-    }
-
-    figures_dir = get_project_root() / str(cfg.paths.figures)
-    global_importance_path = figures_dir / "shap_global_importance.png"
-    beeswarm_path = figures_dir / "shap_beeswarm.png"
-    dependence_path = figures_dir / "shap_dependence.png"
-    cohort_shap_path = figures_dir / "shap_cohort_fn_vs_tp.png"
-    cohort_beeswarm_fn_path = figures_dir / "shap_cohort_beeswarm_fn.png"
-    cohort_beeswarm_tp_path = figures_dir / "shap_cohort_beeswarm_tp.png"
-    cohort_shap_fp_tn_path = figures_dir / "shap_cohort_fp_vs_tn.png"
-    cohort_beeswarm_fp_path = figures_dir / "shap_cohort_beeswarm_fp.png"
-    cohort_beeswarm_tn_path = figures_dir / "shap_cohort_beeswarm_tn.png"
-    cohort_dependence_tenure_path = figures_dir / "shap_cohort_dependence_tenure.png"
-    subgroup_dependence_monthlycharges_path = (
-        figures_dir / "shap_subgroup_dependence_monthlycharges_annual.png"
-    )
-    waterfall_path = figures_dir / "shap_waterfall_examples.png"
-    waterfall_confident_cases_path = figures_dir / "shap_waterfall_confident_cases.png"
-    error_confidence_path = figures_dir / "error_confidence.png"
-    value_weighted_path = figures_dir / "value_weighted_errors.png"
-
-    _save_shap_global_importance_plot(importance_rows, global_importance_path)
-    _save_shap_beeswarm_plot(shap_values, Xt_test, feature_names, beeswarm_path)
-    _save_dependence_plots(dependence_by_feature, dependence_path)
-    _save_cohort_shap_plot(
-        fn_shap_rows, tp_shap_rows, cohort_top_features, cohort_shap_path
-    )
-    _save_cohort_beeswarm_plots(
-        shap_values,
-        Xt_test,
-        feature_names,
-        fn_mask,
-        tp_mask,
-        cohort_top_features,
-        cohort_beeswarm_fn_path,
-        cohort_beeswarm_tp_path,
-    )
-    _save_cohort_shap_plot(
-        fp_shap_rows,
-        tn_shap_rows,
-        cohort_top_features_fp_tn,
-        cohort_shap_fp_tn_path,
-        label_a="FP cohort",
-        label_b="TN cohort",
-        color_a="tab:orange",
-        color_b="tab:blue",
-        title="FP vs. TN cohort — signed SHAP",
-    )
-    _save_cohort_beeswarm_plots(
-        shap_values,
-        Xt_test,
-        feature_names,
-        fp_mask,
-        tn_mask,
-        cohort_top_features_fp_tn,
-        cohort_beeswarm_fp_path,
-        cohort_beeswarm_tn_path,
-    )
-    _save_cohort_dependence_plot(
-        Xt_test[:, feature_index["numeric__tenure"]],
-        shap_values[:, feature_index["numeric__tenure"]],
-        fn_mask,
-        tp_mask,
-        fp_mask,
-        tn_mask,
-        display_feature_name("numeric__tenure"),
-        cohort_dependence_tenure_path,
-    )
-    # Renders the annual-contract FN-vs-TN Monthly Charges comparison already
-    # computed and stats-tested above (annual_contract_fn_vs_tn_monthlycharges)
-    # — confirmatory, not a fresh fishing trip. Needs its own restricted plot
-    # rather than reusing _save_cohort_dependence_plot's whole-cohort
-    # structure precisely because the whole-cohort view is what hides this
-    # finding in the first place (see the comment above the stats block).
-    _save_subgroup_dependence_plot(
-        monthlycharges_col,
-        monthlycharges_shap_col,
-        fn_annual_mask,
-        tn_annual_mask,
-        "FN (annual/two-year contract)",
-        "TN (annual/two-year contract)",
-        "tab:red",
-        "tab:blue",
-        display_feature_name("numeric__monthlycharges"),
-        "Monthly Charges — annual/two-year-contract customers only: FN vs. TN",
-        subgroup_dependence_monthlycharges_path,
-    )
-    n_fn_illustrative = len(illustrative["fn"])
-    n_fp_illustrative = len(illustrative["fp"])
-    fn_end = n_fn_illustrative
-    fp_end = fn_end + n_fp_illustrative
-    tp_end = fp_end + len(illustrative["tp"])
-    _save_waterfall_plots(
-        local_explanation_rows[:fn_end],
-        illustrative_labels[:fn_end],
-        local_explanation_rows[fn_end:fp_end],
-        illustrative_labels[fn_end:fp_end],
-        waterfall_path,
-    )
-    _save_confident_case_waterfalls(
-        local_explanation_rows[fp_end:tp_end][0],
-        illustrative_labels[fp_end:tp_end][0],
-        local_explanation_rows[tp_end:][0],
-        illustrative_labels[tp_end:][0],
-        waterfall_confident_cases_path,
-    )
-    _save_error_confidence_plot(confidence, error_confidence_path)
-    _save_value_weighted_plot(value_weighted_rows, value_weighted_path)
-
-    ensure_experiment_metadata(cfg)
-    model_id = resolve_logged_model_id(model_version, cfg)
-    test_dataset = mlflow_dataset_from_pandas(
-        pd.concat(
-            [
-                test_features_df[committed_features].reset_index(drop=True),
-                test_predictions["y_true"].rename(TARGET_COL).reset_index(drop=True),
-            ],
-            axis=1,
-        ),
-        name="sealed_test",
-        targets=TARGET_COL,
+    concentration = _compute_error_concentration(
+        y_dev, proba_dev, base_threshold, loaded["dev_features_df"], ea_cfg
     )
 
-    with mlflow.start_run(run_name="error_analysis") as run:
-        set_run_description(_RUN_DESCRIPTION)
-        error_analysis_run_id = run.info.run_id
-        mlflow.log_input(test_dataset, context="error_analysis")
+    dev_oof_diagnostics = _load_dev_oof_diagnostics_carrythrough(loaded["reports_dir"])
 
-        scalar_metrics: dict[str, float] = {
-            "test_fn_near_miss_share": cast(float, confidence["fn_near_miss_share"]),
-            "test_fn_rate_top_value_decile": cast(float, fn_rate_top_value_decile),
-            "direction_sanity_check_passed": 1.0 if v3_result["passed"] else 0.0,
-        }
-        for row in importance_rows:
-            feature_key = _sanitize_metric_name(str(row["feature"]))
-            scalar_metrics[f"shap_importance_{feature_key}"] = cast(
-                float, row["mean_abs_shap"]
-            )
-        mlflow.log_metrics(scalar_metrics, model_id=model_id, dataset=test_dataset)
-
-        mlflow.set_tag(
-            "direction_sanity_check",
-            "pass" if v3_result["passed"] else "fail",
-        )
-
-        mlflow.log_dict(error_analysis_payload, "error_analysis.json")
-        mlflow.log_dict(
-            {
-                "dev_oof_top_fnr_cohorts": concentration_fnr_rows,
-                "dev_oof_top_fpr_cohorts": concentration_fpr_rows,
-            },
-            "slices/error_concentration.json",
-        )
-
-        for path in (
-            global_importance_path,
-            beeswarm_path,
-            dependence_path,
-            cohort_shap_path,
-            cohort_beeswarm_fn_path,
-            cohort_beeswarm_tp_path,
-            cohort_shap_fp_tn_path,
-            cohort_beeswarm_fp_path,
-            cohort_beeswarm_tn_path,
-            cohort_dependence_tenure_path,
-            subgroup_dependence_monthlycharges_path,
-            waterfall_path,
-            waterfall_confident_cases_path,
-            error_confidence_path,
-            value_weighted_path,
-        ):
-            mlflow.log_artifact(str(path), artifact_path="figures")
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            shap_values_path = Path(tmp_dir) / "shap_values.parquet"
-            shap_df = pd.DataFrame(shap_values, columns=feature_names)
-            shap_df.insert(0, "customerid", test_predictions["customerid"].to_numpy())
-            shap_df["base_value"] = base_value
-            shap_df.to_parquet(shap_values_path, index=False)
-            mlflow.log_artifact(str(shap_values_path))
-
-    # register.py's only supported path from "the model version being
-    # registered" to this cycle's error_analysis.json — same tag pattern as
-    # calibrate.py's logged_model_id and evaluate.py's eval_run_id, since
-    # nothing else auto-populates a run-to-version link. A local reports/
-    # path is not a substitute: it only reflects whichever run last executed
-    # error_analysis.py on this machine, not necessarily this model_version's
-    # own cycle.
-    mlflow.tracking.MlflowClient().set_model_version_tag(
-        registered_model_name,
+    error_analysis_payload = _assemble_error_analysis_payload(
         model_version,
-        "error_analysis_run_id",
-        error_analysis_run_id,
+        run_id,
+        base_threshold,
+        shap_diag,
+        fn_tp_gap,
+        fp_tn_gap,
+        subgroup,
+        illustrative_bundle,
+        error_profiles,
+        concentration,
+        dev_oof_diagnostics,
     )
 
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    with open(reports_dir / "error_analysis.json", "w", encoding="utf-8") as f:
-        json.dump(error_analysis_payload, f, indent=2, default=str)
+    masks = {
+        "fn_mask": fn_mask,
+        "tp_mask": tp_mask,
+        "fp_mask": fp_mask,
+        "tn_mask": tn_mask,
+    }
+    figure_paths = _render_error_analysis_figures(
+        shap_diag,
+        fn_tp_gap,
+        fp_tn_gap,
+        masks,
+        subgroup,
+        illustrative_bundle,
+        error_profiles,
+        cfg,
+    )
 
+    error_analysis_run_id = _log_error_analysis_run(
+        model_version,
+        loaded,
+        shap_diag,
+        concentration,
+        error_analysis_payload,
+        figure_paths,
+        cfg,
+    )
+
+    _tag_and_write_error_analysis_reports(
+        model_version,
+        loaded["registered_model_name"],
+        error_analysis_run_id,
+        error_analysis_payload,
+        loaded["reports_dir"],
+    )
+
+    v3_result = shap_diag["v3_result"]
     logger.info(
         "error_analysis_step_done",
         run_id=run_id,
