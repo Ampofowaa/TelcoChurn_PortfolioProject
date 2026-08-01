@@ -65,6 +65,19 @@ def global_importance(
     return rows
 
 
+def _signed_direction(
+    feature_values: NDArray[np.float64], shap_values: NDArray[np.float64]
+) -> float:
+    """Pearson correlation between a feature's raw values and its own SHAP values.
+
+    Zero variance in either array (degenerate input) returns 0.0 rather than
+    NaN — there is no direction to read.
+    """
+    if np.std(feature_values) == 0 or np.std(shap_values) == 0:
+        return 0.0
+    return float(np.corrcoef(feature_values, shap_values)[0, 1])
+
+
 def dependence_points(
     feature_values: NDArray[np.float64], shap_values: NDArray[np.float64]
 ) -> dict[str, Any]:
@@ -79,10 +92,7 @@ def dependence_points(
     renders. A feature with zero variance in either array (degenerate input)
     returns direction 0.0 rather than NaN — there is no direction to read.
     """
-    if np.std(feature_values) == 0 or np.std(shap_values) == 0:
-        direction = 0.0
-    else:
-        direction = float(np.corrcoef(feature_values, shap_values)[0, 1])
+    direction = _signed_direction(feature_values, shap_values)
     return {
         "feature_values": [float(v) for v in feature_values],
         "shap_values": [float(v) for v in shap_values],
@@ -110,10 +120,7 @@ def binary_feature_effects(
     """
     at_1 = feature_values == 1
     at_0 = ~at_1
-    if np.std(feature_values) == 0 or np.std(shap_values) == 0:
-        direction = 0.0
-    else:
-        direction = float(np.corrcoef(feature_values, shap_values)[0, 1])
+    direction = _signed_direction(feature_values, shap_values)
     return {
         "direction": direction,
         "mean_shap_at_1": float(shap_values[at_1].mean()) if at_1.any() else 0.0,
