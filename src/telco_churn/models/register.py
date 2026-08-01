@@ -738,6 +738,322 @@ def _summarize_promotion_context(
     )
 
 
+def _build_business_case_section(
+    manifest: dict[str, Any],
+    metrics: dict[str, Any],
+    economics: dict[str, Any],
+    decision: dict[str, Any],
+) -> dict[str, Any]:
+    """Build model_card.json's business_case section."""
+    return {
+        "what_it_predicts": (
+            "Whether a specific customer cancels within the current "
+            "billing cycle (about 30 days) — a binary, already-happened "
+            "outcome (the IBM Telco dataset's own `Churn` column, "
+            "recoded 0/1), not a prediction of future intent to leave "
+            "or dissatisfaction. One score per customer per scoring "
+            "cycle (monthly by default), not per household or account. "
+            "See ANALYSIS.md §0 for the full problem framing."
+        ),
+        "why_this_exists": (
+            "Rank-order and score existing telecom customers by "
+            "probability of churn, to prioritize retention outreach "
+            "within a fixed campaign budget."
+        ),
+        "promotion_rationale": _summarize_promotion_context(
+            decision, metrics.get("champion_version")
+        ),
+        "who_uses_it": (
+            "Retention/marketing operations teams and the analysts supporting them."
+        ),
+        "how_to_use_the_output": (
+            "The model returns a probability and a recommended contact "
+            "decision at the shipped threshold. Use expected_impact's "
+            "scenarios to compare cost assumptions before committing "
+            "campaign budget — the recommended contact list changes "
+            "with the scenario chosen."
+        ),
+        "expected_impact": {
+            "scenarios": metrics.get("business_impact", {}).get("scenarios"),
+            "ev_by_k_logged": "ev_by_k" in economics,
+        },
+        "recommended_next_steps": (
+            f"See ANALYSIS.md §7 Business takeaways and §10 "
+            f"Recommendations & Next Steps, both as of commit "
+            f"{str(manifest.get('git_sha', 'unknown'))[:8]}, for this "
+            "model version's specific targeting/modelling-fix "
+            "recommendations and the project's deployment/monitoring "
+            "commitments — these are human judgment calls, kept in one "
+            "place and not duplicated here. Both sections are rewritten "
+            "each cycle to describe whichever model is then champion, "
+            "so the commit pin is what ties them back to this version "
+            "rather than a later one."
+        ),
+    }
+
+
+def _build_risks_and_limitations_section(
+    manifest: dict[str, Any], error_analysis: dict[str, Any]
+) -> dict[str, Any]:
+    """Build model_card.json's risks_and_limitations section."""
+    return {
+        "out_of_scope": (
+            "Do not use this model's score to make a decision that "
+            "penalizes a specific customer — denying them something, "
+            "charging them more, downgrading their service — without a "
+            "person reviewing that decision first (what's formally "
+            "called an 'adverse action'). And don't assume the numbers "
+            "on this card apply to any customer base other than the one "
+            "the model was built and tested on: a single historical "
+            "snapshot of one telecom's customers (the IBM Telco "
+            "dataset), not a different company, market, or time period "
+            "(what's formally called the 'training distribution')."
+        ),
+        "ethical_considerations": {
+            "sensitive_attributes_used_as_factors": (
+                "Gender, senior-citizen status, partner/dependents "
+                "status ARE model inputs — not excluded. This is "
+                "deliberate: the model drives a retention offer, not a "
+                "credit or employment decision; three of the four carry "
+                "real predictive signal; and fairness is enforced by "
+                "measuring outcomes across these groups (below), not by "
+                "hiding them. See ANALYSIS.md §4a for the full "
+                "reasoning."
+            ),
+            "risk_of_misuse": (
+                "A churn score is a prediction about behavior, not a "
+                "judgment of a customer's worth or trustworthiness — "
+                "treating it as the latter is a misuse of this tool; "
+                "see out_of_scope above."
+            ),
+            "known_gap": (
+                "The claim 'this model treats customer subgroups "
+                "fairly' rests on evidence from the development data, "
+                "not the sealed test set. The held-out test set is "
+                "simply too small to trust every subgroup on its own — "
+                "its thinnest single slice (two-year contracts, a "
+                "different segment reported alongside these axes) has "
+                "under ten churners in it, and the same sample-size "
+                "problem affects the fairness comparisons below too, "
+                "just less severely. Test-set numbers are reported in "
+                "technical_appendix for reference but were not the "
+                "basis for the promotion decision."
+            ),
+        },
+        "known_limitations": {
+            "cost_parameters_are_assumed_not_measured": (
+                "The dollar figures in this card assume that a "
+                "contacted customer who was about to churn can be "
+                "retained a certain fraction of the time (the "
+                "'retention rate') — a reasonable industry benchmark, "
+                "not something measured from this company's own past "
+                "campaigns, because no such data exists yet. Customer "
+                "lifetime value is also a scenario-level average, not a "
+                "number specific to each customer."
+            ),
+            "where_the_model_struggles": _summarize_error_patterns(
+                error_analysis, str(manifest.get("git_sha", "unknown"))
+            ),
+            "prevalence_drift_invalidates_calibration_and_threshold": (
+                "The model's probabilities and the cutoff it uses to "
+                "flag a customer are both tuned to today's churn rate "
+                "(about 26.5%). If the real share of customers who "
+                "churn changes meaningfully over time, this model's "
+                "numbers need to be re-verified, not simply assumed to "
+                "still hold."
+            ),
+            "no_shadow_or_canary_validation": (
+                "Before this version started serving, it was checked "
+                "offline against historical data — it was not first "
+                "tried out on a small slice of live traffic or run "
+                "silently alongside the previous model for comparison "
+                "(what's formally called 'shadow' or 'canary' "
+                "deployment), because there is no live customer feed "
+                "for this project to do that with."
+            ),
+            "see_also": (
+                "Two more limitations worth knowing: this model predicts "
+                "who will cancel, not who would actually respond to a "
+                "retention offer — the expected-value figures above "
+                "assume a benchmark response rate rather than a "
+                "measured one. And they also assume enough capacity to "
+                "contact everyone the model flags; if the retention "
+                "team can't act on that many customers, the real "
+                "expected value is lower. This card covers the "
+                "limitations most relevant to day-to-day use of the "
+                "model's recommendations — the project's full technical "
+                "documentation (ANALYSIS.md §9) covers additional, more "
+                "technical limitations for a reviewer with access to it."
+            ),
+        },
+    }
+
+
+def _build_governance_section(
+    manifest: dict[str, Any],
+    metrics: dict[str, Any],
+    decision: dict[str, Any],
+    calibration_method: str,
+    run_id: str,
+    eval_run_id: str,
+    error_analysis_run_id: str,
+    model_version: str,
+    registered_model_name: str,
+    alias: str,
+    promoted_at: str,
+) -> dict[str, Any]:
+    """Build model_card.json's governance section."""
+    return {
+        "model_details": {
+            "registered_model_name": registered_model_name,
+            "version": model_version,
+            "alias": alias,
+            "promoted_at": promoted_at,
+            "model_type": (
+                f"{manifest.get('model_family', 'unknown')} + "
+                f"{calibration_method} CalibratedClassifierCV"
+            ),
+            "maintainer": "Richlove Frimpong (see README.md § Author for contact)",
+            "hyperparameters_and_provenance": (
+                "Full hyperparameters, git SHA, DVC data hash, and the "
+                "family-comparison paired-Δ are in training_manifest.json "
+                "on this run — not duplicated here."
+            ),
+            "run_id": run_id,
+            "eval_run_id": eval_run_id,
+            "error_analysis_run_id": error_analysis_run_id,
+            "mlflow_ui": (
+                "Every artifact this card points to (training_manifest.json, "
+                "calibration_summary.json, error_analysis.json, metrics.json, "
+                "economics.json, promotion_decision.json, drift_reference.json) "
+                "lives on one of the three run IDs above. Open the MLflow UI "
+                "(README.md § Quick Start, step 8 — Browse experiment runs) "
+                "and search a run ID there to browse its artifacts directly."
+            ),
+        },
+        "monitoring": {
+            "drift_reference_captured": True,
+            "note": (
+                "A drift-monitoring baseline (feature distributions, "
+                "out-of-sample score distribution, churn prevalence) was "
+                "captured at promotion; see drift_reference.json on this "
+                "run."
+            ),
+        },
+        "promotion_context": {
+            "regime": decision.get("regime"),
+            "previous_champion_version": metrics.get("champion_version"),
+            "criteria": decision.get("criteria"),
+        },
+        "human_review": {
+            "review": decision.get("review"),
+            "review_notes": decision.get("review_notes"),
+            "reviewed_at": decision.get("reviewed_at"),
+        },
+    }
+
+
+def _build_technical_appendix_section(
+    manifest: dict[str, Any], metrics: dict[str, Any], error_analysis: dict[str, Any]
+) -> dict[str, Any]:
+    """Build model_card.json's technical_appendix section.
+
+    n_test/evaluation_data_description/n_dev/training_data_description are
+    computed here, their only consumer, rather than in the parent assembler.
+    """
+    dev_oof_flags = error_analysis.get("dev_oof_diagnostics_carried_through", {})
+    calibration = metrics.get("calibration", {})
+    sliced = metrics.get("sliced", {})
+
+    classification_rows = metrics.get("classification", [])
+    n_test = (
+        int(sum(classification_rows[0].get(k, 0) for k in ("tp", "fp", "fn", "tn")))
+        if classification_rows
+        else None
+    )
+    evaluation_data_description = (
+        f"Sealed test set: n={n_test:,}, stratified by customerid, held out "
+        "before feature discovery and touched once."
+        if n_test is not None
+        else (
+            "Sealed test set description unavailable — classification rows "
+            "missing from metrics.json."
+        )
+    )
+
+    n_dev = manifest.get("tuning_summary", {}).get("n_final_fit")
+    training_data_description = (
+        f"{n_dev:,}-row development partition — the same rows and model "
+        "whose metrics are reported here."
+        if n_dev is not None
+        else (
+            "Development-partition description unavailable — n_final_fit "
+            "missing from training_manifest.json."
+        )
+    )
+
+    return {
+        "evaluation_data": {
+            "description": evaluation_data_description,
+            "dummy_pr_auc_floor": metrics.get("ranking", {}).get("dummy_pr_auc_floor"),
+        },
+        "training_data": {
+            "description": training_data_description,
+            "feature_columns": manifest.get("feature_selection", {}).get(
+                "model_features"
+            ),
+        },
+        "performance_vs_baselines": {
+            "pr_auc": metrics.get("ranking", {}).get("pr_auc"),
+            "pr_auc_ci": [
+                metrics.get("ranking", {}).get("pr_auc_ci_lower"),
+                metrics.get("ranking", {}).get("pr_auc_ci_upper"),
+            ],
+            "classification_at_shipped_thresholds": metrics.get("classification"),
+        },
+        "fixed_recall_profile": metrics.get("fixed_recall_profile"),
+        "calibration_quality": {
+            "brier": calibration.get("brier"),
+            "bss": calibration.get("bss"),
+            "calibration_slope": calibration.get("calibration_slope", {}).get("slope"),
+        },
+        "factors": {
+            "robustness_axes": list(ROBUSTNESS_AXES),
+            "fairness_axes": list(FAIRNESS_AXES),
+            "rationale": (
+                "Robustness axes (contract type, tenure cohort, internet "
+                "service) are the segments where the business impact of "
+                "a ranking collapse is largest. Fairness axes (gender, "
+                "senior citizen, partner/dependents status) are checked "
+                "because they are protected or quasi-protected "
+                "attributes present in the IBM Telco schema — an empty "
+                "flag list below means these axes were examined and "
+                "cleared, not that they were not examined."
+            ),
+        },
+        "fairness_robustness": {
+            "flags": {
+                "v1_segment_collapse_flagged": dev_oof_flags.get("v1_flagged", []),
+                "v2_equal_opportunity_flagged": dev_oof_flags.get(
+                    "v2_equal_opportunity_flagged", {}
+                ),
+                "v2_demographic_parity_flagged": dev_oof_flags.get(
+                    "v2_demographic_parity_flagged", {}
+                ),
+                "v2b_calibration_flagged": dev_oof_flags.get("v2b_flagged", []),
+                "v3_direction_sanity_violations": error_analysis.get(
+                    "direction_sanity_check", {}
+                ).get("violations", []),
+            },
+            "disaggregated_results": {
+                "dev_oof": sliced.get("dev_oof_diagnostics", {}),
+                "sealed_test": sliced.get("test", {}),
+            },
+        },
+        "error_concentration": error_analysis.get("error_concentration", {}),
+    }
+
+
 def _assemble_model_card(
     manifest: dict[str, Any],
     metrics: dict[str, Any],
@@ -770,307 +1086,40 @@ def _assemble_model_card(
     LogReg (that family comparison lives in ANALYSIS.md §4 and
     training_manifest.json's own paired-Δ field).
     """
-    dev_oof_flags = error_analysis.get("dev_oof_diagnostics_carried_through", {})
-    calibration = metrics.get("calibration", {})
-    sliced = metrics.get("sliced", {})
-
-    classification_rows = metrics.get("classification", [])
-    n_test = (
-        int(sum(classification_rows[0].get(k, 0) for k in ("tp", "fp", "fn", "tn")))
-        if classification_rows
-        else None
-    )
-    evaluation_data_description = (
-        f"Sealed test set: n={n_test:,}, stratified by customerid, held out "
-        "before feature discovery and touched once."
-        if n_test is not None
-        else (
-            "Sealed test set description unavailable — classification rows "
-            "missing from metrics.json."
-        )
-    )
-
-    n_dev = manifest.get("tuning_summary", {}).get("n_final_fit")
-    training_data_description = (
-        f"{n_dev:,}-row development partition — the same rows and model "
-        "whose metrics are reported here."
-        if n_dev is not None
-        else (
-            "Development-partition description unavailable — n_final_fit "
-            "missing from training_manifest.json."
-        )
-    )
     return {
         "executive_summary": _summarize_for_stakeholders(metrics),
-        "business_case": {
-            "what_it_predicts": (
-                "Whether a specific customer cancels within the current "
-                "billing cycle (about 30 days) — a binary, already-happened "
-                "outcome (the IBM Telco dataset's own `Churn` column, "
-                "recoded 0/1), not a prediction of future intent to leave "
-                "or dissatisfaction. One score per customer per scoring "
-                "cycle (monthly by default), not per household or account. "
-                "See ANALYSIS.md §0 for the full problem framing."
-            ),
-            "why_this_exists": (
-                "Rank-order and score existing telecom customers by "
-                "probability of churn, to prioritize retention outreach "
-                "within a fixed campaign budget."
-            ),
-            "promotion_rationale": _summarize_promotion_context(
-                decision, metrics.get("champion_version")
-            ),
-            "who_uses_it": (
-                "Retention/marketing operations teams and the analysts supporting them."
-            ),
-            "how_to_use_the_output": (
-                "The model returns a probability and a recommended contact "
-                "decision at the shipped threshold. Use expected_impact's "
-                "scenarios to compare cost assumptions before committing "
-                "campaign budget — the recommended contact list changes "
-                "with the scenario chosen."
-            ),
-            "expected_impact": {
-                "scenarios": metrics.get("business_impact", {}).get("scenarios"),
-                "ev_by_k_logged": "ev_by_k" in economics,
-            },
-            "recommended_next_steps": (
-                f"See ANALYSIS.md §7 Business takeaways and §10 "
-                f"Recommendations & Next Steps, both as of commit "
-                f"{str(manifest.get('git_sha', 'unknown'))[:8]}, for this "
-                "model version's specific targeting/modelling-fix "
-                "recommendations and the project's deployment/monitoring "
-                "commitments — these are human judgment calls, kept in one "
-                "place and not duplicated here. Both sections are rewritten "
-                "each cycle to describe whichever model is then champion, "
-                "so the commit pin is what ties them back to this version "
-                "rather than a later one."
-            ),
-        },
-        "risks_and_limitations": {
-            "out_of_scope": (
-                "Do not use this model's score to make a decision that "
-                "penalizes a specific customer — denying them something, "
-                "charging them more, downgrading their service — without a "
-                "person reviewing that decision first (what's formally "
-                "called an 'adverse action'). And don't assume the numbers "
-                "on this card apply to any customer base other than the one "
-                "the model was built and tested on: a single historical "
-                "snapshot of one telecom's customers (the IBM Telco "
-                "dataset), not a different company, market, or time period "
-                "(what's formally called the 'training distribution')."
-            ),
-            "ethical_considerations": {
-                "sensitive_attributes_used_as_factors": (
-                    "Gender, senior-citizen status, partner/dependents "
-                    "status ARE model inputs — not excluded. This is "
-                    "deliberate: the model drives a retention offer, not a "
-                    "credit or employment decision; three of the four carry "
-                    "real predictive signal; and fairness is enforced by "
-                    "measuring outcomes across these groups (below), not by "
-                    "hiding them. See ANALYSIS.md §4a for the full "
-                    "reasoning."
-                ),
-                "risk_of_misuse": (
-                    "A churn score is a prediction about behavior, not a "
-                    "judgment of a customer's worth or trustworthiness — "
-                    "treating it as the latter is a misuse of this tool; "
-                    "see out_of_scope above."
-                ),
-                "known_gap": (
-                    "The claim 'this model treats customer subgroups "
-                    "fairly' rests on evidence from the development data, "
-                    "not the sealed test set. The held-out test set is "
-                    "simply too small to trust every subgroup on its own — "
-                    "its thinnest single slice (two-year contracts, a "
-                    "different segment reported alongside these axes) has "
-                    "under ten churners in it, and the same sample-size "
-                    "problem affects the fairness comparisons below too, "
-                    "just less severely. Test-set numbers are reported in "
-                    "technical_appendix for reference but were not the "
-                    "basis for the promotion decision."
-                ),
-            },
-            "known_limitations": {
-                "cost_parameters_are_assumed_not_measured": (
-                    "The dollar figures in this card assume that a "
-                    "contacted customer who was about to churn can be "
-                    "retained a certain fraction of the time (the "
-                    "'retention rate') — a reasonable industry benchmark, "
-                    "not something measured from this company's own past "
-                    "campaigns, because no such data exists yet. Customer "
-                    "lifetime value is also a scenario-level average, not a "
-                    "number specific to each customer."
-                ),
-                "where_the_model_struggles": _summarize_error_patterns(
-                    error_analysis, str(manifest.get("git_sha", "unknown"))
-                ),
-                "prevalence_drift_invalidates_calibration_and_threshold": (
-                    "The model's probabilities and the cutoff it uses to "
-                    "flag a customer are both tuned to today's churn rate "
-                    "(about 26.5%). If the real share of customers who "
-                    "churn changes meaningfully over time, this model's "
-                    "numbers need to be re-verified, not simply assumed to "
-                    "still hold."
-                ),
-                "no_shadow_or_canary_validation": (
-                    "Before this version started serving, it was checked "
-                    "offline against historical data — it was not first "
-                    "tried out on a small slice of live traffic or run "
-                    "silently alongside the previous model for comparison "
-                    "(what's formally called 'shadow' or 'canary' "
-                    "deployment), because there is no live customer feed "
-                    "for this project to do that with."
-                ),
-                "see_also": (
-                    "Two more limitations worth knowing: this model predicts "
-                    "who will cancel, not who would actually respond to a "
-                    "retention offer — the expected-value figures above "
-                    "assume a benchmark response rate rather than a "
-                    "measured one. And they also assume enough capacity to "
-                    "contact everyone the model flags; if the retention "
-                    "team can't act on that many customers, the real "
-                    "expected value is lower. This card covers the "
-                    "limitations most relevant to day-to-day use of the "
-                    "model's recommendations — the project's full technical "
-                    "documentation (ANALYSIS.md §9) covers additional, more "
-                    "technical limitations for a reviewer with access to it."
-                ),
-            },
-        },
-        "governance": {
-            "model_details": {
-                "registered_model_name": registered_model_name,
-                "version": model_version,
-                "alias": alias,
-                "promoted_at": promoted_at,
-                "model_type": (
-                    f"{manifest.get('model_family', 'unknown')} + "
-                    f"{calibration_method} CalibratedClassifierCV"
-                ),
-                "maintainer": "Richlove Frimpong (see README.md § Author for contact)",
-                "hyperparameters_and_provenance": (
-                    "Full hyperparameters, git SHA, DVC data hash, and the "
-                    "family-comparison paired-Δ are in training_manifest.json "
-                    "on this run — not duplicated here."
-                ),
-                "run_id": run_id,
-                "eval_run_id": eval_run_id,
-                "error_analysis_run_id": error_analysis_run_id,
-                "mlflow_ui": (
-                    "Every artifact this card points to (training_manifest.json, "
-                    "calibration_summary.json, error_analysis.json, metrics.json, "
-                    "economics.json, promotion_decision.json, drift_reference.json) "
-                    "lives on one of the three run IDs above. Open the MLflow UI "
-                    "(README.md § Quick Start, step 8 — Browse experiment runs) "
-                    "and search a run ID there to browse its artifacts directly."
-                ),
-            },
-            "monitoring": {
-                "drift_reference_captured": True,
-                "note": (
-                    "A drift-monitoring baseline (feature distributions, "
-                    "out-of-sample score distribution, churn prevalence) was "
-                    "captured at promotion; see drift_reference.json on this "
-                    "run."
-                ),
-            },
-            "promotion_context": {
-                "regime": decision.get("regime"),
-                "previous_champion_version": metrics.get("champion_version"),
-                "criteria": decision.get("criteria"),
-            },
-            "human_review": {
-                "review": decision.get("review"),
-                "review_notes": decision.get("review_notes"),
-                "reviewed_at": decision.get("reviewed_at"),
-            },
-        },
-        "technical_appendix": {
-            "evaluation_data": {
-                "description": evaluation_data_description,
-                "dummy_pr_auc_floor": metrics.get("ranking", {}).get(
-                    "dummy_pr_auc_floor"
-                ),
-            },
-            "training_data": {
-                "description": training_data_description,
-                "feature_columns": manifest.get("feature_selection", {}).get(
-                    "model_features"
-                ),
-            },
-            "performance_vs_baselines": {
-                "pr_auc": metrics.get("ranking", {}).get("pr_auc"),
-                "pr_auc_ci": [
-                    metrics.get("ranking", {}).get("pr_auc_ci_lower"),
-                    metrics.get("ranking", {}).get("pr_auc_ci_upper"),
-                ],
-                "classification_at_shipped_thresholds": metrics.get("classification"),
-            },
-            "fixed_recall_profile": metrics.get("fixed_recall_profile"),
-            "calibration_quality": {
-                "brier": calibration.get("brier"),
-                "bss": calibration.get("bss"),
-                "calibration_slope": calibration.get("calibration_slope", {}).get(
-                    "slope"
-                ),
-            },
-            "factors": {
-                "robustness_axes": list(ROBUSTNESS_AXES),
-                "fairness_axes": list(FAIRNESS_AXES),
-                "rationale": (
-                    "Robustness axes (contract type, tenure cohort, internet "
-                    "service) are the segments where the business impact of "
-                    "a ranking collapse is largest. Fairness axes (gender, "
-                    "senior citizen, partner/dependents status) are checked "
-                    "because they are protected or quasi-protected "
-                    "attributes present in the IBM Telco schema — an empty "
-                    "flag list below means these axes were examined and "
-                    "cleared, not that they were not examined."
-                ),
-            },
-            "fairness_robustness": {
-                "flags": {
-                    "v1_segment_collapse_flagged": dev_oof_flags.get("v1_flagged", []),
-                    "v2_equal_opportunity_flagged": dev_oof_flags.get(
-                        "v2_equal_opportunity_flagged", {}
-                    ),
-                    "v2_demographic_parity_flagged": dev_oof_flags.get(
-                        "v2_demographic_parity_flagged", {}
-                    ),
-                    "v2b_calibration_flagged": dev_oof_flags.get("v2b_flagged", []),
-                    "v3_direction_sanity_violations": error_analysis.get(
-                        "direction_sanity_check", {}
-                    ).get("violations", []),
-                },
-                "disaggregated_results": {
-                    "dev_oof": sliced.get("dev_oof_diagnostics", {}),
-                    "sealed_test": sliced.get("test", {}),
-                },
-            },
-            "error_concentration": error_analysis.get("error_concentration", {}),
-        },
+        "business_case": _build_business_case_section(
+            manifest, metrics, economics, decision
+        ),
+        "risks_and_limitations": _build_risks_and_limitations_section(
+            manifest, error_analysis
+        ),
+        "governance": _build_governance_section(
+            manifest,
+            metrics,
+            decision,
+            calibration_method,
+            run_id,
+            eval_run_id,
+            error_analysis_run_id,
+            model_version,
+            registered_model_name,
+            alias,
+            promoted_at,
+        ),
+        "technical_appendix": _build_technical_appendix_section(
+            manifest, metrics, error_analysis
+        ),
     }
 
 
-def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
-    """Act on evaluate.py's persisted promotion decision for `model_version`.
+def _check_already_decided(
+    current_version: Any, model_version: str
+) -> dict[str, Any] | None:
+    """Short-circuit a re-invocation of an already-decided cycle.
 
-    See the module docstring for the full step order. Returns a dict
-    describing the outcome: {"model_version", "promotion_status", ...}.
-    Raises on any abort that is not a genuine pass/fail verdict (missing
-    manifest artifacts, missing error_analysis.json, an environment
-    mismatch, a stale incumbent) — those leave promotion_status untouched.
-    A genuine smoke-check failure tags "rejected" and re-raises.
+    Cheapest check first — needs nothing else resolved or read.
     """
-    ensure_experiment_metadata(cfg)
-    registered_model_name = str(cfg.mlflow.registered_model_name)
-    alias = str(cfg.register.alias)
-    client = mlflow.tracking.MlflowClient()
-
-    # --- Cheapest check first: a re-invocation of an already-decided cycle
-    # needs nothing else resolved or read.
-    current_version = client.get_model_version(registered_model_name, model_version)
     current_status = current_version.tags.get("promotion_status")
     if current_status in ("promoted", "rejected"):
         logger.info(
@@ -1083,10 +1132,16 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
             "promotion_status": current_status,
             "already_decided": True,
         }
+    return None
 
-    # --- Resolve eval_run_id from the model version's own tag (set by
-    # evaluate.py) and read this cycle's decision/metrics from that run —
-    # never a local reports/ path (module docstring).
+
+def _load_and_verify_evaluation_artifacts(
+    current_version: Any, model_version: str
+) -> dict[str, Any]:
+    """Resolve eval_run_id from the version's own tag and load+verify its decision/metrics.
+
+    Never a local reports/ path (module docstring).
+    """
     eval_run_id = current_version.tags.get("eval_run_id")
     if not eval_run_id:
         raise RuntimeError(
@@ -1119,6 +1174,11 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
             "its own evidence."
         )
 
+    return {"eval_run_id": eval_run_id, "decision": decision, "metrics": metrics}
+
+
+def _check_review_approval(cfg: DictConfig, decision: dict[str, Any]) -> None:
+    """Raise if a stamped human review is required but absent."""
     if bool(cfg.register.require_review) and decision.get("review") != "approved":
         raise RuntimeError(
             f"promotion_decision.json's review is {decision.get('review')!r}, "
@@ -1126,30 +1186,46 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
             "act without a stamped human review."
         )
 
-    if decision["gate"] == "fail":
-        client.set_model_version_tag(
-            registered_model_name, model_version, "promotion_status", "rejected"
-        )
-        client.update_model_version(
-            registered_model_name,
-            model_version,
-            description=_rejection_description(decision, "gate_fail"),
-        )
-        logger.info(
-            "model_rejected",
-            model_version=model_version,
-            regime=decision["regime"],
-            reason="gate_fail",
-        )
-        return {"model_version": model_version, "promotion_status": "rejected"}
 
-    run_id = str(current_version.run_id)
-    _check_manifest_artifacts(run_id)
+def _tag_rejected(
+    client: Any,
+    registered_model_name: str,
+    model_version: str,
+    decision: dict[str, Any],
+    reason: str,
+) -> None:
+    """Tag, describe, and log a rejection — the caller still decides return vs. raise.
 
-    # --- Resolve error_analysis_run_id from the model version's own tag (set
-    # by error_analysis.py) and read error_analysis.json from that run —
-    # verified against this model_version too, so a stale error_analysis.json
-    # from a different cycle can't be silently attributed to this one.
+    Shared by all three reject sites (gate_fail, smoke_check_failed,
+    post_flip_parity_failed), which differ in control flow: gate_fail
+    returns normally, the other two raise from inside an except block. This
+    helper only ever tags/logs — unifying the return-vs-raise decision here
+    too would either swallow a traceback or return instead of propagating.
+    """
+    client.set_model_version_tag(
+        registered_model_name, model_version, "promotion_status", "rejected"
+    )
+    client.update_model_version(
+        registered_model_name,
+        model_version,
+        description=_rejection_description(decision, reason),
+    )
+    logger.info(
+        "model_rejected",
+        model_version=model_version,
+        regime=decision["regime"],
+        reason=reason,
+    )
+
+
+def _load_and_verify_error_analysis(
+    client: Any, current_version: Any, model_version: str
+) -> dict[str, Any]:
+    """Resolve error_analysis_run_id from the version's own tag and load+verify error_analysis.json.
+
+    Verified against this model_version too, so a stale error_analysis.json
+    from a different cycle can't be silently attributed to this one.
+    """
     error_analysis_run_id = current_version.tags.get("error_analysis_run_id")
     if not error_analysis_run_id:
         raise RuntimeError(
@@ -1180,14 +1256,29 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
             f"not {model_version!r} — refusing to assemble a model card from "
             "diagnostics for a different artifact."
         )
+    return {
+        "error_analysis_run_id": error_analysis_run_id,
+        "error_analysis": error_analysis,
+    }
 
-    manifest = load_training_manifest(run_id, cfg)
-    committed_features = committed_features_from_manifest(manifest)
-    X_dev, _y_dev = load_dev_features(committed_features)
 
+def _run_pre_flip_checks(
+    cfg: DictConfig,
+    client: Any,
+    registered_model_name: str,
+    model_version: str,
+    committed_features: list[str],
+    X_dev: pd.DataFrame,
+    run_id: str,
+    decision: dict[str, Any],
+) -> dict[str, Any]:
+    """Phase 1: pre-flip checks, by explicit version URI.
+
+    Tags rejected and re-raises on a genuine smoke-check failure — the only
+    reject path here that isn't a plain abort.
+    """
     model_uri = f"models:/{registered_model_name}/{model_version}"
 
-    # --- Phase 1: pre-flip, by explicit version URI ---
     environment_packages = list(cfg.register.environment_packages)
     check_environment_parity(model_uri, environment_packages)
 
@@ -1204,28 +1295,28 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
         _smoke_check_schema_and_range(model, committed_features, X_dev.head(5))
         _check_golden_parity(model, golden, golden_atol)
     except AssertionError:
-        client.set_model_version_tag(
-            registered_model_name, model_version, "promotion_status", "rejected"
-        )
-        client.update_model_version(
-            registered_model_name,
-            model_version,
-            description=_rejection_description(decision, "smoke_check_failed"),
-        )
-        logger.info(
-            "model_rejected",
-            model_version=model_version,
-            regime=decision["regime"],
-            reason="smoke_check_failed",
+        _tag_rejected(
+            client, registered_model_name, model_version, decision, "smoke_check_failed"
         )
         raise
 
     _log_smoke_diagnostics(model, pd.DataFrame(golden["rows"]), model_uri, run_id)
 
-    # --- Re-verify the incumbent immediately before flipping, not earlier ---
-    # `metrics` was already loaded (and hash-verified) earlier in this
-    # function — reused here rather than re-read, so there is exactly one
-    # load of runs:/<eval_run_id>/metrics.json per invocation.
+    return {
+        "golden": golden,
+        "calibration_summary": calibration_summary,
+        "golden_atol": golden_atol,
+    }
+
+
+def _reverify_incumbent(cfg: DictConfig, metrics: dict[str, Any]) -> Any:
+    """Re-verify the incumbent immediately before flipping, not earlier.
+
+    `metrics` was already loaded (and hash-verified) by
+    _load_and_verify_evaluation_artifacts — reused here rather than
+    re-read, so there is exactly one load of
+    runs:/<eval_run_id>/metrics.json per invocation.
+    """
     recorded_champion_version = metrics.get("champion_version")
     if recorded_champion_version is not None:
         live_champion_version = resolve_champion_version(cfg)
@@ -1236,36 +1327,49 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
                 "since evaluation — refusing to flip against a stale "
                 "comparison."
             )
+    return recorded_champion_version
 
-    # --- Phase 2: flip, then confirm through the alias ---
+
+def _flip_and_confirm(
+    client: Any,
+    registered_model_name: str,
+    model_version: str,
+    alias: str,
+    golden: dict[str, Any],
+    golden_atol: float,
+    decision: dict[str, Any],
+) -> None:
+    """Phase 2: flip the alias, then confirm parity through the alias itself.
+
+    Rolls the alias back, tags rejected, and re-raises on a post-flip parity
+    failure — the alias must never point at a model that failed its own
+    serving check.
+    """
     promote_to_alias(registered_model_name, model_version, alias)
     reloaded = mlflow.sklearn.load_model(f"models:/{registered_model_name}@{alias}")
     try:
         _check_golden_parity(reloaded, golden, golden_atol)
     except AssertionError:
         rollback_champion(registered_model_name)
-        client.set_model_version_tag(
-            registered_model_name, model_version, "promotion_status", "rejected"
-        )
-        client.update_model_version(
+        _tag_rejected(
+            client,
             registered_model_name,
             model_version,
-            description=_rejection_description(decision, "post_flip_parity_failed"),
-        )
-        logger.info(
-            "model_rejected",
-            model_version=model_version,
-            regime=decision["regime"],
-            reason="post_flip_parity_failed",
+            decision,
+            "post_flip_parity_failed",
         )
         raise
 
-    # --- On promotion: drift_reference.json + model_card.json ---
-    # reports_dir is write-only from here on — a human-inspection mirror,
-    # never a source this module reads back from (module docstring).
-    reports_dir = get_project_root() / str(cfg.paths.reports)
-    reports_dir.mkdir(parents=True, exist_ok=True)
 
+def _build_and_log_drift_reference(
+    client: Any,
+    cfg: DictConfig,
+    run_id: str,
+    eval_run_id: str,
+    X_dev: pd.DataFrame,
+    reports_dir: Path,
+) -> None:
+    """Build the drift reference, log it onto the promoted run, and mirror it to reports/."""
     oos_proba, y_combined = _build_drift_reference_inputs(run_id, eval_run_id, cfg)
     drift_reference = build_reference(
         X_dev, oos_proba, y_combined, n_bins=int(cfg.register.drift_reference_n_bins)
@@ -1274,6 +1378,24 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
     with open(reports_dir / "drift_reference.json", "w", encoding="utf-8") as f:
         json.dump(drift_reference, f, indent=2, default=str)
 
+
+def _build_and_log_model_card(
+    client: Any,
+    cfg: DictConfig,
+    manifest: dict[str, Any],
+    metrics: dict[str, Any],
+    error_analysis: dict[str, Any],
+    decision: dict[str, Any],
+    calibration_summary: dict[str, Any],
+    run_id: str,
+    eval_run_id: str,
+    error_analysis_run_id: str,
+    model_version: str,
+    registered_model_name: str,
+    alias: str,
+    reports_dir: Path,
+) -> dict[str, Any]:
+    """Assemble the model card, log it onto the promoted run, and mirror it to reports/."""
     eval_run_artifacts = {a.path for a in client.list_artifacts(eval_run_id)}
     economics = (
         mlflow.artifacts.load_dict(f"runs:/{eval_run_id}/economics.json")
@@ -1298,7 +1420,18 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
     client.log_dict(run_id, model_card, "registration/model_card.json")
     with open(reports_dir / "model_card.json", "w", encoding="utf-8") as f:
         json.dump(model_card, f, indent=2, default=str)
+    return model_card
 
+
+def _finalize_promotion(
+    client: Any,
+    registered_model_name: str,
+    model_version: str,
+    decision: dict[str, Any],
+    model_card: dict[str, Any],
+    recorded_champion_version: Any,
+) -> str:
+    """Tag the version promoted, describe it, and append the promotion event."""
     promoted_at = str(model_card["governance"]["model_details"]["promoted_at"])
     client.set_model_version_tag(
         registered_model_name, model_version, "promotion_status", "promoted"
@@ -1317,6 +1450,114 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
             "at": promoted_at,
         },
     )
+    return promoted_at
+
+
+def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+    """Act on evaluate.py's persisted promotion decision for `model_version`.
+
+    See the module docstring for the full step order. Returns a dict
+    describing the outcome: {"model_version", "promotion_status", ...}.
+    Raises on any abort that is not a genuine pass/fail verdict (missing
+    manifest artifacts, missing error_analysis.json, an environment
+    mismatch, a stale incumbent) — those leave promotion_status untouched.
+    A genuine smoke-check failure tags "rejected" and re-raises.
+    """
+    ensure_experiment_metadata(cfg)
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+    alias = str(cfg.register.alias)
+    client = mlflow.tracking.MlflowClient()
+
+    current_version = client.get_model_version(registered_model_name, model_version)
+    already_decided = _check_already_decided(current_version, model_version)
+    if already_decided is not None:
+        return already_decided
+
+    eval_artifacts = _load_and_verify_evaluation_artifacts(
+        current_version, model_version
+    )
+    eval_run_id = eval_artifacts["eval_run_id"]
+    decision = eval_artifacts["decision"]
+    metrics = eval_artifacts["metrics"]
+
+    _check_review_approval(cfg, decision)
+
+    if decision["gate"] == "fail":
+        _tag_rejected(
+            client, registered_model_name, model_version, decision, "gate_fail"
+        )
+        return {"model_version": model_version, "promotion_status": "rejected"}
+
+    run_id = str(current_version.run_id)
+    _check_manifest_artifacts(run_id)
+
+    ea_artifacts = _load_and_verify_error_analysis(
+        client, current_version, model_version
+    )
+    error_analysis_run_id = ea_artifacts["error_analysis_run_id"]
+    error_analysis = ea_artifacts["error_analysis"]
+
+    manifest = load_training_manifest(run_id, cfg)
+    committed_features = committed_features_from_manifest(manifest)
+    X_dev, _y_dev = load_dev_features(committed_features)
+
+    pre_flip = _run_pre_flip_checks(
+        cfg,
+        client,
+        registered_model_name,
+        model_version,
+        committed_features,
+        X_dev,
+        run_id,
+        decision,
+    )
+
+    recorded_champion_version = _reverify_incumbent(cfg, metrics)
+
+    _flip_and_confirm(
+        client,
+        registered_model_name,
+        model_version,
+        alias,
+        pre_flip["golden"],
+        pre_flip["golden_atol"],
+        decision,
+    )
+
+    # --- On promotion: drift_reference.json + model_card.json ---
+    # reports_dir is write-only from here on — a human-inspection mirror,
+    # never a source this module reads back from (module docstring).
+    reports_dir = get_project_root() / str(cfg.paths.reports)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    _build_and_log_drift_reference(client, cfg, run_id, eval_run_id, X_dev, reports_dir)
+
+    model_card = _build_and_log_model_card(
+        client,
+        cfg,
+        manifest,
+        metrics,
+        error_analysis,
+        decision,
+        pre_flip["calibration_summary"],
+        run_id,
+        eval_run_id,
+        error_analysis_run_id,
+        model_version,
+        registered_model_name,
+        alias,
+        reports_dir,
+    )
+
+    promoted_at = _finalize_promotion(
+        client,
+        registered_model_name,
+        model_version,
+        decision,
+        model_card,
+        recorded_champion_version,
+    )
+
     logger.info(
         "model_promoted",
         model_version=model_version,
