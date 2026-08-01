@@ -17,6 +17,7 @@ import shap
 from joblib import Parallel, delayed
 from lightgbm import LGBMClassifier
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.compose import ColumnTransformer
 from sklearn.metrics import average_precision_score
 from sklearn.model_selection import RepeatedStratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
@@ -305,6 +306,38 @@ class PermutationImportanceSelector(BaseEstimator, TransformerMixin):  # type: i
         return np.array(self._output_columns_)
 
 
+def _build_selector(
+    binary: list[str],
+    multi_cat: list[str],
+    numeric: list[str],
+    estimator_params: dict[str, Any],
+    n_repeats: int,
+    noise_floor_margin: float,
+    correlated_groups: tuple[tuple[str, ...], ...],
+    inner_val_size: float,
+    random_state: int,
+) -> tuple[ColumnTransformer, PermutationImportanceSelector]:
+    """Build the unfitted [tree_preprocessor, PermutationImportanceSelector] pair.
+
+    Shared by _build_selection_pipeline (adds an LGBMClassifier model step) and
+    mint_committed_list (fits the pair alone, no model step needed to freeze
+    survivors_).
+    """
+    preprocessor = build_preprocessor(binary, multi_cat, numeric)
+    selector = PermutationImportanceSelector(
+        binary=binary,
+        multi_cat=multi_cat,
+        numeric=numeric,
+        estimator_params=estimator_params,
+        n_repeats=n_repeats,
+        noise_floor_margin=noise_floor_margin,
+        correlated_groups=correlated_groups,
+        inner_val_size=inner_val_size,
+        random_state=random_state,
+    )
+    return preprocessor, selector
+
+
 def _build_selection_pipeline(
     binary: list[str],
     multi_cat: list[str],
@@ -317,17 +350,16 @@ def _build_selection_pipeline(
     random_state: int,
 ) -> Pipeline:
     """Build [tree_preprocessor -> PermutationImportanceSelector -> LightGBM] as one Pipeline."""
-    preprocessor = build_preprocessor(binary, multi_cat, numeric)
-    selector = PermutationImportanceSelector(
-        binary=binary,
-        multi_cat=multi_cat,
-        numeric=numeric,
-        estimator_params=estimator_params,
-        n_repeats=n_repeats,
-        noise_floor_margin=noise_floor_margin,
-        correlated_groups=correlated_groups,
-        inner_val_size=inner_val_size,
-        random_state=random_state,
+    preprocessor, selector = _build_selector(
+        binary,
+        multi_cat,
+        numeric,
+        estimator_params,
+        n_repeats,
+        noise_floor_margin,
+        correlated_groups,
+        inner_val_size,
+        random_state,
     )
     model = LGBMClassifier(**estimator_params)
     return Pipeline(
@@ -493,17 +525,16 @@ def mint_committed_list(
     returned selector is the frozen feature_columns.txt list;
     permutation_importance_table_ is its audit trail.
     """
-    preprocessor = build_preprocessor(binary, multi_cat, numeric)
-    selector = PermutationImportanceSelector(
-        binary=binary,
-        multi_cat=multi_cat,
-        numeric=numeric,
-        estimator_params=estimator_params,
-        n_repeats=n_repeats,
-        noise_floor_margin=noise_floor_margin,
-        correlated_groups=correlated_groups,
-        inner_val_size=inner_val_size,
-        random_state=random_state,
+    preprocessor, selector = _build_selector(
+        binary,
+        multi_cat,
+        numeric,
+        estimator_params,
+        n_repeats,
+        noise_floor_margin,
+        correlated_groups,
+        inner_val_size,
+        random_state,
     )
     pipeline = Pipeline([("preprocessor", preprocessor), ("selector", selector)])
     pipeline.fit(X, y)
