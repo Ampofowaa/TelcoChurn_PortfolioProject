@@ -15,6 +15,7 @@ import numpy as np
 import optuna
 import pandas as pd
 from lightgbm import LGBMClassifier
+from matplotlib.figure import Figure
 from omegaconf import DictConfig, OmegaConf
 from sklearn.metrics import average_precision_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
@@ -304,45 +305,17 @@ def _study_name(cfg: DictConfig, committed_features: list[str]) -> str:
     return f"tuning_{digest}"
 
 
-def run_tuning_step(
+def _build_optuna_study(
     X_dev: pd.DataFrame,
     y_dev: pd.Series,
     committed_features: list[str],
     cfg: DictConfig,
-    storage: optuna.storages.BaseStorage | None = None,
+    storage: optuna.storages.BaseStorage | None,
 ) -> dict[str, Any]:
-    """Optuna tuning of LightGBM on the frozen feature set.
+    """Build (or resume) the Optuna study, its pruner/sampler, and the CV splits trials will use.
 
-    Must run after feature selection freezes the input space — rerunning
-    selection afterward invalidates the study. Uses single stratified CV
-    (cfg.tuning.cv_folds), not the repeated CV used earlier for model and
-    feature-set comparison — this step already multiplies cost by n_trials,
-    so repeats aren't worth the added compute here. n_estimators is not
-    searched; each trial resolves its own ceiling via early stopping on
-    average_precision.
-
-    A trial that raises is marked FAILED rather than aborting the study. Too
-    few completed trials (cfg.tuning.min_completed_trials) logs a warning and
-    persists trial_count_below_threshold into tuning_summary and the
-    trial_count_below_threshold MLflow metric — visible after the fact, not
-    just in the log stream — but does not block selection: this step only
-    flags an untrustworthy result, it does not gate on it. (Enforcement
-    belongs at the point a tuned pipeline becomes a registered model — Phase
-    6's calibrate.py — not here; see PROJECT_PLAN.md Phase 6.) storage
-    defaults to a Postgres-backed study (see _build_optuna_storage); pass an
-    InMemoryStorage for tests.
-
-    Idempotent against a study that already reached n_trials: only the trials
-    still needed to reach n_trials are run, so re-running against a completed
-    study reuses its existing trials instead of piling n_trials more on top.
-
-    Returns {"best_params", "best_n_estimators_median", "best_cv_pr_auc_mean",
-    "boundary_hits", "n_completed_trials", "parent_run_id", "committed_features",
-    "tuning_summary"}. tuning_summary carries the audit trail behind the
-    selection_rule pick — trial counts, selected vs. raw-best trial number/score,
-    the 1-SE standard error and band floor — so training_manifest.json and any
-    notebook narrating the decision read the same numbers select_best_trial
-    actually used, not a client-side reconstruction.
+    Study creation and CV-split resolution don't need an active MLflow run —
+    only trial execution does, since each trial opens its own nested run.
     """
     tuning_cfg = cfg.tuning
     random_state = int(tuning_cfg.random_state)
@@ -391,6 +364,269 @@ def run_tuning_step(
         warm_start_params = {str(k): v for k, v in raw_warm_start.items()}
         study.enqueue_trial(warm_start_params, skip_if_exists=True)
 
+    return {
+        "tuning_cfg": tuning_cfg,
+        "random_state": random_state,
+        "timeout_seconds": timeout_seconds,
+        "min_completed_trials": min_completed_trials,
+        "binary": binary,
+        "multi_cat": multi_cat,
+        "numeric": numeric,
+        "fixed_params": fixed_params,
+        "cv_splits": cv_splits,
+        "pruning_enabled": pruning_enabled,
+        "study_name": study_name,
+        "study": study,
+    }
+
+
+def _run_study_trials(
+    setup: dict[str, Any], X_dev: pd.DataFrame, y_dev: pd.Series
+) -> dict[str, Any]:
+    """Run the study's remaining trials — call only from inside an active MLflow run.
+
+    Each trial opens its own nested MLflow run, which requires a parent run
+    already open. load_if_exists=True resumes a study interrupted mid-run
+    (e.g. a crashed process) rather than losing its trials — n_remaining_trials
+    guards against piling n_trials more on top of a study that already
+    reached n_trials on every re-run.
+    """
+    study = setup["study"]
+    tuning_cfg = setup["tuning_cfg"]
+
+    objective = partial(
+        _tuning_objective,
+        X=X_dev,
+        y=y_dev,
+        cv_splits=setup["cv_splits"],
+        binary=setup["binary"],
+        multi_cat=setup["multi_cat"],
+        numeric=setup["numeric"],
+        tuning_cfg=tuning_cfg,
+        fixed_params=setup["fixed_params"],
+        random_state=setup["random_state"],
+        pruning_enabled=setup["pruning_enabled"],
+    )
+    n_remaining_trials = max(int(tuning_cfg.n_trials) - len(study.trials), 0)
+    if n_remaining_trials > 0:
+        study.optimize(
+            objective,
+            n_trials=n_remaining_trials,
+            timeout=setup["timeout_seconds"],
+            catch=(Exception,),
+        )
+    else:
+        logger.info(
+            "tuning_study_already_complete",
+            study_name=setup["study_name"],
+            n_trials=len(study.trials),
+        )
+
+    n_failed_trials = sum(
+        1 for t in study.trials if t.state == optuna.trial.TrialState.FAIL
+    )
+    n_pruned_trials = sum(
+        1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED
+    )
+    if n_failed_trials:
+        logger.warning(
+            "tuning_trials_failed",
+            n_failed_trials=n_failed_trials,
+            n_total_trials=len(study.trials),
+        )
+    # catch=(Exception,) above lets one bad hyperparameter combination fail
+    # without killing the study, but that same breadth would also swallow a
+    # systematic bug (bad search-space config, a typo in the objective) as
+    # a per-trial FAIL — which n_failed_trials only warns about, and a
+    # resumed study with pre-existing completed trials could dodge the
+    # min_completed_trials floor entirely. Every submitted trial failing is
+    # never a legitimate per-trial fluke, so it raises instead of warning.
+    if n_remaining_trials > 0 and n_failed_trials == n_remaining_trials:
+        raise RuntimeError(
+            f"All {n_remaining_trials} trials submitted this run failed — "
+            "this is not an expected per-trial failure rate and indicates a "
+            "systematic bug (search-space config, objective code) rather than "
+            "an unlucky hyperparameter draw. Inspect the study's failed trial "
+            "exceptions before re-running."
+        )
+
+    return {"n_failed_trials": n_failed_trials, "n_pruned_trials": n_pruned_trials}
+
+
+def _summarize_completed_trials(
+    setup: dict[str, Any], trial_result: dict[str, Any]
+) -> dict[str, Any]:
+    """Summarize completed trials, apply the selection rule, and check for boundary hits."""
+    study = setup["study"]
+    tuning_cfg = setup["tuning_cfg"]
+
+    trial_summaries = [
+        {
+            "number": t.number,
+            "value": t.value,
+            "fold_scores": t.user_attrs["fold_scores"],
+            "n_estimators_median": t.user_attrs["n_estimators_median"],
+            "params": t.params,
+        }
+        for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+    ]
+    trial_count_below_threshold = (
+        setup["min_completed_trials"] is not None
+        and len(trial_summaries) < setup["min_completed_trials"]
+    )
+    if trial_count_below_threshold:
+        logger.warning(
+            "tuning_too_few_completed_trials",
+            n_completed_trials=len(trial_summaries),
+            min_completed_trials=setup["min_completed_trials"],
+            n_failed_trials=trial_result["n_failed_trials"],
+            selection_rule=str(tuning_cfg.selection_rule),
+            hint=(
+                "selection_rule pick is drawn from too few completed trials "
+                "to be a meaningful selection — investigate pruning/failures "
+                "or increase n_trials before trusting this run's champion"
+            ),
+        )
+    selected = select_best_trial(trial_summaries, str(tuning_cfg.selection_rule))
+    diagnostics = _raw_best_diagnostics(trial_summaries)
+    search_space_dict = {
+        str(name): {"low": spec.low, "high": spec.high}
+        for name, spec in tuning_cfg.search_space.items()
+    }
+    boundary_hits = boundary_hit_check(selected["params"], search_space_dict)
+    hit_params = [name for name, hit in boundary_hits.items() if hit]
+    if hit_params:
+        logger.warning(
+            "tuning_boundary_hit",
+            hit_params=hit_params,
+            selected_params=selected["params"],
+            hint=(
+                "selected trial's params sit on a searched range's edge — "
+                "widen the range in configs/tuning/optuna.yaml search_space "
+                "and re-run"
+            ),
+        )
+
+    return {
+        "trial_summaries": trial_summaries,
+        "trial_count_below_threshold": trial_count_below_threshold,
+        "selected": selected,
+        "diagnostics": diagnostics,
+        "boundary_hits": boundary_hits,
+    }
+
+
+def _plot_optimization_history(trial_summaries: list[dict[str, Any]]) -> Figure:
+    """Plot each trial's CV PR-AUC alongside the running best."""
+    fig_hist, ax_hist = plt.subplots(figsize=(7, 4))
+    trial_numbers = [t["number"] for t in trial_summaries]
+    values = [t["value"] for t in trial_summaries]
+    running_best = np.maximum.accumulate(values)
+    ax_hist.scatter(trial_numbers, values, alpha=0.5, label="trial CV PR-AUC")
+    ax_hist.plot(trial_numbers, running_best, color="C1", label="running best")
+    ax_hist.set_xlabel("Trial")
+    ax_hist.set_ylabel("CV PR-AUC")
+    ax_hist.set_title("Optuna Optimization History")
+    ax_hist.legend()
+    return fig_hist
+
+
+def _log_tuning_artifacts(
+    summary: dict[str, Any], trial_result: dict[str, Any], fig_hist: Figure
+) -> None:
+    """Log the selected trial's params/metrics, the trials table, boundary hits, and the history plot.
+
+    Call from inside the active `tuning_study` MLflow run.
+    """
+    selected, diagnostics = summary["selected"], summary["diagnostics"]
+    boundary_hits = summary["boundary_hits"]
+    trial_summaries = summary["trial_summaries"]
+
+    mlflow.log_params({f"best_{k}": v for k, v in selected["params"].items()})
+    mlflow.log_params(
+        {
+            "best_trial_number": selected["number"],
+            "best_n_estimators_median": selected["n_estimators_median"],
+            "raw_best_trial_number": diagnostics["raw_best_trial_number"],
+        }
+    )
+    mlflow.log_metrics(
+        {
+            # "selected_" (not "best_"): this is the 1-SE-adopted trial's score,
+            # not the raw-argmax winner — "best_cv_pr_auc_mean" read as exactly
+            # the opposite of what it is on first glance in the MLflow UI.
+            "selected_cv_pr_auc_mean": round(selected["value"], 3),
+            "raw_best_cv_pr_auc_mean": round(diagnostics["raw_best_cv_pr_auc"], 3),
+            # "one_se_band_*" (not "raw_best_*"): these aren't a property of the
+            # raw-best trial in isolation, they're the 1-SE selection band derived
+            # from it — the mechanism that decides who counts as "close enough" to
+            # the winner. "raw_best_se" reads as "SE of the raw-best score" rather
+            # than "the band selection is judged against."
+            "one_se_band_se": diagnostics["se"],
+            "one_se_band_floor": diagnostics["band_floor"],
+            "n_completed_trials": len(trial_summaries),
+            "n_pruned_trials": trial_result["n_pruned_trials"],
+            "n_boundary_hits": sum(boundary_hits.values()),
+            "n_failed_trials": trial_result["n_failed_trials"],
+            # int(): MLflow metrics must be numeric. Surfaces the too-few-trials
+            # warning (logged above, ephemeral) as a persistent, queryable
+            # signal in the MLflow UI/API, not just a vanished log line.
+            "trial_count_below_threshold": int(summary["trial_count_below_threshold"]),
+        }
+    )
+    mlflow.log_table(
+        pd.DataFrame(trial_summaries).drop(columns=["fold_scores"]),
+        "tuning/trials.json",
+    )
+    mlflow.log_dict(boundary_hits, "tuning/boundary_hits.json")
+    mlflow.log_figure(fig_hist, "tuning/optimization_history.png")
+    plt.close(fig_hist)
+
+
+def run_tuning_step(
+    X_dev: pd.DataFrame,
+    y_dev: pd.Series,
+    committed_features: list[str],
+    cfg: DictConfig,
+    storage: optuna.storages.BaseStorage | None = None,
+) -> dict[str, Any]:
+    """Optuna tuning of LightGBM on the frozen feature set.
+
+    Must run after feature selection freezes the input space — rerunning
+    selection afterward invalidates the study. Uses single stratified CV
+    (cfg.tuning.cv_folds), not the repeated CV used earlier for model and
+    feature-set comparison — this step already multiplies cost by n_trials,
+    so repeats aren't worth the added compute here. n_estimators is not
+    searched; each trial resolves its own ceiling via early stopping on
+    average_precision.
+
+    A trial that raises is marked FAILED rather than aborting the study. Too
+    few completed trials (cfg.tuning.min_completed_trials) logs a warning and
+    persists trial_count_below_threshold into tuning_summary and the
+    trial_count_below_threshold MLflow metric — visible after the fact, not
+    just in the log stream — but does not block selection: this step only
+    flags an untrustworthy result, it does not gate on it. (Enforcement
+    belongs at the point a tuned pipeline becomes a registered model — Phase
+    6's calibrate.py — not here; see PROJECT_PLAN.md Phase 6.) storage
+    defaults to a Postgres-backed study (see _build_optuna_storage); pass an
+    InMemoryStorage for tests.
+
+    Idempotent against a study that already reached n_trials: only the trials
+    still needed to reach n_trials are run, so re-running against a completed
+    study reuses its existing trials instead of piling n_trials more on top.
+
+    Returns {"best_params", "best_n_estimators_median", "best_cv_pr_auc_mean",
+    "boundary_hits", "n_completed_trials", "parent_run_id", "committed_features",
+    "tuning_summary"}. tuning_summary carries the audit trail behind the
+    selection_rule pick — trial counts, selected vs. raw-best trial number/score,
+    the 1-SE standard error and band floor — so training_manifest.json and any
+    notebook narrating the decision read the same numbers select_best_trial
+    actually used, not a client-side reconstruction.
+    """
+    setup = _build_optuna_study(X_dev, y_dev, committed_features, cfg, storage)
+    tuning_cfg = setup["tuning_cfg"]
+
     ensure_experiment_metadata(cfg)
 
     with mlflow.start_run(run_name="tuning_study") as parent_run:
@@ -407,7 +643,7 @@ def run_tuning_step(
         _log_dev_input(X_dev, y_dev, context="training")
         mlflow.log_params(
             {
-                "optuna_study_name": study_name,
+                "optuna_study_name": setup["study_name"],
                 "n_trials": int(tuning_cfg.n_trials),
                 "sampler": "tpe",
                 "sampler_seed": int(tuning_cfg.sampler_seed),
@@ -419,172 +655,21 @@ def run_tuning_step(
                 "n_estimators_ceiling": int(tuning_cfg.n_estimators_ceiling),
                 "early_stopping_rounds": int(tuning_cfg.early_stopping_rounds),
                 "n_committed_features": len(committed_features),
-                "timeout_seconds": timeout_seconds,
-                "min_completed_trials": min_completed_trials,
+                "timeout_seconds": setup["timeout_seconds"],
+                "min_completed_trials": setup["min_completed_trials"],
             }
         )
 
-        objective = partial(
-            _tuning_objective,
-            X=X_dev,
-            y=y_dev,
-            cv_splits=cv_splits,
-            binary=binary,
-            multi_cat=multi_cat,
-            numeric=numeric,
-            tuning_cfg=tuning_cfg,
-            fixed_params=fixed_params,
-            random_state=random_state,
-            pruning_enabled=pruning_enabled,
-        )
-        # load_if_exists=True resumes a study interrupted mid-run (e.g. a crashed
-        # process) rather than losing its trials — but without this guard, re-running
-        # a study that already reached n_trials would just pile on n_trials more on
-        # top of the existing ones every time, silently growing the candidate pool
-        # each run instead of reproducing it.
-        n_remaining_trials = max(int(tuning_cfg.n_trials) - len(study.trials), 0)
-        if n_remaining_trials > 0:
-            study.optimize(
-                objective,
-                n_trials=n_remaining_trials,
-                timeout=timeout_seconds,
-                catch=(Exception,),
-            )
-        else:
-            logger.info(
-                "tuning_study_already_complete",
-                study_name=study_name,
-                n_trials=len(study.trials),
-            )
-
-        n_failed_trials = sum(
-            1 for t in study.trials if t.state == optuna.trial.TrialState.FAIL
-        )
-        n_pruned_trials = sum(
-            1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED
-        )
-        if n_failed_trials:
-            logger.warning(
-                "tuning_trials_failed",
-                n_failed_trials=n_failed_trials,
-                n_total_trials=len(study.trials),
-            )
-        # catch=(Exception,) above lets one bad hyperparameter combination fail
-        # without killing the study, but that same breadth would also swallow a
-        # systematic bug (bad search-space config, a typo in the objective) as
-        # a per-trial FAIL — which n_failed_trials only warns about, and a
-        # resumed study with pre-existing completed trials could dodge the
-        # min_completed_trials floor entirely. Every submitted trial failing is
-        # never a legitimate per-trial fluke, so it raises instead of warning.
-        if n_remaining_trials > 0 and n_failed_trials == n_remaining_trials:
-            raise RuntimeError(
-                f"All {n_remaining_trials} trials submitted this run failed — "
-                "this is not an expected per-trial failure rate and indicates a "
-                "systematic bug (search-space config, objective code) rather than "
-                "an unlucky hyperparameter draw. Inspect the study's failed trial "
-                "exceptions before re-running."
-            )
-
-        trial_summaries = [
-            {
-                "number": t.number,
-                "value": t.value,
-                "fold_scores": t.user_attrs["fold_scores"],
-                "n_estimators_median": t.user_attrs["n_estimators_median"],
-                "params": t.params,
-            }
-            for t in study.trials
-            if t.state == optuna.trial.TrialState.COMPLETE
-        ]
-        trial_count_below_threshold = (
-            min_completed_trials is not None
-            and len(trial_summaries) < min_completed_trials
-        )
-        if trial_count_below_threshold:
-            logger.warning(
-                "tuning_too_few_completed_trials",
-                n_completed_trials=len(trial_summaries),
-                min_completed_trials=min_completed_trials,
-                n_failed_trials=n_failed_trials,
-                selection_rule=str(tuning_cfg.selection_rule),
-                hint=(
-                    "selection_rule pick is drawn from too few completed trials "
-                    "to be a meaningful selection — investigate pruning/failures "
-                    "or increase n_trials before trusting this run's champion"
-                ),
-            )
-        selected = select_best_trial(trial_summaries, str(tuning_cfg.selection_rule))
-        diagnostics = _raw_best_diagnostics(trial_summaries)
-        search_space_dict = {
-            str(name): {"low": spec.low, "high": spec.high}
-            for name, spec in tuning_cfg.search_space.items()
-        }
-        boundary_hits = boundary_hit_check(selected["params"], search_space_dict)
-        hit_params = [name for name, hit in boundary_hits.items() if hit]
-        if hit_params:
-            logger.warning(
-                "tuning_boundary_hit",
-                hit_params=hit_params,
-                selected_params=selected["params"],
-                hint=(
-                    "selected trial's params sit on a searched range's edge — "
-                    "widen the range in configs/tuning/optuna.yaml search_space "
-                    "and re-run"
-                ),
-            )
-
-        fig_hist, ax_hist = plt.subplots(figsize=(7, 4))
-        trial_numbers = [t["number"] for t in trial_summaries]
-        values = [t["value"] for t in trial_summaries]
-        running_best = np.maximum.accumulate(values)
-        ax_hist.scatter(trial_numbers, values, alpha=0.5, label="trial CV PR-AUC")
-        ax_hist.plot(trial_numbers, running_best, color="C1", label="running best")
-        ax_hist.set_xlabel("Trial")
-        ax_hist.set_ylabel("CV PR-AUC")
-        ax_hist.set_title("Optuna Optimization History")
-        ax_hist.legend()
-
-        mlflow.log_params({f"best_{k}": v for k, v in selected["params"].items()})
-        mlflow.log_params(
-            {
-                "best_trial_number": selected["number"],
-                "best_n_estimators_median": selected["n_estimators_median"],
-                "raw_best_trial_number": diagnostics["raw_best_trial_number"],
-            }
-        )
-        mlflow.log_metrics(
-            {
-                # "selected_" (not "best_"): this is the 1-SE-adopted trial's score,
-                # not the raw-argmax winner — "best_cv_pr_auc_mean" read as exactly
-                # the opposite of what it is on first glance in the MLflow UI.
-                "selected_cv_pr_auc_mean": round(selected["value"], 3),
-                "raw_best_cv_pr_auc_mean": round(diagnostics["raw_best_cv_pr_auc"], 3),
-                # "one_se_band_*" (not "raw_best_*"): these aren't a property of the
-                # raw-best trial in isolation, they're the 1-SE selection band derived
-                # from it — the mechanism that decides who counts as "close enough" to
-                # the winner. "raw_best_se" reads as "SE of the raw-best score" rather
-                # than "the band selection is judged against."
-                "one_se_band_se": diagnostics["se"],
-                "one_se_band_floor": diagnostics["band_floor"],
-                "n_completed_trials": len(trial_summaries),
-                "n_pruned_trials": n_pruned_trials,
-                "n_boundary_hits": sum(boundary_hits.values()),
-                "n_failed_trials": n_failed_trials,
-                # int(): MLflow metrics must be numeric. Surfaces the too-few-trials
-                # warning (logged above, ephemeral) as a persistent, queryable
-                # signal in the MLflow UI/API, not just a vanished log line.
-                "trial_count_below_threshold": int(trial_count_below_threshold),
-            }
-        )
-        mlflow.log_table(
-            pd.DataFrame(trial_summaries).drop(columns=["fold_scores"]),
-            "tuning/trials.json",
-        )
-        mlflow.log_dict(boundary_hits, "tuning/boundary_hits.json")
-        mlflow.log_figure(fig_hist, "tuning/optimization_history.png")
-        plt.close(fig_hist)
+        trial_result = _run_study_trials(setup, X_dev, y_dev)
+        summary = _summarize_completed_trials(setup, trial_result)
+        fig_hist = _plot_optimization_history(summary["trial_summaries"])
+        _log_tuning_artifacts(summary, trial_result, fig_hist)
 
         parent_run_id = parent_run.info.run_id
+
+    selected, diagnostics = summary["selected"], summary["diagnostics"]
+    boundary_hits = summary["boundary_hits"]
+    trial_summaries = summary["trial_summaries"]
 
     logger.info(
         "tuning_step_done",
@@ -605,10 +690,10 @@ def run_tuning_step(
         "tuning_summary": {
             "n_trials_requested": int(tuning_cfg.n_trials),
             "n_completed_trials": len(trial_summaries),
-            "n_pruned_trials": n_pruned_trials,
-            "n_failed_trials": n_failed_trials,
-            "min_completed_trials": min_completed_trials,
-            "trial_count_below_threshold": trial_count_below_threshold,
+            "n_pruned_trials": trial_result["n_pruned_trials"],
+            "n_failed_trials": trial_result["n_failed_trials"],
+            "min_completed_trials": setup["min_completed_trials"],
+            "trial_count_below_threshold": summary["trial_count_below_threshold"],
             "selection_rule": str(tuning_cfg.selection_rule),
             "selected_trial_number": selected["number"],
             "selected_cv_pr_auc": selected["value"],
