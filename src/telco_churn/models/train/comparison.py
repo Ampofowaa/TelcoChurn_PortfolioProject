@@ -23,7 +23,7 @@ from telco_churn.models.diagnostics import (
 )
 from telco_churn.models.train.common import _dvc_hash, _git_sha, _log_dev_input
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri, set_run_description
+from telco_churn.utils.mlflow import ensure_experiment_metadata, set_run_description
 from telco_churn.utils.stats import paired_bootstrap_ci
 
 __all__ = ["bootstrap_comparison", "run_comparison_step", "run_diagnostics_step"]
@@ -324,8 +324,7 @@ def run_comparison_step(
     ax_bs.set_title("Paired-Bootstrap Δ Distribution")
     ax_bs.legend()
 
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    mlflow.set_experiment(cfg.mlflow.experiment_name)
+    ensure_experiment_metadata(cfg)
 
     with mlflow.start_run(run_name="model_comparison"):
         set_run_description(_RUN_DESCRIPTION)

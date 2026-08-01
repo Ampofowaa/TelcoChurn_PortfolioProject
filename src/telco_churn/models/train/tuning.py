@@ -30,7 +30,7 @@ from telco_churn.models.train.common import (
 )
 from telco_churn.utils.db import get_engine
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.mlflow import ensure_experiment_metadata
 
 __all__ = [
     "boundary_hit_check",
@@ -391,8 +391,7 @@ def run_tuning_step(
         warm_start_params = {str(k): v for k, v in raw_warm_start.items()}
         study.enqueue_trial(warm_start_params, skip_if_exists=True)
 
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    mlflow.set_experiment(cfg.mlflow.experiment_name)
+    ensure_experiment_metadata(cfg)
 
     with mlflow.start_run(run_name="tuning_study") as parent_run:
         mlflow.set_tags(

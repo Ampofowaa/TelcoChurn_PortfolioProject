@@ -27,7 +27,7 @@ from telco_churn.models.train.common import (
     lgbm_default_params,
 )
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri, set_run_description
+from telco_churn.utils.mlflow import ensure_experiment_metadata, set_run_description
 
 __all__ = ["run_selection_step"]
 
@@ -227,8 +227,7 @@ def run_selection_step(
     ax_bs.legend()
     fig_bs.tight_layout()
 
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    mlflow.set_experiment(cfg.mlflow.experiment_name)
+    ensure_experiment_metadata(cfg)
 
     with mlflow.start_run(run_name="feature_selection"):
         set_run_description(_RUN_DESCRIPTION)

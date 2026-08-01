@@ -28,7 +28,7 @@ from telco_churn.models.train.common import (
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (
     TRAINING_CYCLE_RUN_DESCRIPTION,
-    resolve_tracking_uri,
+    ensure_experiment_metadata,
     set_logged_model_description,
     set_run_description,
 )
@@ -277,8 +277,7 @@ def run_model_logging_step(
         },
     }
 
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    mlflow.set_experiment(cfg.mlflow.experiment_name)
+    ensure_experiment_metadata(cfg)
 
     run_id = str(tuning_result["parent_run_id"])
     with mlflow.start_run(run_id=run_id):
