@@ -5,8 +5,8 @@ economics.py, and plots.py. These take already-computed SHAP values (a shap
 library explainer call is I/O-adjacent: it resolves a fitted estimator and
 runs inference) and return summary statistics. models/error_analysis.py is
 the only caller: it resolves the champion pipeline, computes
-`shap.TreeExplainer(...).shap_values(...)` once on the sealed-test rows, and
-calls these functions on the result. Interpretability is its own discipline,
+`shap.TreeExplainer(...)(...)` once on the sealed-test rows, and calls these
+functions on the result. Interpretability is its own discipline,
 distinct from performance measurement (evaluate.py) and from error diagnosis
 proper — it lives here so neither of those modules has to import shap.
 

@@ -550,9 +550,21 @@ def calibration_slope(
     def _fit(
         y_arr: NDArray[np.float64], x_arr: NDArray[np.float64]
     ) -> tuple[float, float]:
-        # C=np.inf, not penalty=None: sklearn 1.8 deprecates penalty=None,
-        # scheduled for removal in 1.10. Effectively unregularized either way.
-        model = LogisticRegression(C=np.inf)
+        # C=1e10 (not np.inf, not penalty=None): sklearn 1.8 deprecates
+        # penalty=None, and its own suggested replacement, C=np.inf, still
+        # trips an internal migration shim that re-derives penalty=None from
+        # C == np.inf and warns "Setting penalty=None will ignore the C and
+        # l1_ratio parameters" — a false positive on every one of up to
+        # n_bootstrap calls here. A merely-huge finite C sidesteps that shim
+        # entirely (verified: no warnings, and coefficients agree with a
+        # true C=np.inf fit to ~1e-9 relative error on non-separable data).
+        # It also strictly dominates C=np.inf numerically: L2 regularization
+        # keeps the objective strictly convex even under perfect separation
+        # in a bootstrap resample, so there's always a unique finite optimum
+        # for lbfgs to converge to — where true C=np.inf has no finite
+        # optimum at all under separation, and a ConvergenceWarning there
+        # would be reporting a genuinely ill-posed fit, not a false one.
+        model = LogisticRegression(C=1e10, l1_ratio=0)
         model.fit(x_arr, y_arr)
         return float(model.coef_[0][0]), float(model.intercept_[0])
 

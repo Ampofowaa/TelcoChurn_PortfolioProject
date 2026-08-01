@@ -74,8 +74,17 @@ def build_preprocessor(
 
     Must be fitted on the training split only so held-out statistics never leak into
     the preprocessing step.
+
+    Output is pandas, not the sklearn default ndarray: LightGBM's sklearn wrapper
+    always reports a non-null feature_names_in_ (it auto-generates Column_0..N when
+    fit on an unnamed array — lightgbm.sklearn.LGBMModel.feature_name_'s docstring),
+    so predicting through a Pipeline whose ColumnTransformer emits plain ndarrays
+    false-positives sklearn's feature-name-consistency check on every call. Named
+    pandas output at both fit and predict keeps the names genuinely consistent (real
+    encoded column names, not Column_0..N) instead of merely suppressing the
+    resulting warning, and reads better in feature_columns.txt/SHAP as a side effect.
     """
-    return ColumnTransformer(
+    preprocessor = ColumnTransformer(
         transformers=[
             (
                 "binary",
@@ -93,6 +102,8 @@ def build_preprocessor(
         ],
         remainder="drop",
     )
+    preprocessor.set_output(transform="pandas")
+    return preprocessor
 
 
 def build_linear_preprocessor(

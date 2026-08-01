@@ -318,7 +318,6 @@ def _build_selection_pipeline(
 ) -> Pipeline:
     """Build [tree_preprocessor -> PermutationImportanceSelector -> LightGBM] as one Pipeline."""
     preprocessor = build_preprocessor(binary, multi_cat, numeric)
-    preprocessor.set_output(transform="pandas")
     selector = PermutationImportanceSelector(
         binary=binary,
         multi_cat=multi_cat,
@@ -495,7 +494,6 @@ def mint_committed_list(
     permutation_importance_table_ is its audit trail.
     """
     preprocessor = build_preprocessor(binary, multi_cat, numeric)
-    preprocessor.set_output(transform="pandas")
     selector = PermutationImportanceSelector(
         binary=binary,
         multi_cat=multi_cat,
@@ -530,11 +528,19 @@ def compute_shap_audit(
     TreeSHAP ranks highly. This never decides keep/drop — permutation importance
     vs. the decoy is the sole gate — it only flags a mismatch worth a human look
     (flag_high_shap_dropouts).
+
+    Uses the explainer's __call__ API (explainer(Xt) -> Explanation) rather
+    than the legacy .shap_values(Xt): for a binary LightGBM classifier the
+    latter unconditionally warns on every call (shap/explainers/_tree.py),
+    since __call__ is the only caller that passes from_call=True internally.
+    Explanation.values comes back shape (n_rows, n_features, 2) for a binary
+    classifier — index [..., 1] selects the positive (churn) class, the same
+    selection the old list[1] indexing made on .shap_values()'s legacy
+    list-of-two-ndarrays return.
     """
     source_columns = list(binary) + list(multi_cat) + list(numeric)
 
     preprocessor = build_preprocessor(binary, multi_cat, numeric)
-    preprocessor.set_output(transform="pandas")
     model = LGBMClassifier(**estimator_params)
     pipeline = Pipeline([("preprocessor", preprocessor), ("model", model)])
     pipeline.fit(X[source_columns], y)
@@ -542,9 +548,9 @@ def compute_shap_audit(
     Xt = pipeline.named_steps["preprocessor"].transform(X[source_columns])
     column_map = _build_column_map(list(Xt.columns), source_columns)
     explainer = shap.TreeExplainer(pipeline.named_steps["model"])
-    shap_values = explainer.shap_values(Xt)
-    if isinstance(shap_values, list):
-        shap_values = shap_values[1]
+    shap_values = explainer(Xt).values
+    if shap_values.ndim == 3:
+        shap_values = shap_values[..., 1]
 
     mean_abs = pd.Series(np.abs(shap_values).mean(axis=0), index=Xt.columns)
     per_feature = mean_abs.groupby(mean_abs.index.map(column_map)).sum()

@@ -13,12 +13,14 @@ shared, import-safe location instead.
 from __future__ import annotations
 
 import re
+import warnings
 from typing import TYPE_CHECKING
 
 import mlflow
 import mlflow.tracking
 from mlflow.entities import Experiment
 from omegaconf import DictConfig, OmegaConf
+from pandas.errors import Pandas4Warning
 
 from telco_churn.utils.paths import get_project_root
 
@@ -39,6 +41,42 @@ __all__ = [
 
 _SQLITE_PREFIX = "sqlite:///"
 _WINDOWS_ABS_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+_mlflow_warnings_suppressed = False
+
+
+def _suppress_known_mlflow_warnings() -> None:
+    """Silence MLflow/pandas warnings already investigated and confirmed benign.
+
+    Mirrors pyproject.toml's [tool.pytest.ini_options] filterwarnings entries
+    verbatim, which only take effect inside a pytest session — dvc repro,
+    notebooks, and direct CLI runs never register them, so the same three
+    filters are applied here too: mlflow 3.14's dataset digest computation
+    still calls DataFrame.map(...).all(0) positionally (Pandas4Warning, scoped
+    to mlflow's own module so the project's own pandas code isn't silenced too);
+    mlflow.data.from_pandas's source-type registry reports two internally
+    duplicated LocalArtifactDatasetSource registrations as ambiguous and
+    self-resolves; and infer_signature's integer-column advisory doesn't
+    apply here since the committed feature columns are never null at
+    training time. Idempotent, so safe to call from every resolve_tracking_uri
+    invocation rather than once at process start.
+    """
+    global _mlflow_warnings_suppressed
+    if _mlflow_warnings_suppressed:
+        return
+    warnings.filterwarnings("ignore", category=Pandas4Warning, module=r"mlflow\..*")
+    warnings.filterwarnings(
+        "ignore",
+        message="The specified dataset source can be interpreted in multiple ways",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="Hint: Inferred schema contains integer column",
+        category=UserWarning,
+    )
+    _mlflow_warnings_suppressed = True
+
 
 _EXPERIMENT_DESCRIPTION = (
     "End-to-end training cycle for the IBM Telco Customer Churn model — candidate "
@@ -89,7 +127,14 @@ def resolve_tracking_uri(uri: str) -> str:
     Windows, str(path) yields 'C:\\...\\mlruns', and MLflow's store registry
     reads urlparse's scheme off that string, which is 'c' for a drive letter,
     not a recognized backend.
+
+    Also registers _suppress_known_mlflow_warnings() as a side effect: every
+    training-cycle module calls this function (directly, or transitively via
+    ensure_experiment_metadata/resolve_model_run_id/resolve_logged_model_id)
+    before its first from_pandas/infer_signature call, making this the one
+    choke point that reaches pytest, dvc repro, notebooks, and CLI runs alike.
     """
+    _suppress_known_mlflow_warnings()
     if uri.startswith(_SQLITE_PREFIX):
         db_path = uri[len(_SQLITE_PREFIX) :]
         if _is_absolute_sqlite_path(db_path):

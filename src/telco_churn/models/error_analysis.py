@@ -557,6 +557,17 @@ def _shap_values_for_test_rows(
     input matrix) is returned too, since dependence_points/local_explanations
     both need the paired feature values in the identical space shap_values
     was computed in.
+
+    Uses the explainer's __call__ API (explainer(Xt) -> Explanation) rather
+    than the legacy .shap_values(Xt): for a binary LightGBM classifier the
+    latter unconditionally warns on every call (shap/explainers/_tree.py),
+    since __call__ is the only caller that passes from_call=True internally.
+    Explanation.values comes back shape (n_rows, n_features, 2) for a binary
+    classifier — index [..., 1] selects the positive (churn) class, the same
+    selection the old list[1] indexing made on .shap_values()'s legacy
+    list-of-two-ndarrays return. self.expected_value is still set as a side
+    effect of the same underlying shap_values() call __call__ makes
+    internally, so the base_value extraction below is unchanged.
     """
     base_pipeline = model.calibrated_classifiers_[0].estimator
     preprocessor = base_pipeline.named_steps["preprocessor"]
@@ -566,9 +577,9 @@ def _shap_values_for_test_rows(
     feature_names = list(preprocessor.get_feature_names_out())
 
     explainer = shap.TreeExplainer(booster)
-    shap_values = explainer.shap_values(Xt)
-    if isinstance(shap_values, list):
-        shap_values = shap_values[1]
+    shap_values = explainer(Xt).values
+    if shap_values.ndim == 3:
+        shap_values = shap_values[..., 1]
 
     base_value_raw = explainer.expected_value
     base_value = (
@@ -654,6 +665,9 @@ def _save_shap_beeswarm_plot(
     — shap.summary_plot's default plot_size="auto" hardcodes its own width
     (fig.set_size_inches(8, ...)) regardless of the current figure's size,
     silently discarding whatever figsize was passed to plt.figure() above.
+    rng=42 makes the point-jitter reproducible and opts out of shap's legacy
+    global-NumPy-RNG fallback (SPEC 7), consistent with this project's
+    random_state=42 convention everywhere else.
     """
     plt.figure(figsize=(14, 0.3 * len(feature_names) + 1.5))
     display_names = [display_feature_name(name) for name in feature_names]
@@ -664,6 +678,7 @@ def _save_shap_beeswarm_plot(
         max_display=len(display_names),
         plot_size=None,
         show=False,
+        rng=42,
     )
     fig = plt.gcf()
     fig.tight_layout()

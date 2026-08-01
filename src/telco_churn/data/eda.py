@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import chi2_contingency, mannwhitneyu
 
-from telco_churn.utils.stats import pool_adjusted_p_values, vif_single
+from telco_churn.utils.stats import cramers_v, pool_adjusted_p_values, vif_single
 
 __all__ = [
     "CAT_FEATURES",
@@ -268,9 +268,7 @@ def compute_chi2_tests(
                 f"'{col}' is constant — chi-squared undefined, skipping.", stacklevel=2
             )
             continue
-        n = int(ct.values.sum())
-        min_dim = min(ct.shape[0] - 1, ct.shape[1] - 1)
-        v = float(np.sqrt(chi2_stat / (n * min_dim)))
+        v = cramers_v(df[col], df[target])
         rows.append(
             {
                 "feature": col,

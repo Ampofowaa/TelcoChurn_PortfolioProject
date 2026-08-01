@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Any, cast
 
@@ -510,12 +511,24 @@ def sealed_test_classification_report(
             precisions[i], recalls[i], f1s[i] = _precision_recall_f1_at(
                 y[idx], p[idx], threshold
             )
-        row["precision_ci_lower"] = float(np.nanpercentile(precisions, 2.5))
-        row["precision_ci_upper"] = float(np.nanpercentile(precisions, 97.5))
-        row["recall_ci_lower"] = float(np.nanpercentile(recalls, 2.5))
-        row["recall_ci_upper"] = float(np.nanpercentile(recalls, 97.5))
-        row["f1_ci_lower"] = float(np.nanpercentile(f1s, 2.5))
-        row["f1_ci_upper"] = float(np.nanpercentile(f1s, 97.5))
+        # A resample with zero predicted positives (tp + fp == 0) makes
+        # _precision_recall_f1_at return nan by design (division is
+        # undefined, not erroneous); at a high enough threshold on a small
+        # sample every one of the n_bootstrap draws can land there
+        # simultaneously, so nanpercentile's all-NaN warning fires on an
+        # already-correct nan-in/nan-out result. Suppressed narrowly, by
+        # message, so an unrelated RuntimeWarning inside this block would
+        # still surface.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="All-NaN slice encountered", category=RuntimeWarning
+            )
+            row["precision_ci_lower"] = float(np.nanpercentile(precisions, 2.5))
+            row["precision_ci_upper"] = float(np.nanpercentile(precisions, 97.5))
+            row["recall_ci_lower"] = float(np.nanpercentile(recalls, 2.5))
+            row["recall_ci_upper"] = float(np.nanpercentile(recalls, 97.5))
+            row["f1_ci_lower"] = float(np.nanpercentile(f1s, 2.5))
+            row["f1_ci_upper"] = float(np.nanpercentile(f1s, 97.5))
     return rows
 
 
