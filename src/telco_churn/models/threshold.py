@@ -665,12 +665,8 @@ def _save_scenario_ev_curve_plot(
     plt.close(fig)
 
 
-def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
-    """Derive and ship the cost-sensitive threshold for a registered calibrated model.
-
-    Resolved by explicit model_version, never the challenger alias: a
-    re-calibration invalidates a previously-derived threshold, and an alias
-    is a moving pointer that could later point at a different version.
+def _load_and_align_dev_oof(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+    """Resolve the model's run, load its dev-OOF probabilities, and align them to the dev partition.
 
     Loads the same leak-free OOF probabilities calibrate.py's method
     selection used, from its persisted dev_oof_predictions.parquet artifact
@@ -679,56 +675,10 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     data split directly, and never re-derives the OOF vector calibrate.py
     already logged.
 
-    threshold.json (the full, unsplit bundle — every scenario's complete
-    diagnostic set, model stamp included) is logged onto the model's run as
-    the audit-trail copy. What gets mirrored to disk splits along the line
-    the closed form already draws, because the two halves have different
-    lifetimes:
-      - configs/policy/threshold.yaml — the policy: threshold/costs/
-        retention_rate_sensitivity, pure functions of configs/costs.yaml
-        (t* = c / (r × LTV) is model-independent by construction). Pinned by
-        a costs_config_hash, carries no model_run_id/model_version — a file
-        whose content is model-independent must not carry a model stamp, or
-        an emergency rollback to a different champion leaves it silently
-        describing the wrong model.
-      - threshold_validation.json — the model-dependent half (argmax-EV
-        threshold, its bootstrap CI, within_ci, implied contact rate,
-        dev_ev_at_t_star, calibration_method), logged only as an artifact on
-        this model's run — same rule as drift_reference.json: an artifact
-        describing a specific version travels with that version, never sits
-        at a fixed path a rollback could leave stale.
-
-    Every scenario's full diagnostic bundle ships in both threshold_payload
-    (unsplit) and validation_payload (model-dependent half only) — not just
-    its t* — conservative and optimistic are equally auditable, not merely
-    stored numbers nobody can validate later. base is still the only
-    scenario that drives the top-level threshold/within_ci warning: it is
-    the shipped operating point, the others are reference alternatives.
-
-    Logs t_star_{scenario}, implied_contact_rate_{scenario}, and
-    dev_ev_at_t_star_{scenario} as MLflow metrics for every scenario, and
-    persists the EV-curve points themselves as ev_curve.parquet — the curve
-    exists today only as pixels in expected_value_by_scenario.png.
-
-    Three figures are logged onto the run's figures/ artifacts and mirrored
-    to reports/figures/: threshold_sensitivity.png (base's t* vs. retention
-    rate), threshold_by_scenario.png (closed-form t* vs. empirical argmax +
-    its bootstrap CI, all three scenarios), and
-    expected_value_by_scenario.png (each scenario's EV curve overlaid, with
-    its t* marked).
-
-    Like reports/figures/reliability_diagram.png, these three are overwritten
-    on every call — the copy on disk reflects the most recent local run, not
-    a specific run_id. threshold_validation.json is self-describing
-    (model_run_id, model_version), so that is the right place to confirm
-    provenance, not the PNGs' mtimes.
-
-    Finally runs the dev-OOF screen (module docstring): screens calibrate.py's
-    logged calibration slope against ANALYSIS.md §0's band, computes V1/V2/V2b
-    on the same aligned dev-OOF vector this function already built for the
-    threshold derivation above (no second fetch of dev_oof_predictions.parquet),
-    and writes reports/dev_oof_predictions.parquet + reports/dev_oof_diagnostics.json.
-    Raises RuntimeError, after logging, if the slope fails the band.
+    Aligned by customerid rather than trusted positionally: dev_oof and
+    X_dev/y_dev are two independent loads (an MLflow artifact fetch and a
+    features.parquet read), and only their row order happening to match by
+    construction is not something a silent misalignment would ever surface.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     run_id = resolve_model_run_id(model_version, cfg)
@@ -740,10 +690,6 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     committed_features = committed_features_from_manifest(manifest)
     X_dev, y_dev = load_dev_features(committed_features)
 
-    # Aligned by customerid rather than trusted positionally: dev_oof and
-    # X_dev/y_dev are two independent loads (an MLflow artifact fetch and a
-    # features.parquet read), and only their row order happening to match by
-    # construction is not something a silent misalignment would ever surface.
     customerid = load_dev_customer_ids()
     dev_oof = load_dev_oof_predictions(run_id, cfg).set_index("customerid")
     aligned = dev_oof.reindex(customerid)
@@ -760,6 +706,26 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         "current dev partition."
     )
 
+    return {
+        "run_id": run_id,
+        "calibration_summary": calibration_summary,
+        "method": method,
+        "X_dev": X_dev,
+        "y_dev": y_dev,
+        "customerid": customerid,
+        "oof_proba": oof_proba,
+        "y_dev_arr": y_dev_arr,
+    }
+
+
+def _derive_scenario_thresholds(
+    X_dev: pd.DataFrame,
+    y_dev: pd.Series,
+    oof_proba: NDArray[np.float64],
+    y_dev_arr: NDArray[np.int_],
+    cfg: DictConfig,
+) -> dict[str, Any]:
+    """Derive every scenario's threshold and the base scenario's retention-rate sensitivity sweep."""
     costs_cfg = load_costs_config(get_project_root() / str(cfg.paths.costs_config))
     scenarios = resolve_all_scenarios(X_dev["monthlycharges"], y_dev, costs_cfg)
 
@@ -799,19 +765,50 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
             "configs/costs.yaml."
         )
 
+    return {
+        "costs_cfg": costs_cfg,
+        "scenarios": scenarios,
+        "results": results,
+        "base": base,
+        "sweep": sweep,
+    }
+
+
+def _render_threshold_figures(
+    derived: dict[str, Any],
+    oof_proba: NDArray[np.float64],
+    y_dev_arr: NDArray[np.int_],
+    cfg: DictConfig,
+) -> dict[str, Any]:
+    """Render the three threshold figures and the EV-curve series they (and the persisted artifact) share.
+
+    Three figures are logged onto the run's figures/ artifacts and mirrored
+    to reports/figures/: threshold_sensitivity.png (base's t* vs. retention
+    rate), threshold_by_scenario.png (closed-form t* vs. empirical argmax +
+    its bootstrap CI, all three scenarios), and
+    expected_value_by_scenario.png (each scenario's EV curve overlaid, with
+    its t* marked).
+
+    ev_curves is computed once, shared by the plot and the persisted
+    artifact — a second recomputation is exactly the risk CLAUDE.md's
+    "persist the evidence" rule exists to close off.
+    """
+    results, base, scenarios = (
+        derived["results"],
+        derived["base"],
+        derived["scenarios"],
+    )
+
     figure_path = (
         get_project_root() / str(cfg.paths.figures) / "threshold_sensitivity.png"
     )
-    _save_sensitivity_plot(sweep, float(base["threshold"]), figure_path)
+    _save_sensitivity_plot(derived["sweep"], float(base["threshold"]), figure_path)
 
     scenario_threshold_path = (
         get_project_root() / str(cfg.paths.figures) / "threshold_by_scenario.png"
     )
     _save_scenario_threshold_plot(results, scenario_threshold_path)
 
-    # Computed once, shared by the plot and the persisted artifact — a second
-    # recomputation is exactly the risk CLAUDE.md's "persist the evidence"
-    # rule exists to close off.
     ev_curves = {
         name: expected_value_curve(oof_proba, y_dev_arr, scenario)
         for name, scenario in scenarios.items()
@@ -822,22 +819,86 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     )
     _save_scenario_ev_curve_plot(ev_curves, scenarios, ev_curve_path)
 
-    # --- Dev-OOF screen (module docstring): reuses the aligned vector above,
-    # never re-fetches dev_oof_predictions.parquet a second time.
-    dev_oof_screen_frame = build_dev_oof_screen_frame(customerid, y_dev_arr, oof_proba)
-    slope = calibration_summary["calibration_slope"]
+    return {
+        "figure_path": figure_path,
+        "scenario_threshold_path": scenario_threshold_path,
+        "ev_curve_path": ev_curve_path,
+        "ev_curves": ev_curves,
+    }
+
+
+def _run_dev_oof_screen(
+    loaded: dict[str, Any],
+    base_threshold: float,
+    cfg: DictConfig,
+    random_state: int,
+) -> dict[str, Any]:
+    """Screen calibrate.py's logged calibration slope against ANALYSIS.md §0's band.
+
+    Reuses the aligned dev-OOF vector _load_and_align_dev_oof already built —
+    never re-fetches dev_oof_predictions.parquet a second time. Returns
+    screen_passed rather than raising: the caller must log and mirror the
+    audit trail first, and raise only afterward, so a failing screen is
+    recorded rather than silently vanishing (module docstring).
+    """
+    dev_oof_screen_frame = build_dev_oof_screen_frame(
+        loaded["customerid"], loaded["y_dev_arr"], loaded["oof_proba"]
+    )
+    slope = loaded["calibration_summary"]["calibration_slope"]
     calibration_slope_band = load_model_promotion_bars(cfg).calibration_slope_band
     screen_passed = slope_passes(
         slope["slope_ci_lower"], slope["slope_ci_upper"], calibration_slope_band
     )
     dev_oof_diagnostics = compute_dev_oof_diagnostics(
         dev_oof_screen_frame,
-        float(base["threshold"]),
+        base_threshold,
         calibration_slope_band,
         cfg,
         int(cfg.threshold.n_bootstrap),
         random_state,
     )
+    return {
+        "dev_oof_screen_frame": dev_oof_screen_frame,
+        "slope": slope,
+        "calibration_slope_band": calibration_slope_band,
+        "screen_passed": screen_passed,
+        "dev_oof_diagnostics": dev_oof_diagnostics,
+    }
+
+
+def _assemble_threshold_payloads(
+    loaded: dict[str, Any],
+    derived: dict[str, Any],
+    model_version: str,
+    cfg: DictConfig,
+) -> dict[str, Any]:
+    """Assemble threshold.json, threshold.yaml (policy), and threshold_validation.json.
+
+    What gets mirrored to disk splits along the line the closed form already
+    draws, because the two halves have different lifetimes:
+      - configs/policy/threshold.yaml — the policy: threshold/costs/
+        retention_rate_sensitivity, pure functions of configs/costs.yaml
+        (t* = c / (r × LTV) is model-independent by construction). Pinned by
+        a costs_config_hash, carries no model_run_id/model_version — a file
+        whose content is model-independent must not carry a model stamp, or
+        an emergency rollback to a different champion leaves it silently
+        describing the wrong model.
+      - threshold_validation.json — the model-dependent half (argmax-EV
+        threshold, its bootstrap CI, within_ci, implied contact rate,
+        dev_ev_at_t_star, calibration_method), logged only as an artifact on
+        this model's run — same rule as drift_reference.json: an artifact
+        describing a specific version travels with that version, never sits
+        at a fixed path a rollback could leave stale.
+
+    Every scenario's full diagnostic bundle ships in both threshold_payload
+    (unsplit) and validation_payload (model-dependent half only) — not just
+    its t* — conservative and optimistic are equally auditable, not merely
+    stored numbers nobody can validate later. base is still the only
+    scenario that drives the top-level threshold/within_ci warning: it is
+    the shipped operating point, the others are reference alternatives.
+    """
+    results, base, sweep = derived["results"], derived["base"], derived["sweep"]
+    run_id, method = loaded["run_id"], loaded["method"]
 
     threshold_payload: dict[str, Any] = {
         "threshold": base["threshold"],
@@ -891,15 +952,47 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         },
     }
 
-    with mlflow.start_run(run_id=run_id):
+    return {
+        "threshold_payload": threshold_payload,
+        "policy_payload": policy_payload,
+        "validation_payload": validation_payload,
+    }
+
+
+def _log_threshold_run(
+    loaded: dict[str, Any],
+    derived: dict[str, Any],
+    figures: dict[str, Any],
+    payloads: dict[str, Any],
+    screen: dict[str, Any],
+    model_version: str,
+    cfg: DictConfig,
+) -> None:
+    """Log every threshold artifact and metric onto the model's own MLflow run.
+
+    Logs t_star_{scenario}, implied_contact_rate_{scenario}, and
+    dev_ev_at_t_star_{scenario} as MLflow metrics for every scenario, and
+    persists the EV-curve points themselves as ev_curve.parquet — the curve
+    exists today only as pixels in expected_value_by_scenario.png.
+    """
+    results = derived["results"]
+    ev_curves = figures["ev_curves"]
+
+    with mlflow.start_run(run_id=loaded["run_id"]):
         set_run_description(TRAINING_CYCLE_RUN_DESCRIPTION)
-        mlflow.log_dict(threshold_payload, "threshold/threshold.json")
-        mlflow.log_dict(validation_payload, "threshold/threshold_validation.json")
-        mlflow.log_artifact(str(figure_path), artifact_path="threshold/figures")
-        mlflow.log_artifact(
-            str(scenario_threshold_path), artifact_path="threshold/figures"
+        mlflow.log_dict(payloads["threshold_payload"], "threshold/threshold.json")
+        mlflow.log_dict(
+            payloads["validation_payload"], "threshold/threshold_validation.json"
         )
-        mlflow.log_artifact(str(ev_curve_path), artifact_path="threshold/figures")
+        mlflow.log_artifact(
+            str(figures["figure_path"]), artifact_path="threshold/figures"
+        )
+        mlflow.log_artifact(
+            str(figures["scenario_threshold_path"]), artifact_path="threshold/figures"
+        )
+        mlflow.log_artifact(
+            str(figures["ev_curve_path"]), artifact_path="threshold/figures"
+        )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             ev_curve_data_path = Path(tmp_dir) / "ev_curve.parquet"
@@ -924,9 +1017,10 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
 
         model_id = resolve_logged_model_id(model_version, cfg)
         dev_oof_dataset = mlflow_dataset_from_pandas(
-            dev_oof_screen_frame, name="dev_oof_screen", targets="y_true"
+            screen["dev_oof_screen_frame"], name="dev_oof_screen", targets="y_true"
         )
         mlflow.log_input(dev_oof_dataset, context="dev_oof_screen")
+        slope = screen["slope"]
         mlflow.log_metrics(
             {
                 "dev_oof_calibration_slope": slope["slope"],
@@ -936,9 +1030,28 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
             model_id=model_id,
             dataset=dev_oof_dataset,
         )
-        mlflow.log_dict(dev_oof_diagnostics, "threshold/dev_oof_diagnostics.json")
-        mlflow.set_tag("dev_oof_screen_result", "pass" if screen_passed else "fail")
+        mlflow.log_dict(
+            screen["dev_oof_diagnostics"], "threshold/dev_oof_diagnostics.json"
+        )
+        mlflow.set_tag(
+            "dev_oof_screen_result", "pass" if screen["screen_passed"] else "fail"
+        )
 
+
+def _write_threshold_reports(
+    loaded: dict[str, Any],
+    policy_payload: dict[str, Any],
+    dev_oof_diagnostics: dict[str, Any],
+    cfg: DictConfig,
+) -> None:
+    """Write configs/policy/threshold.yaml and the reports/ dev-OOF mirror.
+
+    Like reports/figures/reliability_diagram.png, these are overwritten on
+    every call — the copy on disk reflects the most recent local run, not a
+    specific run_id. threshold_validation.json is self-describing
+    (model_run_id, model_version), so that is the right place to confirm
+    provenance, not these files' mtimes.
+    """
     policy_path = get_project_root() / str(cfg.paths.policy) / "threshold.yaml"
     policy_path.parent.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(OmegaConf.create(policy_payload), policy_path)
@@ -946,7 +1059,11 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     reports_dir = get_project_root() / str(cfg.paths.reports)
     reports_dir.mkdir(parents=True, exist_ok=True)
     dev_oof_predictions = pd.DataFrame(
-        {"customerid": customerid.to_numpy(), "y_true": y_dev_arr, "p_hat": oof_proba}
+        {
+            "customerid": loaded["customerid"].to_numpy(),
+            "y_true": loaded["y_dev_arr"],
+            "p_hat": loaded["oof_proba"],
+        }
     )
     dev_oof_predictions.to_parquet(
         reports_dir / "dev_oof_predictions.parquet", index=False
@@ -954,11 +1071,46 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     with open(reports_dir / "dev_oof_diagnostics.json", "w", encoding="utf-8") as f:
         json.dump(dev_oof_diagnostics, f, indent=2, default=str)
 
+
+def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+    """Derive and ship the cost-sensitive threshold for a registered calibrated model.
+
+    Resolved by explicit model_version, never the challenger alias: a
+    re-calibration invalidates a previously-derived threshold, and an alias
+    is a moving pointer that could later point at a different version.
+
+    Finally runs the dev-OOF screen (module docstring): screens calibrate.py's
+    logged calibration slope against ANALYSIS.md §0's band, computes V1/V2/V2b
+    on the same aligned dev-OOF vector this function already built for the
+    threshold derivation above (no second fetch of dev_oof_predictions.parquet),
+    and writes reports/dev_oof_predictions.parquet + reports/dev_oof_diagnostics.json.
+    Raises RuntimeError, after logging, if the slope fails the band.
+    """
+    loaded = _load_and_align_dev_oof(model_version, cfg)
+    derived = _derive_scenario_thresholds(
+        loaded["X_dev"], loaded["y_dev"], loaded["oof_proba"], loaded["y_dev_arr"], cfg
+    )
+    figures = _render_threshold_figures(
+        derived, loaded["oof_proba"], loaded["y_dev_arr"], cfg
+    )
+    random_state = int(cfg.threshold.random_state)
+    screen = _run_dev_oof_screen(
+        loaded, float(derived["base"]["threshold"]), cfg, random_state
+    )
+    payloads = _assemble_threshold_payloads(loaded, derived, model_version, cfg)
+    _log_threshold_run(loaded, derived, figures, payloads, screen, model_version, cfg)
+    _write_threshold_reports(
+        loaded, payloads["policy_payload"], screen["dev_oof_diagnostics"], cfg
+    )
+
+    base = derived["base"]
+    slope = screen["slope"]
+    screen_passed = screen["screen_passed"]
     logger.info(
         "threshold_derived",
-        run_id=run_id,
+        run_id=loaded["run_id"],
         model_version=model_version,
-        method=method,
+        method=loaded["method"],
         threshold=base["threshold"],
         within_ci=base["within_ci"],
         implied_contact_rate=base["implied_contact_rate"],
@@ -967,14 +1119,15 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     )
 
     result = {
-        "threshold_payload": threshold_payload,
-        "policy_payload": policy_payload,
-        "validation_payload": validation_payload,
-        "dev_oof_diagnostics": dev_oof_diagnostics,
+        "threshold_payload": payloads["threshold_payload"],
+        "policy_payload": payloads["policy_payload"],
+        "validation_payload": payloads["validation_payload"],
+        "dev_oof_diagnostics": screen["dev_oof_diagnostics"],
         "dev_oof_screen_passed": screen_passed,
     }
 
     if not screen_passed:
+        calibration_slope_band = screen["calibration_slope_band"]
         raise RuntimeError(
             "Dev-OOF calibration screen failed: calibrate.py's logged slope "
             f"95% CI [{slope['slope_ci_lower']:.4f}, "
