@@ -1111,40 +1111,8 @@ def _save_gains_lift_plot(decile_rows: list[dict[str, float]], path: Path) -> No
     plt.close(fig)
 
 
-def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
-    """Sealed-test evaluation, gate decision, and MLflow logging — the single
-    pass CLAUDE.md's "test set touched once" invariant permits.
-
-    Resolves `model_version` explicitly (never an alias), checks threshold
-    provenance, scores the sealed test set exactly once, and from that one
-    probability vector computes every block this module exposes: ranking,
-    per-scenario classification, the fixed-recall profile, the calibration
-    report, the decile lift table, the business-impact block, the
-    sensitivity suite, the sealed-test disaggregated slices, and — from the
-    dev-OOF probability vector calibrate.py already persisted, joined to the
-    dev partition's segment columns — the V1/V2/V2b diagnostics (reported,
-    non-gating). Resolves
-    the incumbent champion (if any) once, scores it on the identical test
-    rows, and calls gate.py::decide_promotion.
-
-    Logs a dedicated `evaluation` run (a sibling of Phase 5/6's runs, never
-    appended to the dev model's own run — CLAUDE.md), writes
-    reports/metrics.json, reports/economics.json,
-    reports/promotion_decision.json, and reports/test_predictions.parquet
-    (mirrored onto the run as artifacts), tags the dev model version with the
-    four gate criteria (alongside its existing training_data_scope: dev), and eight
-    figures into the run's figures/ artifacts: the PR curve (operating points
-    and prevalence baseline marked), the ROC curve, the classification-report
-    panels, the sealed-test reliability diagram, the EV-vs-budget curve (t*
-    and the EV-maximising K marked, one line per scenario), the r×c
-    break-even heatmap, the sensitivity tornado diagram, and the cumulative
-    gains/lift chart. Notebooks in this project never render their own
-    matplotlib figures — 04-calibration-and-threshold.ipynb only
-    mlflow.artifacts.download_artifacts + IPython.display.Image's what a
-    pipeline module already produced — so this module is where every one of
-    these figures is built; the eventual 05-evaluation-and-error-analysis.ipynb
-    will only display them, following that same convention.
-    """
+def _load_and_score_candidate(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+    """Resolve the candidate's run, check threshold provenance, and score the sealed test set once."""
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     registered_model_name = str(cfg.mlflow.registered_model_name)
 
@@ -1160,14 +1128,40 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     proba: NDArray[np.float64] = model.predict_proba(X_test)[:, 1]
     customer_ids = load_test_customer_ids()
 
+    return {
+        "registered_model_name": registered_model_name,
+        "run_id": run_id,
+        "X_test": X_test,
+        "y_test": y_test,
+        "proba": proba,
+        "customer_ids": customer_ids,
+    }
+
+
+def _load_policy_context(cfg: DictConfig) -> dict[str, Any]:
+    """Load the shipped policy thresholds/scenarios and the evaluate-wide bootstrap settings."""
     policy = load_policy_thresholds(cfg)
     scenarios = resolve_policy_scenarios(policy)
     thresholds = resolve_policy_thresholds_by_scenario(policy)
-    base_scenario = scenarios["base"]
-    base_threshold = thresholds["base"]
+    return {
+        "scenarios": scenarios,
+        "thresholds": thresholds,
+        "base_scenario": scenarios["base"],
+        "base_threshold": thresholds["base"],
+        "n_bootstrap": int(cfg.evaluate.n_bootstrap),
+        "random_state": int(cfg.evaluate.random_state),
+    }
 
-    n_bootstrap = int(cfg.evaluate.n_bootstrap)
-    random_state = int(cfg.evaluate.random_state)
+
+def _compute_core_test_metrics(
+    y_test: pd.Series,
+    proba: NDArray[np.float64],
+    policy_ctx: dict[str, Any],
+    cfg: DictConfig,
+) -> dict[str, Any]:
+    """Compute ranking, per-scenario classification, fixed-recall, calibration, decile, and business-impact blocks."""
+    thresholds, scenarios = policy_ctx["thresholds"], policy_ctx["scenarios"]
+    n_bootstrap, random_state = policy_ctx["n_bootstrap"], policy_ctx["random_state"]
 
     ranking_metrics = sealed_test_ranking_metrics(
         y_test, proba, n_bootstrap, random_state
@@ -1186,6 +1180,28 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         y_test, proba, scenarios, thresholds, n_bootstrap, random_state
     )
 
+    return {
+        "ranking_metrics": ranking_metrics,
+        "classification_rows": classification_rows,
+        "fixed_recall_rows": fixed_recall_rows,
+        "calibration_report": calibration_report,
+        "decile_rows": decile_rows,
+        "business_impact": business_impact,
+    }
+
+
+def _compute_sensitivity_block(
+    y_test: pd.Series,
+    proba: NDArray[np.float64],
+    policy_ctx: dict[str, Any],
+    cfg: DictConfig,
+) -> dict[str, Any]:
+    """Load costs config and compute the sealed-test sensitivity suite (tornado + break-even sweep)."""
+    base_scenario, base_threshold = (
+        policy_ctx["base_scenario"],
+        policy_ctx["base_threshold"],
+    )
+
     costs_cfg = load_costs_config(get_project_root() / str(cfg.paths.costs_config))
     retention_rate_values = [float(r) for r in costs_cfg.retention_rate_sweep]
     cost_values = [base_scenario.cost * m for m in (0.5, 1.0, 1.5, 2.0)]
@@ -1198,6 +1214,27 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         cost_values,
         float(cfg.evaluate.tornado_pct_perturbation),
     )
+
+    return {
+        "costs_cfg": costs_cfg,
+        "retention_rate_values": retention_rate_values,
+        "cost_values": cost_values,
+        "sensitivity": sensitivity,
+    }
+
+
+def _compute_sliced_diagnostics(
+    y_test: pd.Series,
+    proba: NDArray[np.float64],
+    policy_ctx: dict[str, Any],
+    cfg: DictConfig,
+) -> dict[str, Any]:
+    """Compute the sealed-test disaggregated slices and the fairness-difference summaries they feed."""
+    base_scenario, base_threshold = (
+        policy_ctx["base_scenario"],
+        policy_ctx["base_threshold"],
+    )
+    n_bootstrap, random_state = policy_ctx["n_bootstrap"], policy_ctx["random_state"]
 
     all_axes = ROBUSTNESS_AXES + FAIRNESS_AXES
     test_segment_lookup = load_test_segment_lookup()
@@ -1236,6 +1273,27 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         default=float("nan"),
     )
 
+    return {
+        "test_ranking_slices": test_ranking_slices,
+        "test_decision_slices": test_decision_slices,
+        "test_calibration_slices": test_calibration_slices,
+        "test_business_impact_slices": test_business_impact_slices,
+        "test_equal_opportunity_by_axis": test_equal_opportunity_by_axis,
+        "test_demographic_parity_by_axis": test_demographic_parity_by_axis,
+        "test_equal_opportunity_diff": test_equal_opportunity_diff,
+        "test_demographic_parity_diff": test_demographic_parity_diff,
+    }
+
+
+def _compute_promotion_decision(
+    run_id: str,
+    y_test: pd.Series,
+    proba: NDArray[np.float64],
+    core_metrics: dict[str, Any],
+    policy_ctx: dict[str, Any],
+    cfg: DictConfig,
+) -> dict[str, Any]:
+    """Load the gate bars and dev-OOF diagnostics, resolve the incumbent, and call decide_promotion."""
     bars = load_model_promotion_bars(cfg)
 
     # V1/V2/V2b are computed by threshold.py's dev-OOF screen, Phase 6's last
@@ -1253,60 +1311,113 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         y_test,
         proba,
         incumbent_proba,
-        ranking_metrics,
-        classification_rows,
-        calibration_report,
+        core_metrics["ranking_metrics"],
+        core_metrics["classification_rows"],
+        core_metrics["calibration_report"],
         "base",
         bars,
-        n_bootstrap,
-        random_state,
+        policy_ctx["n_bootstrap"],
+        policy_ctx["random_state"],
     )
+
+    return {
+        "dev_oof_diagnostics": dev_oof_diagnostics,
+        "champion_version": champion_version,
+        "decision": decision,
+    }
+
+
+def _assemble_metrics_and_economics_payloads(
+    model_version: str,
+    run_id: str,
+    y_test: pd.Series,
+    proba: NDArray[np.float64],
+    core_metrics: dict[str, Any],
+    sliced: dict[str, Any],
+    sensitivity_block: dict[str, Any],
+    decision_result: dict[str, Any],
+    policy_ctx: dict[str, Any],
+) -> dict[str, Any]:
+    """Assemble metrics.json, economics.json, and promotion_decision.json."""
+    business_impact = core_metrics["business_impact"]
+    decision = decision_result["decision"]
 
     metrics_payload: dict[str, Any] = {
         "model_version": model_version,
         "run_id": run_id,
-        "champion_version": champion_version,
-        "ranking": ranking_metrics,
-        "classification": classification_rows,
-        "fixed_recall_profile": fixed_recall_rows,
-        "calibration": calibration_report,
-        "decile_lift": decile_rows,
+        "champion_version": decision_result["champion_version"],
+        "ranking": core_metrics["ranking_metrics"],
+        "classification": core_metrics["classification_rows"],
+        "fixed_recall_profile": core_metrics["fixed_recall_rows"],
+        "calibration": core_metrics["calibration_report"],
+        "decile_lift": core_metrics["decile_rows"],
         "business_impact": business_impact,
         "sliced": {
             "test": {
-                "ranking": test_ranking_slices,
-                "decision_rates": test_decision_slices,
-                "calibration": test_calibration_slices,
-                "business_impact": test_business_impact_slices,
-                "equal_opportunity_difference_by_axis": test_equal_opportunity_by_axis,
-                "demographic_parity_difference_by_axis": test_demographic_parity_by_axis,
-                "equal_opportunity_diff": test_equal_opportunity_diff,
-                "demographic_parity_diff": test_demographic_parity_diff,
+                "ranking": sliced["test_ranking_slices"],
+                "decision_rates": sliced["test_decision_slices"],
+                "calibration": sliced["test_calibration_slices"],
+                "business_impact": sliced["test_business_impact_slices"],
+                "equal_opportunity_difference_by_axis": sliced[
+                    "test_equal_opportunity_by_axis"
+                ],
+                "demographic_parity_difference_by_axis": sliced[
+                    "test_demographic_parity_by_axis"
+                ],
+                "equal_opportunity_diff": sliced["test_equal_opportunity_diff"],
+                "demographic_parity_diff": sliced["test_demographic_parity_diff"],
             },
-            "dev_oof_diagnostics": dev_oof_diagnostics,
+            "dev_oof_diagnostics": decision_result["dev_oof_diagnostics"],
         },
     }
     y_test_int = y_test.to_numpy(dtype=np.int64)
     ev_curves = {
         name: ev_by_k(proba, y_test_int, scenario)
-        for name, scenario in scenarios.items()
+        for name, scenario in policy_ctx["scenarios"].items()
     }
 
     economics_payload: dict[str, Any] = {
-        "sensitivity": sensitivity,
+        "sensitivity": sensitivity_block["sensitivity"],
         "ev_by_k": ev_curves,
         "ev_treat_all_by_scenario": {
             name: row["ev_treat_all"]
             for name, row in business_impact["scenarios"].items()
         },
-        "retention_rate_values_swept": retention_rate_values,
-        "cost_values_swept": cost_values,
+        "retention_rate_values_swept": sensitivity_block["retention_rate_values"],
+        "cost_values_swept": sensitivity_block["cost_values"],
     }
     promotion_decision_payload: dict[str, Any] = {
         **decision,
         "model_version": model_version,
         "metrics_content_hash": content_hash(metrics_payload),
     }
+
+    return {
+        "metrics_payload": metrics_payload,
+        "ev_curves": ev_curves,
+        "economics_payload": economics_payload,
+        "promotion_decision_payload": promotion_decision_payload,
+    }
+
+
+def _render_evaluation_figures(
+    y_test: pd.Series,
+    proba: NDArray[np.float64],
+    core_metrics: dict[str, Any],
+    sensitivity_block: dict[str, Any],
+    payloads: dict[str, Any],
+    policy_ctx: dict[str, Any],
+    cfg: DictConfig,
+) -> dict[str, Any]:
+    """Render all eight evaluation figures and return their paths."""
+    thresholds = policy_ctx["thresholds"]
+    classification_rows = core_metrics["classification_rows"]
+    calibration_report = core_metrics["calibration_report"]
+    decile_rows = core_metrics["decile_rows"]
+    sensitivity = sensitivity_block["sensitivity"]
+    retention_rate_values = sensitivity_block["retention_rate_values"]
+    cost_values = sensitivity_block["cost_values"]
+    ev_curves = payloads["ev_curves"]
 
     figures_dir = get_project_root() / str(cfg.paths.figures)
     pr_curve_path = figures_dir / "pr_curve_test.png"
@@ -1333,7 +1444,10 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         reliability_path,
     )
     _save_ev_by_budget_plot(
-        ev_curves, thresholds, float(costs_cfg.contact_capacity), ev_by_budget_path
+        ev_curves,
+        thresholds,
+        float(sensitivity_block["costs_cfg"].contact_capacity),
+        ev_by_budget_path,
     )
     _save_breakeven_heatmap_plot(
         cast(list[dict[str, float]], sensitivity["twoway"]),
@@ -1345,6 +1459,114 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         cast(list[dict[str, Any]], sensitivity["tornado"]), sensitivity_tornado_path
     )
     _save_gains_lift_plot(decile_rows, gains_lift_path)
+
+    return {
+        "pr_curve_path": pr_curve_path,
+        "roc_curve_path": roc_curve_path,
+        "classification_report_path": classification_report_path,
+        "reliability_path": reliability_path,
+        "ev_by_budget_path": ev_by_budget_path,
+        "breakeven_heatmap_path": breakeven_heatmap_path,
+        "sensitivity_tornado_path": sensitivity_tornado_path,
+        "gains_lift_path": gains_lift_path,
+    }
+
+
+def _build_scalar_metrics(
+    core_metrics: dict[str, Any], sliced: dict[str, Any]
+) -> dict[str, float]:
+    """Build the flat test_* MLflow metric dict from the already-computed core/sliced blocks.
+
+    Pure dict assembly — no MLflow calls, so it is a no-risk extraction on
+    its own.
+    """
+    ranking_metrics = core_metrics["ranking_metrics"]
+    calibration_report = core_metrics["calibration_report"]
+    classification_rows = core_metrics["classification_rows"]
+    business_impact = core_metrics["business_impact"]
+
+    scalar_metrics: dict[str, float] = {
+        "test_pr_auc": cast(float, ranking_metrics["pr_auc"]),
+        "test_pr_auc_ci_lower": cast(float, ranking_metrics["pr_auc_ci_lower"]),
+        "test_pr_auc_ci_upper": cast(float, ranking_metrics["pr_auc_ci_upper"]),
+        "test_roc_auc": cast(float, ranking_metrics["roc_auc"]),
+        "test_dummy_pr_auc_floor": cast(float, ranking_metrics["dummy_pr_auc_floor"]),
+        "test_brier": cast(float, calibration_report["brier"]),
+        "test_bss": cast(float, calibration_report["bss"]),
+        "test_ece": cast(float, calibration_report["ece"]),
+        "test_calibration_slope": cast(
+            float, calibration_report["calibration_slope"]["slope"]
+        ),
+        "test_calibration_slope_ci_lower": cast(
+            float, calibration_report["calibration_slope"]["slope_ci_lower"]
+        ),
+        "test_calibration_slope_ci_upper": cast(
+            float, calibration_report["calibration_slope"]["slope_ci_upper"]
+        ),
+        "test_equal_opportunity_diff": sliced["test_equal_opportunity_diff"],
+        "test_demographic_parity_diff": sliced["test_demographic_parity_diff"],
+    }
+    for row in classification_rows:
+        scenario_name = cast(str, row["scenario"])
+        for metric_key in ("recall", "precision", "f1", "contact_rate"):
+            scalar_metrics[f"test_{metric_key}_{scenario_name}"] = cast(
+                float, row[metric_key]
+            )
+        for metric_key in ("recall", "precision", "f1"):
+            for bound in ("ci_lower", "ci_upper"):
+                scalar_metrics[f"test_{metric_key}_{scenario_name}_{bound}"] = cast(
+                    float, row[f"{metric_key}_{bound}"]
+                )
+    for scenario_name, row in business_impact["scenarios"].items():
+        scalar_metrics[f"test_ev_{scenario_name}"] = cast(float, row["ev"])
+        scalar_metrics[f"test_ev_{scenario_name}_ci_lower"] = cast(
+            float, row["ev_ci_lower"]
+        )
+        scalar_metrics[f"test_ev_{scenario_name}_ci_upper"] = cast(
+            float, row["ev_ci_upper"]
+        )
+        scalar_metrics[f"test_campaign_cost_{scenario_name}"] = cast(
+            float, row["campaign_cost"]
+        )
+        scalar_metrics[f"test_retained_revenue_{scenario_name}"] = cast(
+            float, row["retained_revenue"]
+        )
+        scalar_metrics[f"test_n_contacted_{scenario_name}"] = cast(
+            float, row["n_contacted"]
+        )
+        scalar_metrics[f"test_break_even_retention_rate_{scenario_name}"] = cast(
+            float, row["break_even_retention_rate"]
+        )
+        scalar_metrics[f"test_ev_treat_all_{scenario_name}"] = cast(
+            float, row["ev_treat_all"]
+        )
+        scalar_metrics[f"test_ev_treat_none_{scenario_name}"] = cast(
+            float, row["ev_treat_none"]
+        )
+    return scalar_metrics
+
+
+def _log_evaluation_run(
+    model_version: str,
+    loaded: dict[str, Any],
+    core_metrics: dict[str, Any],
+    sliced: dict[str, Any],
+    sensitivity_block: dict[str, Any],
+    payloads: dict[str, Any],
+    figures: dict[str, Any],
+    policy_ctx: dict[str, Any],
+    cfg: DictConfig,
+) -> tuple[str, pd.DataFrame]:
+    """Log every evaluation artifact/metric onto a dedicated `evaluation` run.
+
+    Returns (eval_run_id, test_predictions) — both consumed after the run
+    context closes (registry tagging, the local reports/ mirror).
+    """
+    X_test, y_test, proba = loaded["X_test"], loaded["y_test"], loaded["proba"]
+    decision = payloads["promotion_decision_payload"]
+    metrics_payload = payloads["metrics_payload"]
+    economics_payload = payloads["economics_payload"]
+    costs_cfg = sensitivity_block["costs_cfg"]
 
     ensure_experiment_metadata(cfg)
     model_id = resolve_logged_model_id(model_version, cfg)
@@ -1360,74 +1582,15 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         set_run_description(_RUN_DESCRIPTION)
         eval_run_id = run.info.run_id
         # Needed so a later re-log (e.g. the review notebook stamping `review`
-        # onto this same payload) targets this run, not `run_id` above (the
-        # evaluated model's own training run) — the two are never the same run.
-        promotion_decision_payload["eval_run_id"] = eval_run_id
+        # onto this same payload) targets this run, not the evaluated
+        # model's own training run — the two are never the same run.
+        decision["eval_run_id"] = eval_run_id
         mlflow.log_input(test_dataset, context="evaluation")
 
-        scalar_metrics: dict[str, float] = {
-            "test_pr_auc": cast(float, ranking_metrics["pr_auc"]),
-            "test_pr_auc_ci_lower": cast(float, ranking_metrics["pr_auc_ci_lower"]),
-            "test_pr_auc_ci_upper": cast(float, ranking_metrics["pr_auc_ci_upper"]),
-            "test_roc_auc": cast(float, ranking_metrics["roc_auc"]),
-            "test_dummy_pr_auc_floor": cast(
-                float, ranking_metrics["dummy_pr_auc_floor"]
-            ),
-            "test_brier": cast(float, calibration_report["brier"]),
-            "test_bss": cast(float, calibration_report["bss"]),
-            "test_ece": cast(float, calibration_report["ece"]),
-            "test_calibration_slope": cast(
-                float, calibration_report["calibration_slope"]["slope"]
-            ),
-            "test_calibration_slope_ci_lower": cast(
-                float, calibration_report["calibration_slope"]["slope_ci_lower"]
-            ),
-            "test_calibration_slope_ci_upper": cast(
-                float, calibration_report["calibration_slope"]["slope_ci_upper"]
-            ),
-            "test_equal_opportunity_diff": test_equal_opportunity_diff,
-            "test_demographic_parity_diff": test_demographic_parity_diff,
-        }
-        for row in classification_rows:
-            scenario_name = cast(str, row["scenario"])
-            for metric_key in ("recall", "precision", "f1", "contact_rate"):
-                scalar_metrics[f"test_{metric_key}_{scenario_name}"] = cast(
-                    float, row[metric_key]
-                )
-            for metric_key in ("recall", "precision", "f1"):
-                for bound in ("ci_lower", "ci_upper"):
-                    scalar_metrics[f"test_{metric_key}_{scenario_name}_{bound}"] = cast(
-                        float, row[f"{metric_key}_{bound}"]
-                    )
-        for scenario_name, row in business_impact["scenarios"].items():
-            scalar_metrics[f"test_ev_{scenario_name}"] = cast(float, row["ev"])
-            scalar_metrics[f"test_ev_{scenario_name}_ci_lower"] = cast(
-                float, row["ev_ci_lower"]
-            )
-            scalar_metrics[f"test_ev_{scenario_name}_ci_upper"] = cast(
-                float, row["ev_ci_upper"]
-            )
-            scalar_metrics[f"test_campaign_cost_{scenario_name}"] = cast(
-                float, row["campaign_cost"]
-            )
-            scalar_metrics[f"test_retained_revenue_{scenario_name}"] = cast(
-                float, row["retained_revenue"]
-            )
-            scalar_metrics[f"test_n_contacted_{scenario_name}"] = cast(
-                float, row["n_contacted"]
-            )
-            scalar_metrics[f"test_break_even_retention_rate_{scenario_name}"] = cast(
-                float, row["break_even_retention_rate"]
-            )
-            scalar_metrics[f"test_ev_treat_all_{scenario_name}"] = cast(
-                float, row["ev_treat_all"]
-            )
-            scalar_metrics[f"test_ev_treat_none_{scenario_name}"] = cast(
-                float, row["ev_treat_none"]
-            )
+        scalar_metrics = _build_scalar_metrics(core_metrics, sliced)
         mlflow.log_metrics(scalar_metrics, model_id=model_id, dataset=test_dataset)
 
-        for scenario_name, scenario in scenarios.items():
+        for scenario_name, scenario in policy_ctx["scenarios"].items():
             mlflow.log_params(
                 {
                     f"cost_{scenario_name}_c": scenario.cost,
@@ -1453,17 +1616,17 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
 
         mlflow.log_dict(metrics_payload, "metrics.json")
         mlflow.log_dict(economics_payload, "economics.json")
-        mlflow.log_dict(promotion_decision_payload, "promotion_decision.json")
+        mlflow.log_dict(decision, "promotion_decision.json")
 
         for path in (
-            pr_curve_path,
-            roc_curve_path,
-            classification_report_path,
-            reliability_path,
-            ev_by_budget_path,
-            breakeven_heatmap_path,
-            sensitivity_tornado_path,
-            gains_lift_path,
+            figures["pr_curve_path"],
+            figures["roc_curve_path"],
+            figures["classification_report_path"],
+            figures["reliability_path"],
+            figures["ev_by_budget_path"],
+            figures["breakeven_heatmap_path"],
+            figures["sensitivity_tornado_path"],
+            figures["gains_lift_path"],
         ):
             mlflow.log_artifact(str(path), artifact_path="figures")
 
@@ -1471,13 +1634,37 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
             predictions_path = Path(tmp_dir) / "test_predictions.parquet"
             test_predictions = pd.DataFrame(
                 {
-                    "customerid": customer_ids,
+                    "customerid": loaded["customer_ids"],
                     "y_true": y_test.reset_index(drop=True),
                     "p_hat": proba,
                 }
             )
             test_predictions.to_parquet(predictions_path, index=False)
             mlflow.log_artifact(str(predictions_path))
+
+    return eval_run_id, test_predictions
+
+
+def _tag_evaluated_model_version(
+    model_version: str,
+    eval_run_id: str,
+    registered_model_name: str,
+    core_metrics: dict[str, Any],
+) -> None:
+    """Tag the evaluated model version with the four gate criteria and eval_run_id.
+
+    register.py's only supported path from "the model version being
+    registered" to this cycle's promotion_decision.json/metrics.json/
+    economics.json/test_predictions.parquet — ModelVersion.model_id doesn't
+    auto-populate in OSS MLflow 3.14, and the same is true of any other
+    run-to-version link, so it must be persisted deliberately (mirrors
+    calibrate.py's logged_model_id tag). A local reports/ path is not a
+    substitute: it only reflects whichever run last executed evaluate.py on
+    this machine, not necessarily this model_version's own cycle.
+    """
+    ranking_metrics = core_metrics["ranking_metrics"]
+    calibration_report = core_metrics["calibration_report"]
+    classification_rows = core_metrics["classification_rows"]
 
     client = mlflow.tracking.MlflowClient()
     client.set_model_version_tag(
@@ -1510,38 +1697,116 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
         "test_calibration_slope",
         str(calibration_report["calibration_slope"]["slope"]),
     )
-    # register.py's only supported path from "the model version being
-    # registered" to this cycle's promotion_decision.json/metrics.json/
-    # economics.json/test_predictions.parquet — ModelVersion.model_id doesn't
-    # auto-populate in OSS MLflow 3.14, and the same is true of any other
-    # run-to-version link, so it must be persisted deliberately (mirrors
-    # calibrate.py's logged_model_id tag). A local reports/ path is not a
-    # substitute: it only reflects whichever run last executed evaluate.py on
-    # this machine, not necessarily this model_version's own cycle.
     client.set_model_version_tag(
         registered_model_name, model_version, "eval_run_id", eval_run_id
     )
 
+
+def _write_reports_mirror(
+    payloads: dict[str, Any], test_predictions: pd.DataFrame, cfg: DictConfig
+) -> None:
+    """Mirror metrics.json/economics.json/promotion_decision.json/test_predictions.parquet to reports/.
+
+    reports/dev_oof_predictions.parquet and dev_oof_diagnostics.json are not
+    written here — threshold.py's dev-OOF screen (Phase 6's last step)
+    already wrote both; this module only ever fetches the latter (by run_id,
+    via load_dev_oof_diagnostics), never produces either.
+    """
     reports_dir = get_project_root() / str(cfg.paths.reports)
     reports_dir.mkdir(parents=True, exist_ok=True)
     with open(reports_dir / "metrics.json", "w", encoding="utf-8") as f:
-        json.dump(metrics_payload, f, indent=2, default=str)
+        json.dump(payloads["metrics_payload"], f, indent=2, default=str)
     with open(reports_dir / "economics.json", "w", encoding="utf-8") as f:
-        json.dump(economics_payload, f, indent=2, default=str)
+        json.dump(payloads["economics_payload"], f, indent=2, default=str)
     with open(reports_dir / "promotion_decision.json", "w", encoding="utf-8") as f:
-        json.dump(promotion_decision_payload, f, indent=2, default=str)
+        json.dump(payloads["promotion_decision_payload"], f, indent=2, default=str)
     test_predictions.to_parquet(reports_dir / "test_predictions.parquet", index=False)
-    # reports/dev_oof_predictions.parquet and dev_oof_diagnostics.json are not
-    # written here — threshold.py's dev-OOF screen (Phase 6's last step)
-    # already wrote both; this module only ever fetches the latter (by run_id,
-    # via load_dev_oof_diagnostics), never produces either.
 
+
+def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+    """Sealed-test evaluation, gate decision, and MLflow logging — the single
+    pass CLAUDE.md's "test set touched once" invariant permits.
+
+    Resolves `model_version` explicitly (never an alias), checks threshold
+    provenance, scores the sealed test set exactly once, and from that one
+    probability vector computes every block this module exposes: ranking,
+    per-scenario classification, the fixed-recall profile, the calibration
+    report, the decile lift table, the business-impact block, the
+    sensitivity suite, the sealed-test disaggregated slices, and — from the
+    dev-OOF probability vector calibrate.py already persisted, joined to the
+    dev partition's segment columns — the V1/V2/V2b diagnostics (reported,
+    non-gating). Resolves
+    the incumbent champion (if any) once, scores it on the identical test
+    rows, and calls gate.py::decide_promotion.
+
+    Logs a dedicated `evaluation` run (a sibling of Phase 5/6's runs, never
+    appended to the dev model's own run — CLAUDE.md), writes
+    reports/metrics.json, reports/economics.json,
+    reports/promotion_decision.json, and reports/test_predictions.parquet
+    (mirrored onto the run as artifacts), tags the dev model version with the
+    four gate criteria (alongside its existing training_data_scope: dev), and eight
+    figures into the run's figures/ artifacts: the PR curve (operating points
+    and prevalence baseline marked), the ROC curve, the classification-report
+    panels, the sealed-test reliability diagram, the EV-vs-budget curve (t*
+    and the EV-maximising K marked, one line per scenario), the r×c
+    break-even heatmap, the sensitivity tornado diagram, and the cumulative
+    gains/lift chart. Notebooks in this project never render their own
+    matplotlib figures — 04-calibration-and-threshold.ipynb only
+    mlflow.artifacts.download_artifacts + IPython.display.Image's what a
+    pipeline module already produced — so this module is where every one of
+    these figures is built; the eventual 05-evaluation-and-error-analysis.ipynb
+    will only display them, following that same convention.
+    """
+    loaded = _load_and_score_candidate(model_version, cfg)
+    y_test, proba = loaded["y_test"], loaded["proba"]
+
+    policy_ctx = _load_policy_context(cfg)
+    core_metrics = _compute_core_test_metrics(y_test, proba, policy_ctx, cfg)
+    sensitivity_block = _compute_sensitivity_block(y_test, proba, policy_ctx, cfg)
+    sliced = _compute_sliced_diagnostics(y_test, proba, policy_ctx, cfg)
+    decision_result = _compute_promotion_decision(
+        loaded["run_id"], y_test, proba, core_metrics, policy_ctx, cfg
+    )
+
+    payloads = _assemble_metrics_and_economics_payloads(
+        model_version,
+        loaded["run_id"],
+        y_test,
+        proba,
+        core_metrics,
+        sliced,
+        sensitivity_block,
+        decision_result,
+        policy_ctx,
+    )
+    figures = _render_evaluation_figures(
+        y_test, proba, core_metrics, sensitivity_block, payloads, policy_ctx, cfg
+    )
+
+    eval_run_id, test_predictions = _log_evaluation_run(
+        model_version,
+        loaded,
+        core_metrics,
+        sliced,
+        sensitivity_block,
+        payloads,
+        figures,
+        policy_ctx,
+        cfg,
+    )
+
+    _tag_evaluated_model_version(
+        model_version, eval_run_id, loaded["registered_model_name"], core_metrics
+    )
+    _write_reports_mirror(payloads, test_predictions, cfg)
+
+    decision = decision_result["decision"]
     logger.info(
         "evaluation_step_done",
-        run_id=run_id,
+        run_id=loaded["run_id"],
         eval_run_id=eval_run_id,
         model_version=model_version,
-        champion_version=champion_version,
+        champion_version=decision_result["champion_version"],
         gate_regime=decision["regime"],
         gate_result=decision["gate"],
     )
@@ -1549,10 +1814,10 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     return {
         "eval_run_id": eval_run_id,
         "model_version": model_version,
-        "champion_version": champion_version,
-        "metrics": metrics_payload,
-        "economics": economics_payload,
-        "promotion_decision": promotion_decision_payload,
+        "champion_version": decision_result["champion_version"],
+        "metrics": payloads["metrics_payload"],
+        "economics": payloads["economics_payload"],
+        "promotion_decision": payloads["promotion_decision_payload"],
     }
 
 
