@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 from unittest.mock import Mock
 
+import mlflow
 import optuna
 import pandas as pd
 import pytest
@@ -233,11 +233,27 @@ def test_boundary_hit_check_interior_values_not_flagged() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def tuning_mlflow_uri(mlflow_test_experiment: Callable[[str], str]) -> str:
-    """Point MLflow at the shared tmp-scoped experiment (conftest.py ::
-    mlflow_test_experiment)."""
-    return mlflow_test_experiment("test_run_tuning_step")
+@pytest.fixture(scope="module")
+def tuning_mlflow_uri(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Point MLflow at a module-scoped tmp SQLite store with an explicit
+    artifact_location — inlines conftest.py::mlflow_test_experiment's logic
+    rather than requesting it, since that fixture depends on the
+    function-scoped tmp_path and this fixture is module-scoped: every test
+    below only logs a fresh run_tuning_step run into the shared experiment
+    and inspects that run/its own mocks, never enumerates the experiment's
+    full run list, so sharing one experiment (and skipping the ~2.5-3.5s
+    SQLite-store bootstrap cost per test) is safe. tuning_cfg stays
+    function-scoped deliberately — several tests mutate it per-scenario, so
+    it can't be shared."""
+    tmp_path = tmp_path_factory.mktemp("tuning_mlflow")
+    tracking_uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    mlflow.set_tracking_uri(tracking_uri)
+    artifact_location = (tmp_path / "artifacts").as_uri()
+    experiment_id = mlflow.create_experiment(
+        "test_run_tuning_step", artifact_location=artifact_location
+    )
+    mlflow.set_experiment(experiment_id=experiment_id)
+    return tracking_uri
 
 
 @pytest.fixture

@@ -17,7 +17,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
-from collections.abc import Callable
+from collections.abc import Iterator
 from pathlib import Path
 
 import mlflow
@@ -35,9 +35,10 @@ from sklearn.pipeline import Pipeline
 import telco_churn.models.calibrate as calibrate
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
-from telco_churn.features.build import FEATURE_SCHEMA
+from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.models.threshold import CostScenario
+from telco_churn.models.train.common import _FEATURE_COLS
 
 _OUTER_FOLDS = 3
 _INNER_FOLDS = 3
@@ -492,10 +493,23 @@ def test_inherited_contamination_canary(base_scenario: CostScenario) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def threshold_mlflow_uri(mlflow_test_experiment: Callable[[str], str]) -> str:
-    """Point MLflow at the shared tmp-scoped experiment (conftest.py :: mlflow_test_experiment)."""
-    return mlflow_test_experiment("test_run_threshold_step")
+@pytest.fixture(scope="module")
+def threshold_mlflow_uri(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Point MLflow at a module-scoped tmp SQLite store with an explicit
+    artifact_location — inlines conftest.py::mlflow_test_experiment's logic
+    rather than requesting it, since that fixture depends on the
+    function-scoped tmp_path and a module-scoped fixture can't depend on a
+    narrower-scoped one. See registered_model_version's docstring for why
+    this whole chain is module-scoped."""
+    tmp_path = tmp_path_factory.mktemp("threshold_mlflow")
+    tracking_uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    mlflow.set_tracking_uri(tracking_uri)
+    artifact_location = (tmp_path / "artifacts").as_uri()
+    experiment_id = mlflow.create_experiment(
+        "test_run_threshold_step", artifact_location=artifact_location
+    )
+    mlflow.set_experiment(experiment_id=experiment_id)
+    return tracking_uri
 
 
 @pytest.fixture
@@ -514,9 +528,9 @@ def unfitted_pipeline() -> Pipeline:
     )
 
 
-@pytest.fixture
-def model_promotion_config_path(tmp_path: Path) -> Path:
-    path = tmp_path / "model_promotion.yaml"
+@pytest.fixture(scope="module")
+def model_promotion_config_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("model_promotion") / "model_promotion.yaml"
     OmegaConf.save(
         OmegaConf.create(
             {
@@ -532,9 +546,11 @@ def model_promotion_config_path(tmp_path: Path) -> Path:
     return path
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def full_cfg(
-    threshold_mlflow_uri: str, tmp_path: Path, model_promotion_config_path: Path
+    threshold_mlflow_uri: str,
+    tmp_path_factory: pytest.TempPathFactory,
+    model_promotion_config_path: Path,
 ) -> OmegaConf:
     """Cfg covering everything run_calibration_step + run_threshold_step need.
 
@@ -551,7 +567,12 @@ def full_cfg(
     needed by the dev-OOF screen folded into run_threshold_step: the screen
     writes reports/dev_oof_predictions.parquet + reports/dev_oof_diagnostics.json
     and checks the aggregate slope against configs/model_promotion.yaml's band.
+
+    Module-scoped, sharing one tmp_path across every test in this file that
+    consumes full_cfg/registered_model_version — see registered_model_version's
+    docstring for the full rationale and the one caveat it introduces.
     """
+    tmp_path = tmp_path_factory.mktemp("full_cfg")
     costs_config_path = tmp_path / "costs.yaml"
     costs_config_path.write_text("gross_margin: 0.60\n", encoding="utf-8")
     return OmegaConf.create(
@@ -607,10 +628,67 @@ def full_cfg(
     )
 
 
-@pytest.fixture
-def tuning_result(dev_split: tuple[pd.DataFrame, pd.Series]) -> dict:
+@pytest.fixture(scope="module")
+def _module_feature_df() -> pd.DataFrame:
+    """Module-scoped mirror of conftest.py::feature_df — identical body.
+    registered_model_version needs a module-scoped source frame and can't
+    depend on the shared conftest fixture (function-scoped, would raise a
+    pytest ScopeMismatch). Pure and deterministic (seeded rng), so a second
+    copy is behaviourally identical to the original."""
+    rng = np.random.default_rng(0)
+    n = 120  # matches conftest.py::feature_df's _TRAIN_N
+    return pd.DataFrame(
+        {
+            "customerid": [f"cust-{i:04d}" for i in range(n)],
+            "gender": rng.choice(["Male", "Female"], size=n),
+            "has_partner": rng.choice(["Yes", "No"], size=n),
+            "dependents": rng.choice(["Yes", "No"], size=n),
+            "phoneservice": rng.choice(["Yes", "No"], size=n),
+            "paperlessbilling": rng.choice(["Yes", "No"], size=n),
+            "seniorcitizen": rng.integers(0, 2, size=n).tolist(),
+            "multiplelines": rng.choice(["Yes", "No", "No phone service"], size=n),
+            "internetservice": rng.choice(["DSL", "Fiber optic", "No"], size=n),
+            "onlinesecurity": rng.choice(["Yes", "No", "No internet service"], size=n),
+            "onlinebackup": rng.choice(["Yes", "No", "No internet service"], size=n),
+            "deviceprotection": rng.choice(
+                ["Yes", "No", "No internet service"], size=n
+            ),
+            "techsupport": rng.choice(["Yes", "No", "No internet service"], size=n),
+            "streamingtv": rng.choice(["Yes", "No", "No internet service"], size=n),
+            "streamingmovies": rng.choice(["Yes", "No", "No internet service"], size=n),
+            "contract_type": rng.choice(
+                ["Month-to-month", "One year", "Two year"], size=n
+            ),
+            "paymentmethod": rng.choice(
+                [
+                    "Electronic check",
+                    "Mailed check",
+                    "Bank transfer (automatic)",
+                    "Credit card (automatic)",
+                ],
+                size=n,
+            ),
+            "tenure": rng.integers(0, 73, size=n).tolist(),
+            "monthlycharges": rng.uniform(18.25, 118.75, size=n).tolist(),
+            "totalcharges": rng.uniform(18.25, 8684.8, size=n).tolist(),
+            "charge_per_service": rng.uniform(0.5, 50.0, size=n).tolist(),
+            "churn": rng.integers(0, 2, size=n).tolist(),
+        }
+    )
+
+
+@pytest.fixture(scope="module")
+def _module_dev_split(
+    _module_feature_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Module-scoped mirror of conftest.py::dev_split — see _module_feature_df."""
+    return _module_feature_df[_FEATURE_COLS], _module_feature_df[TARGET_COL]
+
+
+@pytest.fixture(scope="module")
+def tuning_result(_module_dev_split: tuple[pd.DataFrame, pd.Series]) -> dict:
     """A plausible Step 4 tuning output — small n_estimators for test speed."""
-    X_dev, _ = dev_split
+    X_dev, _ = _module_dev_split
     return {
         "best_params": {
             "num_leaves": 8,
@@ -644,7 +722,7 @@ def tuning_result(dev_split: tuple[pd.DataFrame, pd.Series]) -> dict:
     }
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def comparison_result() -> dict:
     """A plausible Step 2 output — the fields run_model_logging_step reads."""
     return {
@@ -657,15 +735,14 @@ def comparison_result() -> dict:
     }
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def registered_model_version(
     full_cfg: OmegaConf,
-    dev_split: tuple[pd.DataFrame, pd.Series],
-    feature_df: pd.DataFrame,
+    _module_dev_split: tuple[pd.DataFrame, pd.Series],
+    _module_feature_df: pd.DataFrame,
     comparison_result: dict,
     tuning_result: dict,
-    monkeypatch: pytest.MonkeyPatch,
-) -> str:
+) -> Iterator[str]:
     """Register a real calibrated model version via the actual production chain
     (log_model.run_model_logging_step -> calibrate.run_calibration_step), the
     exact setup run_threshold_step consumes.
@@ -676,8 +753,8 @@ def registered_model_version(
     (called here) and run_threshold_step (called directly by every test using
     this fixture) fall through to the real, gitignored datasets/processed/
     directory instead of this fixture's in-memory frame. The patch stays
-    active for the rest of the test: monkeypatch's teardown only runs after
-    the whole test function completes, not when this fixture returns.
+    active for the rest of the module: torn down (mp.undo()) only once every
+    test in this file has run.
 
     load_dev_customer_ids() is sandboxed the same way, on both bindings too —
     unpatched, run_calibration_step's dev_oof_predictions.parquet build zips
@@ -692,8 +769,24 @@ def registered_model_version(
     — its customerid column already uses the same "cust-{i:04d}" ordering as
     _fake_load_dev_customer_ids below, so the screen's by-customerid join
     lines up rather than reindexing to all-NaN.
+
+    Module-scoped: every consuming test calls run_threshold_step itself (this
+    fixture only builds the registered version it's called against), so the
+    ~9-10s train->calibrate cost is paid once per module instead of once per
+    test. Verified safe against all 9 current consumers — 8 only read the
+    registered version and its run; the ninth
+    (test_run_threshold_step_resolves_by_explicit_version_not_alias)
+    registers an *additional* model version under the same registered_model_
+    name and re-points the challenger alias, which permanently mutates
+    shared state, but no other test in this file resolves by the challenger
+    alias or assumes a specific version count, so it doesn't affect them.
+    Caveat for future maintainers: a new test added to this file that relies
+    on the registry being "clean" (single version, challenger unset) would
+    silently break depending on where it's added relative to that test —
+    this coupling didn't exist under function scoping.
     """
-    X_dev, y_dev = dev_split
+    mp = pytest.MonkeyPatch()
+    X_dev, y_dev = _module_dev_split
 
     def _fake_load_dev_features(
         committed_features: list[str],
@@ -705,11 +798,11 @@ def registered_model_version(
             [f"cust-{i:04d}" for i in range(len(y_dev))], name="customerid"
         )
 
-    monkeypatch.setattr(calibrate, "load_dev_features", _fake_load_dev_features)
-    monkeypatch.setattr(threshold, "load_dev_features", _fake_load_dev_features)
-    monkeypatch.setattr(calibrate, "load_dev_customer_ids", _fake_load_dev_customer_ids)
-    monkeypatch.setattr(threshold, "load_dev_customer_ids", _fake_load_dev_customer_ids)
-    monkeypatch.setattr(threshold, "_load_dev_partition", lambda: feature_df)
+    mp.setattr(calibrate, "load_dev_features", _fake_load_dev_features)
+    mp.setattr(threshold, "load_dev_features", _fake_load_dev_features)
+    mp.setattr(calibrate, "load_dev_customer_ids", _fake_load_dev_customer_ids)
+    mp.setattr(threshold, "load_dev_customer_ids", _fake_load_dev_customer_ids)
+    mp.setattr(threshold, "_load_dev_partition", lambda: _module_feature_df)
 
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result = {**tuning_result, "parent_run_id": run.info.run_id}
@@ -717,7 +810,10 @@ def registered_model_version(
         X_dev, y_dev, comparison_result, tuning_result, full_cfg
     )
     cal_result = calibrate.run_calibration_step(log_result["run_id"], full_cfg)
-    return str(cal_result["model_version"])
+    try:
+        yield str(cal_result["model_version"])
+    finally:
+        mp.undo()
 
 
 def test_run_threshold_step_ships_all_three_scenarios(

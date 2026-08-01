@@ -94,7 +94,7 @@ def test_run_candidate_step_logs_metric_contract(
             "logreg": {
                 "Cs": 2,
                 "cv_folds": 2,
-                "max_iter": 50,
+                "max_iter": 200,
                 "solver": "lbfgs",
                 "l1_ratio": 0.0,
             },
@@ -183,7 +183,7 @@ def test_run_candidate_step_dataset_source_uses_accessor_canonical_path(
             "logreg": {
                 "Cs": 2,
                 "cv_folds": 2,
-                "max_iter": 50,
+                "max_iter": 200,
                 "solver": "lbfgs",
                 "l1_ratio": 0.0,
             },

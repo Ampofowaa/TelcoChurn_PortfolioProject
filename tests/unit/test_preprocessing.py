@@ -110,7 +110,7 @@ def test_numeric_nan_imputed_with_median_from_train() -> None:
     pre = build_preprocessor(binary=[], multi_cat=[], numeric=["tenure"])
     pre.fit(train)
     out = pre.transform(test)
-    assert pytest.approx(20.0) == out[0, 0]
+    assert pytest.approx(20.0) == out.iloc[0, 0]
 
 
 def test_numeric_non_nan_values_pass_through_unchanged() -> None:
@@ -118,7 +118,7 @@ def test_numeric_non_nan_values_pass_through_unchanged() -> None:
     df = pd.DataFrame({"tenure": [5.0, 15.0, 25.0]})
     pre = build_preprocessor(binary=[], multi_cat=[], numeric=["tenure"])
     out = pre.fit_transform(df)
-    assert np.allclose(out.ravel(), [5.0, 15.0, 25.0])
+    assert np.allclose(out.to_numpy().ravel(), [5.0, 15.0, 25.0])
 
 
 # ---------------------------------------------------------------------------

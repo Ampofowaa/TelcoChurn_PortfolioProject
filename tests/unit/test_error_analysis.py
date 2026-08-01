@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -677,6 +678,13 @@ _FAST_CALIBRATION_OVERRIDES = [
 # fast when seeding the fixture; error_analysis.py's own SHAP pass has no
 # bootstrap knob of its own.
 _FAST_EVALUATE_OVERRIDES = ["evaluate.n_bootstrap=30"]
+# threshold.n_bootstrap defaults to 1000 (configs/threshold/default.yaml) and
+# is refit once per FAIRNESS_AXES group (8 groups) inside run_threshold_step's
+# V2b calibration-collapse check (sliced_calibration -> calibration_slope's
+# LogisticRegression bootstrap) -- ~8k unreduced refits. test_threshold.py's
+# own fixture already reduces this to 200; mirrored here since this fixture
+# nests the same call inside a larger chain.
+_FAST_THRESHOLD_OVERRIDES = ["threshold.n_bootstrap=50"]
 
 
 def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame:
@@ -786,10 +794,10 @@ def _base_costs_cfg_dict() -> dict[str, Any]:
     }
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def evaluated_model(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> dict[str, object]:
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[dict[str, object]]:
     """Seed a real registered, calibrated, thresholded, and evaluated model —
     the production chain up to (not including) error_analysis.py — via direct
     in-process calls, then leave PROCESSED_DATA_DIR set so the test body's own
@@ -799,11 +807,21 @@ def evaluated_model(
     tests/integration/test_error_analysis_subprocess.py::evaluated_model,
     which stops at the same point for the same reason but hands off to a
     subprocess instead of a direct call.
+
+    Module-scoped: every test in this file only reads this fixture's output
+    (run_error_analysis_step is re-invoked, deterministically, by each test
+    body) rather than mutating it, so the full train->calibrate->threshold->
+    evaluate chain — ~65s of real model fitting — is built once per module
+    instead of once per test. tmp_path/monkeypatch are function-scoped
+    fixtures and can't be depended on by a module-scoped one, hence
+    tmp_path_factory and a manually-managed MonkeyPatch here.
     """
+    mp = pytest.MonkeyPatch()
+    tmp_path = tmp_path_factory.mktemp("evaluated_model")
     data_dir = tmp_path / "processed"
     data_dir.mkdir()
     df, manifest = _seed_processed_data(data_dir)
-    monkeypatch.setenv("PROCESSED_DATA_DIR", str(data_dir))
+    mp.setenv("PROCESSED_DATA_DIR", str(data_dir))
 
     # Must match cfg.mlflow.experiment_name's own default (not an arbitrary
     # name): log_model.run_model_logging_step calls mlflow.set_experiment(cfg
@@ -835,6 +853,7 @@ def evaluated_model(
             f"paths.reports={reports_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
             *_FAST_EVALUATE_OVERRIDES,
+            *_FAST_THRESHOLD_OVERRIDES,
         ]
     )
 
@@ -893,17 +912,20 @@ def evaluated_model(
     threshold.run_threshold_step(model_version, cfg)
     evaluate.run_evaluation_step(model_version, cfg)
 
-    return {
-        "cfg": cfg,
-        "model_version": model_version,
-        "data_dir": data_dir,
-        "reports_dir": reports_dir,
-        "figures_dir": figures_dir,
-        "policy_dir": policy_dir,
-        "costs_path": costs_path,
-        "tracking_uri": tracking_uri,
-        "registered_model_name": registered_model_name,
-    }
+    try:
+        yield {
+            "cfg": cfg,
+            "model_version": model_version,
+            "data_dir": data_dir,
+            "reports_dir": reports_dir,
+            "figures_dir": figures_dir,
+            "policy_dir": policy_dir,
+            "costs_path": costs_path,
+            "tracking_uri": tracking_uri,
+            "registered_model_name": registered_model_name,
+        }
+    finally:
+        mp.undo()
 
 
 def test_run_error_analysis_step_returns_expected_keys_and_writes_report(
@@ -1053,6 +1075,7 @@ def test_run_error_analysis_step_raises_when_prediction_artifacts_missing(
             f"paths.reports={empty_reports_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
             *_FAST_EVALUATE_OVERRIDES,
+            *_FAST_THRESHOLD_OVERRIDES,
         ]
     )
 

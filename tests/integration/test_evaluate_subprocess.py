@@ -362,7 +362,7 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
     tmp_path: Path,
 ) -> None:
     """evaluate.py __main__ scores the sealed test set, runs the cold-start gate,
-    and writes every artifact register.py/refit.py/the notebook will need."""
+    and writes every artifact register.py/the notebook will need."""
     reports_dir = tmp_path / "reports"
 
     result = _run_evaluate_cli(

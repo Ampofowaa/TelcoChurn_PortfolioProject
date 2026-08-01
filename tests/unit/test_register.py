@@ -18,8 +18,8 @@ them by name).
 
 from __future__ import annotations
 
+import re
 import tempfile
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -40,21 +40,49 @@ from telco_churn.models.evaluate import content_hash
 _COMMITTED_FEATURES = ["tenure", "monthlycharges"]
 
 
-@pytest.fixture
-def register_mlflow_uri(mlflow_test_experiment: Callable[[str], str]) -> str:
-    return mlflow_test_experiment("test_register")
+@pytest.fixture(scope="module")
+def register_mlflow_uri(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Point MLflow at a module-scoped tmp SQLite store with an explicit
+    artifact_location — inlines conftest.py::mlflow_test_experiment's logic
+    rather than requesting it, since that fixture depends on the
+    function-scoped tmp_path.
+
+    Sharing the experiment/tracking store across the whole file (skipping the
+    ~2.5-3.5s SQLite-store bootstrap per test) is safe *only* because
+    register_cfg below gives every test its own uniquely-named registered
+    model — register.py's rollback_champion/register_model_version operate
+    per registered_model_name, and several tests here (e.g.
+    test_rollback_champion_raises_when_nothing_promoted) assert on that
+    namespace being otherwise empty, which a shared name across tests would
+    break. Do not revert registered_model_name to a fixed string without
+    also reverting this fixture to function scope.
+    """
+    tmp_path = tmp_path_factory.mktemp("register_mlflow")
+    tracking_uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    mlflow.set_tracking_uri(tracking_uri)
+    artifact_location = (tmp_path / "artifacts").as_uri()
+    experiment_id = mlflow.create_experiment(
+        "test_register", artifact_location=artifact_location
+    )
+    mlflow.set_experiment(experiment_id=experiment_id)
+    return tracking_uri
 
 
 @pytest.fixture
-def register_cfg(register_mlflow_uri: str, tmp_path: Path) -> DictConfig:
+def register_cfg(
+    register_mlflow_uri: str, tmp_path: Path, request: pytest.FixtureRequest
+) -> DictConfig:
     reports_dir = tmp_path / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
+    registered_model_name = "test-telco-churn-pipeline-" + re.sub(
+        r"[^A-Za-z0-9_-]", "_", request.node.name
+    )
     return OmegaConf.create(
         {
             "mlflow": {
                 "tracking_uri": register_mlflow_uri,
                 "experiment_name": "test_register",
-                "registered_model_name": "test-telco-churn-pipeline",
+                "registered_model_name": registered_model_name,
             },
             "paths": {"reports": str(reports_dir)},
             "register": {
@@ -674,6 +702,71 @@ def test_register_aborts_on_stale_incumbent(
     client = mlflow.tracking.MlflowClient()
     tags = client.get_model_version(registered_name, version).tags
     assert tags["promotion_status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# _build_drift_reference_inputs — dev-OOF union sealed-test, never in-sample
+# ---------------------------------------------------------------------------
+
+
+def test_build_drift_reference_inputs_unions_dev_oof_and_sealed_test(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """The drift score baseline must be dev-OOF union sealed-test — never the
+    champion scoring its own training data. _register_test_version logs a
+    2-row dev_oof (y_true=[0, 1], p_hat=[0.2, 0.8]) at
+    calibration/dev_oof_predictions.parquet on `run_id`;
+    _log_evaluation_and_error_analysis logs a 2-row test_predictions
+    (y_true=[1, 0], p_hat=[0.7, 0.1]) at the root of `eval_run_id`. Assert the
+    function concatenates both halves — dev-OOF first, then sealed-test, per
+    its own pd.concat call order — with no row dropped and no row doubled.
+    """
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+    eval_run_id, _ = _log_evaluation_and_error_analysis(registered_name, version)
+
+    oos_proba, y_combined = register._build_drift_reference_inputs(
+        run_id, eval_run_id, register_cfg
+    )
+
+    # 2 dev-OOF rows + 2 sealed-test rows -- neither half dropped, neither doubled.
+    assert oos_proba.shape == (4,)
+    assert y_combined.shape == (4,)
+    np.testing.assert_array_equal(oos_proba, [0.2, 0.8, 0.7, 0.1])
+    np.testing.assert_array_equal(y_combined, [0, 1, 1, 0])
+    assert oos_proba.dtype == np.float64
+    assert y_combined.dtype == np.int_
+
+
+def test_build_drift_reference_inputs_row_count_equals_sum_of_both_halves(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """Regression guard against a future refactor that unions on a join key
+    instead of a plain concat — row count must be additive, not deduplicated,
+    since dev-OOF and sealed-test are disjoint customer sets by construction."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+    eval_run_id, _ = _log_evaluation_and_error_analysis(registered_name, version)
+
+    dev_oof = register.load_dev_oof_predictions(run_id, register_cfg)
+    test_predictions_path = mlflow.artifacts.download_artifacts(
+        artifact_uri=f"runs:/{eval_run_id}/test_predictions.parquet"
+    )
+    test_predictions = pd.read_parquet(test_predictions_path)
+
+    oos_proba, _y_combined = register._build_drift_reference_inputs(
+        run_id, eval_run_id, register_cfg
+    )
+
+    assert len(oos_proba) == len(dev_oof) + len(test_predictions)
 
 
 # ---------------------------------------------------------------------------
