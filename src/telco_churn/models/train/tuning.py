@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from functools import partial
 from typing import Any
 
@@ -19,7 +20,7 @@ from matplotlib.figure import Figure
 from omegaconf import DictConfig, OmegaConf
 from sklearn.metrics import average_precision_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 
 from telco_churn.features.build import FEATURE_SCHEMA
 from telco_churn.features.preprocessing import build_preprocessor
@@ -29,9 +30,9 @@ from telco_churn.models.train.common import (
     _lgbm_fixed_knobs,
     _log_dev_input,
 )
-from telco_churn.utils.db import get_engine
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import ensure_experiment_metadata
+from telco_churn.utils.paths import get_project_root
 
 __all__ = [
     "boundary_hit_check",
@@ -255,21 +256,39 @@ def _tuning_objective(
 
 
 def _build_optuna_storage() -> optuna.storages.RDBStorage:
-    """Postgres-backed Optuna storage, isolated in its own 'optuna' schema.
+    """Optuna storage: Postgres-backed when POSTGRES_URL is set, a local
+    SQLite file otherwise — the same zero-infra fallback utils.mlflow's
+    tracking_uri already uses, so a fresh clone or CI run doesn't need Docker
+    just to run this step.
 
-    Reuses POSTGRES_URL (the same server MLflow's backend store runs against)
-    rather than a local sqlite file, so a study survives a crashed process and
-    can be reloaded directly with optuna.load_study — no more reconstructing it
-    from MLflow-logged trial params just to run fANOVA importance. The schema
-    is isolated (not the 'public' schema) so Optuna's own tables (studies,
-    trials, ...) can't collide with application tables.
+    Postgres path reuses POSTGRES_URL (the same server MLflow's backend store
+    runs against) rather than a local sqlite file, so a study survives a
+    crashed process and can be reloaded directly with optuna.load_study — no
+    more reconstructing it from MLflow-logged trial params just to run fANOVA
+    importance. Isolated in its own 'optuna' schema (not 'public') so Optuna's
+    own tables (studies, trials, ...) can't collide with application tables.
+    Builds its own engine rather than reusing utils.db.get_engine()'s shared
+    singleton: that one stays strict (raises with no POSTGRES_URL) for
+    ingest.py/sql_features.py, whose SQL is Postgres-only and must never
+    silently run against a SQLite fallback.
+
+    The SQLite fallback skips schema isolation (SQLite has no schema/
+    search_path concept, and nothing else runs against the fallback file to
+    collide with) and isn't shared across machines, so a study doesn't
+    survive a crashed process the way the Postgres path does — acceptable for
+    a fresh clone or a CI run, both single-shot by construction.
     """
-    engine = get_engine()
+    url = os.environ.get("POSTGRES_URL")
+    if not url:
+        return optuna.storages.RDBStorage(
+            url=f"sqlite:///{get_project_root()}/optuna.db"
+        )
+
+    engine = create_engine(url, pool_pre_ping=True)
     with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS optuna"))
-    url = engine.url.render_as_string(hide_password=False)
     return optuna.storages.RDBStorage(
-        url=url,
+        url=engine.url.render_as_string(hide_password=False),
         engine_kwargs={"connect_args": {"options": "-csearch_path=optuna"}},
     )
 
