@@ -825,6 +825,158 @@ def test_build_drift_reference_inputs_row_count_equals_sum_of_both_halves(
 
 
 # ---------------------------------------------------------------------------
+# _describe_criterion — bar-only, CI-based, and delta-based criterion shapes
+# ---------------------------------------------------------------------------
+
+
+def test_describe_criterion_renders_bar_only_shape() -> None:
+    """cold_start-regime criteria (pr_auc, recall) carry value+bar, no ci/delta."""
+    text = register._describe_criterion(
+        "pr_auc", {"passed": True, "value": 0.42, "bar": 0.30}
+    )
+    assert text == "PR-AUC 0.420 vs bar 0.300 (ok)"
+
+
+def test_describe_criterion_renders_bar_only_failure_status() -> None:
+    """A failed bar-only criterion renders (FAIL), not (ok)."""
+    text = register._describe_criterion(
+        "recall", {"passed": False, "value": 0.55, "bar": 0.70}
+    )
+    assert "(FAIL)" in text
+    assert text.startswith("recall 0.550")
+
+
+def test_describe_criterion_renders_ci_based_shape() -> None:
+    """cold_start calibration_slope carries value+ci+band, no bar/delta."""
+    text = register._describe_criterion(
+        "calibration_slope",
+        {"passed": True, "value": 0.95, "ci": [0.85, 1.05], "band": [0.8, 1.2]},
+    )
+    assert text == "calib slope 0.950 [0.850, 1.050] band [0.80, 1.20] (ok)"
+
+
+def test_describe_criterion_renders_delta_based_shape_with_materiality_threshold() -> (
+    None
+):
+    """comparative-regime pr_auc carries delta_obs/delta_ci + materiality_threshold."""
+    text = register._describe_criterion(
+        "pr_auc",
+        {
+            "passed": True,
+            "value": 0.44,
+            "bar": 0.30,
+            "delta_obs": 0.02,
+            "delta_ci": [0.01, 0.03],
+            "materiality_threshold": 0.01,
+        },
+    )
+    assert text == "PR-AUC Δ+0.020 [+0.010, +0.030] vs 0.010 (ok)"
+
+
+def test_describe_criterion_renders_delta_based_shape_with_non_inferiority_margin() -> (
+    None
+):
+    """comparative-regime recall carries delta_obs/delta_ci + non_inferiority_margin
+    instead of materiality_threshold — _describe_criterion's threshold lookup must
+    fall back to it rather than rendering a missing/None threshold."""
+    text = register._describe_criterion(
+        "recall",
+        {
+            "passed": False,
+            "value": 0.60,
+            "bar": 0.70,
+            "delta_obs": -0.05,
+            "delta_ci": [-0.08, -0.02],
+            "non_inferiority_margin": -0.03,
+        },
+    )
+    assert text == "recall Δ-0.050 [-0.080, -0.020] vs -0.030 (FAIL)"
+
+
+def test_describe_criterion_unmapped_key_falls_back_to_raw_key() -> None:
+    """A criterion key with no _CRITERION_LABELS entry renders as itself, not KeyError."""
+    text = register._describe_criterion(
+        "some_future_metric", {"passed": True, "value": 1.0, "bar": 0.5}
+    )
+    assert text.startswith("some_future_metric ")
+
+
+# ---------------------------------------------------------------------------
+# _summarize_promotion_context — model_card.json's promotion-narrative helper
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_promotion_context_cold_start_regime() -> None:
+    """cold_start never compares against a champion_version, regardless of what's passed."""
+    text = register._summarize_promotion_context(
+        {"regime": "cold_start", "criteria": {}}, champion_version=None
+    )
+    assert "first model promoted" in text
+    assert "no existing champion" in text
+
+
+def test_summarize_promotion_context_comparative_regime_with_delta() -> None:
+    """comparative regime narrates the PR-AUC delta and CI against the incumbent version."""
+    decision = {
+        "regime": "comparative",
+        "criteria": {"pr_auc": {"delta_obs": 0.015, "delta_ci": [0.005, 0.025]}},
+    }
+    text = register._summarize_promotion_context(decision, champion_version="7")
+    assert "version 7" in text
+    assert "+0.0150" in text
+    assert "[+0.0050, +0.0250]" in text
+
+
+def test_summarize_promotion_context_comparative_regime_missing_delta_figures() -> None:
+    """comparative regime with no pr_auc delta_obs/delta_ci logged renders the
+    unavailable fallback rather than crashing on a missing key."""
+    decision = {"regime": "comparative", "criteria": {}}
+    text = register._summarize_promotion_context(decision, champion_version="7")
+    assert "unavailable" in text
+
+
+def test_summarize_promotion_context_unrecognized_regime() -> None:
+    """An unrecognized regime string renders its own unavailable fallback, naming the regime."""
+    decision = {"regime": "canary", "criteria": {}}
+    text = register._summarize_promotion_context(decision, champion_version=None)
+    assert "unavailable" in text
+    assert "'canary'" in text
+
+
+# ---------------------------------------------------------------------------
+# _summarize_model_drivers — model_card.json's SHAP-driven business_case insight
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_model_drivers_lists_top_k_features_by_rank_order() -> None:
+    """Feature names are taken in the SHAP global_importance's own rank order,
+    truncated to top_k — never re-sorted or re-ranked here."""
+    error_analysis = {
+        "shap": {
+            "global_importance": [
+                {"feature": "contract_type", "importance": 0.30},
+                {"feature": "tenure", "importance": 0.22},
+                {"feature": "monthlycharges", "importance": 0.18},
+                {"feature": "internetservice", "importance": 0.10},
+            ]
+        }
+    }
+    text = register._summarize_model_drivers(error_analysis, top_k=3)
+    assert "contract_type, tenure, monthlycharges" in text
+    assert "internetservice" not in text
+
+
+def test_summarize_model_drivers_empty_global_importance_renders_fallback() -> None:
+    """A missing/empty global_importance renders the unavailable fallback rather
+    than an empty driver list."""
+    text = register._summarize_model_drivers({"shap": {"global_importance": []}})
+    assert "unavailable" in text
+
+    text_missing_key = register._summarize_model_drivers({"shap": {}})
+    assert "unavailable" in text_missing_key
+
+
+# ---------------------------------------------------------------------------
 # Full pass: alias flip, drift_reference.json, model_card.json, promoted tag
 # ---------------------------------------------------------------------------
 
