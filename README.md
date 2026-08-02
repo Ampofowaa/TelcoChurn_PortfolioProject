@@ -3,8 +3,8 @@
 [![CI](https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/actions/workflows/ci.yml/badge.svg)](https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/actions/workflows/ci.yml)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-771%20passing-brightgreen)](CONTRIBUTING.md#testing)
-[![Coverage](https://img.shields.io/badge/coverage-95.3%25-brightgreen)](CONTRIBUTING.md#testing)
+[![Tests](https://img.shields.io/badge/tests-835%20passing-brightgreen)](CONTRIBUTING.md#testing)
+[![Coverage](https://img.shields.io/badge/coverage-95.7%25-brightgreen)](CONTRIBUTING.md#testing)
 
 Predicts which telecom customers are likely to churn and quantifies the revenue impact of early intervention. Built as a production-grade system covering the full MLOps lifecycle: data ingestion → validation → feature engineering → model training → calibration → cost-sensitive threshold optimisation → serving → monitoring.
 

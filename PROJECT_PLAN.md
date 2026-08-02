@@ -124,18 +124,21 @@ TelcoChurn_PortfolioProject/
 │   │   ├── schema.py           # Pandera RawSchema + CleanedSchema
 │   │   ├── checks.py           # CheckResult types + 5 gate functions
 │   │   ├── validate.py         # orchestrates gates; structured logging; report writer
-│   │   └── split.py            # canonical dev/test partition, sealed before Phase 4a
+│   │   ├── split.py            # canonical dev/test partition, sealed before Phase 4a
+│   │   └── eda.py              # statistical helpers backing notebooks/01-eda.ipynb (Phase 3)
 │   ├── features/
 │   │   ├── sql_features.py     # runs sql/features/*.sql via SQLAlchemy
 │   │   ├── build.py            # column group exports (raw IBM columns + charge_per_service)
-│   │   ├── preprocessing.py    # shared ColumnTransformer builder (Phase 4a; reused by train.py)
+│   │   ├── schema.py           # CustomerFeaturesSchema / FeatureOutputSchema (Phase 4b); FeatureSchema dataclass (Phase 5)
+│   │   ├── preprocessing.py    # shared ColumnTransformer builder (Phase 4a; reused by models/train/)
 │   │   ├── generate.py         # error-driven discovery machinery: OOF profiler, gate, bootstrap CI (Phase 4a)
+│   │   ├── select.py           # permutation-importance feature selection vs. a noise decoy (Phase 5)
 │   │   └── accessor.py         # load_features() + sha256 content hash; owns path & format (Phase 6)
 │   ├── models/
-│   │   ├── train.py            # Optuna + LightGBM + MLflow
+│   │   ├── train/               # Optuna + LightGBM + MLflow: candidates, comparison, feature_freeze, tuning, log_model, common (Phase 5)
 │   │   ├── calibrate.py        # CalibratedClassifierCV
-│   │   ├── threshold.py        # closed-form t* = c/(r*LTV) + argmax-EV agreement check
-│   │   ├── calibration_screen.py  # pre-seal calibration screen + dev-OOF vector (Phase 7, runs first)
+│   │   ├── threshold.py        # closed-form t* = c/(r*LTV) + argmax-EV agreement check + pre-seal dev-OOF screen (Phase 6, last step)
+│   │   ├── diagnostics.py      # shared V1/V2/V2b slicing helpers: segment collapse, fairness gaps, per-group calibration (Phase 5–7)
 │   │   ├── evaluate.py         # test-set metrics + bootstrap CIs + promotion_decision.json
 │   │   ├── plots.py            # pure helpers: reliability bins, EV curves, r-sensitivity (Phase 6)
 │   │   ├── gate.py             # pure promotion gate (ANALYSIS.md §0); called by evaluate, read by register
@@ -156,7 +159,9 @@ TelcoChurn_PortfolioProject/
 │   └── utils/
 │       ├── logging.py          # structlog JSON config
 │       ├── db.py               # SQLAlchemy engine factory
-│       └── io.py
+│       ├── paths.py            # get_project_root() anchor for all src/ file I/O (Phase 0/4.1)
+│       ├── mlflow.py           # tracking-URI resolution, registry/run lookups, experiment metadata (Phase 5+)
+│       └── stats.py            # shared bootstrap-CI helpers (Phase 4a+)
 │
 ├── tests/
 │   ├── conftest.py             # root: --run-integration flag; integration skip guard
@@ -223,7 +228,7 @@ TelcoChurn_PortfolioProject/
 | 4b | Feature engineering — encode the 4a-adopted set | `sql/features/*.sql`, `features/sql_features.py`, `features/build.py`, `features/schema.py` | ✅ Done |
 | 5 | Model training (LightGBM + Optuna + MLflow) | `models/train/` (candidates, comparison, feature_freeze, tuning, registration), `features/select.py`, `models/diagnostics.py`, `configs/training/`, `configs/tuning/`, 371 tests, 93.25% coverage | ✅ Done |
 | 6 | Calibration + cost-sensitive threshold | `models/calibrate.py`, `models/threshold.py`, `models/plots.py`, `features/accessor.py`, `utils/mlflow.py`, `configs/{calibration,costs,policy,threshold}/`, `notebooks/04-calibration-and-threshold.ipynb`, 420 tests, 94.15% coverage | ✅ Done |
-| 7 | Evaluation + error analysis + registry promotion | `models/calibration_screen.py`, `models/evaluate.py`, `models/gate.py`, `models/economics.py`, `models/explain.py`, `models/error_analysis.py`, `models/drift_reference.py`, `models/register.py`, `notebooks/05-evaluation-and-error-analysis.ipynb` | ✅ Done |
+| 7 | Evaluation + error analysis + registry promotion | `models/evaluate.py`, `models/gate.py`, `models/economics.py`, `models/explain.py`, `models/error_analysis.py`, `models/drift_reference.py`, `models/register.py`, `notebooks/05-evaluation-and-error-analysis.ipynb` | ✅ Done |
 | 8 | DVC pipeline wrap | `dvc.yaml` with 5 stages; reproducible end-to-end | Not started |
 | 9 | Serving + UI | FastAPI (`/predict`, `/health`, `/metrics`) + Streamlit + Dockerfiles | Not started |
 | 10 | Orchestration | Prefect retrain flow (weekly) + drift check flow (daily) | Not started |
@@ -531,7 +536,7 @@ byte-identical; `dev`/`test` are disjoint and cover every `customerid` exactly o
   | `validate` | `data/validate.py`, `data/schema.py` | `reports/validation/` |
   | `split` | `data/split.py`, `reports/validation/` (validate output — split blocks on a passing validation run), `configs/config.yaml` (`test_size`, `random_seed`) | `datasets/processed/split_manifest.parquet` |
   | `features` | `features/build.py`, `sql/features/` | `datasets/processed/telco_churn_features.parquet` (Parquet — static snapshot for downstream stages), `preprocessing.pkl` |
-  | `train` | `models/train.py`, `configs/`, `datasets/processed/split_manifest.parquet` | `reports/train_run_id.txt` (the MLflow run-id receipt — a file, since outs must be files), `feature_space.txt`, `feature_columns.txt` |
+  | `train` | `models/train/`, `configs/`, `datasets/processed/split_manifest.parquet` | `reports/train_run_id.txt` (the MLflow run-id receipt — a file, since outs must be files), `feature_space.txt`, `feature_columns.txt` |
   | `evaluate` | `models/evaluate.py`, `datasets/processed/split_manifest.parquet`, `reports/train_run_id.txt` | `reports/metrics.json` |
 
 > **⚠ Two stages' real MLflow edge is not captured by their DVC `deps`/`outs` — document it rather than imply a pure file DAG.** The `train` and `evaluate` rows hide a coupling to MLflow that DVC does not track:
@@ -858,7 +863,7 @@ Notebooks are for exploration and narrative, not for owning logic:
 | `docker-compose.yml` | One-command local stack for development |
 | `configs/config.yaml` | Hydra root; controls data paths, thresholds, MLflow URI, random seed |
 | `src/telco_churn/data/schema.py` | Pandera schema — referenced by validation, training, and FastAPI request models |
-| `src/telco_churn/models/train.py` | Optuna + LightGBM + MLflow; called by both CLI and Prefect |
+| `src/telco_churn/models/train/` | Optuna + LightGBM + MLflow; called by both CLI and Prefect |
 | `src/telco_churn/serving/app.py` | FastAPI app; loads `champion` model from MLflow Registry at startup |
 | `pipelines/retrain.py` | Continuous-training DAG; ties together every `src/` module |
 | `.github/workflows/cd.yml` | Deploy automation; ties code changes to AWS |
@@ -872,7 +877,7 @@ This table maps early-phase artifacts from `notebooks/_archive/EDA-original.ipyn
 | Notebook artifact | Destination in `src/` |
 |---|---|
 | 5 data quality gates | `data/schema.py` + `data/checks.py` |
-| `ColumnTransformer` definition | `features/preprocessing.py` → `models/train.py` (Phase 5) — fitted per CV fold on development; production path is `tree_preprocessor` + LightGBM in an sklearn `Pipeline` (linear baselines use a separate `linear_preprocessor`, Step 1) |
+| `ColumnTransformer` definition | `features/preprocessing.py` → `models/train/` (Phase 5) — fitted per CV fold on development; production path is `tree_preprocessor` + LightGBM in an sklearn `Pipeline` (linear baselines use a separate `linear_preprocessor`, Step 1) |
 | Optuna best hyperparameters | Default values in `configs/tuning/optuna.yaml` (still searchable; warm-start from these) |
 | Cost-sensitive threshold logic (3 scenarios) | `models/threshold.py` |
 | Bootstrap CI evaluation routine | `models/evaluate.py` |

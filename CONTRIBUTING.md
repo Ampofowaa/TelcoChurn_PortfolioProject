@@ -40,7 +40,7 @@ Each step's console output (structlog JSON) prints the `run_id` / `model_version
 
 - `uv run pytest` — full unit suite, no Docker required.
 - `uv run pytest -k "test_name"` — a single test by name.
-- `make test-integration` — integration tests; requires Docker (`make db-up` first).
+- `make test-integration` — integration tests; requires a running Docker daemon. Each test spins up its own ephemeral Postgres via `testcontainers` and points MLflow at a tmp-scoped SQLite file, so `make db-up` is not a prerequisite.
 - `make test-data` / `make test-features` / `make test-models` — scoped coverage per package, for running one phase's tests in isolation without a false `fail_under=80` failure from unrelated packages.
 - Every new package under `src/telco_churn/` needs its own scoped `make test-<package>` target (see `CLAUDE.md`'s Testing section for the required pattern and coverage conventions).
 
@@ -67,5 +67,5 @@ Follow `CLAUDE.md`'s **Git Conventions** section (branch prefixes, Conventional 
 
 1. Ensure `make lint` and `make test` both pass locally.
 2. Push your branch and open a PR against `main`.
-3. CI must be green before merge.
+3. CI must be green before merge. Unit tests, lint, and type-check run on every push and PR; the Docker-dependent integration suite only runs on the daily schedule, manual dispatch, or PRs targeting `main` — so a PR opened against `main` will also need the integration job green, even if you only ran unit tests locally.
 4. Flag any schema-breaking changes in the PR description before implementing them.

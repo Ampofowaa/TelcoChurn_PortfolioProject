@@ -189,8 +189,8 @@ Always use the `§N` format consistently — not "Section N", not "chapter N", n
 
 - Target ≥80% coverage on `src/`. Do not chase 100%.
 - Run a single test: `uv run pytest -k "test_name"` or `uv run pytest tests/unit/test_checks.py`.
-- Integration tests require Docker services to be running (`docker compose --profile infra up -d`).
-- The integration smoke test trains on a 500-row stratified sample and asserts ROC-AUC ≥ 0.75.
+- Integration tests require a running Docker daemon, not the `docker compose --profile infra` stack — each test spins up its own ephemeral Postgres via `testcontainers` (`data.ingest`/`split`/`sql_features`/`validate` suites) and points MLflow at a tmp-scoped SQLite file (the `*_subprocess.py` suites), so `make db-up` is not a prerequisite.
+- `test_train_subprocess.py` runs the full Steps 1–5 pipeline (candidates → selection → tuning → logging) against a synthetic ~150-row fixture under relaxed Hydra overrides (`tuning.n_trials=2`, etc.) — a composition-path smoke test, not a benchmark; it asserts the pipeline completes and logs the expected artifacts, not a ROC-AUC/PR-AUC bar.
 - When writing data, schema, or validation tests, cover: normal case, missing values, wrong dtypes, and empty dataframe.
 - Every module with a `__main__` CLI entry point requires a **subprocess** integration test — invoked via `subprocess.run([sys.executable, "-m", "<module>"], env={...}, capture_output=True)` — covering the full composition path (argparse/config load → I/O → exit code). Direct function calls do not qualify: they miss argparse, OmegaConf resolution, dotenv loading, and env-var-to-engine joints that only surface at the subprocess boundary. Cover both the exit 0 (success) and exit 1 (error) paths. Exception: waived only when the module's entire `__main__` body is exercised as a named subroutine call inside another module's subprocess integration test — direct calls to shared helper functions do not satisfy the exception.
 - Running integration tests in isolation will fail the `fail_under=80` gate because coverage is measured across all `src/` modules. Append `--no-cov` for standalone integration runs: `uv run pytest tests/integration/ --run-integration --no-cov`.
@@ -222,7 +222,7 @@ Lifecycle-ordered. Tests are written alongside each module — there is no dedic
 | 4 | Feature engineering (SQL + Python) | `sql/features/*.sql` + `features/sql_features.py` + `features/build.py` |
 | 5 | Model training (LightGBM + Optuna + MLflow) | `models/train/` + `configs/{model,training}/*.yaml`; logged only, no registration |
 | 6 | Calibration + cost-sensitive threshold | `models/calibrate.py` + `models/threshold.py` |
-| 7 | Evaluation + error analysis + registry promotion | `models/calibration_screen.py` + `models/evaluate.py` + `models/gate.py` + `models/economics.py` + `models/explain.py` + `models/error_analysis.py` + `models/register.py` + `notebooks/05-evaluation-and-error-analysis.ipynb` |
+| 7 | Evaluation + error analysis + registry promotion | `models/evaluate.py` + `models/gate.py` + `models/economics.py` + `models/explain.py` + `models/error_analysis.py` + `models/register.py` + `models/drift_reference.py` + `notebooks/05-evaluation-and-error-analysis.ipynb` |
 | 8 | DVC pipeline wrap | `dvc.yaml` with 5 stages; reproducible end-to-end |
 | 9 | Serving + UI | FastAPI (`/predict`, `/health`, `/metrics`) + Streamlit + Dockerfiles |
 | 10 | Orchestration | Prefect retrain flow (weekly) + drift check flow (daily) |
