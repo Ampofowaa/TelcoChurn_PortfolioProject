@@ -1,79 +1,19 @@
-"""MLflow Model Registry alias flip — acts on the promotion decision evaluate.py persisted.
+"""MLflow registry alias-flip step that closes the training cycle.
 
-register.py reads the gate's verdict; it does not recompute it, and it mints
-no new version. The decision was already made by gate.py::decide_promotion,
-called from evaluate.py at the moment the sealed-test metrics existed, and
-persisted onto evaluate.py's own `evaluation` run — the human review is
-stamped onto that same artifact (config-gated via cfg.register.require_review;
-Phase 10's weekly retrain sets it False since the automated gate is what a
-no-human-in-the-loop cycle uses). Two independent evaluations of one rule are
-how a rule drifts into two rules.
-
-Every cross-cycle read this module makes is resolved by explicit run_id, via
-tags evaluate.py/error_analysis.py set on the model version being registered
-(eval_run_id, error_analysis_run_id — the same pattern calibrate.py's
-logged_model_id tag already establishes), never a local reports/ path. A fixed local path
-reflects whichever run last executed evaluate.py/error_analysis.py on this
-machine, not necessarily this model_version's own cycle — exactly the
-staleness failure mode CLAUDE.md's drift_reference.json rule and
-evaluate.py's own load_dev_oof_diagnostics already avoid for the same reason.
-reports/ is still written (metrics.json, promotion_decision.json,
-error_analysis.json, drift_reference.json, model_card.json, ...) as a
-human-inspection mirror by the steps that produce them — this module just
-never trusts it as a source of truth.
-
-Step order is deliberate — cheapest and most decisive checks run first, and
-nothing mutates before it has to:
-    1. If the candidate's promotion_status tag is already "promoted"/
-       "rejected" (not "pending"), this is a re-invocation of an
-       already-decided cycle — log it and stop, without resolving
-       eval_run_id/error_analysis_run_id or reading anything else, and without
-       repeating any check or re-emitting model_promoted/model_rejected
-       (Phase 10's orchestrated, retried flow makes this a real scenario,
-       not a hypothetical one: a re-emission would silently reset the
-       promoted_at-keyed bake-in window on a promotion that already
-       happened).
-    2. Resolve eval_run_id from the model version's own tag and load
-       promotion_decision.json/metrics.json from that run. Assert the
-       decision was computed for this model_version, and that a fresh hash
-       of metrics.json matches the one the decision stamped.
-    3. If require_review is set, assert review == "approved".
-    4. If the gate itself failed, tag rejected and stop — before the
-       manifest gate, the error_analysis.json gate, or the smoke check,
-       none of which can change that outcome.
-    5. Manifest gate: the four per-cycle artifacts must be present.
-    6. Resolve error_analysis_run_id from the model version's own tag and load
-       error_analysis.json from that run; assert it too was computed for
-       this model_version (the model card's fairness section is assembled
-       from it, never hand-transcribed, so a stale error_analysis.json from
-       a different cycle must not be silently attributed to this one).
-    7. Phase 1 smoke check, pre-flip, by explicit version URI: an
-       environment-parity check first (raises EnvironmentMismatchError and
-       leaves promotion_status untouched on a mismatch — a stale checking
-       environment is not evidence the model is bad), then schema/output-
-       range/golden-parity checks (tag rejected on failure), then a
-       non-gating latency/size diagnostic.
-    8. Immediately before flipping — not earlier — re-resolve champion and
-       assert it still matches the decision's incumbent, closing the race
-       window between evaluation and promotion.
-    9. Phase 2: flip, reload through the alias, reconfirm golden parity.
-       Roll back via rollback_champion() on failure.
-   10. Build and log drift_reference.json and model_card.json onto the
-       promoted run.
-   11. Tag promoted, append a promotion_log entry, log model_promoted with
-       promoted_at.
-
-MLflow surface: register.py opens no run of its own — it acts on the
-registry (alias flips, version tags) and on the registered run (artifacts,
-via MlflowClient calls that target an existing run_id directly, never
-mlflow.start_run). It computes no metrics; if it is ever tempted to, that is
-a decision leaking in that belongs in gate.py.
-
-Champion history: every promotion and rollback appends one entry to a
-promotion_log tag on the *registered model* (see _append_promotion_event /
-champion_history) — an ordered, append-only record of what champion was,
-in sequence, so "what was champion before this one" is a direct index
-rather than a tag-scan-and-max() reconstruction over model versions.
+It never recomputes the gate's verdict or mints a new model version: it
+reads the promotion decision evaluate.py already persisted, verifies it
+against the model version being registered, and either flips the
+`champion` alias onto the already-registered `challenger` version or leaves
+it rejected — validating fully (environment, schema, golden-prediction
+parity) before the flip and reconfirming through the alias afterward. Every
+cross-cycle artifact (eval_run_id, error_analysis_run_id) is resolved from
+tags on the model version itself, never a local reports/ path, so
+promotion always acts on this cycle's own evidence rather than whichever
+run last executed on this machine. It opens no MLflow run of its own — it
+acts on the registry and on already-existing runs by explicit run_id — and
+computes no metrics of its own; every promotion/rollback is appended to a
+`promotion_log` tag on the registered model (see champion_history) as an
+ordered, append-only record.
 """
 
 from __future__ import annotations
@@ -122,7 +62,7 @@ __all__ = [
 logger = get_logger(__name__)
 
 # The four per-cycle artifacts every registered run must carry — a champion
-# that cannot describe itself must not become promotable (CLAUDE.md).
+# that cannot describe itself must not become promotable.
 _MANIFEST_ARTIFACTS = (
     "feature_space.txt",
     "feature_columns.txt",
@@ -166,6 +106,15 @@ def check_environment_parity(model_uri: str, packages: list[str]) -> dict[str, s
             re.MULTILINE | re.IGNORECASE,
         )
         if match is None:
+            logger.warning(
+                "environment_parity_pin_not_found",
+                package=package,
+                hint=(
+                    "no exact `package==version` pin found in the registered "
+                    "model's logged requirements — this package was not "
+                    "checked for environment drift."
+                ),
+            )
             continue
         pinned = match.group(1)
         installed = importlib_metadata.version(package)
@@ -268,7 +217,7 @@ def _rejection_description(decision: dict[str, Any], reason: str) -> str:
         return (
             f"Rejected {today} — gate passed ({decision['regime']}) but failed "
             "golden-prediction parity after the champion alias flip; champion "
-            "rolled back to the prior version."
+            "alias rolled back to the prior version, or unset if none existed."
         )
     raise ValueError(f"unknown rejection reason: {reason!r}")
 
@@ -309,7 +258,9 @@ def _append_promotion_event(registered_model_name: str, event: dict[str, Any]) -
         existing = client.get_registered_model(registered_model_name).tags.get(
             "promotion_log", "[]"
         )
-    except MlflowException:
+    except MlflowException as exc:
+        if exc.error_code != "RESOURCE_DOES_NOT_EXIST":
+            raise
         existing = "[]"
     history: list[dict[str, Any]] = json.loads(existing)
     history.append(event)
@@ -324,21 +275,26 @@ def champion_history(registered_model_name: str) -> list[dict[str, Any]]:
     Each entry is {"action": "promoted" | "rolled_back", "version",
     "previous_champion_version" | "rolled_back_from", "at"}. "What was
     champion before this one" is history[-2] — a direct index into an
-    append-only log, not a scan over model-version tags.
+    append-only log, not a scan over model-version tags. A rolled_back
+    entry with version=None means there was no earlier promoted version to
+    restore, so the champion alias was unset entirely rather than
+    re-pointed.
     """
     client = mlflow.tracking.MlflowClient()
     try:
         raw = client.get_registered_model(registered_model_name).tags.get(
             "promotion_log", "[]"
         )
-    except MlflowException:
+    except MlflowException as exc:
+        if exc.error_code != "RESOURCE_DOES_NOT_EXIST":
+            raise
         raw = "[]"
     return list(json.loads(raw))
 
 
 def rollback_champion(
     registered_model_name: str, target_version: str | None = None
-) -> str:
+) -> str | None:
     """Roll `champion` back to a version tagged promotion_status=promoted.
 
     Never by version arithmetic (N-1): a rejected or crashed evaluation
@@ -365,6 +321,17 @@ def rollback_champion(
     candidate isn't tagged promoted yet, so the exclusion is a no-op there)
     and a manual emergency rollback invocation, so the two can never drift
     into two rules.
+
+    If no other promoted version exists — a first-ever deployment whose
+    post-flip check just failed, or an operator invoking this against a
+    registry with no promotion history — there is no known-good state to
+    restore, so this is a distinct outcome, not an error: the `champion`
+    alias is unset entirely (returning to the pre-promotion "no champion"
+    state) and None is returned instead of a version string. Raising here
+    would be the wrong failure mode for the automated post-flip abort path
+    in particular — it would leave `champion` pointing at the very
+    candidate that just failed its own serving check, which is exactly
+    what a rollback exists to prevent.
     """
     client = mlflow.tracking.MlflowClient()
     versions = client.search_model_versions(f"name='{registered_model_name}'")
@@ -376,17 +343,17 @@ def rollback_champion(
         for v in versions
         if v.tags.get("promotion_status") == "promoted"
     }
-    if not promoted:
-        raise RuntimeError(
-            f"No version of {registered_model_name!r} is tagged "
-            "promotion_status=promoted — nothing to roll back to."
-        )
 
     try:
         current_champion_version: str | None = str(
             client.get_model_version_by_alias(registered_model_name, "champion").version
         )
-    except MlflowException:
+    except MlflowException as exc:
+        # RESOURCE_DOES_NOT_EXIST: model never registered. INVALID_PARAMETER_VALUE:
+        # model exists but no champion alias set. Both, and only both, mean
+        # "no current champion" — anything else must propagate.
+        if exc.error_code not in ("RESOURCE_DOES_NOT_EXIST", "INVALID_PARAMETER_VALUE"):
+            raise
         current_champion_version = None
 
     if target_version is not None:
@@ -402,12 +369,23 @@ def rollback_champion(
             v for v in promoted.values() if str(v.version) != current_champion_version
         ]
         if not candidates:
-            raise RuntimeError(
-                f"No promoted version of {registered_model_name!r} other "
-                f"than the current champion (version "
-                f"{current_champion_version!r}) exists — nothing earlier to "
-                "roll back to."
+            if current_champion_version is not None:
+                client.delete_registered_model_alias(registered_model_name, "champion")
+            _append_promotion_event(
+                registered_model_name,
+                {
+                    "action": "rolled_back",
+                    "version": None,
+                    "rolled_back_from": current_champion_version,
+                    "at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                },
             )
+            logger.info(
+                "champion_rollback_unset",
+                registered_model_name=registered_model_name,
+                rolled_back_from=current_champion_version,
+            )
+            return None
         target = max(candidates, key=lambda v: int(v.version))
 
     promote_to_alias(registered_model_name, str(target.version), "champion")
@@ -1140,7 +1118,9 @@ def _load_and_verify_evaluation_artifacts(
 ) -> dict[str, Any]:
     """Resolve eval_run_id from the version's own tag and load+verify its decision/metrics.
 
-    Never a local reports/ path (module docstring).
+    Never a local reports/ path — a fixed path would reflect whichever run
+    last executed evaluate.py on this machine, not necessarily this
+    model_version's own cycle.
     """
     eval_run_id = current_version.tags.get("eval_run_id")
     if not eval_run_id:
@@ -1453,15 +1433,122 @@ def _finalize_promotion(
     return promoted_at
 
 
+def _complete_promotion(
+    client: Any,
+    cfg: DictConfig,
+    registered_model_name: str,
+    model_version: str,
+    alias: str,
+    run_id: str,
+    eval_run_id: str,
+    error_analysis_run_id: str,
+    manifest: dict[str, Any],
+    metrics: dict[str, Any],
+    error_analysis: dict[str, Any],
+    decision: dict[str, Any],
+    calibration_summary: dict[str, Any],
+    X_dev: pd.DataFrame,
+    recorded_champion_version: Any,
+) -> str:
+    """Build drift_reference.json + model_card.json and tag promoted.
+
+    Runs after _flip_and_confirm has already committed the alias — champion
+    is live on model_version for the rest of this function's duration. That
+    makes every step here a liability rather than a validation: a failure
+    partway through (an artifact-store hiccup, a transient MLflow write
+    error) would otherwise leave champion pointing at a version that never
+    got tagged promoted — indistinguishable from a crashed pending orphan,
+    eligible for the pending-reaper despite being the live champion, and
+    un-retriable (a retry's _reverify_incumbent would see champion already
+    moved to model_version and refuse, since the recorded incumbent at
+    evaluation time was the previous champion).
+
+    So any failure here rolls the alias back to the prior promoted champion
+    via rollback_champion() — the same recovery _flip_and_confirm already
+    uses for a post-flip parity failure — and re-raises. promotion_status
+    is left untouched (still pending, not tagged rejected: this isn't a
+    gate failure), so a re-invocation after the underlying issue is fixed
+    sees a consistent champion/incumbent pair and can retry cleanly.
+    """
+    reports_dir = get_project_root() / str(cfg.paths.reports)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _build_and_log_drift_reference(
+            client, cfg, run_id, eval_run_id, X_dev, reports_dir
+        )
+
+        model_card = _build_and_log_model_card(
+            client,
+            cfg,
+            manifest,
+            metrics,
+            error_analysis,
+            decision,
+            calibration_summary,
+            run_id,
+            eval_run_id,
+            error_analysis_run_id,
+            model_version,
+            registered_model_name,
+            alias,
+            reports_dir,
+        )
+
+        promoted_at = _finalize_promotion(
+            client,
+            registered_model_name,
+            model_version,
+            decision,
+            model_card,
+            recorded_champion_version,
+        )
+    except Exception:
+        logger.error(
+            "post_flip_finalization_failed",
+            model_version=model_version,
+            exc_info=True,
+        )
+        rollback_champion(registered_model_name)
+        raise
+
+    return promoted_at
+
+
 def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     """Act on evaluate.py's persisted promotion decision for `model_version`.
 
-    See the module docstring for the full step order. Returns a dict
-    describing the outcome: {"model_version", "promotion_status", ...}.
+    Step order runs cheapest and most decisive checks first, so nothing
+    mutates before it has to:
+        1. Short-circuit if this version is already promoted/rejected
+           (a re-invocation of an already-decided cycle).
+        2. Resolve eval_run_id from the version's own tag; load and
+           hash-verify promotion_decision.json/metrics.json against it.
+        3. Enforce human review if cfg.register.require_review is set.
+        4. Stop and tag rejected if the gate itself failed.
+        5. Assert the four per-cycle manifest artifacts are present.
+        6. Resolve error_analysis_run_id and load+verify error_analysis.json.
+        7. Pre-flip smoke check by explicit version URI: environment parity,
+           then schema/output-range and golden-prediction parity (tag
+           rejected on failure), then a non-gating latency/size diagnostic.
+        8. Immediately before flipping, re-resolve champion and assert it
+           still matches the decision's incumbent (closes the race window
+           between evaluation and promotion).
+        9. Flip the alias, reload through it, and reconfirm golden parity —
+           rolling back via rollback_champion() on failure.
+        10. Build and log drift_reference.json and model_card.json onto the
+            promoted run, then tag promoted, append a promotion_log entry,
+            and log model_promoted — all as one unit. A failure anywhere in
+            this unit rolls the alias back to the prior promoted champion
+            (rollback_champion()) and re-raises, so champion never points
+            at a version that isn't tagged promoted.
+
+    Returns a dict describing the outcome: {"model_version", "promotion_status", ...}.
     Raises on any abort that is not a genuine pass/fail verdict (missing
     manifest artifacts, missing error_analysis.json, an environment
-    mismatch, a stale incumbent) — those leave promotion_status untouched.
-    A genuine smoke-check failure tags "rejected" and re-raises.
+    mismatch, a stale incumbent, a post-flip finalization failure) — those
+    leave promotion_status untouched. A genuine smoke-check failure tags
+    "rejected" and re-raises.
     """
     ensure_experiment_metadata(cfg)
     registered_model_name = str(cfg.mlflow.registered_model_name)
@@ -1524,37 +1611,24 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
         decision,
     )
 
-    # --- On promotion: drift_reference.json + model_card.json ---
-    # reports_dir is write-only from here on — a human-inspection mirror,
-    # never a source this module reads back from (module docstring).
-    reports_dir = get_project_root() / str(cfg.paths.reports)
-    reports_dir.mkdir(parents=True, exist_ok=True)
-
-    _build_and_log_drift_reference(client, cfg, run_id, eval_run_id, X_dev, reports_dir)
-
-    model_card = _build_and_log_model_card(
+    # reports_dir mirrors written inside _complete_promotion are
+    # write-only — a human-inspection copy, never a source this module
+    # reads back from.
+    promoted_at = _complete_promotion(
         client,
         cfg,
+        registered_model_name,
+        model_version,
+        alias,
+        run_id,
+        eval_run_id,
+        error_analysis_run_id,
         manifest,
         metrics,
         error_analysis,
         decision,
         pre_flip["calibration_summary"],
-        run_id,
-        eval_run_id,
-        error_analysis_run_id,
-        model_version,
-        registered_model_name,
-        alias,
-        reports_dir,
-    )
-
-    promoted_at = _finalize_promotion(
-        client,
-        registered_model_name,
-        model_version,
-        decision,
-        model_card,
+        X_dev,
         recorded_champion_version,
     )
 

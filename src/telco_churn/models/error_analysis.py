@@ -1,44 +1,39 @@
-"""Error-diagnosis step — runs after evaluate.py, owns reports/error_analysis.json.
+"""Error-diagnosis step, run after evaluate.py. Owns reports/error_analysis.json.
 
-Answers the three questions aggregate performance metrics cannot: *where* are
-the errors, *how wrong* were they, and *what did they cost?* Calls explain.py
-for the SHAP work; reads reports/test_predictions.parquet (evaluate.py),
-calibrate.py's dev-OOF vector (threshold.load_dev_oof_predictions, fetched by
-run_id from MLflow — never threshold.py's local reports/dev_oof_predictions.parquet
-mirror, which reflects whichever run last executed threshold.py on this
-machine, not necessarily run_id), and the champion model by explicit version —
-never by alias, never via telco_churn's data/split.py, so evaluate.py remains
-the sole importer of the test partition. Full raw feature values for a
-customer id set are recovered via features.accessor.load_features() (the
-unsplit feature table) restricted to the id set an upstream artifact already
-sealed — never a fresh split.
+Answers what aggregate metrics can't: *where* the errors are, *how wrong*
+they were, and *what they cost*. Delegates SHAP mechanics to explain.py.
 
-register.py aborts without this module's output — a fairness/robustness
-section retyped from a rendered notebook cell is exactly the section that
-gets quoted back at you, so the model card must be assembled from an
-artifact, not a human reading a chart.
+Data provenance:
+- Test/dev-OOF predictions come from evaluate.py's test_predictions.parquet
+  and calibrate.py's dev-OOF vector (via threshold.load_dev_oof_predictions,
+  fetched by run_id — never threshold.py's local parquet mirror, which only
+  reflects whichever run last executed threshold.py on this machine).
+- The champion model is loaded by explicit version, never alias, and never
+  via data/split.py, so evaluate.py stays the sole importer of the test split.
+- Raw feature values are recovered via features.accessor.load_features(),
+  restricted to an already-sealed id set — never a fresh split.
 
-Error-concentration scanning runs on dev OOF only, never on the 1,409-row
-sealed test set: exploratory slicing over that many candidate cohorts is
-multiple-comparisons fishing dressed as analysis, and dev has roughly four
-times the statistical power. Every other analysis here (SHAP, error
-confidence, value-weighted errors, illustrative cases) runs on the sealed
-test set, mirroring what evaluate.py measured its headline numbers on.
+register.py aborts without this module's output: model-card fairness and
+robustness sections must be assembled from an artifact, not retyped from a
+rendered notebook cell.
+
+Error-concentration scanning (exploratory cohort search) runs on dev OOF
+only — the 1,409-row sealed test set is too small for that much slicing to
+be sound, and dev has roughly four times the statistical power. Every other
+analysis here (SHAP, error confidence, value-weighted errors, illustrative
+cases) runs on the sealed test set, mirroring what evaluate.py measured its
+headline numbers on.
 
 SHAP values are computed against the champion's base LightGBM decision
-function (shap.TreeExplainer on calibrated_classifiers_[0].estimator's
-"model" step), not the final calibrated probability — TreeExplainer has no
-way to see through CalibratedClassifierCV's post-hoc sigmoid/isotonic map, so
-nothing in this codebase can explain the calibrated output directly (the same
-constraint features.select.compute_shap_audit works under in Phase 4/5).
-Consequence, stated rather than glossed over: the map is monotone, so a
-feature's *direction* of effect is provably identical on the base score and
-the calibrated probability (V3 reads only this, and only this is guaranteed).
-Its *magnitude* is not similarly protected — a non-linear monotone map can
-stretch or compress SHAP magnitudes unevenly across the score range, so the
-mean-|SHAP| ranking global_importance produces (and therefore which features
-make the top-8 V3 even checks) is computed pre-calibration and is not
-guaranteed identical to a hypothetical post-calibration ranking.
+function, not the final calibrated probability — TreeExplainer cannot see
+through CalibratedClassifierCV's post-hoc sigmoid/isotonic map (the same
+constraint features.select.compute_shap_audit works under). That map is
+monotone, so a feature's *direction* of effect is provably identical
+pre- and post-calibration — V3 relies on exactly this, and only this. Its
+*magnitude* is not similarly protected: a non-linear monotone map can
+stretch or compress SHAP magnitudes unevenly, so global_importance's
+mean-|SHAP| ranking (and therefore which features make the V3 top-8) is a
+pre-calibration ranking, not guaranteed to match a post-calibration one.
 """
 
 from __future__ import annotations
@@ -123,15 +118,15 @@ _RUN_DESCRIPTION = (
 # with an underscore before a feature name becomes part of a metric key.
 _METRIC_NAME_DISALLOWED_CHARS_RE = re.compile(r"[^a-zA-Z0-9_\-. /]")
 
-# ANALYSIS.md §2's established bivariate relationships, keyed by a lowercase
-# substring of the transformed (post-ColumnTransformer) feature name — the
-# longest matching key wins, mirroring features.select's column-map
-# resolution. +1 means "higher/present pushes toward churn"; -1 the reverse.
+# EDA's established bivariate relationships, keyed by a lowercase substring
+# of the transformed (post-ColumnTransformer) feature name — the longest
+# matching key wins, mirroring features.select's column-map resolution. +1
+# means "higher/present pushes toward churn"; -1 the reverse.
 # A top-8 SHAP feature with no key here has no established relationship to
 # contradict and is simply not checked (V3 is silent, not passing-by-default
 # on a claim it never evaluated).
 _EXPECTED_EDA_DIRECTIONS: dict[str, int] = {
-    "tenure": -1,  # longer tenure -> lower churn (ANALYSIS.md §2)
+    "tenure": -1,  # longer tenure -> lower churn
     "totalcharges": -1,  # higher lifetime spend -> lower churn (only long-tenure customers accumulate it)
     "monthlycharges": 1,  # higher monthly spend (fiber concentration) -> higher churn
     "month-to-month": 1,  # contract_type dummy: r ~= +0.40
@@ -372,10 +367,10 @@ def error_concentration_scan(
     feature this project never had a prior hypothesis about — is invisible to
     them by construction, and a veto cannot fire on something nobody computed.
     This scans feature_frame's full column set instead. Confirmatory, not
-    generative (PROJECT_PLAN.md Phase 7): a discovered cohort may inform the
-    human review and belongs in the model card, but must never send you back
-    to engineer a feature — that is Phase 4a/5's training-time loop, and this
-    runs on already-sealed evaluation data.
+    generative: a discovered cohort may inform the human review and belongs
+    in the model card, but must never send you back to engineer a feature —
+    that is training-time feature engineering's job, and this runs on
+    already-sealed evaluation data.
 
     Cohorts below `min_support`, or carrying zero of the relevant actual class
     (no positives for "fnr", no negatives for "fpr" — the rate is undefined),
@@ -509,10 +504,10 @@ def _features_by_customer_id(customer_ids: pd.Series) -> pd.DataFrame:
 
     Checks for a missing lookup by id membership, not by scanning the joined
     frame for any NaN: 11 zero-tenure customers carry a legitimate NaN
-    totalcharges (the TotalCharges gotcha — CLAUDE.md, imputed downstream by
-    the model's ColumnTransformer, not by load_features()), and one of them
-    routinely lands in the sealed test set. An any-NaN check would treat that
-    expected value as a broken join.
+    totalcharges (the raw CSV's blank-string TotalCharges for zero-tenure
+    rows, imputed downstream by the model's ColumnTransformer, not by
+    load_features()), and one of them routinely lands in the sealed test
+    set. An any-NaN check would treat that expected value as a broken join.
     """
     df = load_features().set_index("customerid")
     missing_ids = set(customer_ids) - set(df.index)
@@ -533,21 +528,16 @@ def _shap_values_for_test_rows(
     calibrated_classifiers_ to length 1, whose .estimator is the
     [preprocessor -> model] Pipeline refit on all of development — the same
     access path features.select.compute_shap_audit uses. Returns
-    (shap_values, feature_names, base_value, Xt) — Xt (the transformed model
-    input matrix) is returned too, since dependence_points/local_explanations
-    both need the paired feature values in the identical space shap_values
-    was computed in.
+    (shap_values, feature_names, base_value, Xt); Xt (the transformed model
+    input matrix) is returned too because dependence_points/local_explanations
+    both need feature values in the same space shap_values was computed in.
 
-    Uses the explainer's __call__ API (explainer(Xt) -> Explanation) rather
-    than the legacy .shap_values(Xt): for a binary LightGBM classifier the
-    latter unconditionally warns on every call (shap/explainers/_tree.py),
-    since __call__ is the only caller that passes from_call=True internally.
-    Explanation.values comes back shape (n_rows, n_features, 2) for a binary
-    classifier — index [..., 1] selects the positive (churn) class, the same
-    selection the old list[1] indexing made on .shap_values()'s legacy
-    list-of-two-ndarrays return. self.expected_value is still set as a side
-    effect of the same underlying shap_values() call __call__ makes
-    internally, so the base_value extraction below is unchanged.
+    Uses the explainer's `__call__` API rather than the legacy
+    `.shap_values(Xt)`, which warns unconditionally for a binary LightGBM
+    classifier (shap/explainers/_tree.py). `Explanation.values` comes back
+    shape (n_rows, n_features, 2) for a binary classifier — index `[..., 1]`
+    selects the positive (churn) class, mirroring the old `list[1]` indexing
+    on the legacy API's two-array return.
     """
     base_pipeline = model.calibrated_classifiers_[0].estimator
     preprocessor = base_pipeline.named_steps["preprocessor"]
@@ -695,16 +685,14 @@ def _sorted_gap_pairs(
 ) -> list[tuple[str, float]]:
     """Every feature's |A - B| mean-signed-SHAP gap, (name, gap) sorted descending.
 
-    Shared selection logic for both signed-cohort-SHAP pairs this module
-    renders — FN vs. TP and FP vs. TN — and their respective cohort
-    beeswarms: both need "which features actually separate the two
-    cohorts," not global_importance's overall-population rank, which can
-    and does pick a different top-n (a feature both cohorts agree on
-    contributes nothing to distinguishing one from the other). Returns every
-    feature, not just a top-n slice — the full ranking is what
-    _check_top_k_elbow verifies a configured cutoff against, and what
-    error_analysis.json persists in full so a human re-deriving a drifted
-    cutoff can read it straight off the file instead of recomputing it.
+    Shared by both cohort pairs this module renders (FN-vs-TP, FP-vs-TN):
+    both need "which features actually separate the two cohorts," not
+    global_importance's overall-population rank, which can and does pick a
+    different top-n (a feature both cohorts agree on contributes nothing to
+    distinguishing one from the other). Returns every feature, not a top-n
+    slice — the full ranking is what `_check_top_k_elbow` verifies a cutoff
+    against, and what error_analysis.json persists so a drifted cutoff can
+    be re-derived by hand straight from the file.
     """
     b_by_feature = {
         cast(str, r["feature"]): cast(float, r["mean_signed_shap"]) for r in rows_b
@@ -732,32 +720,25 @@ def _check_top_k_elbow(
     """Verify the plateau-then-elbow shape that justified `configured_k` still holds.
 
     `top_k_shap_features`, `top_k_cohort_gap_features`, and
-    `top_k_cohort_gap_features_fp_tn` are each derived once, by a human
-    reading the sorted deltas of exactly this kind of ranking off exactly
-    this data (see their config comments). Nothing re-derives them if the
-    champion model changes — Phase 10's weekly retrain calls this same
-    module against a different model with no human in the loop, so a config
-    value tuned for today's SHAP ranking can go stale silently.
+    `top_k_cohort_gap_features_fp_tn` were each hand-derived once from the
+    sorted deltas of exactly this kind of ranking (see their config
+    comments), and nothing re-derives them when the champion changes —
+    Phase 10's retrain calls this module with no human in the loop, so a
+    stale cutoff would otherwise drift silently.
 
-    The obvious fix — auto-pick k = argmax(delta) at runtime — is worse than
-    doing nothing: on this project's own global-importance ranking, the
-    single biggest delta sits between rank 1 and rank 2 (0.22), not at the
-    plateau's real end (rank 8, delta 0.046). An argmax picker would set
-    k=1 or k=2, discarding most of the genuinely important features the
-    human derivation correctly kept. So this asks a narrower, safer
-    question instead of trying to discover a new k: is the drop immediately
-    after `configured_k` still clearly bigger than the drops immediately
-    before it? `plateau_window` deltas ending at rank `configured_k` set the
-    local baseline; `min_elbow_ratio` is how many multiples of that baseline
-    the elbow drop must still clear to call the cutoff valid. A ratio well
-    below the threshold is a real signal the plateau has shifted and `k`
-    needs re-deriving by hand, exactly as it was derived the first time;
-    this check does not attempt to resolve boundary-adjacent ambiguity
-    (an off-by-one k may still pass) — it exists to catch gross drift, not
-    to prove a given k is uniquely optimal. Never raises: an insufficient
-    number of features before `configured_k` to form a baseline (a tiny
-    feature set, or a `configured_k` too close to 1) reports `valid=True`
-    with no baseline to compare against, rather than a spurious failure.
+    Deliberately not "auto-pick k = argmax(delta)": on this project's own
+    global-importance ranking, the single biggest delta sits at rank 1-2
+    (0.22), not the plateau's real end (rank 8, delta 0.046) — an argmax
+    picker would discard most of the features the human derivation correctly
+    kept. Instead this asks a narrower question: is the drop right after
+    `configured_k` still clearly bigger than the drops right before it?
+    `plateau_window` deltas ending at `configured_k` set the local baseline;
+    `min_elbow_ratio` is how many multiples of it the elbow drop must clear
+    to pass. A ratio well below that threshold means the plateau has shifted
+    and `k` needs re-deriving by hand. This catches gross drift only — it
+    doesn't resolve boundary-adjacent ambiguity (an off-by-one `k` may still
+    pass) and never raises: too few features before `configured_k` to form a
+    baseline reports `valid=True` rather than a spurious failure.
     """
     deltas = [values[i] - values[i + 1] for i in range(len(values) - 1)]
     elbow_delta = deltas[configured_k - 1]
@@ -1770,7 +1751,8 @@ def _log_error_analysis_run(
             ),
             "direction_sanity_check_passed": 1.0 if v3_result["passed"] else 0.0,
         }
-        for row in shap_diag["importance_rows"]:
+        top_k_shap = int(cfg.error_analysis.top_k_shap_features)
+        for row in shap_diag["importance_rows"][:top_k_shap]:
             feature_key = _sanitize_metric_name(str(row["feature"]))
             scalar_metrics[f"shap_importance_{feature_key}"] = cast(
                 float, row["mean_abs_shap"]
@@ -1840,70 +1822,34 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
     """Run the full error-diagnosis pass and write reports/error_analysis.json.
 
     Resolves `model_version` explicitly (never an alias), checks threshold
-    provenance (same guard evaluate.py applies — a stale threshold_validation.json
-    would otherwise silently derive a near-miss band from the wrong model's
-    CI), loads the champion, and reads reports/test_predictions.parquet
-    (evaluate.py) + reports/dev_oof_predictions.parquet (threshold.py's
-    dev-OOF screen) — the only route this module reaches evaluation data
-    through. The error-
-    confidence near-miss band is derived from threshold.py's argmax-EV
-    bootstrap CI (near_miss_band_from_validation), falling back to
-    error_analysis.near_miss_band only if that CI is unavailable. Computes
-    SHAP once on the sealed-test rows; everything explain.py exposes is
-    derived from that single call, including `binary_dependence` — the
-    signed group-mean SHAP split for every `binary__`-prefixed feature
-    (gender, dependents, seniorcitizen, has_partner, phoneservice,
-    paperlessbilling), computed for all of them regardless of
-    `top_k_shap_features` rank, since a two-level feature's dependence_points
-    scatter is the wrong shape and its global_importance magnitude alone
-    cannot say which level pushes toward churn. Runs the error-concentration scan on dev
-    OOF only, twice — once ranking cohorts by FNR, once by FPR, each carrying
-    its own `metric` field. Renders SHAP global importance (all features),
-    beeswarm, dependence, FN-vs-TP cohort, FN/TP cohort beeswarms, and
-    waterfall (illustrative FN/FP cases, plus a same-format most-confident
-    TP/TN comparison pair) figures, plus the error-confidence
-    and value-weighted-error charts. The FN/TP cohort beeswarms restrict the
-    same shap_values/Xt_test this module already computed to
-    `cohort_top_features` — the features _sorted_gap_pairs ranks by
-    |FN - TP| mean-signed-SHAP gap, not global_importance's overall rank, and
-    sized by its own `top_k_cohort_gap_features` config value (the two
-    rankings' plateaus sit at different cutoffs, so each is tuned
-    independently). They restore the individual spread within each cohort
-    that the FN-vs-TP bar chart's single mean per feature collapses away, the same
-    relationship the full-population beeswarm has to global_importance.
-    `cohort_top_features` is persisted alongside `cohort_shap` so the
-    notebook never has to guess which features either cohort figure shows.
-    `cohort_gap_ranking_fn_tp` persists the full |FN - TP| ranking, not just
-    its `cohort_top_features` head — mirrors `global_importance` already
-    being fully persisted rather than just `top_features`, and closes the
-    same gap for this ranking: if `_check_top_k_elbow` ever flags
-    `top_k_cohort_gap_features` as drifted, re-deriving the new cutoff by
-    hand needs the full sorted ranking, not just the current top-k names.
-    The same FN-vs-TP treatment is mirrored for the two actual-non-churner
-    outcomes — FP vs. TN, `cohort_top_features_fp_tn` — sized by its own
-    `top_k_cohort_gap_features_fp_tn` config value rather than reusing
-    `top_k_cohort_gap_features`: the |FP - TN| gap ranking has a differently-
-    shaped plateau (its elbow sits at rank 9, not rank 7), so sharing one
-    cutoff would silently mis-cut whichever pair didn't set the config value.
-    Does a false alarm's SHAP profile look like a real churner's, or is it a
-    diluted push that only just crossed `t*`? A cohort-colored dependence
-    scatter for Tenure — the one continuous feature in both pairs' top-ranked
-    gap features — makes the "no loyalty/satisfaction signal, so these
-    customer types overlap in the features available" claim visible directly:
-    where the cohort means and beeswarms show that FN/FP are diluted/collided
-    relative to TP/TN, this shows whether that happens because the cohorts
-    occupy the same region of Tenure's range, restricted to the same
-    shap_values/Xt_test already computed (no new SHAP call). Each of the
-    three top-k config values (`top_k_shap_features`,
+    provenance (a stale threshold_validation.json would otherwise silently
+    derive the near-miss band from the wrong model's CI), loads the
+    champion, and reads the sealed-test and dev-OOF prediction artifacts —
+    the only route this module reaches evaluation data through.
+
+    Computes SHAP once on the sealed-test rows (`_compute_shap_diagnostics`)
+    and derives every SHAP-based diagnostic from that single call: global
+    importance, per-feature dependence, binary-feature effects, the V3
+    direction-sanity check, and — via `_compute_cohort_gap` — the FN-vs-TP
+    and FP-vs-TN signed-SHAP cohort gaps (each ranked and sized
+    independently; see that function's docstring for why). The
+    annual-contract Monthly Charges subgroup finding
+    (`_annual_contract_subgroup_finding`) and the illustrative FN/FP/TP/TN
+    waterfall cases (`_compute_illustrative_cases`) reuse the same SHAP call.
+
+    Runs the error-concentration scan on dev OOF only, twice — ranked by FNR
+    and by FPR (`_compute_error_concentration`). Renders all figures
+    (`_render_error_analysis_figures`), logs its own `error_analysis` MLflow
+    run (a sibling of evaluate.py's `evaluation` run), and writes
+    reports/error_analysis.json — register.py aborts without it.
+
+    Each of the three top-k cutoffs used above (`top_k_shap_features`,
     `top_k_cohort_gap_features`, `top_k_cohort_gap_features_fp_tn`) is
-    checked against its own ranking via `_check_top_k_elbow` and a warning
-    logged — never raised — if the plateau-then-elbow shape that justified it
-    no longer holds: none of these were re-derived when the champion changes
-    (Phase 10's retrain calls this module against a different model with no
-    human in the loop), so a stale cutoff would otherwise silently narrow or
-    widen a chart's feature set with nothing to flag it. Logs its own
-    `error_analysis` MLflow run (a sibling of evaluate.py's `evaluation` run)
-    and writes reports/error_analysis.json — register.py aborts without it.
+    checked against its own ranking via `_check_top_k_elbow`, with a
+    warning — never a raise — if the plateau-then-elbow shape that justified
+    it has drifted: none of these are re-derived when the champion changes,
+    so a stale cutoff would otherwise silently narrow or widen a chart's
+    feature set with nothing to flag it.
     """
     loaded = _load_error_analysis_inputs(model_version, cfg)
     run_id = loaded["run_id"]

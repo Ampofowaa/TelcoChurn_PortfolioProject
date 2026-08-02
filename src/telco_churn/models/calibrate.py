@@ -1,14 +1,15 @@
 """Calibrate the tuned pipeline logged by run_model_logging_step (models/train/log_model.py).
 
 Calibration is cross-fit on the development set, so there is no separate
-validation split. CalibratedClassifierCV(ensemble=False) wraps the pipeline
-*unfitted*, so its ColumnTransformer refits inside every fold instead of
-leaking preprocessing statistics across folds.
+validation split: `CalibratedClassifierCV(ensemble=False)` wraps the
+pipeline *unfitted*, so its ColumnTransformer refits inside every fold
+instead of leaking preprocessing statistics across folds. The unfitted
+pipeline comes from cloning the model at `manifest["logged_model_uri"]`, not
+from `runs:/<run_id>/model` — the latter becomes ambiguous once this module
+logs its own `calibrated_model` onto the same run.
 
-The unfitted pipeline comes from cloning the model at
-manifest["logged_model_uri"] (a models:/m-<id> URI) — not from
-runs:/<run_id>/model, which becomes ambiguous once this module logs its own
-calibrated_model onto the same run.
+This module performs the training cycle's single MLflow model registration,
+pointing the `challenger` alias at the calibrated pipeline.
 """
 
 from __future__ import annotations
@@ -181,14 +182,11 @@ def select_golden_rows(
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Return the n_rows dev-partition rows with the lowest customerid, for the golden-parity fixture.
 
-    Selected by customerid value, not row position, so the fixture register.py
-    checks against is stable against an unrelated reordering of the processed
-    feature table upstream — a positional .head(n) would silently pin a
-    different set of customers if that ordering ever shifted. X_dev and
-    customer_ids must already be row-order-aligned (as load_dev_features and
-    load_dev_customer_ids are, both derived from the same
-    _load_dev_partition() call), since selection is by position within the
-    customerid sort order, not by pandas index label.
+    Selected by customerid value, not row position, so the fixture is stable
+    against an unrelated reordering of the processed feature table upstream —
+    a positional `.head(n)` would silently pin a different set of customers.
+    X_dev and customer_ids must already be row-order-aligned (as
+    `load_dev_features` and `load_dev_customer_ids` are).
     """
     order = np.argsort(customer_ids.to_numpy())[:n_rows]
     golden_X = X_dev.iloc[order].reset_index(drop=True)
@@ -230,13 +228,12 @@ def build_calibrated_pipeline(
 ) -> CalibratedClassifierCV:
     """Wrap the unfitted pipeline in CalibratedClassifierCV(ensemble=False).
 
-    ensemble=False collapses calibrated_classifiers_ to length 1, whose
-    .estimator is the base Pipeline refit on all of development — the SHAP
-    access path notebooks/05-error-analysis.ipynb depends on. pipeline must be
-    unfitted;
-    CalibratedClassifierCV.fit clones it internally per inner fold, so passing
-    the same unfitted instance to two CalibratedClassifierCV objects (e.g. one
-    per method) is safe without an extra clone() here.
+    `ensemble=False` collapses `calibrated_classifiers_` to length 1, whose
+    `.estimator` is the base Pipeline refit on all of development — the SHAP
+    access path notebooks/05-error-analysis.ipynb depends on. `pipeline`
+    must be unfitted; `CalibratedClassifierCV.fit` clones it internally per
+    inner fold, so reusing the same unfitted instance across methods is safe
+    without an extra `clone()` here.
     """
     return CalibratedClassifierCV(
         pipeline,
@@ -317,12 +314,12 @@ def per_fold_average_precision(
 ) -> list[float]:
     """Mean-of-per-fold average precision for an OOF vector — never pooled.
 
-    Pooling mixes each fold's tie structure (or, for a calibrated vector, each
-    fold's distinct calibration map) into one ranking, which can mask a
-    per-fold ranking regression that scoring each fold separately catches.
-    Recomputes outer_cv(cfg)'s fold assignment rather than threading indices
-    through the OOF computation — same params + same (X_dev, y_dev) ordering
-    reproduces the identical folds cross_val_predict used to build proba.
+    Pooling mixes each fold's tie structure (or, for a calibrated vector,
+    each fold's distinct calibration map) into one ranking, which can mask a
+    per-fold regression that scoring each fold separately catches. Recomputes
+    `outer_cv(cfg)`'s fold assignment rather than threading indices through,
+    since the same params + ordering reproduce the identical folds
+    `cross_val_predict` used to build `proba`.
     """
     cv = outer_cv(cfg)
     return [
@@ -1296,13 +1293,16 @@ def _verify_reload_parity(
     return parity_ok
 
 
-def _register_challenger_version(cfg: DictConfig, model_info: Any) -> str:
-    """Register the logged model as a new version and point `challenger` at it.
+def _tag_new_version_pending(cfg: DictConfig, model_info: Any) -> str:
+    """Tag a freshly minted registry version promotion_status=pending at mint time.
 
-    Tags the newly registered version promotion_status=pending at mint time,
-    before anything downstream (evaluate.py, error_analysis.py, register.py)
-    can fail — so a crash anywhere in that chain leaves the version exactly
-    where it started rather than untagged.
+    Called immediately after log_model returns — before _verify_reload_parity
+    runs — so that even a parity failure leaves a well-formed, reapable
+    `pending` version rather than a permanently untagged orphan. A version
+    with no promotion_status tag at all is invisible to both the tag-based
+    rollback rule and the Phase 14 pending-reaper, so tagging cannot wait on
+    any downstream check succeeding — including this function's own caller's
+    reload-parity check.
     """
     registered_model_name = str(cfg.mlflow.registered_model_name)
     version = str(model_info.registered_model_version)
@@ -1324,17 +1324,29 @@ def _register_challenger_version(cfg: DictConfig, model_info: Any) -> str:
         registered_model_name, version, "logged_model_id", model_info.model_id
     )
     # Mint-time default, set before anything downstream can fail: a crash in
-    # evaluate.py/error_analysis.py/register.py leaves this version with no
-    # verdict recorded, rather than with a tag someone forgot to write on an
-    # abort path nobody anticipated. register.py's rollback_champion() query
-    # (highest version tagged promotion_status: promoted) and the Phase 14
-    # pending-orphan reaper both depend on every version reliably starting
-    # here — see CLAUDE.md § MLflow Model Registry.
+    # _verify_reload_parity, evaluate.py, error_analysis.py, or register.py
+    # leaves this version with no verdict recorded, rather than with a tag
+    # someone forgot to write on an abort path nobody anticipated.
+    # register.py's rollback_champion() query (highest version tagged
+    # promotion_status: promoted) and the Phase 14 pending-orphan reaper both
+    # depend on every version reliably starting here — see CLAUDE.md § MLflow
+    # Model Registry.
     client.set_model_version_tag(
         registered_model_name, version, "promotion_status", "pending"
     )
-    client.set_registered_model_alias(registered_model_name, "challenger", version)
     return version
+
+
+def _point_challenger_alias(cfg: DictConfig, version: str) -> None:
+    """Point `challenger` at a version that has already passed reload parity.
+
+    Deliberately the last step of registration: the alias is what makes a
+    version reachable by evaluate.py/register.py/a human, so nothing may be
+    aliased until it has been verified to be the artifact it claims to be.
+    """
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+    client = mlflow.tracking.MlflowClient()
+    client.set_registered_model_alias(registered_model_name, "challenger", version)
 
 
 def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
@@ -1388,10 +1400,12 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
         golden,
     )
 
+    version = _tag_new_version_pending(cfg, model_info)
+
     parity_ok = _verify_reload_parity(
         model_info, golden["input_example"], golden["in_memory_preds"]
     )
-    version = _register_challenger_version(cfg, model_info)
+    _point_challenger_alias(cfg, version)
 
     logger.info(
         "calibration_registered",

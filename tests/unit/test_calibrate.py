@@ -1596,3 +1596,46 @@ def test_run_calibration_step_override_trial_count_gate(
     result = calibrate.run_calibration_step(run_id, registration_cfg)
 
     assert result["model_version"] == "1"
+
+
+def test_run_calibration_step_parity_failure_leaves_tagged_pending_orphan(
+    registration_cfg: DictConfig,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    comparison_result: dict[str, Any],
+    tuning_result: dict[str, Any],
+    sandboxed_dev_features: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reload-parity failure must not leave a permanently untagged orphan.
+
+    promotion_status=pending is tagged immediately after log_model returns,
+    before _verify_reload_parity runs — so a parity failure still leaves a
+    well-formed, reapable `pending` version rather than one with no
+    promotion_status tag at all (invisible to both the tag-based rollback
+    rule and the Phase 14 pending-reaper). The version must also stay
+    unaliased: `challenger` may only ever point at something that has
+    actually passed the parity check.
+    """
+    monkeypatch.setattr(
+        calibrate,
+        "_verify_reload_parity",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("forced parity failure")
+        ),
+    )
+    run_id = _log_parent_run(
+        dev_split, comparison_result, tuning_result, registration_cfg
+    )
+
+    with pytest.raises(AssertionError, match="forced parity failure"):
+        calibrate.run_calibration_step(run_id, registration_cfg)
+
+    client = mlflow.tracking.MlflowClient()
+    registered_name = str(registration_cfg.mlflow.registered_model_name)
+    version = client.get_model_version(registered_name, "1")
+    assert version.tags["promotion_status"] == "pending"
+    assert version.tags["training_data_scope"] == "dev"
+    assert version.tags["logged_model_id"]
+
+    registered_model = client.get_registered_model(registered_name)
+    assert "challenger" not in registered_model.aliases

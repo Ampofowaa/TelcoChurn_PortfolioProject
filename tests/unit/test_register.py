@@ -30,7 +30,9 @@ import mlflow.tracking
 import numpy as np
 import pandas as pd
 import pytest
+from mlflow.exceptions import MlflowException
 from mlflow.models import infer_signature
+from mlflow.protos.databricks_pb2 import INTERNAL_ERROR
 from omegaconf import DictConfig, OmegaConf
 from sklearn.linear_model import LogisticRegression
 
@@ -640,6 +642,59 @@ def test_register_post_flip_failure_rolls_back(
     }
 
 
+def test_register_post_flip_failure_unsets_alias_on_cold_start(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+    X_dev: pd.DataFrame,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same post-flip parity failure as above, but the first-ever promotion —
+    no prior champion exists. The abort path must unset `champion` (not
+    raise, and not leave it pointing at the failed candidate) and still tag
+    the candidate rejected.
+    """
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    candidate_version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+    _log_evaluation_and_error_analysis(registered_name, candidate_version)
+    _patch_calibrate_helpers(monkeypatch, X_dev)
+    monkeypatch.setattr(register, "check_environment_parity", lambda *a, **k: {})
+
+    call_count = {"n": 0}
+    real_check = register._check_golden_parity
+
+    def _flaky_parity(model: Any, golden: dict[str, Any], atol: float) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            real_check(model, golden, atol)
+        else:
+            raise AssertionError(
+                "Golden-parity check failed: simulated post-flip drift."
+            )
+
+    monkeypatch.setattr(register, "_check_golden_parity", _flaky_parity)
+
+    with pytest.raises(AssertionError):
+        register.run_registration_step(candidate_version, register_cfg)
+
+    client = mlflow.tracking.MlflowClient()
+    tags = client.get_model_version(registered_name, candidate_version).tags
+    assert tags["promotion_status"] == "rejected"
+
+    model = client.get_registered_model(registered_name)
+    assert "champion" not in model.aliases
+
+    history = register.champion_history(registered_name)
+    assert history[-1] == {
+        "action": "rolled_back",
+        "version": None,
+        "rolled_back_from": candidate_version,
+        "at": history[-1]["at"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Golden round trip is genuine, not circular
 # ---------------------------------------------------------------------------
@@ -847,6 +902,86 @@ def test_register_full_pass_promotes_and_logs_artifacts(
     }
 
 
+def test_register_rolls_back_alias_when_post_flip_finalization_fails(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+    X_dev: pd.DataFrame,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure between the alias flip and the promoted tag (drift_reference/
+    model_card build, or the tag write itself) must not leave `champion`
+    pointing at a version that isn't tagged promoted. _complete_promotion
+    rolls the alias back to the prior promoted champion and re-raises,
+    leaving promotion_status untouched (pending, not rejected — this isn't a
+    gate failure) so a retry after fixing the underlying issue is valid.
+
+    Sets up a real incumbent champion first (rather than a cold start) so the
+    retry also exercises _reverify_incumbent's race check: before the fix,
+    a crashed first attempt would leave `champion` pointing at the candidate
+    with no promoted tag, so a retry would see live_champion == candidate but
+    metrics["champion_version"] == the original incumbent, mismatch, and
+    raise forever. With the rollback, the retry sees a consistent pair and
+    completes.
+    """
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    _patch_calibrate_helpers(monkeypatch, X_dev)
+    monkeypatch.setattr(register, "check_environment_parity", lambda *a, **k: {})
+
+    incumbent_version, _incumbent_run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+    _log_evaluation_and_error_analysis(registered_name, incumbent_version)
+    incumbent_result = register.run_registration_step(incumbent_version, register_cfg)
+    assert incumbent_result["promotion_status"] == "promoted"
+
+    candidate_version, _candidate_run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+    _log_evaluation_and_error_analysis(
+        registered_name, candidate_version, champion_version=incumbent_version
+    )
+
+    original_build_model_card = register._build_and_log_model_card
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("simulated MLflow write failure")
+
+    monkeypatch.setattr(register, "_build_and_log_model_card", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated MLflow write failure"):
+        register.run_registration_step(candidate_version, register_cfg)
+
+    client = mlflow.tracking.MlflowClient()
+    candidate_tags = client.get_model_version(registered_name, candidate_version).tags
+    assert candidate_tags["promotion_status"] == "pending"
+
+    model = client.get_registered_model(registered_name)
+    assert str(model.aliases["champion"]) == incumbent_version
+
+    history = register.champion_history(registered_name)
+    assert history[-1]["action"] == "rolled_back"
+    assert history[-1]["version"] == incumbent_version
+    assert history[-1]["rolled_back_from"] == candidate_version
+
+    # Retry after the transient failure is fixed: champion/incumbent are
+    # consistent again (rolled back to incumbent_version), so this must
+    # complete cleanly rather than tripping _reverify_incumbent.
+    monkeypatch.setattr(
+        register, "_build_and_log_model_card", original_build_model_card
+    )
+
+    retry_result = register.run_registration_step(candidate_version, register_cfg)
+
+    assert retry_result["promotion_status"] == "promoted"
+    candidate_tags_after_retry = client.get_model_version(
+        registered_name, candidate_version
+    ).tags
+    assert candidate_tags_after_retry["promotion_status"] == "promoted"
+    model_after_retry = client.get_registered_model(registered_name)
+    assert str(model_after_retry.aliases["champion"]) == candidate_version
+
+
 # ---------------------------------------------------------------------------
 # Emergency rollback: highest promoted, never highest version number
 # ---------------------------------------------------------------------------
@@ -875,17 +1010,65 @@ def test_rollback_champion_selects_highest_promoted_not_highest_version(
     assert str(model.aliases["champion"]) == legit_version
 
 
-def test_rollback_champion_raises_when_nothing_promoted(
+def test_rollback_champion_unsets_alias_when_nothing_promoted(
     register_cfg: DictConfig,
     fitted_model: LogisticRegression,
     X_golden: pd.DataFrame,
 ) -> None:
+    """No promoted version exists anywhere (a from-scratch registry) — there is
+    nothing to restore, so this is a first-class unset, not an error. This is
+    also the shape rollback_champion() sees from the automated post-flip
+    abort path during a first-ever (cold-start) promotion, where the just-
+    flipped candidate isn't tagged promoted yet and no earlier champion ever
+    existed.
+    """
     registered_name = str(register_cfg.mlflow.registered_model_name)
     _register_test_version(
         registered_name, fitted_model, X_golden, promotion_status="rejected"
     )
 
-    with pytest.raises(RuntimeError, match="nothing to roll back to"):
+    result = register.rollback_champion(registered_name)
+
+    assert result is None
+    client = mlflow.tracking.MlflowClient()
+    model = client.get_registered_model(registered_name)
+    assert "champion" not in model.aliases
+
+    history = register.champion_history(registered_name)
+    assert history[-1] == {
+        "action": "rolled_back",
+        "version": None,
+        "rolled_back_from": None,
+        "at": history[-1]["at"],
+    }
+
+
+def test_rollback_champion_reraises_non_not_found_mlflow_errors(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient/auth/server failure while reading the current champion
+    alias must propagate, not be read as 'no champion currently set' —
+    silently swallowing it risks rolling back a healthy champion under a
+    wrong premise about what is currently serving.
+    """
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="promoted"
+    )
+
+    def _raise_transient(
+        self: mlflow.tracking.MlflowClient, name: str, alias: str
+    ) -> None:
+        raise MlflowException("temporarily unavailable", error_code=INTERNAL_ERROR)
+
+    monkeypatch.setattr(
+        mlflow.tracking.MlflowClient, "get_model_version_by_alias", _raise_transient
+    )
+
+    with pytest.raises(MlflowException, match="temporarily unavailable"):
         register.rollback_champion(registered_name)
 
 
