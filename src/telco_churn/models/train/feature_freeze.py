@@ -24,14 +24,314 @@ from telco_churn.models.train.common import (
     _dvc_hash,
     _git_sha,
     _log_dev_input,
+    _plot_bootstrap_delta,
     lgbm_default_params,
 )
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.mlflow import ensure_experiment_metadata, set_run_description
 
 __all__ = ["run_selection_step"]
 
 logger = get_logger(__name__)
+
+_RUN_DESCRIPTION = (
+    "Feature selection — permutation importance against a noise-decoy "
+    "column, inside CV against default LightGBM. Freezes the model's input "
+    "feature space via a paired-bootstrap keep-vs-reduce test; a non-gating "
+    "SHAP audit cross-checks the result."
+)
+
+
+def _run_selection_cv_and_bootstrap(
+    X_dev: pd.DataFrame,
+    y_dev: pd.Series,
+    candidate_results: dict[str, dict[str, Any]],
+    cfg: DictConfig,
+) -> dict[str, Any]:
+    """Run permutation-importance selection CV and the paired-bootstrap full-vs-reduced test."""
+    random_state = int(cfg.random_seed)
+    cc = cfg.training_setup
+    sel = cfg.selection
+    estimator_params = lgbm_default_params(cfg, random_state)
+
+    binary = list(FEATURE_SCHEMA.binary)
+    multi_cat = list(FEATURE_SCHEMA.multi_cat)
+    numeric = list(FEATURE_SCHEMA.numeric)
+    correlated_groups = tuple(tuple(group) for group in sel.correlated_groups)
+
+    cv = RepeatedStratifiedKFold(
+        n_splits=int(cc.cv_folds),
+        n_repeats=int(cc.cv_repeats),
+        random_state=random_state,
+    )
+
+    cv_result = run_selection_cv(
+        X_dev,
+        y_dev,
+        cv,
+        binary,
+        multi_cat,
+        numeric,
+        estimator_params,
+        n_repeats=int(sel.n_repeats),
+        noise_floor_margin=float(sel.noise_floor_margin),
+        correlated_groups=correlated_groups,
+        inner_val_size=float(sel.inner_val_size),
+        random_state=int(sel.random_state),
+        n_jobs=int(cc.cv_n_jobs),
+    )
+    reduced_scores = cv_result["fold_scores"]
+    reduced_mean = float(np.mean(reduced_scores))
+
+    full_scores = candidate_results["lgbm_default"]["pr_auc_scores"]
+    bootstrap_test = reduced_set_bootstrap_test(
+        full_scores,
+        reduced_scores,
+        n_bootstrap=int(sel.bootstrap_n_samples),
+        delta_threshold=float(cc.delta_threshold),
+        random_state=int(sel.random_state),
+    )
+
+    return {
+        "random_state": random_state,
+        "cc": cc,
+        "sel": sel,
+        "estimator_params": estimator_params,
+        "binary": binary,
+        "multi_cat": multi_cat,
+        "numeric": numeric,
+        "correlated_groups": correlated_groups,
+        "cv_result": cv_result,
+        "reduced_scores": reduced_scores,
+        "reduced_mean": reduced_mean,
+        "full_scores": full_scores,
+        "bootstrap_test": bootstrap_test,
+    }
+
+
+def _mint_committed_features(
+    X_dev: pd.DataFrame, y_dev: pd.Series, cv: dict[str, Any]
+) -> dict[str, Any]:
+    """Fit the committed selector on all of development and freeze the committed feature list."""
+    sel, binary, multi_cat, numeric = (
+        cv["sel"],
+        cv["binary"],
+        cv["multi_cat"],
+        cv["numeric"],
+    )
+    committed_selector = mint_committed_list(
+        X_dev,
+        y_dev,
+        binary,
+        multi_cat,
+        numeric,
+        cv["estimator_params"],
+        n_repeats=int(sel.n_repeats),
+        noise_floor_margin=float(sel.noise_floor_margin),
+        correlated_groups=cv["correlated_groups"],
+        inner_val_size=float(sel.inner_val_size),
+        random_state=int(sel.random_state),
+    )
+
+    decision = cv["bootstrap_test"]["decision"]
+    committed_features = (
+        committed_selector.survivors_
+        if decision == "reduced"
+        else binary + multi_cat + numeric
+    )
+
+    return {
+        "committed_selector": committed_selector,
+        "decision": decision,
+        "committed_features": committed_features,
+    }
+
+
+def _compute_shap_audits(
+    X_dev: pd.DataFrame,
+    y_dev: pd.Series,
+    cv: dict[str, Any],
+    minted: dict[str, Any],
+) -> dict[str, Any]:
+    """Fit the full-candidate-space SHAP audit, and a ship-accurate second audit when reduced.
+
+    shap_audit always fits on the full candidate space (needed so a dropped
+    feature still gets a SHAP value for flag_high_shap_dropouts to compare
+    against). When the reduced set is what actually ships, that full-set fit
+    no longer describes the shipped model, so shap_audit_committed — fit
+    only on committed_features — is the ship-accurate complementary view.
+    Skipped when decision == "full" (committed_features already equals the
+    full set there, so shap_audit already is that view) or when
+    committed_features is empty (no columns left to fit a model on).
+    """
+    binary, multi_cat, numeric = cv["binary"], cv["multi_cat"], cv["numeric"]
+    committed_features = minted["committed_features"]
+
+    shap_audit = compute_shap_audit(
+        X_dev,
+        y_dev,
+        committed_features,
+        binary,
+        multi_cat,
+        numeric,
+        cv["estimator_params"],
+    )
+    high_shap_dropouts = flag_high_shap_dropouts(shap_audit)
+
+    shap_audit_committed: pd.DataFrame | None = None
+    if minted["decision"] == "reduced" and committed_features:
+        shap_audit_committed = compute_shap_audit(
+            X_dev,
+            y_dev,
+            committed_features,
+            [c for c in binary if c in committed_features],
+            [c for c in multi_cat if c in committed_features],
+            [c for c in numeric if c in committed_features],
+            cv["estimator_params"],
+        )
+
+    return {
+        "shap_audit": shap_audit,
+        "high_shap_dropouts": high_shap_dropouts,
+        "shap_audit_committed": shap_audit_committed,
+    }
+
+
+def _plot_selection_figures(
+    candidate_results: dict[str, dict[str, Any]], cv: dict[str, Any]
+) -> dict[str, Any]:
+    """Plot the pooled OOF PR curves (full vs. reduced) and the paired-bootstrap Δ distribution."""
+    cv_result, bootstrap_test, cc = cv["cv_result"], cv["bootstrap_test"], cv["cc"]
+
+    full_res = candidate_results["lgbm_default"]
+    full_pr_auc_oof = float(
+        average_precision_score(full_res["oof_true"], full_res["oof_proba"])
+    )
+    reduced_pr_auc_oof = float(
+        average_precision_score(cv_result["oof_true"], cv_result["oof_proba"])
+    )
+
+    fig_pr, ax_pr = plt.subplots(figsize=(6, 5))
+    reduced_disp = PrecisionRecallDisplay.from_predictions(
+        cv_result["oof_true"], cv_result["oof_proba"], name="Reduced set", ax=ax_pr
+    )
+    reduced_disp.line_.set_label(
+        f"Reduced set (pooled OOF AP = {reduced_pr_auc_oof:.3f})"
+    )
+    reduced_disp.line_.set_alpha(0.6)
+    full_disp = PrecisionRecallDisplay.from_predictions(
+        full_res["oof_true"], full_res["oof_proba"], name="Full set", ax=ax_pr
+    )
+    full_disp.line_.set_label(f"Full set (pooled OOF AP = {full_pr_auc_oof:.3f})")
+    ax_pr.legend()
+    ax_pr.set_title("Pooled OOF PR Curves — full vs. reduced feature set")
+    fig_pr.tight_layout()
+
+    fig_bs = _plot_bootstrap_delta(
+        bootstrap_test["bootstrap_deltas"],
+        bootstrap_test["delta_obs"],
+        float(cc.delta_threshold),
+        title="Paired-Bootstrap Δ Distribution — full vs. reduced feature set",
+        xlabel="Δ mean-of-fold PR-AUC (full − reduced)",
+    )
+
+    return {
+        "full_pr_auc_oof": full_pr_auc_oof,
+        "reduced_pr_auc_oof": reduced_pr_auc_oof,
+        "fig_pr": fig_pr,
+        "fig_bs": fig_bs,
+    }
+
+
+def _log_selection_run(
+    X_dev: pd.DataFrame,
+    y_dev: pd.Series,
+    cv: dict[str, Any],
+    minted: dict[str, Any],
+    audits: dict[str, Any],
+    figures: dict[str, Any],
+    cfg: DictConfig,
+) -> None:
+    """Log every feature-selection artifact/metric onto a dedicated `feature_selection` run."""
+    sel, cc = cv["sel"], cv["cc"]
+    binary, multi_cat, numeric = cv["binary"], cv["multi_cat"], cv["numeric"]
+    decision, committed_selector = minted["decision"], minted["committed_selector"]
+    committed_features = minted["committed_features"]
+    shap_audit = audits["shap_audit"]
+    shap_audit_committed = audits["shap_audit_committed"]
+    high_shap_dropouts = audits["high_shap_dropouts"]
+    bootstrap_test = cv["bootstrap_test"]
+    reduced_scores, full_scores = cv["reduced_scores"], cv["full_scores"]
+
+    ensure_experiment_metadata(cfg)
+
+    with mlflow.start_run(run_name="feature_selection"):
+        set_run_description(_RUN_DESCRIPTION)
+        mlflow.set_tags(
+            {
+                "stage": "selection",
+                "git_sha": _git_sha(),
+                "dvc_data_hash": _dvc_hash(cfg),
+            }
+        )
+        _log_dev_input(X_dev, y_dev, context="training")
+        mlflow.log_params(
+            {
+                "n_repeats": int(sel.n_repeats),
+                "noise_floor_margin": float(sel.noise_floor_margin),
+                "inner_val_size": float(sel.inner_val_size),
+                "selection_random_state": int(sel.random_state),
+                "delta_threshold": float(cc.delta_threshold),
+                "decision": decision,
+                "decision_rule": bootstrap_test["decision_rule"],
+                "n_committed_features": len(committed_features),
+                "n_full_features": len(binary) + len(multi_cat) + len(numeric),
+                "n_high_shap_dropouts": len(high_shap_dropouts),
+            }
+        )
+        mlflow.log_metrics(
+            {
+                "reduced_cv_pr_auc_mean": round(cv["reduced_mean"], 3),
+                "full_cv_pr_auc_mean": round(float(np.mean(full_scores)), 3),
+                "reduced_pr_auc_oof": round(figures["reduced_pr_auc_oof"], 3),
+                "full_pr_auc_oof": round(figures["full_pr_auc_oof"], 3),
+                "bootstrap_delta_obs": bootstrap_test["delta_obs"],
+                "bootstrap_delta_ci_lower": bootstrap_test["delta_ci_lower"],
+                "bootstrap_delta_ci_upper": bootstrap_test["delta_ci_upper"],
+                "bootstrap_p_value": bootstrap_test["p_value"],
+            }
+        )
+        for step, fold_score in enumerate(reduced_scores):
+            mlflow.log_metric("reduced_cv_pr_auc_fold", round(fold_score, 3), step=step)
+        mlflow.log_text(
+            committed_selector.permutation_importance_table_.round(3).to_csv(
+                index=False
+            ),
+            "selection/permutation_importance_table.csv",
+        )
+        mlflow.log_text(
+            pd.DataFrame(cv["cv_result"]["stability"]).round(3).to_csv(index=False),
+            "selection/per_fold_stability.csv",
+        )
+        mlflow.log_text(
+            shap_audit.round(3).to_csv(index=False),
+            "selection/shap_importance_audit.csv",
+        )
+        if shap_audit_committed is not None:
+            mlflow.log_text(
+                shap_audit_committed.round(3).to_csv(index=False),
+                "selection/shap_importance_audit_committed.csv",
+            )
+        mlflow.log_text(
+            "\n".join(high_shap_dropouts), "selection/high_shap_dropouts.txt"
+        )
+        mlflow.log_text(
+            "\n".join(committed_features), "selection/committed_features.txt"
+        )
+        mlflow.log_figure(figures["fig_bs"], "selection/bootstrap_delta_dist.png")
+        mlflow.log_figure(figures["fig_pr"], "selection/pr_curves.png")
+        plt.close(figures["fig_bs"])
+        plt.close(figures["fig_pr"])
 
 
 def run_selection_step(
@@ -78,224 +378,28 @@ def run_selection_step(
     "shap_audit_committed": [...] | None, "high_shap_dropouts": [...],
     "stability": [...], "bootstrap_test": {...}}.
     """
-    random_state = int(cfg.random_seed)
-    cc = cfg.training_setup
-    sel = cfg.selection
-    estimator_params = lgbm_default_params(cfg, random_state)
+    cv = _run_selection_cv_and_bootstrap(X_dev, y_dev, candidate_results, cfg)
+    minted = _mint_committed_features(X_dev, y_dev, cv)
+    audits = _compute_shap_audits(X_dev, y_dev, cv, minted)
+    figures = _plot_selection_figures(candidate_results, cv)
 
-    binary = list(FEATURE_SCHEMA.binary)
-    multi_cat = list(FEATURE_SCHEMA.multi_cat)
-    numeric = list(FEATURE_SCHEMA.numeric)
-    correlated_groups = tuple(tuple(group) for group in sel.correlated_groups)
+    _log_selection_run(X_dev, y_dev, cv, minted, audits, figures, cfg)
 
-    cv = RepeatedStratifiedKFold(
-        n_splits=int(cc.cv_folds),
-        n_repeats=int(cc.cv_repeats),
-        random_state=random_state,
-    )
-
-    cv_result = run_selection_cv(
-        X_dev,
-        y_dev,
-        cv,
-        binary,
-        multi_cat,
-        numeric,
-        estimator_params,
-        n_repeats=int(sel.n_repeats),
-        noise_floor_margin=float(sel.noise_floor_margin),
-        correlated_groups=correlated_groups,
-        inner_val_size=float(sel.inner_val_size),
-        random_state=int(sel.random_state),
-        n_jobs=int(cc.cv_n_jobs),
-    )
-    reduced_scores = cv_result["fold_scores"]
-    reduced_mean = float(np.mean(reduced_scores))
-
-    full_scores = candidate_results["lgbm_default"]["pr_auc_scores"]
-    bootstrap_test = reduced_set_bootstrap_test(
-        full_scores,
-        reduced_scores,
-        n_bootstrap=int(sel.bootstrap_n_samples),
-        delta_threshold=float(cc.delta_threshold),
-        random_state=int(sel.random_state),
-    )
-
-    committed_selector = mint_committed_list(
-        X_dev,
-        y_dev,
-        binary,
-        multi_cat,
-        numeric,
-        estimator_params,
-        n_repeats=int(sel.n_repeats),
-        noise_floor_margin=float(sel.noise_floor_margin),
-        correlated_groups=correlated_groups,
-        inner_val_size=float(sel.inner_val_size),
-        random_state=int(sel.random_state),
-    )
-
-    decision = bootstrap_test["decision"]
-    committed_features = (
-        committed_selector.survivors_
-        if decision == "reduced"
-        else binary + multi_cat + numeric
-    )
-
-    shap_audit = compute_shap_audit(
-        X_dev,
-        y_dev,
-        committed_features,
-        binary,
-        multi_cat,
-        numeric,
-        estimator_params,
-    )
-    high_shap_dropouts = flag_high_shap_dropouts(shap_audit)
-
-    # shap_audit above always fits on the full candidate space (needed so a dropped
-    # feature still gets a SHAP value for flag_high_shap_dropouts to compare against).
-    # When the reduced set is what actually ships, that full-set fit no longer
-    # describes the shipped model, so a second audit — fit only on committed_features
-    # — is computed here as the ship-accurate complementary view. Skipped when
-    # decision == "full" (committed_features already equals the full set there, so
-    # shap_audit above already is that view) or when committed_features is empty
-    # (no columns left to fit a model on).
-    shap_audit_committed: pd.DataFrame | None = None
-    if decision == "reduced" and committed_features:
-        shap_audit_committed = compute_shap_audit(
-            X_dev,
-            y_dev,
-            committed_features,
-            [c for c in binary if c in committed_features],
-            [c for c in multi_cat if c in committed_features],
-            [c for c in numeric if c in committed_features],
-            estimator_params,
-        )
-
-    full_res = candidate_results["lgbm_default"]
-    full_pr_auc_oof = float(
-        average_precision_score(full_res["oof_true"], full_res["oof_proba"])
-    )
-    reduced_pr_auc_oof = float(
-        average_precision_score(cv_result["oof_true"], cv_result["oof_proba"])
-    )
-
-    fig_pr, ax_pr = plt.subplots(figsize=(6, 5))
-    reduced_disp = PrecisionRecallDisplay.from_predictions(
-        cv_result["oof_true"], cv_result["oof_proba"], name="Reduced set", ax=ax_pr
-    )
-    reduced_disp.line_.set_label(
-        f"Reduced set (pooled OOF AP = {reduced_pr_auc_oof:.3f})"
-    )
-    reduced_disp.line_.set_alpha(0.6)
-    full_disp = PrecisionRecallDisplay.from_predictions(
-        full_res["oof_true"], full_res["oof_proba"], name="Full set", ax=ax_pr
-    )
-    full_disp.line_.set_label(f"Full set (pooled OOF AP = {full_pr_auc_oof:.3f})")
-    ax_pr.legend()
-    ax_pr.set_title("Pooled OOF PR Curves — full vs. reduced feature set")
-    fig_pr.tight_layout()
-
-    fig_bs, ax_bs = plt.subplots(figsize=(6, 4))
-    ax_bs.hist(
-        bootstrap_test["bootstrap_deltas"], bins=50, edgecolor="none", alpha=0.75
-    )
-    ax_bs.axvline(
-        bootstrap_test["delta_obs"],
-        color="C1",
-        linestyle="--",
-        label=f"Δ_obs = {bootstrap_test['delta_obs']:.3f}",
-    )
-    ax_bs.axvline(0.0, color="black", linestyle=":", label="Δ = 0 (null)")
-    ax_bs.axvline(
-        float(cc.delta_threshold),
-        color="C2",
-        linestyle="--",
-        label=f"Δ* = {cc.delta_threshold}",
-    )
-    ax_bs.set_xlabel("Δ mean-of-fold PR-AUC (full − reduced)")
-    ax_bs.set_ylabel("Bootstrap resamples")
-    ax_bs.set_title("Paired-Bootstrap Δ Distribution — full vs. reduced feature set")
-    ax_bs.legend()
-    fig_bs.tight_layout()
-
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    mlflow.set_experiment(cfg.mlflow.experiment_name)
-
-    with mlflow.start_run(run_name="feature_selection"):
-        mlflow.set_tags(
-            {
-                "stage": "selection",
-                "git_sha": _git_sha(),
-                "dvc_data_hash": _dvc_hash(cfg),
-            }
-        )
-        _log_dev_input(X_dev, y_dev, context="training")
-        mlflow.log_params(
-            {
-                "n_repeats": int(sel.n_repeats),
-                "noise_floor_margin": float(sel.noise_floor_margin),
-                "inner_val_size": float(sel.inner_val_size),
-                "selection_random_state": int(sel.random_state),
-                "delta_threshold": float(cc.delta_threshold),
-                "decision": decision,
-                "decision_rule": bootstrap_test["decision_rule"],
-                "n_committed_features": len(committed_features),
-                "n_full_features": len(binary) + len(multi_cat) + len(numeric),
-                "n_high_shap_dropouts": len(high_shap_dropouts),
-            }
-        )
-        mlflow.log_metrics(
-            {
-                "reduced_cv_pr_auc_mean": round(reduced_mean, 3),
-                "full_cv_pr_auc_mean": round(float(np.mean(full_scores)), 3),
-                "reduced_pr_auc_oof": round(reduced_pr_auc_oof, 3),
-                "full_pr_auc_oof": round(full_pr_auc_oof, 3),
-                "bootstrap_delta_obs": bootstrap_test["delta_obs"],
-                "bootstrap_delta_ci_lower": bootstrap_test["delta_ci_lower"],
-                "bootstrap_delta_ci_upper": bootstrap_test["delta_ci_upper"],
-                "bootstrap_p_value": bootstrap_test["p_value"],
-            }
-        )
-        for step, fold_score in enumerate(reduced_scores):
-            mlflow.log_metric("reduced_cv_pr_auc_fold", round(fold_score, 3), step=step)
-        mlflow.log_text(
-            committed_selector.permutation_importance_table_.round(3).to_csv(
-                index=False
-            ),
-            "selection/permutation_importance_table.csv",
-        )
-        mlflow.log_text(
-            pd.DataFrame(cv_result["stability"]).round(3).to_csv(index=False),
-            "selection/per_fold_stability.csv",
-        )
-        mlflow.log_text(
-            shap_audit.round(3).to_csv(index=False),
-            "selection/shap_importance_audit.csv",
-        )
-        if shap_audit_committed is not None:
-            mlflow.log_text(
-                shap_audit_committed.round(3).to_csv(index=False),
-                "selection/shap_importance_audit_committed.csv",
-            )
-        mlflow.log_text(
-            "\n".join(high_shap_dropouts), "selection/high_shap_dropouts.txt"
-        )
-        mlflow.log_text(
-            "\n".join(committed_features), "selection/committed_features.txt"
-        )
-        mlflow.log_figure(fig_bs, "selection/bootstrap_delta_dist.png")
-        mlflow.log_figure(fig_pr, "selection/pr_curves.png")
-        plt.close(fig_bs)
-        plt.close(fig_pr)
+    decision = minted["decision"]
+    committed_features = minted["committed_features"]
+    committed_selector = minted["committed_selector"]
+    shap_audit = audits["shap_audit"]
+    shap_audit_committed = audits["shap_audit_committed"]
+    high_shap_dropouts = audits["high_shap_dropouts"]
+    bootstrap_test = cv["bootstrap_test"]
+    full_scores = cv["full_scores"]
 
     logger.info(
         "selection_step_done",
         decision=decision,
         decision_rule=bootstrap_test["decision_rule"],
         n_committed=len(committed_features),
-        reduced_cv_pr_auc_mean=round(reduced_mean, 3),
+        reduced_cv_pr_auc_mean=round(cv["reduced_mean"], 3),
         full_cv_pr_auc_mean=round(float(np.mean(full_scores)), 3),
         delta_obs=bootstrap_test["delta_obs"],
         p_value=bootstrap_test["p_value"],
@@ -320,6 +424,6 @@ def run_selection_step(
             else None
         ),
         "high_shap_dropouts": high_shap_dropouts,
-        "stability": cv_result["stability"],
+        "stability": cv["cv_result"]["stability"],
         "bootstrap_test": bootstrap_test,
     }

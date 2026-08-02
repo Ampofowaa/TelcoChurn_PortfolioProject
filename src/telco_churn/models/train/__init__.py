@@ -1,20 +1,14 @@
-"""Model training pipeline — five steps, run in sequence.
+"""Model training pipeline: five sequential steps, each in its own module.
 
-Step 1: candidate training — CV-score Dummy / LogReg / LightGBM on the dev set.
-    See candidates.py.
-Step 2: paired-bootstrap comparison + decision rule, plus non-gating diagnostics
-    (fixed-recall profile, fairness/robustness flags via diagnostics.py).
-    See comparison.py.
-Step 3: feature selection via features/select.py — freezes the input space.
-    See feature_freeze.py.
-Step 4: Optuna hyperparameter tuning on the frozen feature set.
-    See tuning.py.
-Step 5: log the tuned pipeline as an MLflow run artifact — not registered.
-    See log_model.py. Phase 6's calibrate.py performs the training cycle's
-    single registration, on the calibrated artifact.
+1. candidates.py — CV-score Dummy / LogReg / LightGBM on the dev set.
+2. comparison.py — paired-bootstrap family decision, plus non-gating diagnostics.
+3. feature_freeze.py — permutation-importance selection; freezes the input space.
+4. tuning.py — Optuna hyperparameter search on the frozen feature set.
+5. log_model.py — log the tuned pipeline as an MLflow run artifact, unregistered
+   (Phase 6's calibrate.py performs the cycle's single registration).
 
 Run as `python -m telco_churn.models.train` (see __main__.py) to execute all five
-steps in sequence.
+in sequence.
 """
 
 from __future__ import annotations

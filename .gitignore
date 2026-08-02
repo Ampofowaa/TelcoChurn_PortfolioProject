@@ -224,10 +224,10 @@ datasets/processed/
 datasets/interim/
 mlruns/
 mlflow.db
+optuna.db
 mlartifacts/
 reports/
 .dvc/cache/
 project_thoughts.md
 prompts.txt
 summary.md
-summary.md.bak

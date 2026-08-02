@@ -189,7 +189,7 @@ def test_features_sha256_changes_when_content_changes(
     tmp_path: Path, valid_features_df: pd.DataFrame
 ) -> None:
     """A content edit (e.g. a re-run of the feature pipeline on updated raw
-    data) changes the digest — the consistency check evaluate.py/refit.py rely
+    data) changes the digest — the consistency check evaluate.py relies
     on to catch a stale or mismatched features file."""
     path = tmp_path / "features.csv"
     valid_features_df.to_csv(path, index=False)

@@ -553,9 +553,10 @@ def test_compute_vif_custom_numeric_cols(eda_df: pd.DataFrame) -> None:
 def test_compute_vif_perfect_collinearity_returns_inf(eda_df: pd.DataFrame) -> None:
     df_collinear = eda_df.drop(columns=["churn"]).copy()
     df_collinear["tenure_double"] = df_collinear["tenure"] * 2
-    result = compute_vif(
-        df_collinear, num_cols=["tenure", "tenure_double"], cat_cols=[]
-    )
+    with pytest.warns(UserWarning, match="perfect multicollinearity"):
+        result = compute_vif(
+            df_collinear, num_cols=["tenure", "tenure_double"], cat_cols=[]
+        )
     collinear_vifs = result.loc[
         result["feature"].isin(["tenure", "tenure_double"]), "VIF"
     ]

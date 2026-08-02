@@ -7,14 +7,111 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
+from omegaconf import DictConfig, OmegaConf
 
 from telco_churn.models.diagnostics import (
+    build_segment_lookup,
+    demographic_parity_difference_by_axis,
+    equal_opportunity_difference_by_axis,
     fixed_recall_profile,
+    flag_calibration_collapse,
+    flag_segment_collapse,
     generalization_gap,
     learning_curve_points,
+    segment_bootstrap_ci,
     segment_bootstrap_delta,
+    segment_decision_rates,
     segment_oof_errors,
+    sliced_calibration,
+    sliced_decision_rates,
+    sliced_ranking_metrics,
 )
+
+_N_BOOTSTRAP = 200
+_RANDOM_STATE = 42
+
+
+@pytest.fixture
+def eval_cfg() -> DictConfig:
+    """Small bin count for speed — same shape as production config, not its values."""
+    return OmegaConf.create(
+        {"calibration": {"ece_n_bins": 5, "ece_strategy": "uniform"}}
+    )
+
+
+@pytest.fixture
+def segment_fixture() -> tuple[pd.Series, np.ndarray, dict[str, pd.Series]]:
+    """400 rows across two contract_type groups with a planted PR-AUC/FNR gap
+    between them — enough support in each group for a bootstrap CI."""
+    rng = np.random.default_rng(11)
+    n = 200
+    y_a = (rng.random(n) < 0.30).astype(int)
+    proba_a = np.clip(y_a * 0.6 + rng.normal(0.2, 0.1, size=n), 0.001, 0.999)
+    y_b = (rng.random(n) < 0.30).astype(int)
+    proba_b = np.clip(rng.random(n), 0.001, 0.999)  # no signal in group b
+
+    y = pd.Series(np.concatenate([y_a, y_b]), name="churn")
+    proba = np.concatenate([proba_a, proba_b])
+    df = pd.DataFrame(
+        {
+            "tenure": rng.integers(0, 72, size=2 * n),
+            "contract_type": ["month-to-month"] * n + ["two-year"] * n,
+            "internetservice": ["fiber optic"] * (2 * n),
+            "gender": (["male"] * n) + (["female"] * n),
+            "seniorcitizen": [0] * (2 * n),
+            "has_partner": [1, 0] * n,
+            "dependents": [0, 1] * n,
+        }
+    )
+    return y, proba, build_segment_lookup(df)
+
+
+# ---------------------------------------------------------------------------
+# build_segment_lookup
+# ---------------------------------------------------------------------------
+
+
+def test_build_segment_lookup_returns_all_seven_axes() -> None:
+    """Every robustness and fairness axis is present, including derived tenure_cohort."""
+    df = pd.DataFrame(
+        {
+            "tenure": [0, 15, 30, 50, 70],
+            "contract_type": ["month-to-month"] * 5,
+            "internetservice": ["fiber optic"] * 5,
+            "gender": ["male"] * 5,
+            "seniorcitizen": [0] * 5,
+            "has_partner": [1] * 5,
+            "dependents": [0] * 5,
+        }
+    )
+    lookup = build_segment_lookup(df)
+    assert set(lookup) == {
+        "contract_type",
+        "tenure_cohort",
+        "internetservice",
+        "gender",
+        "seniorcitizen",
+        "has_partner",
+        "dependents",
+    }
+
+
+def test_build_segment_lookup_tenure_cohort_bins_correctly() -> None:
+    """tenure_cohort assigns each row to the cohort its tenure value falls into."""
+    df = pd.DataFrame(
+        {
+            "tenure": [0, 15, 30, 50, 70],
+            "contract_type": ["a"] * 5,
+            "internetservice": ["a"] * 5,
+            "gender": ["a"] * 5,
+            "seniorcitizen": [0] * 5,
+            "has_partner": [0] * 5,
+            "dependents": [0] * 5,
+        }
+    )
+    cohorts = build_segment_lookup(df)["tenure_cohort"].tolist()
+    assert cohorts == ["0-12m", "13-24m", "25-48m", "49-65m", "65+m"]
+
 
 # ---------------------------------------------------------------------------
 # fixed_recall_profile
@@ -323,6 +420,251 @@ def test_segment_bootstrap_delta_deterministic_with_fixed_seed() -> None:
 
 
 # ---------------------------------------------------------------------------
+# segment_bootstrap_ci
+# ---------------------------------------------------------------------------
+
+
+def test_segment_bootstrap_ci_keys() -> None:
+    """Each row contains the six expected keys."""
+    rng = np.random.default_rng(20)
+    n = 100
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(rng.choice(["A", "B"], size=n), name="test_col")
+    rows = segment_bootstrap_ci(y_true, proba, group, n_bootstrap=200, random_state=42)
+    assert len(rows) >= 1
+    for row in rows:
+        assert {
+            "segment",
+            "value",
+            "n",
+            "pr_auc_obs",
+            "pr_auc_ci_lower",
+            "pr_auc_ci_upper",
+        } <= set(row)
+
+
+def test_segment_bootstrap_ci_segment_name() -> None:
+    """segment field matches the Series name."""
+    rng = np.random.default_rng(21)
+    n = 60
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(["X"] * 30 + ["Y"] * 30, name="my_col")
+    rows = segment_bootstrap_ci(y_true, proba, group, n_bootstrap=200, random_state=42)
+    assert all(r["segment"] == "my_col" for r in rows)
+
+
+def test_segment_bootstrap_ci_skips_small_groups() -> None:
+    """Groups with fewer than 10 samples are excluded."""
+    rng = np.random.default_rng(22)
+    n_common, n_rare = 80, 5
+    n = n_common + n_rare
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(["common"] * n_common + ["rare"] * n_rare, name="g")
+    rows = segment_bootstrap_ci(y_true, proba, group, n_bootstrap=200, random_state=42)
+    values = [r["value"] for r in rows]
+    assert "rare" not in values
+    assert "common" in values
+
+
+def test_segment_bootstrap_ci_skips_single_class_segment() -> None:
+    """A segment with only one class present is skipped — PR-AUC is undefined without both classes."""
+    y_true = [0] * 10
+    proba = [0.1 + i * 0.01 for i in range(10)]
+    group = pd.Series(["only"] * 10, name="flag")
+    rows = segment_bootstrap_ci(y_true, proba, group, n_bootstrap=200, random_state=42)
+    assert rows == []
+
+
+def test_segment_bootstrap_ci_lower_bound_clears_churn_floor_for_strong_segment() -> (
+    None
+):
+    """A segment where the model separates classes cleanly has a CI lower bound
+    comfortably above that segment's own churn-rate floor — the V1 veto condition
+    this function feeds."""
+    rng = np.random.default_rng(23)
+    n = 300
+    y_true = rng.integers(0, 2, size=n)
+    proba = np.where(y_true == 1, 0.9, 0.1) + rng.normal(0, 0.05, n)
+    group = pd.Series(["seg"] * n, name="g")
+    rows = segment_bootstrap_ci(
+        y_true.tolist(), proba.tolist(), group, n_bootstrap=500, random_state=42
+    )
+    churn_floor = float(y_true.mean())
+    assert rows[0]["pr_auc_ci_lower"] > churn_floor
+
+
+def test_segment_bootstrap_ci_flags_weak_segment_near_floor() -> None:
+    """A segment with near-random predictions has a CI lower bound close to (not
+    materially above) its own churn-rate floor — the collapse case V1 vetoes on."""
+    rng = np.random.default_rng(24)
+    n = 300
+    y_true = rng.integers(0, 2, size=n)
+    proba = rng.random(n)  # uninformative
+    group = pd.Series(["seg"] * n, name="g")
+    rows = segment_bootstrap_ci(
+        y_true.tolist(), proba.tolist(), group, n_bootstrap=500, random_state=42
+    )
+    churn_floor = float(y_true.mean())
+    assert rows[0]["pr_auc_ci_lower"] < churn_floor + 0.15
+
+
+def test_segment_bootstrap_ci_deterministic_with_fixed_seed() -> None:
+    """Same random_state reproduces byte-identical results across calls."""
+    rng = np.random.default_rng(25)
+    n = 100
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(["seg"] * n, name="g")
+    rows_a = segment_bootstrap_ci(
+        y_true, proba, group, n_bootstrap=200, random_state=42
+    )
+    rows_b = segment_bootstrap_ci(
+        y_true, proba, group, n_bootstrap=200, random_state=42
+    )
+    assert rows_a == rows_b
+
+
+def test_segment_bootstrap_ci_empty_group_returns_empty_list() -> None:
+    """An empty group Series returns an empty list, not an error."""
+    rows = segment_bootstrap_ci(
+        [], [], pd.Series([], dtype=object, name="g"), n_bootstrap=200, random_state=42
+    )
+    assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# segment_decision_rates
+# ---------------------------------------------------------------------------
+
+
+def test_segment_decision_rates_keys() -> None:
+    """Each row contains the six expected keys."""
+    rng = np.random.default_rng(30)
+    n = 100
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(rng.choice(["A", "B"], size=n), name="test_col")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert len(rows) >= 1
+    for row in rows:
+        assert {
+            "segment",
+            "value",
+            "n",
+            "selection_rate",
+            "fnr",
+            "fpr",
+            "precision",
+        } <= set(row)
+
+
+def test_segment_decision_rates_segment_name() -> None:
+    """segment field matches the Series name."""
+    rng = np.random.default_rng(31)
+    n = 60
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(["X"] * 30 + ["Y"] * 30, name="my_col")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert all(r["segment"] == "my_col" for r in rows)
+
+
+def test_segment_decision_rates_skips_small_groups() -> None:
+    """Groups with fewer than 10 samples are excluded."""
+    rng = np.random.default_rng(32)
+    n_common, n_rare = 80, 5
+    n = n_common + n_rare
+    y_true = rng.integers(0, 2, size=n).tolist()
+    proba = rng.random(size=n).tolist()
+    group = pd.Series(["common"] * n_common + ["rare"] * n_rare, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    values = [r["value"] for r in rows]
+    assert "rare" not in values
+    assert "common" in values
+
+
+def test_segment_decision_rates_selection_rate_matches_manual_count() -> None:
+    """selection_rate equals the fraction of the segment scored >= threshold."""
+    y_true = [0] * 20
+    proba = [0.1] * 10 + [0.9] * 10  # exactly half above threshold
+    group = pd.Series(["seg"] * 20, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert rows[0]["selection_rate"] == pytest.approx(0.5)
+
+
+def test_segment_decision_rates_all_negatives_selected_gives_fpr_one_fnr_nan() -> None:
+    """An all-negative segment scored entirely above threshold has FPR=1.0 and an
+    undefined (NaN) FNR — there are no positives to miss."""
+    y_true = [0] * 10
+    proba = [0.9] * 10
+    group = pd.Series(["seg"] * 10, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert rows[0]["fpr"] == pytest.approx(1.0)
+    assert math.isnan(rows[0]["fnr"])
+
+
+def test_segment_decision_rates_all_positives_missed_gives_fnr_one_fpr_nan() -> None:
+    """An all-positive segment scored entirely below threshold has FNR=1.0 and an
+    undefined (NaN) FPR — there are no negatives to falsely flag."""
+    y_true = [1] * 10
+    proba = [0.1] * 10
+    group = pd.Series(["seg"] * 10, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert rows[0]["fnr"] == pytest.approx(1.0)
+    assert math.isnan(rows[0]["fpr"])
+
+
+def test_segment_decision_rates_precision_nan_when_nothing_selected() -> None:
+    """Precision is NaN, not a divide-by-zero error, when no one in the segment is
+    scored above threshold."""
+    y_true = [0] * 5 + [1] * 5
+    proba = [0.1] * 10
+    group = pd.Series(["seg"] * 10, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert math.isnan(rows[0]["precision"])
+
+
+def test_segment_decision_rates_perfect_classifier_has_zero_error_rates() -> None:
+    """A perfect classifier at the decision threshold has FNR=0, FPR=0, precision=1."""
+    y_true = [0] * 10 + [1] * 10
+    proba = [0.1] * 10 + [0.9] * 10
+    group = pd.Series(["seg"] * 20, name="g")
+    rows = segment_decision_rates(y_true, proba, group, threshold=0.5)
+    assert rows[0]["fnr"] == pytest.approx(0.0)
+    assert rows[0]["fpr"] == pytest.approx(0.0)
+    assert rows[0]["precision"] == pytest.approx(1.0)
+
+
+def test_segment_decision_rates_detects_selection_rate_gap_across_segments() -> None:
+    """Two segments with different score distributions around the threshold show a
+    visibly different selection rate — the demographic-parity-diff signal this
+    function exists to surface."""
+    y_true = [0] * 20 + [1] * 20
+    proba_low_selected = [0.1] * 15 + [0.6] * 5  # segment A: mostly below threshold
+    proba_high_selected = [0.6] * 5 + [0.9] * 15  # segment B: mostly above threshold
+    y_a, y_b = y_true[:20], y_true[20:]
+    group = pd.Series(["A"] * 20 + ["B"] * 20, name="g")
+    rows = {
+        r["value"]: r
+        for r in segment_decision_rates(
+            y_a + y_b, proba_low_selected + proba_high_selected, group, threshold=0.5
+        )
+    }
+    assert rows["B"]["selection_rate"] > rows["A"]["selection_rate"] + 0.3
+
+
+def test_segment_decision_rates_empty_group_returns_empty_list() -> None:
+    """An empty group Series returns an empty list, not an error."""
+    rows = segment_decision_rates(
+        [], [], pd.Series([], dtype=object, name="g"), threshold=0.5
+    )
+    assert rows == []
+
+
+# ---------------------------------------------------------------------------
 # generalization_gap
 # ---------------------------------------------------------------------------
 
@@ -403,3 +745,183 @@ def test_learning_curve_points_single_repeat_std_is_zero() -> None:
 def test_learning_curve_points_empty_input() -> None:
     """No training sizes returns an empty list, not an error."""
     assert learning_curve_points([], [], []) == []
+
+
+# ---------------------------------------------------------------------------
+# sliced_ranking_metrics / flag_segment_collapse (V1)
+# ---------------------------------------------------------------------------
+
+
+def test_sliced_ranking_metrics_one_row_per_axis_value(
+    segment_fixture: tuple[pd.Series, np.ndarray, dict[str, pd.Series]],
+) -> None:
+    """One row per (axis, value) pair, tagged with its axis and churn_rate_floor."""
+    y, proba, segment_lookup = segment_fixture
+    rows = sliced_ranking_metrics(
+        y, proba, segment_lookup, ("contract_type",), _N_BOOTSTRAP, _RANDOM_STATE
+    )
+    assert len(rows) == 2
+    assert {row["axis"] for row in rows} == {"contract_type"}
+    for row in rows:
+        assert "churn_rate_floor" in row
+        assert "pr_auc_ci_lower" in row
+
+
+def test_flag_segment_collapse_flags_the_no_signal_group(
+    segment_fixture: tuple[pd.Series, np.ndarray, dict[str, pd.Series]],
+) -> None:
+    """The planted no-signal group (two-year) is flagged; the signal group is not."""
+    y, proba, segment_lookup = segment_fixture
+    rows = sliced_ranking_metrics(
+        y, proba, segment_lookup, ("contract_type",), _N_BOOTSTRAP, _RANDOM_STATE
+    )
+    flagged = flag_segment_collapse(rows)
+    flagged_values = {row["value"] for row in flagged}
+    assert "two-year" in flagged_values
+    assert "month-to-month" not in flagged_values
+
+
+def test_flag_segment_collapse_empty_when_no_rows_collapse() -> None:
+    """No flagged rows when every segment's CI lower bound clears its floor."""
+    rows = [
+        {
+            "axis": "gender",
+            "value": "male",
+            "pr_auc_ci_lower": 0.5,
+            "churn_rate_floor": 0.27,
+        },
+        {
+            "axis": "gender",
+            "value": "female",
+            "pr_auc_ci_lower": 0.45,
+            "churn_rate_floor": 0.27,
+        },
+    ]
+    assert flag_segment_collapse(rows) == []
+
+
+# ---------------------------------------------------------------------------
+# sliced_decision_rates / equal_opportunity_difference_by_axis /
+# demographic_parity_difference_by_axis (V2)
+# ---------------------------------------------------------------------------
+
+
+def test_sliced_decision_rates_one_row_per_axis_value(
+    segment_fixture: tuple[pd.Series, np.ndarray, dict[str, pd.Series]],
+) -> None:
+    """One row per (axis, value) pair, tagged with its axis."""
+    y, proba, segment_lookup = segment_fixture
+    rows = sliced_decision_rates(y, proba, segment_lookup, ("gender",), 0.3)
+    assert len(rows) == 2
+    assert {row["axis"] for row in rows} == {"gender"}
+    for row in rows:
+        assert {"selection_rate", "fnr", "fpr", "precision"} <= set(row)
+
+
+def test_equal_opportunity_difference_by_axis_computed_per_axis_not_pooled() -> None:
+    """The diff is the max-min FNR within each axis's own rows — an axis with a
+    large FNR gap does not leak into another axis's smaller one."""
+    rows = [
+        {"axis": "gender", "value": "male", "fnr": 0.20},
+        {"axis": "gender", "value": "female", "fnr": 0.24},
+        {"axis": "seniorcitizen", "value": 0, "fnr": 0.10},
+        {"axis": "seniorcitizen", "value": 1, "fnr": 0.40},
+    ]
+    diffs = equal_opportunity_difference_by_axis(rows)
+    assert diffs["gender"] == pytest.approx(0.04)
+    assert diffs["seniorcitizen"] == pytest.approx(0.30)
+
+
+def test_equal_opportunity_difference_by_axis_excludes_nan_fnr() -> None:
+    """A group with no churners (NaN FNR) is excluded rather than poisoning the max/min."""
+    rows = [
+        {"axis": "gender", "value": "male", "fnr": 0.20},
+        {"axis": "gender", "value": "female", "fnr": float("nan")},
+    ]
+    diffs = equal_opportunity_difference_by_axis(rows)
+    assert math.isnan(diffs["gender"])
+
+
+def test_demographic_parity_difference_by_axis_computed_per_axis() -> None:
+    """The diff is the max-min selection rate within each axis's own rows."""
+    rows = [
+        {"axis": "gender", "value": "male", "selection_rate": 0.30},
+        {"axis": "gender", "value": "female", "selection_rate": 0.35},
+        {"axis": "dependents", "value": 0, "selection_rate": 0.20},
+        {"axis": "dependents", "value": 1, "selection_rate": 0.50},
+    ]
+    diffs = demographic_parity_difference_by_axis(rows)
+    assert diffs["gender"] == pytest.approx(0.05)
+    assert diffs["dependents"] == pytest.approx(0.30)
+
+
+# ---------------------------------------------------------------------------
+# sliced_calibration / flag_calibration_collapse (V2b)
+# ---------------------------------------------------------------------------
+
+
+def test_sliced_calibration_one_row_per_axis_value(
+    segment_fixture: tuple[pd.Series, np.ndarray, dict[str, pd.Series]],
+    eval_cfg: DictConfig,
+) -> None:
+    """One row per (axis, value) pair meeting the minimum-support/two-class floor."""
+    y, proba, segment_lookup = segment_fixture
+    rows = sliced_calibration(
+        y,
+        proba,
+        segment_lookup,
+        ("contract_type",),
+        eval_cfg,
+        _N_BOOTSTRAP,
+        _RANDOM_STATE,
+    )
+    assert len(rows) == 2
+    for row in rows:
+        assert {"slope", "slope_ci_lower", "slope_ci_upper", "ece", "n"} <= set(row)
+
+
+def test_sliced_calibration_skips_single_class_segment(eval_cfg: DictConfig) -> None:
+    """A segment with only one class present (no calibration slope estimable) is
+    skipped; a segment with both classes and enough support is kept."""
+    rng = np.random.default_rng(13)
+    y = pd.Series([0] * 20 + ([0] * 10 + [1] * 10))
+    proba = np.concatenate([rng.random(20), rng.random(20)])
+    group = pd.Series(["single_class"] * 20 + ["mixed"] * 20)
+    rows = sliced_calibration(
+        y, proba, {"axis": group}, ("axis",), eval_cfg, _N_BOOTSTRAP, _RANDOM_STATE
+    )
+    assert {row["value"] for row in rows} == {"mixed"}
+
+
+def test_flag_calibration_collapse_flags_ci_entirely_outside_band() -> None:
+    """Only rows whose CI lies entirely outside the band are flagged."""
+    rows = [
+        {
+            "axis": "gender",
+            "value": "male",
+            "slope_ci_lower": 0.85,
+            "slope_ci_upper": 1.10,
+        },
+        {
+            "axis": "gender",
+            "value": "female",
+            "slope_ci_lower": 0.30,
+            "slope_ci_upper": 0.60,
+        },
+    ]
+    flagged = flag_calibration_collapse(rows, band=(0.80, 1.25))
+    assert {row["value"] for row in flagged} == {"female"}
+
+
+def test_flag_calibration_collapse_does_not_flag_overlapping_ci() -> None:
+    """A CI that merely overlaps the band's edge (point estimate outside, CI overlapping)
+    is not flagged — only a CI entirely outside counts."""
+    rows = [
+        {
+            "axis": "gender",
+            "value": "male",
+            "slope_ci_lower": 0.70,
+            "slope_ci_upper": 0.90,
+        },
+    ]
+    assert flag_calibration_collapse(rows, band=(0.80, 1.25)) == []

@@ -9,6 +9,7 @@ import pytest
 from omegaconf import OmegaConf
 
 import telco_churn.models.train.candidates as candidates
+import telco_churn.models.train.common as common
 from telco_churn.features.accessor import features_path
 
 # ---------------------------------------------------------------------------
@@ -94,7 +95,7 @@ def test_run_candidate_step_logs_metric_contract(
             "logreg": {
                 "Cs": 2,
                 "cv_folds": 2,
-                "max_iter": 50,
+                "max_iter": 200,
                 "solver": "lbfgs",
                 "l1_ratio": 0.0,
             },
@@ -144,7 +145,7 @@ def test_run_candidate_step_logs_metric_contract(
         candidates.mlflow, "log_metrics", lambda metrics: logged_metrics.append(metrics)
     )
     monkeypatch.setattr(candidates.mlflow, "log_metric", lambda *a, **k: None)
-    monkeypatch.setattr(candidates, "mlflow_from_pandas", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(common, "mlflow_from_pandas", lambda *a, **k: MagicMock())
     monkeypatch.setattr(candidates, "_git_sha", lambda: "deadbeef")
     monkeypatch.setattr(candidates, "_dvc_hash", lambda cfg: "unknown")
 
@@ -183,7 +184,7 @@ def test_run_candidate_step_dataset_source_uses_accessor_canonical_path(
             "logreg": {
                 "Cs": 2,
                 "cv_folds": 2,
-                "max_iter": 50,
+                "max_iter": 200,
                 "solver": "lbfgs",
                 "l1_ratio": 0.0,
             },
@@ -231,7 +232,7 @@ def test_run_candidate_step_dataset_source_uses_accessor_canonical_path(
     monkeypatch.setattr(candidates.mlflow, "log_params", lambda params: None)
     monkeypatch.setattr(candidates.mlflow, "log_metrics", lambda metrics: None)
     monkeypatch.setattr(candidates.mlflow, "log_metric", lambda *a, **k: None)
-    monkeypatch.setattr(candidates, "mlflow_from_pandas", _fake_from_pandas)
+    monkeypatch.setattr(common, "mlflow_from_pandas", _fake_from_pandas)
     monkeypatch.setattr(candidates, "_git_sha", lambda: "deadbeef")
     monkeypatch.setattr(candidates, "_dvc_hash", lambda cfg: "unknown")
 

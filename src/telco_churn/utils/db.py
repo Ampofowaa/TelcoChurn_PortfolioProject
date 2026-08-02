@@ -5,6 +5,8 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
+__all__ = ["get_engine"]
+
 _engine: Engine | None = None
 
 

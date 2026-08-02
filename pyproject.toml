@@ -45,6 +45,7 @@ dev = [
     "nbstripout>=0.9.1",
     "nbconvert>=7.17.1",
     "ipykernel>=7.2.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.ruff]
@@ -66,12 +67,20 @@ target-version = ["py313"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-ignore_missing_imports = true
 exclude = ["notebooks/", "pipelines/", "tests/"]
 
 [[tool.mypy.overrides]]
 module = "pandera.*"
 follow_imports = "skip"
+
+# Scoped, not the removed top-level ignore_missing_imports: only these libraries
+# actually lack stubs/py.typed (confirmed by running mypy without the blanket
+# flag). mlflow, optuna, and lightgbm already ship their own types and are
+# checked normally; a typo in one of those import paths still surfaces as a
+# real error instead of silently falling back to Any.
+[[tool.mypy.overrides]]
+module = ["pandas", "pandas.*", "scipy", "scipy.*", "sklearn.*", "shap", "joblib", "yaml"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -79,6 +88,43 @@ pythonpath = ["tests/unit"]
 addopts = "--cov=src --cov-report=term-missing"
 markers = [
     "integration: integration tests that require Docker (pass --run-integration to run)",
+]
+# Each entry below is a confirmed-benign warning, not an unexamined blanket
+# silence — see CHANGELOG/PR history for the investigation. Message patterns
+# are matched from the start of the string (regex, unescaped); keep them free
+# of literal colons (pytest's ini parser splits the whole line on ":").
+filterwarnings = [
+    # LogisticRegression stand-ins for LightGBM in test_calibrate.py/test_threshold.py
+    # deliberately keep the real, unscaled tree-family ColumnTransformer (they
+    # exercise calibrate.py's/threshold.py's own CV-wrapping logic, not model
+    # quality) — confirmed this still fires at max_iter=2000. Not reachable from
+    # production configs: configs/training/logreg.yaml sets max_iter=200, and
+    # scales the data via the real preprocessing pipeline these test stand-ins skip.
+    "ignore:lbfgs failed to converge:sklearn.exceptions.ConvergenceWarning",
+    # mlflow 3.14's own dataset digest computation still calls DataFrame.map(...).all(0)
+    # positionally; nothing in this project touches that call site. Scoped to mlflow's
+    # own module so a genuine Pandas4Warning from this project's own pandas code (e.g.
+    # once pandas 4 actually ships) still surfaces instead of being swallowed here too.
+    "ignore::pandas.errors.Pandas4Warning:mlflow.*",
+    # mlflow.data.from_pandas's source-type registry reports the same source
+    # string as matching two internally-duplicated LocalArtifactDatasetSource
+    # registrations and self-resolves the ambiguity; not something callers can
+    # disambiguate from the public from_pandas API.
+    "ignore:The specified dataset source can be interpreted in multiple ways:UserWarning",
+    # mlflow's schema-inference advisory on integer training columns; the committed
+    # feature columns are never null at training time (TotalCharges is imputed
+    # upstream of this point), so this is advisory noise, not a real risk today.
+    # ("." stands in for the literal colon after "Hint" — a literal colon here
+    # would break pytest's 5-field colon-split of this ini entry.)
+    "ignore:Hint. Inferred schema contains integer column:UserWarning",
+    # test_eda.py's eda_df fixture models IBM Telco's real structural constraint
+    # (internet add-on columns collapse to a single value when internetservice
+    # is "No"), which makes compute_vif's default cat_cols design matrix
+    # rank-deficient. Confirmed-benign: it's a property of the realistic fixture,
+    # not of compute_vif itself, and fires incidentally in tests unrelated to
+    # collinearity. Tests that specifically assert this warning use pytest.warns,
+    # which still captures it under this filter.
+    "ignore:VIF is inf for one or more features:UserWarning",
 ]
 
 [tool.coverage.run]

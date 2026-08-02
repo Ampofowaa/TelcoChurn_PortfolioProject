@@ -21,17 +21,31 @@ from telco_churn.models.diagnostics import (
     segment_bootstrap_delta,
     segment_oof_errors,
 )
-from telco_churn.models.train.common import _dvc_hash, _git_sha, _log_dev_input
+from telco_churn.models.train.common import (
+    _dvc_hash,
+    _git_sha,
+    _log_dev_input,
+    _plot_bootstrap_delta,
+)
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.mlflow import ensure_experiment_metadata, set_run_description
 from telco_churn.utils.stats import paired_bootstrap_ci
 
 __all__ = ["bootstrap_comparison", "run_comparison_step", "run_diagnostics_step"]
 
 logger = get_logger(__name__)
 
-# Flag-only characterization segments — never decide the model family (CLAUDE.md
-# one-metric invariant).
+_RUN_DESCRIPTION = (
+    "Candidate comparison — Dummy / LogReg / LightGBM scored on one shared, "
+    "paired RepeatedStratifiedKFold(5x3) over the development split. Decides "
+    "model family via a pre-registered paired-bootstrap PR-AUC rule "
+    "(materiality delta*=0.005); non-gating fixed-recall and "
+    "fairness/robustness diagnostics logged alongside but never decide the "
+    "family."
+)
+
+# Flag-only characterization segments — diagnostics reported alongside the
+# comparison, never inputs to it; PR-AUC alone decides the model family.
 _ROBUSTNESS_SEGMENTS: tuple[str, ...] = (
     "contract_type",
     "tenure_cohort",
@@ -85,9 +99,7 @@ def bootstrap_comparison(
         "decision": decision,
         "decision_rule": decision_rule,
         "n_bootstrap": n_bootstrap,
-        "bootstrap_deltas": result[
-            "bootstrap_deltas"
-        ],  # raw distribution; used for plotting in run_comparison_step
+        "bootstrap_deltas": result["bootstrap_deltas"],
     }
 
 
@@ -221,6 +233,69 @@ def run_diagnostics_step(
     }
 
 
+def _build_comparison_table(
+    candidate_results: dict[str, dict[str, Any]],
+    roc_lgbm: float,
+    roc_logreg: float,
+    pr_auc_oof_lgbm: float,
+    pr_auc_oof_logreg: float,
+) -> list[dict[str, Any]]:
+    """Build the per-candidate comparison table (CV mean/std, pooled OOF AP, ROC-AUC, timings)."""
+    comparison_rows: list[dict[str, Any]] = []
+    for cname, res in candidate_results.items():
+        roc: float = (
+            roc_lgbm
+            if cname == "lgbm_default"
+            else roc_logreg if cname == "logreg_cv" else float("nan")
+        )
+        pr_auc_oof: float = (
+            pr_auc_oof_lgbm
+            if cname == "lgbm_default"
+            else pr_auc_oof_logreg if cname == "logreg_cv" else float("nan")
+        )
+        comparison_rows.append(
+            {
+                "candidate": cname,
+                "cv_pr_auc_mean": round(res["pr_auc_mean"], 3),
+                "cv_pr_auc_std": round(res["pr_auc_std"], 3),
+                "pr_auc_oof": (
+                    round(pr_auc_oof, 3) if not np.isnan(pr_auc_oof) else float("nan")
+                ),
+                "roc_auc": round(roc, 3) if not np.isnan(roc) else float("nan"),
+                "train_time_s": round(res["train_time_s"], 2),
+                "predict_time_s": round(res["predict_time_s"], 3),
+            }
+        )
+    return comparison_rows
+
+
+def _plot_comparison_figures(
+    candidate_results: dict[str, dict[str, Any]],
+    bootstrap: dict[str, Any],
+    delta_threshold: float,
+) -> dict[str, Any]:
+    """Plot the OOF precision-recall curves and the paired-bootstrap Δ distribution."""
+    lgbm_res = candidate_results["lgbm_default"]
+    logreg_res = candidate_results["logreg_cv"]
+
+    fig_pr, ax_pr = plt.subplots(figsize=(6, 5))
+    for label, res in [("LightGBM", lgbm_res), ("LogReg", logreg_res)]:
+        PrecisionRecallDisplay.from_predictions(
+            res["oof_true"], res["oof_proba"], name=label, ax=ax_pr
+        )
+    ax_pr.set_title("OOF Precision-Recall Curves (dev set)")
+
+    fig_bs = _plot_bootstrap_delta(
+        bootstrap["bootstrap_deltas"],
+        bootstrap["delta_obs"],
+        delta_threshold,
+        title="Paired-Bootstrap Δ Distribution",
+        xlabel="Δ PR-AUC (LGBM − LogReg)",
+    )
+
+    return {"fig_pr": fig_pr, "fig_bs": fig_bs}
+
+
 def run_comparison_step(
     X_dev: pd.DataFrame,
     y_dev: pd.Series,
@@ -262,63 +337,18 @@ def run_comparison_step(
         average_precision_score(logreg_res["oof_true"], logreg_res["oof_proba"])
     )
 
-    comparison_rows: list[dict[str, Any]] = []
-    for cname, res in candidate_results.items():
-        roc: float = (
-            roc_lgbm
-            if cname == "lgbm_default"
-            else roc_logreg if cname == "logreg_cv" else float("nan")
-        )
-        pr_auc_oof: float = (
-            pr_auc_oof_lgbm
-            if cname == "lgbm_default"
-            else pr_auc_oof_logreg if cname == "logreg_cv" else float("nan")
-        )
-        comparison_rows.append(
-            {
-                "candidate": cname,
-                "cv_pr_auc_mean": round(res["pr_auc_mean"], 3),
-                "cv_pr_auc_std": round(res["pr_auc_std"], 3),
-                "pr_auc_oof": (
-                    round(pr_auc_oof, 3) if not np.isnan(pr_auc_oof) else float("nan")
-                ),
-                "roc_auc": round(roc, 3) if not np.isnan(roc) else float("nan"),
-                "train_time_s": round(res["train_time_s"], 2),
-                "predict_time_s": round(res["predict_time_s"], 3),
-            }
-        )
-
-    fig_pr, ax_pr = plt.subplots(figsize=(6, 5))
-    for label, res in [("LightGBM", lgbm_res), ("LogReg", logreg_res)]:
-        PrecisionRecallDisplay.from_predictions(
-            res["oof_true"], res["oof_proba"], name=label, ax=ax_pr
-        )
-    ax_pr.set_title("OOF Precision-Recall Curves (dev set)")
-
-    fig_bs, ax_bs = plt.subplots(figsize=(6, 4))
-    ax_bs.hist(bootstrap["bootstrap_deltas"], bins=50, edgecolor="none", alpha=0.75)
-    ax_bs.axvline(
-        bootstrap["delta_obs"],
-        color="C1",
-        linestyle="--",
-        label=f"Δ_obs = {bootstrap['delta_obs']:.3f}",
+    comparison_rows = _build_comparison_table(
+        candidate_results, roc_lgbm, roc_logreg, pr_auc_oof_lgbm, pr_auc_oof_logreg
     )
-    ax_bs.axvline(0.0, color="black", linestyle=":", label="Δ = 0 (null)")
-    ax_bs.axvline(
-        float(ts.delta_threshold),
-        color="C2",
-        linestyle="--",
-        label=f"Δ* = {ts.delta_threshold}",
+    figures = _plot_comparison_figures(
+        candidate_results, bootstrap, float(ts.delta_threshold)
     )
-    ax_bs.set_xlabel("Δ PR-AUC (LGBM − LogReg)")
-    ax_bs.set_ylabel("Bootstrap resamples")
-    ax_bs.set_title("Paired-Bootstrap Δ Distribution")
-    ax_bs.legend()
+    fig_pr, fig_bs = figures["fig_pr"], figures["fig_bs"]
 
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    mlflow.set_experiment(cfg.mlflow.experiment_name)
+    ensure_experiment_metadata(cfg)
 
     with mlflow.start_run(run_name="model_comparison"):
+        set_run_description(_RUN_DESCRIPTION)
         mlflow.set_tags(
             {
                 "stage": "comparison",

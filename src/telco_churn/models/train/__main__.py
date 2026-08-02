@@ -48,8 +48,7 @@ try:
                 "Step 3's permutation-importance selector is model-agnostic, but "
                 "this pipeline still fits LightGBM internally and Step 4 tuning "
                 "is LightGBM-only; a LogReg winner still needs a linear-model "
-                "pipeline built before Steps 3-5 can run (PROJECT_PLAN.md Step 2 "
-                "rule-4 contingency)."
+                "pipeline built before Steps 3-5 can run."
             ),
         )
 

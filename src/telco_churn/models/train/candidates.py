@@ -7,7 +7,6 @@ from typing import Any
 import mlflow
 import pandas as pd
 from lightgbm import LGBMClassifier
-from mlflow.data.pandas_dataset import from_pandas as mlflow_from_pandas
 from omegaconf import DictConfig
 from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegressionCV
@@ -15,13 +14,13 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.pipeline import Pipeline
 
-from telco_churn.features.accessor import features_path
-from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
+from telco_churn.features.build import FEATURE_SCHEMA
 from telco_churn.features.preprocessing import (
     build_linear_preprocessor,
     build_preprocessor,
 )
 from telco_churn.models.train.common import (
+    _build_dev_dataset,
     _dvc_hash,
     _git_sha,
     cv_score_candidate,
@@ -29,7 +28,7 @@ from telco_churn.models.train.common import (
     logreg_default_params,
 )
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.mlflow import ensure_experiment_metadata
 
 __all__ = ["run_candidate_step"]
 
@@ -107,37 +106,11 @@ def run_candidate_step(
         ),
     }
 
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    exp = mlflow.set_experiment(cfg.mlflow.experiment_name)
-    _client = mlflow.tracking.MlflowClient()
-    _client.set_experiment_tag(
-        exp.experiment_id,
-        "mlflow.note.content",
-        (
-            "Model selection — candidate comparison (Dummy / Logistic Regression / LightGBM) "
-            "and paired-bootstrap decision on the IBM Telco Customer Churn dev set. "
-            "Selection criterion: PR-AUC (average precision). "
-            "Winning family proceeds to feature selection and Optuna tuning."
-        ),
-    )
-    for _tag_key, _tag_val in {
-        "project": "telco-churn",
-        "phase": "model-selection",
-        "dataset": "ibm-telco-churn",
-        "env": "development",
-    }.items():
-        _client.set_experiment_tag(exp.experiment_id, _tag_key, _tag_val)
+    ensure_experiment_metadata(cfg)
 
     git_sha = _git_sha()
     dvc_hash = _dvc_hash(cfg)
-    dev_df = X_dev.copy()
-    dev_df[TARGET_COL] = y_dev.values
-    _dev_dataset = mlflow_from_pandas(
-        dev_df,
-        source=str(features_path()),
-        name="telco_churn_dev",
-        targets=TARGET_COL,
-    )
+    _dev_dataset = _build_dev_dataset(X_dev, y_dev)
 
     _model_family = {
         "dummy_prior": "dummy",

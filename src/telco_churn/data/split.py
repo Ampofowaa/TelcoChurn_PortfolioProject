@@ -2,10 +2,9 @@
 
 The split depends only on (customerid, churn), never on any engineered feature, so
 it is established once, right after raw-data validation, before feature discovery
-or feature engineering run. See docs/canonical-split-refactor-tasks.md for the
-motivating refactor: this module is the single place the split is defined; every
-downstream consumer (feature discovery, models/train/, evaluate.py) imports it
-rather than redefining it.
+or feature engineering run. This module is the single place the split is defined;
+every downstream consumer (feature discovery, models/train/, evaluate.py) imports
+it rather than redefining it.
 """
 
 from __future__ import annotations

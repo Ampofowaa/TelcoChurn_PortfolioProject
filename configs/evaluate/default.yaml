@@ -1,0 +1,18 @@
+# Sealed-test evaluation configuration — see models/evaluate.py.
+
+# telco-churn-pipeline version to evaluate on the sealed test set — required, e.g. `evaluate.model_version=1`.
+model_version: null
+
+# Bootstrap resample count for every reported metric's CI (PR-AUC, recall, precision,
+# F1, BSS, calibration slope, EV). Distinct from training_setup.bootstrap_n_samples
+# (Phase 5's model-family comparison uses a different count for a different decision).
+n_bootstrap: 1000
+
+# Bootstrap resampling seed.
+random_state: 42
+
+# Symmetric +/- perturbation applied to each CostScenario field in turn for the
+# tornado diagram (models.economics.tornado) — a caller-supplied band, not
+# something economics.py invents. 20% is wide enough to move the EV needle
+# without leaving the plausible range of any of retention_rate/cost/ltv.
+tornado_pct_perturbation: 0.2

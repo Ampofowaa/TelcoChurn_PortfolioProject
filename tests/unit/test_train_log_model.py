@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import mlflow
 import numpy as np
 import pandas as pd
@@ -17,11 +15,27 @@ import telco_churn.models.train.log_model as log_model
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def tuning_mlflow_uri(mlflow_test_experiment: Callable[[str], str]) -> str:
-    """Point MLflow at the shared tmp-scoped experiment (conftest.py ::
-    mlflow_test_experiment)."""
-    return mlflow_test_experiment("test_run_model_logging_step")
+@pytest.fixture(scope="module")
+def tuning_mlflow_uri(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Point MLflow at a module-scoped tmp SQLite store with an explicit
+    artifact_location — inlines conftest.py::mlflow_test_experiment's logic
+    rather than requesting it, since that fixture depends on the
+    function-scoped tmp_path and this fixture is module-scoped: every test
+    below starts its own fresh parent run (_start_parent_run) and only
+    inspects that run, never enumerates the experiment's full run list, so
+    sharing one experiment (and skipping the ~2.5-3.5s SQLite-store
+    bootstrap cost per test) is safe. registration_cfg stays function-scoped
+    deliberately — several tests mutate it per-scenario, so it can't be
+    shared."""
+    tmp_path = tmp_path_factory.mktemp("log_model_mlflow")
+    tracking_uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    mlflow.set_tracking_uri(tracking_uri)
+    artifact_location = (tmp_path / "artifacts").as_uri()
+    experiment_id = mlflow.create_experiment(
+        "test_run_model_logging_step", artifact_location=artifact_location
+    )
+    mlflow.set_experiment(experiment_id=experiment_id)
+    return tracking_uri
 
 
 @pytest.fixture

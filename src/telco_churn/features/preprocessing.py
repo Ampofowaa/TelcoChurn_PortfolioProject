@@ -59,23 +59,22 @@ def build_preprocessor(
 ) -> ColumnTransformer:
     """Return an unfitted tree-family ColumnTransformer for binary, multi-cat, and numeric columns.
 
-    Designed for tree-based models (GBDT): trees are invariant to monotone feature
-    transformations, so StandardScaler is deliberately omitted — scaling adds no
-    information to split decisions and belongs only in the linear-family preprocessor.
+    No scaling: trees are invariant to monotone transforms, so StandardScaler
+    is reserved for build_linear_preprocessor. binary columns use
+    OHE(drop='if_binary') (1 column per feature, regardless of str/int dtype);
+    multi_cat columns keep all levels (no drop='first' — irrelevant for trees,
+    and needed for importance screens); numeric columns are median-imputed
+    to cover the 11 NaN zero-tenure rows. Must be fit on the training split
+    only, so held-out statistics never leak into preprocessing.
 
-    binary    — union of str and int binary columns. OHE(drop='if_binary') handles
-                heterogeneous dtypes per-column and produces exactly 1 column per
-                binary feature (cleaner feature names in feature_columns.txt and SHAP).
-    multi_cat — multi-level categoricals; OHE without drop='first' — correct for trees
-                (immune to the dummy-variable trap) and keeps all levels visible in
-                importance screens.
-    numeric   — numeric columns; SimpleImputer(median) handles the 11 NaN zero-tenure
-                rows (fit on X_train only). No scaling — trees don't need it.
-
-    Must be fitted on the training split only so held-out statistics never leak into
-    the preprocessing step.
+    Output is pandas, not the sklearn-default ndarray: LightGBM's sklearn
+    wrapper auto-generates Column_0..N feature names for unnamed arrays, which
+    false-positives its feature-name-consistency check at predict time if fit
+    and predict ever pass through a Pipeline with mismatched output types.
+    Named pandas output keeps names genuinely consistent and also reads
+    better in feature_columns.txt/SHAP.
     """
-    return ColumnTransformer(
+    preprocessor = ColumnTransformer(
         transformers=[
             (
                 "binary",
@@ -93,6 +92,8 @@ def build_preprocessor(
         ],
         remainder="drop",
     )
+    preprocessor.set_output(transform="pandas")
+    return preprocessor
 
 
 def build_linear_preprocessor(
@@ -102,27 +103,24 @@ def build_linear_preprocessor(
 ) -> ColumnTransformer:
     """Return an unfitted linear-family ColumnTransformer for binary, multi-cat, and numeric columns.
 
-    Designed for logistic regression and related linear models. Three key differences
-    from build_preprocessor (the tree path):
+    For logistic regression and related linear models — differs from
+    build_preprocessor (the tree path) in three ways:
 
-    - OHE(drop='first') on all categoricals — avoids the dummy-variable trap that
-      inflates coefficient variance and destabilises estimates for linear models.
-    - StandardScaler on non-tenure numerics — required for comparable L2 regularisation
-      across features on different scales.
-    - tenure routed through a stateless cohort-binning branch via FunctionTransformer
-      over TENURE_COHORT_EDGES rather than passed as a continuous numeric — a single
-      linear slope on continuous tenure cannot represent the survival-distribution shape;
-      per-cohort OHE coefficients are directly readable in the odds-ratio table.
+    - OHE(drop='first') on all categoricals, avoiding the dummy-variable trap
+      that inflates coefficient variance for linear models.
+    - StandardScaler on non-tenure numerics, needed for comparable L2
+      regularisation across differently-scaled features.
+    - tenure is cohort-binned (via TENURE_COHORT_EDGES) rather than passed as
+      a continuous numeric, since one linear slope can't represent the
+      survival-distribution shape; per-cohort OHE coefficients are directly
+      readable in the odds-ratio table. Callers still pass tenure inside
+      `numeric` as usual — the split into its own branch happens internally,
+      and the resulting `tenure_cohort` column is not a FeatureSchema column.
 
-    tenure is extracted from numeric internally; callers pass the same column groups as
-    the tree path (tenure stays in numeric) with no caller-side column swapping.
-    tenure_cohort is NOT a FeatureSchema column — it is encapsulated here.
-
-    Comparison-only: used by models/train/candidates.py to build the
-    DummyClassifier / LogisticRegressionCV candidate pipelines. Nothing past model
-    comparison imports it.
-
-    Must be fitted on the training split only so held-out statistics never leak.
+    Comparison-only: used by models/train/candidates.py for the
+    DummyClassifier / LogisticRegressionCV candidates; nothing past model
+    comparison imports it. Must be fit on the training split only, so
+    held-out statistics never leak.
     """
     non_tenure_numeric = [c for c in numeric if c != "tenure"]
 

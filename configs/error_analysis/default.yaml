@@ -1,0 +1,82 @@
+# Error-diagnosis step configuration — see models/error_analysis.py.
+
+# telco-churn-pipeline version to run error analysis on — required, e.g. `error_analysis.model_version=1`.
+model_version: null
+
+# Fallback score band (+/- around t*) a false negative/positive must fall within to
+# count as a near-miss (threshold artifact) rather than a confident failure (model
+# failure). Used only if threshold_validation.json has no argmax_ev_bootstrap_ci to
+# derive a data-driven band from (see error_analysis.py::near_miss_band_from_validation)
+# — normally the half-width of that CI is used instead of this fixed value.
+near_miss_band: 0.05
+
+# Quantile bins for the MonthlyCharges value-weighted error profile.
+n_value_deciles: 10
+
+# Minimum rows a scanned cohort needs before its FNR is reported — below this a
+# cohort's FNR is noise, not signal.
+min_cohort_support: 20
+
+# Quantile bins for numeric features in the error-concentration scan.
+n_quantile_bins: 5
+
+# How many of the scan's highest-FNR cohorts to keep.
+top_k_cohorts: 15
+
+# How many top-|SHAP| features feed the V3 direction-sanity check and the
+# dependence plots. 8, not a round number: mean-|SHAP| forms a tight plateau
+# across ranks 4-8 (0.1949-0.1747, deltas <=0.03) before a real elbow at rank
+# 8->9 (delta 0.046) — cutting at 5 excluded two checkable, EDA-keyed features
+# (Online Security: No, Internet Service: Fiber optic) by a margin smaller
+# than sampling noise would produce on a re-run. Derived once, by hand, off
+# this ranking — nothing re-derives it if the champion changes (Phase 10's
+# retrain). error_analysis.py::_check_top_k_elbow re-verifies at every run
+# that this cutoff still sits on a real elbow and logs a warning (never
+# raises) if it doesn't, so drift is a visible signal to re-derive this by
+# hand, not a silent staleness.
+top_k_shap_features: 8
+
+# How many |FN - TP| cohort-gap features feed the signed-cohort-SHAP bar
+# chart and beeswarms (see _sorted_gap_pairs). A different ranking axis from
+# top_k_shap_features above, with its own plateau: ranks 3-7 sit within 0.037
+# of each other before a real elbow at rank 7->8 (delta 0.051) — hence 7, not
+# the same value as the global-importance cutoff. Same drift-check coverage
+# as top_k_shap_features above — see that comment.
+top_k_cohort_gap_features: 7
+
+# How many |FP - TN| cohort-gap features feed the mirrored FP-vs-TN chart and
+# beeswarms. Not reused from top_k_cohort_gap_features above — this axis has
+# its own plateau, and it lands on a different rank: ranks 3-9 sit within
+# 0.10 of each other (0.23 down to 0.12) before a real elbow at rank 9->10
+# (delta 0.052, the largest gap after the top-2 dominant features) — hence 9.
+# Same drift-check coverage as top_k_shap_features above — see that comment.
+top_k_cohort_gap_features_fp_tn: 9
+
+# Illustrative FN/FP case studies rendered as SHAP waterfalls per side — anecdotal
+# only, never evidence in their own right (see explain.py::local_explanations).
+# The single most-confident TP and single most-confident TN comparison panel
+# does not scale with this value — see _illustrative_indices' docstring for why
+# one reference case per side is the right count regardless of n here.
+n_local_explanation_examples: 3
+
+# Top-k SHAP contributors labelled individually in each local (waterfall) explanation.
+# Unlike the three top_k_* values above, this one has no elbow derivation, and
+# deliberately so: it is a per-customer cutoff on one individual's own SHAP row,
+# not a ranking over a population/cohort statistic, so there is no single global
+# "real elbow" for it to sit on — every customer's own top-feature decay looks
+# different. It also feeds a section explicitly documented as anecdotal, never
+# evidence (see n_local_explanation_examples above and explain.py::
+# local_explanations), unlike top_k_shap_features which gates V3.
+#
+# Still checked empirically, not picked blind: measured, for the 8 illustrative/
+# confident-case rows in this project's sealed-test evaluation, what share of
+# |f(x) - E[f(x)]| the top-k bars actually capture before the rest folds into
+# "other features" — k=5 averaged 75.4% (worst case 65.8%, i.e. a third of one
+# customer's own score movement was unlabeled); k=7 84.3%; k=8 89.3% (worst case
+# 81.9%); k=9 92.5% but starts producing a >100% overshoot on at least one row
+# (individual bars of opposite sign overshooting a small total). Diminishing
+# returns set in cleanly after 8 (+9pp, +5pp, +3pp per step) — hence 8. This is
+# a per-run empirical check, not a persisted _check_top_k_elbow-style guard: the
+# 8 rows it was measured on are illustrative, not the sealed-test population, so
+# there is nothing here for a drift check to compare a future run against.
+local_explanation_top_k: 8

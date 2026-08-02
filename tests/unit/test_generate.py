@@ -399,6 +399,30 @@ def test_candidate_importance_returns_importance_result_type(
     assert isinstance(result.above_floor, bool)
 
 
+def test_candidate_importance_pure_noise_candidate_is_below_floor(
+    discovery_data: tuple[pd.DataFrame, pd.Series],
+    numeric_pre: object,
+    dt: DecisionTreeClassifier,
+) -> None:
+    """Roles swapped: score the pure-noise column as the candidate against the
+    planted-signal column as the reference floor. A noise candidate cannot
+    clear a floor set by a column the model actually relies on -- drives
+    candidate_importance's own above_floor=False branch directly, rather than
+    only through adoption_gate's ImportanceResult(above_floor=False) fixture."""
+    X, y = discovery_data
+    result = candidate_importance(
+        X,
+        y,
+        numeric_pre,
+        candidate_col="decoy",
+        decoy_col="candidate_good",
+        n_repeats=5,
+        model=dt,
+    )
+    assert result.above_floor is False
+    assert result.candidate_importance <= result.noise_floor
+
+
 # ---------------------------------------------------------------------------
 # adoption_gate
 # ---------------------------------------------------------------------------

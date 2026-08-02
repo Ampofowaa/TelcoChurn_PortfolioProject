@@ -13,12 +13,16 @@ import subprocess
 import time
 from typing import Any
 
+import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import pandas as pd
 import yaml
 from joblib import Parallel, delayed
+from matplotlib.figure import Figure
+from mlflow.data.pandas_dataset import PandasDataset
 from mlflow.data.pandas_dataset import from_pandas as mlflow_from_pandas
+from numpy.typing import NDArray
 from omegaconf import DictConfig
 from sklearn.base import clone
 from sklearn.metrics import average_precision_score
@@ -108,27 +112,66 @@ def _load_dev_features(cfg: DictConfig) -> tuple[pd.DataFrame, pd.Series]:
     return dev_df[_FEATURE_COLS], dev_df[TARGET_COL]
 
 
-def _log_dev_input(X_dev: pd.DataFrame, y_dev: pd.Series, context: str) -> None:
-    """Log the dev-partition dataset as an MLflow run input — call from inside an active run.
+def _build_dev_dataset(X_dev: pd.DataFrame, y_dev: pd.Series) -> PandasDataset:
+    """Build the dev-partition MLflow dataset object, not yet logged to any run.
 
-    Shared by comparison.py, feature_freeze.py, and tuning.py (candidates.py builds
-    its own per-candidate copy since each of its three candidate runs needs its own
-    log_input call, not one shared across runs). source resolves through
-    features/accessor.py's canonical path, the same single-owner rule candidates.py
-    already follows, so this can't go stale at Phase 8's CSV->parquet rename. The
-    dataset's digest is content-based (from_pandas), so this is purely lineage
-    metadata — it records what data this run touched, never something a computed
-    number depends on.
+    source resolves through features/accessor.py's canonical path, the same
+    single-owner rule candidates.py already follows, so this can't go stale
+    at Phase 8's CSV->parquet rename. The dataset's digest is content-based
+    (from_pandas), so this is purely lineage metadata — it records what data
+    a run touched, never something a computed number depends on.
     """
     dev_df = X_dev.copy()
     dev_df[TARGET_COL] = y_dev.values
-    dataset = mlflow_from_pandas(
+    return mlflow_from_pandas(
         dev_df,
         source=str(features_path()),
         name="telco_churn_dev",
         targets=TARGET_COL,
     )
-    mlflow.log_input(dataset, context=context)
+
+
+def _log_dev_input(X_dev: pd.DataFrame, y_dev: pd.Series, context: str) -> None:
+    """Log the dev-partition dataset as an MLflow run input — call from inside an active run.
+
+    Shared by comparison.py, feature_freeze.py, and tuning.py (candidates.py
+    calls _build_dev_dataset directly instead, since each of its three
+    candidate runs needs its own log_input call against one shared dataset
+    object, not a fresh build-and-log per run).
+    """
+    mlflow.log_input(_build_dev_dataset(X_dev, y_dev), context=context)
+
+
+def _plot_bootstrap_delta(
+    bootstrap_deltas: NDArray[np.float64],
+    delta_obs: float,
+    delta_threshold: float,
+    title: str,
+    xlabel: str,
+) -> Figure:
+    """Histogram of the paired-bootstrap Δ distribution against the null and the decision threshold.
+
+    Shared by comparison.py's model-family decision and feature_freeze.py's
+    full-vs-reduced feature-set decision — both plot the identical shape
+    (bootstrap_deltas histogram, Δ_obs/0/Δ* reference lines) against a
+    different Δ definition and title.
+    """
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(bootstrap_deltas, bins=50, edgecolor="none", alpha=0.75)
+    ax.axvline(delta_obs, color="C1", linestyle="--", label=f"Δ_obs = {delta_obs:.3f}")
+    ax.axvline(0.0, color="black", linestyle=":", label="Δ = 0 (null)")
+    ax.axvline(
+        delta_threshold,
+        color="C2",
+        linestyle="--",
+        label=f"Δ* = {delta_threshold}",
+    )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Bootstrap resamples")
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    return fig
 
 
 def _fit_and_score_fold(

@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from pathlib import Path
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
+import mlflow
 import optuna
 import pandas as pd
 import pytest
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 import telco_churn.models.train.tuning as tuning
 
@@ -229,19 +230,89 @@ def test_boundary_hit_check_interior_values_not_flagged() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _build_optuna_storage
+# ---------------------------------------------------------------------------
+
+
+def test_build_optuna_storage_falls_back_to_sqlite_without_postgres_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No POSTGRES_URL: a real, working SQLite-backed study is returned instead
+    of raising — the fallback CLAUDE.md's zero-infra convention requires."""
+    monkeypatch.delenv("POSTGRES_URL", raising=False)
+    monkeypatch.setattr(tuning, "get_project_root", lambda: tmp_path)
+
+    storage = tuning._build_optuna_storage()
+
+    assert isinstance(storage, optuna.storages.RDBStorage)
+    assert storage.url == f"sqlite:///{tmp_path}/optuna.db"
+    assert (tmp_path / "optuna.db").exists()
+    optuna.create_study(storage=storage)  # proves the fallback is actually usable
+
+
+def test_build_optuna_storage_isolates_schema_when_postgres_url_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSTGRES_URL set: schema isolation runs and RDBStorage gets the
+    search_path connect_args, both unchanged from the pre-fallback behavior."""
+    monkeypatch.setenv(
+        "POSTGRES_URL", "postgresql://user:pass@host/db"  # pragma: allowlist secret
+    )
+    conn = MagicMock()
+    engine = MagicMock()
+    engine.begin.return_value.__enter__.return_value = conn
+    engine.url.render_as_string.return_value = (
+        "postgresql://user:pass@host/db"  # pragma: allowlist secret
+    )
+    create_engine_mock = Mock(return_value=engine)
+    monkeypatch.setattr(tuning, "create_engine", create_engine_mock)
+    rdb_storage_mock = Mock()
+    monkeypatch.setattr(optuna.storages, "RDBStorage", rdb_storage_mock)
+
+    tuning._build_optuna_storage()
+
+    create_engine_mock.assert_called_once_with(
+        "postgresql://user:pass@host/db",  # pragma: allowlist secret
+        pool_pre_ping=True,
+    )
+    assert "CREATE SCHEMA IF NOT EXISTS optuna" in str(conn.execute.call_args.args[0])
+    rdb_storage_mock.assert_called_once_with(
+        url="postgresql://user:pass@host/db",  # pragma: allowlist secret
+        engine_kwargs={"connect_args": {"options": "-csearch_path=optuna"}},
+    )
+
+
+# ---------------------------------------------------------------------------
 # run_tuning_step (C1) — end-to-end smoke test on a tiny synthetic study
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def tuning_mlflow_uri(mlflow_test_experiment: Callable[[str], str]) -> str:
-    """Point MLflow at the shared tmp-scoped experiment (conftest.py ::
-    mlflow_test_experiment)."""
-    return mlflow_test_experiment("test_run_tuning_step")
+@pytest.fixture(scope="module")
+def tuning_mlflow_uri(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Point MLflow at a module-scoped tmp SQLite store with an explicit
+    artifact_location — inlines conftest.py::mlflow_test_experiment's logic
+    rather than requesting it, since that fixture depends on the
+    function-scoped tmp_path and this fixture is module-scoped: every test
+    below only logs a fresh run_tuning_step run into the shared experiment
+    and inspects that run/its own mocks, never enumerates the experiment's
+    full run list, so sharing one experiment (and skipping the ~2.5-3.5s
+    SQLite-store bootstrap cost per test) is safe. tuning_cfg stays
+    function-scoped deliberately — several tests mutate it per-scenario, so
+    it can't be shared."""
+    tmp_path = tmp_path_factory.mktemp("tuning_mlflow")
+    tracking_uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    mlflow.set_tracking_uri(tracking_uri)
+    artifact_location = (tmp_path / "artifacts").as_uri()
+    experiment_id = mlflow.create_experiment(
+        "test_run_tuning_step", artifact_location=artifact_location
+    )
+    mlflow.set_experiment(experiment_id=experiment_id)
+    return tracking_uri
 
 
 @pytest.fixture
-def tuning_cfg() -> OmegaConf:
+def tuning_cfg() -> DictConfig:
     """A tiny Optuna study config — 3 trials, 2 folds, low n_estimators ceiling."""
     return OmegaConf.create(
         {
@@ -295,7 +366,7 @@ def tuning_cfg() -> OmegaConf:
 def test_run_tuning_step_returns_expected_keys(
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """run_tuning_step completes a tiny study end-to-end and returns the documented keys."""
     tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -343,7 +414,7 @@ def test_run_tuning_step_enqueues_warm_start_params(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """cfg.tuning.warm_start_params is queued via study.enqueue_trial before optimize."""
     tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -386,7 +457,7 @@ def test_run_tuning_step_logs_trial_history_as_mlflow_table(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """Trial history is logged via mlflow.log_table (queryable), not a flat CSV blob."""
     tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -394,7 +465,7 @@ def test_run_tuning_step_logs_trial_history_as_mlflow_table(
     committed_features = list(X_dev.columns)
 
     log_table_mock = Mock()
-    monkeypatch.setattr(tuning.mlflow, "log_table", log_table_mock)
+    monkeypatch.setattr(mlflow, "log_table", log_table_mock)
 
     tuning.run_tuning_step(
         X_dev,
@@ -414,7 +485,7 @@ def test_run_tuning_step_skips_enqueue_without_warm_start_params(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """Without warm_start_params in config, no trial is enqueued (pure random/TPE warm-up)."""
     tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -439,7 +510,7 @@ def test_run_tuning_step_warns_on_boundary_hit(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """A boundary hit on the selected trial escalates via logger.warning, not just info."""
     tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -475,7 +546,7 @@ def test_run_tuning_step_no_warning_without_boundary_hit(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """No trial param on a search-space edge means no boundary-hit warning fires."""
     tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -510,7 +581,7 @@ def test_run_tuning_step_warns_on_too_few_completed_trials(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """Fewer completed trials than min_completed_trials flags the pick as unreliable."""
     tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -547,7 +618,7 @@ def test_run_tuning_step_raises_when_every_trial_fails(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """A systematic bug (bad config, objective typo) fails every trial and must raise
     loudly, not just log a warning that a resumed study or unset min_completed_trials
@@ -575,7 +646,7 @@ def test_run_tuning_step_no_warning_when_completed_trials_meet_floor(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """A completed-trial count at or above min_completed_trials raises no warning."""
     tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -610,7 +681,7 @@ def test_run_tuning_step_passes_timeout_seconds_to_optimize(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """cfg.tuning.timeout_seconds reaches study.optimize as its wall-clock timeout."""
     tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -642,7 +713,7 @@ def test_run_tuning_step_defaults_timeout_seconds_to_none(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """Without timeout_seconds in config, study.optimize is left n_trials-only (timeout=None)."""
     tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -672,7 +743,7 @@ def test_run_tuning_step_defaults_timeout_seconds_to_none(
 def test_run_tuning_step_n_estimators_median_is_positive(
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """The selected trial's median early-stopped tree count is a positive integer."""
     tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -695,7 +766,7 @@ def test_run_tuning_step_is_idempotent_against_completed_study(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """Re-running against a study that already reached n_trials adds no new trials.
 
@@ -732,7 +803,7 @@ def test_run_tuning_step_logs_dev_input_once_on_parent_run(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_cfg: OmegaConf,
+    tuning_cfg: DictConfig,
 ) -> None:
     """Fix 6: the tuning_study parent run logs a dataset-lineage input exactly
     once, via common.py's shared _log_dev_input — the same call that also

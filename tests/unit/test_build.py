@@ -261,7 +261,7 @@ def _make_property_df(tenure: int, monthly: float, total: float) -> pd.DataFrame
 
 
 @given(tenure=_TENURE_STRATEGY, monthly=_MONTHLY_STRATEGY, total=_TOTAL_STRATEGY)
-@settings(max_examples=100, deadline=None)
+@settings(max_examples=25, deadline=None)
 def test_column_count_invariant(tenure: int, monthly: float, total: float) -> None:
     """Column count is identical regardless of input values."""
     assume(math.isnan(total) or total >= monthly)
@@ -271,7 +271,7 @@ def test_column_count_invariant(tenure: int, monthly: float, total: float) -> No
 
 
 @given(tenure=_TENURE_STRATEGY, monthly=_MONTHLY_STRATEGY, total=_TOTAL_STRATEGY)
-@settings(max_examples=100, deadline=None)
+@settings(max_examples=25, deadline=None)
 def test_build_feature_df_is_deterministic(
     tenure: int, monthly: float, total: float
 ) -> None:

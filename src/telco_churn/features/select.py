@@ -17,6 +17,7 @@ import shap
 from joblib import Parallel, delayed
 from lightgbm import LGBMClassifier
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.compose import ColumnTransformer
 from sklearn.metrics import average_precision_score
 from sklearn.model_selection import RepeatedStratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
@@ -305,6 +306,38 @@ class PermutationImportanceSelector(BaseEstimator, TransformerMixin):  # type: i
         return np.array(self._output_columns_)
 
 
+def _build_selector(
+    binary: list[str],
+    multi_cat: list[str],
+    numeric: list[str],
+    estimator_params: dict[str, Any],
+    n_repeats: int,
+    noise_floor_margin: float,
+    correlated_groups: tuple[tuple[str, ...], ...],
+    inner_val_size: float,
+    random_state: int,
+) -> tuple[ColumnTransformer, PermutationImportanceSelector]:
+    """Build the unfitted [tree_preprocessor, PermutationImportanceSelector] pair.
+
+    Shared by _build_selection_pipeline (adds an LGBMClassifier model step) and
+    mint_committed_list (fits the pair alone, no model step needed to freeze
+    survivors_).
+    """
+    preprocessor = build_preprocessor(binary, multi_cat, numeric)
+    selector = PermutationImportanceSelector(
+        binary=binary,
+        multi_cat=multi_cat,
+        numeric=numeric,
+        estimator_params=estimator_params,
+        n_repeats=n_repeats,
+        noise_floor_margin=noise_floor_margin,
+        correlated_groups=correlated_groups,
+        inner_val_size=inner_val_size,
+        random_state=random_state,
+    )
+    return preprocessor, selector
+
+
 def _build_selection_pipeline(
     binary: list[str],
     multi_cat: list[str],
@@ -317,18 +350,16 @@ def _build_selection_pipeline(
     random_state: int,
 ) -> Pipeline:
     """Build [tree_preprocessor -> PermutationImportanceSelector -> LightGBM] as one Pipeline."""
-    preprocessor = build_preprocessor(binary, multi_cat, numeric)
-    preprocessor.set_output(transform="pandas")
-    selector = PermutationImportanceSelector(
-        binary=binary,
-        multi_cat=multi_cat,
-        numeric=numeric,
-        estimator_params=estimator_params,
-        n_repeats=n_repeats,
-        noise_floor_margin=noise_floor_margin,
-        correlated_groups=correlated_groups,
-        inner_val_size=inner_val_size,
-        random_state=random_state,
+    preprocessor, selector = _build_selector(
+        binary,
+        multi_cat,
+        numeric,
+        estimator_params,
+        n_repeats,
+        noise_floor_margin,
+        correlated_groups,
+        inner_val_size,
+        random_state,
     )
     model = LGBMClassifier(**estimator_params)
     return Pipeline(
@@ -494,18 +525,16 @@ def mint_committed_list(
     returned selector is the frozen feature_columns.txt list;
     permutation_importance_table_ is its audit trail.
     """
-    preprocessor = build_preprocessor(binary, multi_cat, numeric)
-    preprocessor.set_output(transform="pandas")
-    selector = PermutationImportanceSelector(
-        binary=binary,
-        multi_cat=multi_cat,
-        numeric=numeric,
-        estimator_params=estimator_params,
-        n_repeats=n_repeats,
-        noise_floor_margin=noise_floor_margin,
-        correlated_groups=correlated_groups,
-        inner_val_size=inner_val_size,
-        random_state=random_state,
+    preprocessor, selector = _build_selector(
+        binary,
+        multi_cat,
+        numeric,
+        estimator_params,
+        n_repeats,
+        noise_floor_margin,
+        correlated_groups,
+        inner_val_size,
+        random_state,
     )
     pipeline = Pipeline([("preprocessor", preprocessor), ("selector", selector)])
     pipeline.fit(X, y)
@@ -530,11 +559,19 @@ def compute_shap_audit(
     TreeSHAP ranks highly. This never decides keep/drop — permutation importance
     vs. the decoy is the sole gate — it only flags a mismatch worth a human look
     (flag_high_shap_dropouts).
+
+    Uses the explainer's __call__ API (explainer(Xt) -> Explanation) rather
+    than the legacy .shap_values(Xt): for a binary LightGBM classifier the
+    latter unconditionally warns on every call (shap/explainers/_tree.py),
+    since __call__ is the only caller that passes from_call=True internally.
+    Explanation.values comes back shape (n_rows, n_features, 2) for a binary
+    classifier — index [..., 1] selects the positive (churn) class, the same
+    selection the old list[1] indexing made on .shap_values()'s legacy
+    list-of-two-ndarrays return.
     """
     source_columns = list(binary) + list(multi_cat) + list(numeric)
 
     preprocessor = build_preprocessor(binary, multi_cat, numeric)
-    preprocessor.set_output(transform="pandas")
     model = LGBMClassifier(**estimator_params)
     pipeline = Pipeline([("preprocessor", preprocessor), ("model", model)])
     pipeline.fit(X[source_columns], y)
@@ -542,9 +579,9 @@ def compute_shap_audit(
     Xt = pipeline.named_steps["preprocessor"].transform(X[source_columns])
     column_map = _build_column_map(list(Xt.columns), source_columns)
     explainer = shap.TreeExplainer(pipeline.named_steps["model"])
-    shap_values = explainer.shap_values(Xt)
-    if isinstance(shap_values, list):
-        shap_values = shap_values[1]
+    shap_values = explainer(Xt).values
+    if shap_values.ndim == 3:
+        shap_values = shap_values[..., 1]
 
     mean_abs = pd.Series(np.abs(shap_values).mean(axis=0), index=Xt.columns)
     per_feature = mean_abs.groupby(mean_abs.index.map(column_map)).sum()

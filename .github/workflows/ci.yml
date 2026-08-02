@@ -4,21 +4,27 @@ on:
   push:
   pull_request:
     branches: [main]
+  schedule:
+    # Runs once daily, 06:13 UTC — offset from :00 to avoid the top-of-hour
+    # scheduling queue GitHub Actions cron jobs pile up in.
+    - cron: "13 6 * * *"
+  workflow_dispatch:
 
 jobs:
-  ci:
+  unit:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v9.0.0
 
       - name: Install dependencies
         run: uv sync --frozen
@@ -30,4 +36,25 @@ jobs:
         run: uv run mypy src/
 
       - name: Unit tests + coverage
-        run: uv run pytest
+        run: uv run pytest -m "not integration" -n auto
+
+  integration:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Integration tests
+        run: uv run pytest -m integration --run-integration --no-cov -n auto

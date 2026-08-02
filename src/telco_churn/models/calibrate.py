@@ -1,14 +1,15 @@
 """Calibrate the tuned pipeline logged by run_model_logging_step (models/train/log_model.py).
 
 Calibration is cross-fit on the development set, so there is no separate
-validation split. CalibratedClassifierCV(ensemble=False) wraps the pipeline
-*unfitted*, so its ColumnTransformer refits inside every fold instead of
-leaking preprocessing statistics across folds.
+validation split: `CalibratedClassifierCV(ensemble=False)` wraps the
+pipeline *unfitted*, so its ColumnTransformer refits inside every fold
+instead of leaking preprocessing statistics across folds. The unfitted
+pipeline comes from cloning the model at `manifest["logged_model_uri"]`, not
+from `runs:/<run_id>/model` — the latter becomes ambiguous once this module
+logs its own `calibrated_model` onto the same run.
 
-The unfitted pipeline comes from cloning the model at
-manifest["logged_model_uri"] (a models:/m-<id> URI) — not from
-runs:/<run_id>/model, which becomes ambiguous once this module logs its own
-calibrated_model onto the same run.
+This module performs the training cycle's single MLflow model registration,
+pointing the `challenger` alias at the calibrated pipeline.
 """
 
 from __future__ import annotations
@@ -40,7 +41,14 @@ from telco_churn.features.accessor import load_features
 from telco_churn.features.build import TARGET_COL
 from telco_churn.models.plots import reliability_diagram_bins
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import resolve_tracking_uri
+from telco_churn.utils.mlflow import (
+    TRAINING_CYCLE_RUN_DESCRIPTION,
+    ensure_experiment_metadata,
+    resolve_tracking_uri,
+    set_logged_model_description,
+    set_registered_model_description,
+    set_run_description,
+)
 from telco_churn.utils.paths import get_project_root
 from telco_churn.utils.stats import paired_bootstrap_ci
 
@@ -50,6 +58,7 @@ __all__ = [
     "unfitted_pipeline_from_manifest",
     "load_dev_features",
     "load_dev_customer_ids",
+    "select_golden_rows",
     "outer_cv",
     "inner_cv",
     "build_calibrated_pipeline",
@@ -61,6 +70,7 @@ __all__ = [
     "pooled_brier",
     "brier_skill_score",
     "expected_calibration_error",
+    "murphy_decomposition",
     "calibration_slope",
     "pr_auc_gate_passes",
     "brier_switch_decision",
@@ -69,6 +79,24 @@ __all__ = [
 ]
 
 logger = get_logger(__name__)
+
+_MODEL_DESCRIPTION = (
+    "Sigmoid-calibrated CalibratedClassifierCV wrapping the 'model' "
+    "pipeline logged on this run. This is the artifact registered to the "
+    "model registry and pointed at by 'challenger'/'champion'."
+)
+
+_REGISTRY_DESCRIPTION = (
+    "Calibrated LightGBM churn-prediction pipeline for IBM Telco Customer "
+    "Churn. Selected by PR-AUC among Dummy/LogReg/LightGBM candidates, "
+    "calibrated (sigmoid), thresholded at a cost-sensitive cutoff "
+    "t* = c/(r x LTV). 'champion' serves production; 'challenger' holds the "
+    "most recent candidate. Every version carries a promotion_status tag "
+    "(pending/promoted/rejected) - only 'promoted' versions are valid "
+    "rollback targets."
+)
+
+_PENDING_VERSION_DESCRIPTION = "Awaiting sealed-test evaluation and promotion review."
 
 # CalibratedClassifierCV(ensemble=...) — shared by build_calibrated_pipeline and
 # the calibration_spec block logged alongside it, so the two can never drift
@@ -149,6 +177,23 @@ def load_dev_customer_ids() -> pd.Series:
     return _load_dev_partition()["customerid"].reset_index(drop=True)
 
 
+def select_golden_rows(
+    X_dev: pd.DataFrame, customer_ids: pd.Series, n_rows: int
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Return the n_rows dev-partition rows with the lowest customerid, for the golden-parity fixture.
+
+    Selected by customerid value, not row position, so the fixture is stable
+    against an unrelated reordering of the processed feature table upstream —
+    a positional `.head(n)` would silently pin a different set of customers.
+    X_dev and customer_ids must already be row-order-aligned (as
+    `load_dev_features` and `load_dev_customer_ids` are).
+    """
+    order = np.argsort(customer_ids.to_numpy())[:n_rows]
+    golden_X = X_dev.iloc[order].reset_index(drop=True)
+    golden_ids = customer_ids.iloc[order].reset_index(drop=True)
+    return golden_X, golden_ids
+
+
 def outer_cv(cfg: DictConfig) -> StratifiedKFold:
     """Return the outer StratifiedKFold shared by the uncalibrated baseline and every method.
 
@@ -183,13 +228,12 @@ def build_calibrated_pipeline(
 ) -> CalibratedClassifierCV:
     """Wrap the unfitted pipeline in CalibratedClassifierCV(ensemble=False).
 
-    ensemble=False collapses calibrated_classifiers_ to length 1, whose
-    .estimator is the base Pipeline refit on all of development — the SHAP
-    access path notebooks/05-error-analysis.ipynb depends on. pipeline must be
-    unfitted;
-    CalibratedClassifierCV.fit clones it internally per inner fold, so passing
-    the same unfitted instance to two CalibratedClassifierCV objects (e.g. one
-    per method) is safe without an extra clone() here.
+    `ensemble=False` collapses `calibrated_classifiers_` to length 1, whose
+    `.estimator` is the base Pipeline refit on all of development — the SHAP
+    access path notebooks/05-error-analysis.ipynb depends on. `pipeline`
+    must be unfitted; `CalibratedClassifierCV.fit` clones it internally per
+    inner fold, so reusing the same unfitted instance across methods is safe
+    without an extra `clone()` here.
     """
     return CalibratedClassifierCV(
         pipeline,
@@ -270,12 +314,12 @@ def per_fold_average_precision(
 ) -> list[float]:
     """Mean-of-per-fold average precision for an OOF vector — never pooled.
 
-    Pooling mixes each fold's tie structure (or, for a calibrated vector, each
-    fold's distinct calibration map) into one ranking, which can mask a
-    per-fold ranking regression that scoring each fold separately catches.
-    Recomputes outer_cv(cfg)'s fold assignment rather than threading indices
-    through the OOF computation — same params + same (X_dev, y_dev) ordering
-    reproduces the identical folds cross_val_predict used to build proba.
+    Pooling mixes each fold's tie structure (or, for a calibrated vector,
+    each fold's distinct calibration map) into one ranking, which can mask a
+    per-fold regression that scoring each fold separately catches. Recomputes
+    `outer_cv(cfg)`'s fold assignment rather than threading indices through,
+    since the same params + ordering reproduce the identical folds
+    `cross_val_predict` used to build `proba`.
     """
     cv = outer_cv(cfg)
     return [
@@ -388,6 +432,67 @@ def expected_calibration_error(
     return float(ece)
 
 
+def murphy_decomposition(
+    proba: NDArray[np.float64], y_dev: pd.Series, cfg: DictConfig
+) -> dict[str, float]:
+    """Murphy's three-term decomposition: Brier = reliability - resolution + uncertainty.
+
+    Binned identically to expected_calibration_error (same
+    cfg.calibration.ece_n_bins/ece_strategy), so the two diagnostics are read
+    off the same bins rather than two independently-tuned schemes. Per bin k
+    (mean forecast p_k, observed frequency o_k, count n_k) and overall base
+    rate o-bar:
+      reliability = (1/N) sum_k n_k (p_k - o_k)^2   -- calibration error
+      resolution  = (1/N) sum_k n_k (o_k - o-bar)^2 -- discrimination ability
+      uncertainty = o-bar (1 - o-bar)               -- outcome variance alone
+
+    This is what makes a Brier movement attributable rather than a single
+    opaque number: Brier blends calibration quality with ranking quality, so
+    a model can improve its Brier purely by improving resolution (better
+    ranking) while reliability (calibration) gets worse — exactly the failure
+    the calibration-slope guardrail exists to catch independently (ANALYSIS.md
+    §0). reliability/resolution/uncertainty reconstruct the directly-computed
+    Brier only approximately for continuous forecasts (the identity is exact
+    for forecasts that are literally constant within each bin); the gap
+    shrinks as n_bins grows and is a discretization artifact, not a bug.
+    """
+    n_bins = int(cfg.calibration.ece_n_bins)
+    strategy = str(cfg.calibration.ece_strategy)
+    y = y_dev.to_numpy()
+    p = np.asarray(proba)
+    n = len(p)
+    base_rate = float(y.mean())
+
+    if strategy == "quantile":
+        edges = np.unique(np.quantile(p, np.linspace(0.0, 1.0, n_bins + 1)))
+        if len(edges) < 2:
+            edges = np.array([0.0, 1.0])
+    else:
+        edges = np.linspace(0.0, 1.0, n_bins + 1)
+    edges[0], edges[-1] = 0.0, 1.0
+    bin_ids = np.clip(np.digitize(p, edges[1:-1], right=True), 0, len(edges) - 2)
+
+    reliability = 0.0
+    resolution = 0.0
+    for b in range(len(edges) - 1):
+        mask = bin_ids == b
+        if not mask.any():
+            continue
+        n_k = float(mask.sum())
+        p_k = float(p[mask].mean())
+        o_k = float(y[mask].mean())
+        reliability += n_k / n * (p_k - o_k) ** 2
+        resolution += n_k / n * (o_k - base_rate) ** 2
+
+    uncertainty = base_rate * (1.0 - base_rate)
+    return {
+        "reliability": float(reliability),
+        "resolution": float(resolution),
+        "uncertainty": float(uncertainty),
+        "brier_reconstructed": float(reliability - resolution + uncertainty),
+    }
+
+
 def calibration_slope(
     y_true: pd.Series | NDArray[np.float64],
     proba: NDArray[np.float64],
@@ -442,9 +547,21 @@ def calibration_slope(
     def _fit(
         y_arr: NDArray[np.float64], x_arr: NDArray[np.float64]
     ) -> tuple[float, float]:
-        # C=np.inf, not penalty=None: sklearn 1.8 deprecates penalty=None,
-        # scheduled for removal in 1.10. Effectively unregularized either way.
-        model = LogisticRegression(C=np.inf)
+        # C=1e10 (not np.inf, not penalty=None): sklearn 1.8 deprecates
+        # penalty=None, and its own suggested replacement, C=np.inf, still
+        # trips an internal migration shim that re-derives penalty=None from
+        # C == np.inf and warns "Setting penalty=None will ignore the C and
+        # l1_ratio parameters" — a false positive on every one of up to
+        # n_bootstrap calls here. A merely-huge finite C sidesteps that shim
+        # entirely (verified: no warnings, and coefficients agree with a
+        # true C=np.inf fit to ~1e-9 relative error on non-separable data).
+        # It also strictly dominates C=np.inf numerically: L2 regularization
+        # keeps the objective strictly convex even under perfect separation
+        # in a bootstrap resample, so there's always a unique finite optimum
+        # for lbfgs to converge to — where true C=np.inf has no finite
+        # optimum at all under separation, and a ConvergenceWarning there
+        # would be reporting a genuinely ill-posed fit, not a false one.
+        model = LogisticRegression(C=1e10, l1_ratio=0)
         model.fit(x_arr, y_arr)
         return float(model.coef_[0][0]), float(model.intercept_[0])
 
@@ -579,11 +696,19 @@ def select_calibration_method(
     invalidate the derived threshold.
 
     method: 'sigmoid' | 'isotonic' pinned — the normal path once 'auto' has
-    picked a winner. Computes only that method's OOF, skipping the other
-    method and the sigmoid-vs-isotonic Brier bootstrap entirely (~30 fits vs
-    ~65). Still runs pr_auc_gate_passes against the uncalibrated baseline — a
-    cheap, single-method check — so a pinned method that regresses ranking on
-    a later retrain fails loudly instead of registering silently.
+    picked a winner. Still fits *both* methods' OOF every cycle — the same
+    per-fold model-fit cost as 'auto' — so calibration_summary.json always
+    carries both candidates' diagnostics, not just the pinned winner's; a
+    notebook or ANALYSIS.md citing "isotonic scored X" is never citing a
+    number this cycle didn't actually produce. What pinned mode skips is the
+    sigmoid-vs-isotonic Brier-bootstrap switch test itself — a cheap
+    resampling step, not additional fits — since deciding the method is not
+    this branch's job. Only the pinned (configured) method's diagnostics
+    gate: pr_auc_gate_passes runs against it and raises on regression, so a
+    pinned method that regresses ranking on a later retrain fails loudly
+    instead of registering silently. The unpinned method's diagnostics are
+    informational only — never gated, never able to change `method` or
+    `calibrated_proba`.
 
     Returns {"method", "diagnostics": {method_name: {...}}, "switch_decision",
     "uncalibrated_proba", "calibrated_proba"}. switch_decision is always present
@@ -645,6 +770,18 @@ def select_calibration_method(
                 "to register a model with degraded ranking; re-run calibration.method="
                 "'auto' to re-derive the method."
             )
+
+        other_method = "isotonic" if configured_method == "sigmoid" else "sigmoid"
+        other_proba = oof_calibrated_proba(pipeline, other_method, X_dev, y_dev, cfg)
+        other_per_fold_ap = per_fold_average_precision(other_proba, X_dev, y_dev, cfg)
+        other_brier = pooled_brier(other_proba, y_dev)
+        diagnostics[other_method] = {
+            "per_fold_mean_ap": float(np.mean(other_per_fold_ap)),
+            "pooled_brier": other_brier,
+            "ece": expected_calibration_error(other_proba, y_dev, cfg),
+            "bss": brier_skill_score(other_brier, dummy_brier),
+        }
+
         return {
             "method": configured_method,
             "diagnostics": diagnostics,
@@ -817,59 +954,13 @@ def _save_reliability_plot(
     plt.close(fig)
 
 
-def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
-    """Calibrate, select a method, and register the fitted pipeline as `challenger`.
+def _check_trial_count_gate(
+    manifest: dict[str, Any], run_id: str, cfg: DictConfig
+) -> None:
+    """Abort before fitting anything if the run's Optuna trial count is untrustworthy.
 
-    The training cycle's single registration point — run_model_logging_step
-    only logs an uncalibrated pipeline and stops there.
-
-    Aborts before fitting anything (raises RuntimeError) if
-    tuning_summary.trial_count_below_threshold is true and
-    cfg.calibration.override_trial_count_gate is not set — a data-quality
-    gate on the tuning result, not a performance comparison.
-
-    name="calibrated_model" is load-bearing: reusing name="model" would
-    rebind runs:/<run_id>/model away from the uncalibrated pipeline, and
-    would make a second run of this function wrap a CalibratedClassifierCV
-    inside another one. serialization_format=cloudpickle is mandatory —
-    mlflow's skops default rejects CalibratedClassifierCV's internals.
-
-    Also renders and logs the pre/post-calibration reliability diagram
-    (reports/figures/reliability_diagram.png, mirrored onto the run's
-    figures/ artifacts) from the exact OOF vectors that decided the winning
-    method — not a recomputation, so the picture matches the numbers in
-    calibration_summary.json.
-
-    Logs dev_oof_predictions.parquet (customerid, y_true, p_hat) — the
-    winning method's OOF vector, persisted rather than left to be
-    recomputed by a downstream consumer (Phase 7's drift reference,
-    dev-OOF veto surface, and calibration screen). calibration_summary.json
-    additionally carries calibration_slope (the dev-OOF Cox slope, with a
-    bootstrap CI), uncalibrated_calibration_slope (the same statistic on
-    the pre-calibration OOF vector, paired for comparison — a reliability
-    diagram's bin-level scatter can't by itself distinguish genuine
-    miscalibration from sampling noise, and this pairing is what turns that
-    visual ambiguity into two comparable numbers), and calibration_spec
-    (method/inner_cv_folds/random_state/ensemble — the four fields Phase 7's
-    refit.py needs to rebuild an identical CalibratedClassifierCV without
-    re-deriving it).
-
-    Also logs dev_brier/dev_bss/dev_ece/dev_per_fold_mean_ap/
-    dev_calibration_slope/dev_uncalibrated_calibration_slope/
-    dev_mean_p_hat_calibrated/dev_mean_p_hat_uncalibrated/
-    dev_observed_churn_rate as MLflow metrics (not just JSON fields), so they
-    are plottable as a series across retraining cycles.
-
-    reports/figures/reliability_diagram.png is overwritten on every call —
-    it reflects whichever run executed this function most recently on this
-    machine, not a specific run_id. A reader who needs to know which run a
-    figure on disk corresponds to should cross-check that run's own
-    calibration_summary.json rather than trusting the file's mtime; the
-    MLflow-logged copy under that run's figures/ artifacts is the durable,
-    run-pinned reference.
+    A data-quality gate on the tuning result, not a performance comparison.
     """
-    manifest = load_training_manifest(run_id, cfg)
-
     tuning_summary = manifest.get("tuning_summary", {})
     trial_count_below_threshold = bool(
         tuning_summary.get("trial_count_below_threshold", False)
@@ -891,10 +982,32 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
             "anyway."
         )
 
+
+def _load_calibration_inputs(
+    manifest: dict[str, Any], cfg: DictConfig
+) -> dict[str, Any]:
+    """Load the unfitted committed pipeline and the dev-partition feature/target split."""
     committed_features = committed_features_from_manifest(manifest)
     pipeline = unfitted_pipeline_from_manifest(manifest)
     X_dev, y_dev = load_dev_features(committed_features)
+    return {
+        "committed_features": committed_features,
+        "pipeline": pipeline,
+        "X_dev": X_dev,
+        "y_dev": y_dev,
+    }
 
+
+def _select_and_render_calibration(
+    pipeline: Pipeline, X_dev: pd.DataFrame, y_dev: pd.Series, cfg: DictConfig
+) -> dict[str, Any]:
+    """Select the calibration method and render the pre/post-calibration reliability diagram.
+
+    Renders and logs the reliability diagram (reports/figures/reliability_diagram.png,
+    mirrored onto the run's figures/ artifacts) from the exact OOF vectors that
+    decided the winning method — not a recomputation, so the picture matches
+    the numbers in calibration_summary.json.
+    """
     selection = select_calibration_method(pipeline, X_dev, y_dev, cfg)
     method = str(selection["method"])
 
@@ -918,25 +1031,98 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
         figure_path,
     )
 
+    return {"selection": selection, "method": method, "figure_path": figure_path}
+
+
+def _fit_and_build_golden_fixture(
+    pipeline: Pipeline,
+    method: str,
+    cfg: DictConfig,
+    X_dev: pd.DataFrame,
+    y_dev: pd.Series,
+) -> dict[str, Any]:
+    """Fit the calibrated pipeline and build register.py's serving-parity reference.
+
+    in_memory_preds is the reference for register.py's serving-parity smoke
+    check, captured here — while `fitted` is still the live in-memory object
+    this run just produced, before mlflow.sklearn.log_model/pickling touches
+    it at all. register.py reloads this same model later, in a separate
+    process, and must compare against a reference computed independently of
+    that reload — a reference generated by scoring through the reload itself
+    would be circular: any serialization bug would already be baked into the
+    "expected" value, and the check could never fail no matter how broken
+    the round trip was. Rows are stored in full (not just scores), pinned by
+    customerid, at the model's committed input schema, so the fixture is
+    self-contained and Phase 9/11 can replay it without touching the
+    dataset. Every golden row is a development-partition row the model
+    trained on — in-sample, and therefore reproducibility evidence only,
+    never performance evidence; the "purpose" key travels that caveat with
+    the artifact rather than leaving it to live only in a plan document.
+    """
     fitted = build_calibrated_pipeline(pipeline, method, cfg)
     fitted.fit(X_dev, y_dev)
 
-    input_example = X_dev.head(5)
+    dev_customer_ids = load_dev_customer_ids()
+    input_example, golden_customer_ids = select_golden_rows(
+        X_dev, dev_customer_ids, int(cfg.calibration.golden_n_rows)
+    )
     in_memory_preds = fitted.predict_proba(input_example)
     signature = infer_signature(X_dev, fitted.predict_proba(X_dev))
 
-    # The vector that selected `method`, produced its BSS, and will validate
-    # t* — computed already, above, as selection["calibrated_proba"]. Logged
-    # as-is rather than recomputed downstream (CLAUDE.md § Persist the
-    # evidence, not just the conclusion): a recompute is only sound while the
-    # dataset is static and the folds are seeded, and silently diverges from
-    # the vector this cycle's decisions actually rested on once either isn't
-    # true (Phase 10's retraining). Segment/protected columns are joined
-    # later, by Phase 7's calibration_screen.py, where the dev-partition
-    # feature columns are in hand — this is the minimal vector.
+    golden_fixture = {
+        "purpose": (
+            "serving-parity fixture — reproducibility only; scores are "
+            "in-sample and are not performance evidence"
+        ),
+        "customerid": golden_customer_ids.tolist(),
+        "rows": input_example.to_dict(orient="records"),
+        "p_hat": in_memory_preds[:, 1].tolist(),
+    }
+
+    return {
+        "fitted": fitted,
+        "dev_customer_ids": dev_customer_ids,
+        "input_example": input_example,
+        "in_memory_preds": in_memory_preds,
+        "signature": signature,
+        "golden_fixture": golden_fixture,
+    }
+
+
+def _compute_calibration_slopes_and_summary(
+    y_dev: pd.Series,
+    dev_customer_ids: pd.Series,
+    selection: dict[str, Any],
+    method: str,
+    cfg: DictConfig,
+) -> dict[str, Any]:
+    """Compute the calibrated/uncalibrated slopes and assemble calibration_summary.json.
+
+    calibration_summary.json carries calibration_slope (the dev-OOF Cox
+    slope, with a bootstrap CI), uncalibrated_calibration_slope (the same
+    statistic on the pre-calibration OOF vector, paired for comparison — a
+    reliability diagram's bin-level scatter can't by itself distinguish
+    genuine miscalibration from sampling noise, and this pairing is what
+    turns that visual ambiguity into two comparable numbers), and
+    calibration_spec (method/inner_cv_folds/random_state/ensemble — the four
+    fields a future Phase 10 recalibration flow, not yet designed, would
+    need to rebuild an identical CalibratedClassifierCV without re-deriving
+    it).
+
+    dev_oof_predictions.parquet is the vector that selected `method`,
+    produced its BSS, and will validate t* — computed already as
+    selection["calibrated_proba"]. Logged as-is rather than recomputed
+    downstream (CLAUDE.md § Persist the evidence, not just the conclusion):
+    a recompute is only sound while the dataset is static and the folds are
+    seeded, and silently diverges from the vector this cycle's decisions
+    actually rested on once either isn't true (Phase 10's retraining).
+    Segment/protected columns are joined later, by Phase 7's evaluate.py,
+    where the dev-partition feature columns are in hand — this is the
+    minimal vector.
+    """
     dev_oof_predictions = pd.DataFrame(
         {
-            "customerid": load_dev_customer_ids(),
+            "customerid": dev_customer_ids,
             "y_true": y_dev.reset_index(drop=True),
             "p_hat": selection["calibrated_proba"],
         }
@@ -983,9 +1169,10 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
         "mean_p_hat_uncalibrated": float(np.mean(selection["uncalibrated_proba"])),
         "observed_churn_rate": float(y_dev.mean()),
         # The four fields that reconstruct the fitted CalibratedClassifierCV
-        # from this run alone — Phase 7's refit.py rebuilds the identical
-        # estimator from this block instead of re-deriving it, and its
-        # provenance spec hash is computed over exactly these fields.
+        # from this run alone — a future Phase 10 recalibration flow (not yet
+        # designed) would rebuild the identical estimator from this block
+        # instead of re-deriving it, and its provenance spec hash is computed
+        # over exactly these fields.
         "calibration_spec": {
             "method": method,
             "inner_cv_folds": int(cfg.calibration.inner_cv_folds),
@@ -994,19 +1181,55 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
         },
     }
 
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    mlflow.set_experiment(str(cfg.mlflow.experiment_name))
+    return {
+        "dev_oof_predictions": dev_oof_predictions,
+        "slope": slope,
+        "uncalibrated_slope": uncalibrated_slope,
+        "calibration_summary": calibration_summary,
+    }
+
+
+def _log_calibration_run(
+    run_id: str,
+    cfg: DictConfig,
+    calibration_summary: dict[str, Any],
+    slope: dict[str, Any],
+    uncalibrated_slope: dict[str, Any],
+    figure_path: Path,
+    dev_oof_predictions: pd.DataFrame,
+    golden: dict[str, Any],
+) -> Any:
+    """Log every calibration artifact and metric, and register the calibrated pipeline.
+
+    name="calibrated_model" is load-bearing: reusing name="model" would
+    rebind runs:/<run_id>/model away from the uncalibrated pipeline, and
+    would make a second run of this function wrap a CalibratedClassifierCV
+    inside another one. serialization_format=cloudpickle is mandatory —
+    mlflow's skops default rejects CalibratedClassifierCV's internals.
+
+    Also logs dev_brier/dev_bss/dev_ece/dev_per_fold_mean_ap/
+    dev_calibration_slope/dev_calibration_slope_ci_lower/
+    dev_calibration_slope_ci_upper/dev_uncalibrated_calibration_slope/
+    dev_uncalibrated_calibration_slope_ci_lower/
+    dev_uncalibrated_calibration_slope_ci_upper/dev_mean_p_hat_calibrated/
+    dev_mean_p_hat_uncalibrated/dev_observed_churn_rate as MLflow metrics (not
+    just JSON fields), so they are plottable as a series across retraining
+    cycles.
+    """
+    method = str(calibration_summary["method"])
+    ensure_experiment_metadata(cfg)
     registered_model_name = str(cfg.mlflow.registered_model_name)
 
     with mlflow.start_run(run_id=run_id):
-        mlflow.log_dict(calibration_summary, "calibration_summary.json")
-        mlflow.log_artifact(str(figure_path), artifact_path="figures")
+        set_run_description(TRAINING_CYCLE_RUN_DESCRIPTION)
+        mlflow.log_dict(calibration_summary, "calibration/calibration_summary.json")
+        mlflow.log_artifact(str(figure_path), artifact_path="calibration/figures")
 
         # calibration_summary.json remains the audit record — these duplicate a
         # handful of its fields so BSS/ECE/Brier/slope are plottable as a series
         # across cycles (Phase 10), the same pattern Phase 5's candidates.py/
         # tuning.py/feature_freeze.py already follow and Phase 6 had skipped.
-        winning_diagnostics = selection["diagnostics"][method]
+        winning_diagnostics = calibration_summary["diagnostics"][method]
         mlflow.log_metrics(
             {
                 "dev_brier": winning_diagnostics["pooled_brier"],
@@ -1014,7 +1237,15 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
                 "dev_ece": winning_diagnostics["ece"],
                 "dev_per_fold_mean_ap": winning_diagnostics["per_fold_mean_ap"],
                 "dev_calibration_slope": slope["slope"],
+                "dev_calibration_slope_ci_lower": slope["slope_ci_lower"],
+                "dev_calibration_slope_ci_upper": slope["slope_ci_upper"],
                 "dev_uncalibrated_calibration_slope": uncalibrated_slope["slope"],
+                "dev_uncalibrated_calibration_slope_ci_lower": uncalibrated_slope[
+                    "slope_ci_lower"
+                ],
+                "dev_uncalibrated_calibration_slope_ci_upper": uncalibrated_slope[
+                    "slope_ci_upper"
+                ],
                 "dev_mean_p_hat_calibrated": calibration_summary[
                     "mean_p_hat_calibrated"
                 ],
@@ -1028,18 +1259,28 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
         with tempfile.TemporaryDirectory() as tmp_dir:
             oof_path = Path(tmp_dir) / "dev_oof_predictions.parquet"
             dev_oof_predictions.to_parquet(oof_path, index=False)
-            mlflow.log_artifact(str(oof_path))
+            mlflow.log_artifact(str(oof_path), artifact_path="calibration")
+
+        mlflow.log_dict(golden["golden_fixture"], "calibration/golden_predictions.json")
 
         model_info = mlflow.sklearn.log_model(
-            sk_model=fitted,
+            sk_model=golden["fitted"],
             name="calibrated_model",
-            signature=signature,
-            input_example=input_example,
+            signature=golden["signature"],
+            input_example=golden["input_example"],
             pyfunc_predict_fn="predict_proba",
             serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE,
             registered_model_name=registered_model_name,
         )
+        set_logged_model_description(model_info.model_id, _MODEL_DESCRIPTION)
 
+    return model_info
+
+
+def _verify_reload_parity(
+    model_info: Any, input_example: pd.DataFrame, in_memory_preds: NDArray[np.float64]
+) -> bool:
+    """Assert the reloaded model's predictions match the in-memory pipeline's, before registering."""
     reloaded = mlflow.sklearn.load_model(model_info.model_uri)
     reload_preds = reloaded.predict_proba(input_example)
     parity_ok = bool(np.allclose(in_memory_preds, reload_preds, rtol=0, atol=1e-12))
@@ -1049,17 +1290,122 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
             "calibrated model differ from the in-memory pipeline on the same "
             "input sample — the serialized model is not safe to register."
         )
+    return parity_ok
 
+
+def _tag_new_version_pending(cfg: DictConfig, model_info: Any) -> str:
+    """Tag a freshly minted registry version promotion_status=pending at mint time.
+
+    Called immediately after log_model returns — before _verify_reload_parity
+    runs — so that even a parity failure leaves a well-formed, reapable
+    `pending` version rather than a permanently untagged orphan. A version
+    with no promotion_status tag at all is invisible to both the tag-based
+    rollback rule and the Phase 14 pending-reaper, so tagging cannot wait on
+    any downstream check succeeding — including this function's own caller's
+    reload-parity check.
+    """
+    registered_model_name = str(cfg.mlflow.registered_model_name)
     version = str(model_info.registered_model_version)
     client = mlflow.tracking.MlflowClient()
-    client.set_model_version_tag(registered_model_name, version, "refit_scope", "dev")
+    # Idempotent — same self-healing pattern as ensure_experiment_metadata:
+    # cheap to re-set on every registration, so the registry overview page
+    # is never left describing a stale training cycle.
+    set_registered_model_description(registered_model_name, _REGISTRY_DESCRIPTION)
+    client.update_model_version(
+        registered_model_name, version, description=_PENDING_VERSION_DESCRIPTION
+    )
+    client.set_model_version_tag(
+        registered_model_name, version, "training_data_scope", "dev"
+    )
     # ModelVersion.model_id does not auto-populate in OSS MLflow 3.14 — this tag
     # is the only supported hop from "the version being evaluated" to the
     # LoggedModel Phase 7's evaluate.py attaches sealed-test metrics to.
     client.set_model_version_tag(
         registered_model_name, version, "logged_model_id", model_info.model_id
     )
+    # Mint-time default, set before anything downstream can fail: a crash in
+    # _verify_reload_parity, evaluate.py, error_analysis.py, or register.py
+    # leaves this version with no verdict recorded, rather than with a tag
+    # someone forgot to write on an abort path nobody anticipated.
+    # register.py's rollback_champion() query (highest version tagged
+    # promotion_status: promoted) and the Phase 14 pending-orphan reaper both
+    # depend on every version reliably starting here — see CLAUDE.md § MLflow
+    # Model Registry.
+    client.set_model_version_tag(
+        registered_model_name, version, "promotion_status", "pending"
+    )
+    return version
+
+
+def _point_challenger_alias(cfg: DictConfig, version: str) -> None:
+    """Point `challenger` at a version that has already passed reload parity.
+
+    Deliberately the last step of registration: the alias is what makes a
+    version reachable by evaluate.py/register.py/a human, so nothing may be
+    aliased until it has been verified to be the artifact it claims to be.
+    """
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+    client = mlflow.tracking.MlflowClient()
     client.set_registered_model_alias(registered_model_name, "challenger", version)
+
+
+def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
+    """Calibrate, select a method, and register the fitted pipeline as `challenger`.
+
+    The training cycle's single registration point — run_model_logging_step
+    only logs an uncalibrated pipeline and stops there.
+
+    reports/figures/reliability_diagram.png is overwritten on every call —
+    it reflects whichever run executed this function most recently on this
+    machine, not a specific run_id. A reader who needs to know which run a
+    figure on disk corresponds to should cross-check that run's own
+    calibration_summary.json rather than trusting the file's mtime; the
+    MLflow-logged copy under that run's figures/ artifacts is the durable,
+    run-pinned reference.
+
+    Also logs golden_predictions.json (customerid-pinned dev rows, at the
+    model's committed input schema, plus the in-memory fitted pipeline's
+    reference scores on them, captured before log_model/pickling touches
+    anything) — the independent reference register.py's serving-parity
+    smoke check verifies against, and Phase 9's API parity test reuses.
+    """
+    manifest = load_training_manifest(run_id, cfg)
+    _check_trial_count_gate(manifest, run_id, cfg)
+
+    loaded = _load_calibration_inputs(manifest, cfg)
+    X_dev, y_dev = loaded["X_dev"], loaded["y_dev"]
+
+    selection_result = _select_and_render_calibration(
+        loaded["pipeline"], X_dev, y_dev, cfg
+    )
+    method = selection_result["method"]
+
+    golden = _fit_and_build_golden_fixture(
+        loaded["pipeline"], method, cfg, X_dev, y_dev
+    )
+
+    slopes_and_summary = _compute_calibration_slopes_and_summary(
+        y_dev, golden["dev_customer_ids"], selection_result["selection"], method, cfg
+    )
+    calibration_summary = slopes_and_summary["calibration_summary"]
+
+    model_info = _log_calibration_run(
+        run_id,
+        cfg,
+        calibration_summary,
+        slopes_and_summary["slope"],
+        slopes_and_summary["uncalibrated_slope"],
+        selection_result["figure_path"],
+        slopes_and_summary["dev_oof_predictions"],
+        golden,
+    )
+
+    version = _tag_new_version_pending(cfg, model_info)
+
+    parity_ok = _verify_reload_parity(
+        model_info, golden["input_example"], golden["in_memory_preds"]
+    )
+    _point_challenger_alias(cfg, version)
 
     logger.info(
         "calibration_registered",

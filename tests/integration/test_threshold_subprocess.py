@@ -163,13 +163,6 @@ def registered_threshold_model(
     experiment_name = str(compose_config().mlflow.experiment_name)
     tracking_uri = _sqlite_experiment(seed_root, experiment_name)
     registered_model_name = "test-threshold-subprocess-pipeline"
-    cfg = compose_config(
-        overrides=[
-            f"mlflow.tracking_uri={tracking_uri}",
-            f"mlflow.registered_model_name={registered_model_name}",
-            *_FAST_CALIBRATION_OVERRIDES,
-        ]
-    )
 
     dev_df, _test_df = partition(df, manifest)
     feature_cols = [c for c in df.columns if c not in ("customerid", "churn")]
@@ -215,12 +208,33 @@ def registered_threshold_model(
         "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
     }
 
-    with mlflow.start_run(run_name="tuning_study") as run:
-        tuning_result["parent_run_id"] = run.info.run_id
-    log_result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, cfg
-    )
-    cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
+    # calibrate.run_calibration_step (unlike log_model.run_model_logging_step,
+    # which takes X_dev/y_dev explicitly) loads dev data itself internally via
+    # load_dev_features()/load_dev_customer_ids() — both resolve
+    # cfg.paths.processed_data = ${oc.env:PROCESSED_DATA_DIR,datasets/processed/}.
+    # Composing cfg and calling calibration inside this scoped env override
+    # (rather than after, as a bare compose_config() call would do) is
+    # load-bearing: without it, this in-process call silently reads the real
+    # project's datasets/processed/ instead of this fixture's seeded data,
+    # logging dev_oof_predictions.parquet against real customerids that share
+    # no overlap with the synthetic cust-NNNN ids the subprocess below
+    # computes (via the same env var, correctly set for it) — surfacing as a
+    # dev-partition mismatch assertion failure in threshold.py, not here.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PROCESSED_DATA_DIR", str(data_dir))
+        cfg = compose_config(
+            overrides=[
+                f"mlflow.tracking_uri={tracking_uri}",
+                f"mlflow.registered_model_name={registered_model_name}",
+                *_FAST_CALIBRATION_OVERRIDES,
+            ]
+        )
+        with mlflow.start_run(run_name="tuning_study") as run:
+            tuning_result["parent_run_id"] = run.info.run_id
+        log_result = log_model.run_model_logging_step(
+            X_dev, y_dev, comparison_result, tuning_result, cfg
+        )
+        cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
 
     return (
         tracking_uri,
@@ -237,15 +251,23 @@ def _run_threshold_cli(
     data_dir: Path,
     figures_dir: Path,
     policy_dir: Path,
+    reports_dir: Path,
     extra_overrides: list[str] | None = None,
     timeout: int = 120,
 ) -> subprocess.CompletedProcess[str]:
-    """Invoke threshold.py's CLI as a real subprocess with sandboxed output paths."""
+    """Invoke threshold.py's CLI as a real subprocess with sandboxed output paths.
+
+    paths.reports must be sandboxed here — threshold.py's folded-in dev-OOF
+    screen writes reports/dev_oof_predictions.parquet and
+    reports/dev_oof_diagnostics.json, and the default path resolves to the
+    real project's reports/ directory if left unset.
+    """
     overrides = [
         f"mlflow.tracking_uri={tracking_uri}",
         f"mlflow.registered_model_name={registered_model_name}",
         f"paths.figures={figures_dir}",
         f"paths.policy={policy_dir}",
+        f"paths.reports={reports_dir}",
     ]
     if model_version is not None:
         overrides.append(f"threshold.model_version={model_version}")
@@ -267,16 +289,25 @@ def _run_threshold_cli(
     )
 
 
-def test_threshold_main_cli_exits_zero_and_ships_policy(
+def test_threshold_main_cli_ships_policy_regardless_of_dev_oof_screen_verdict(
     registered_threshold_model: tuple[str, str, str, Path],
     tmp_path: Path,
 ) -> None:
-    """threshold.py __main__ derives t* and writes threshold.json + policy.yaml + figures."""
+    """threshold.py __main__ derives t* and writes threshold.json + policy.yaml +
+    figures — all written before the folded-in dev-OOF screen runs, so they
+    exist regardless of the screen's own pass/fail verdict on this synthetic
+    fixture's real (not mocked) calibration slope. Exit code 0 vs. 1 and
+    "threshold_step_done" vs. "threshold_dev_oof_screen_failed" simply track
+    which branch fired — both are valid resting states for this test, same
+    tolerance test_calibration_screen_subprocess.py used to apply for the
+    screen before it was folded into this module.
+    """
     tracking_uri, registered_model_name, model_version, data_dir = (
         registered_threshold_model
     )
     figures_dir = tmp_path / "figures"
     policy_dir = tmp_path / "policy"
+    reports_dir = tmp_path / "reports"
 
     result = _run_threshold_cli(
         model_version,
@@ -285,12 +316,16 @@ def test_threshold_main_cli_exits_zero_and_ships_policy(
         data_dir,
         figures_dir,
         policy_dir,
+        reports_dir,
     )
 
-    assert (
-        result.returncode == 0
-    ), f"threshold CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    assert "threshold_step_done" in result.stdout
+    assert result.returncode in (0, 1), (
+        f"threshold CLI exited unexpectedly:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "threshold_step_done" in result.stdout or (
+        "threshold_dev_oof_screen_failed" in result.stdout
+    )
 
     assert (policy_dir / "threshold.yaml").exists()
     written = OmegaConf.load(policy_dir / "threshold.yaml")
@@ -300,6 +335,11 @@ def test_threshold_main_cli_exits_zero_and_ships_policy(
     assert (figures_dir / "threshold_sensitivity.png").exists()
     assert (figures_dir / "threshold_by_scenario.png").exists()
     assert (figures_dir / "expected_value_by_scenario.png").exists()
+
+    # The folded-in dev-OOF screen (module docstring) writes both regardless
+    # of pass/fail.
+    assert (reports_dir / "dev_oof_predictions.parquet").exists()
+    assert (reports_dir / "dev_oof_diagnostics.json").exists()
 
 
 def test_threshold_main_cli_exits_one_when_model_version_missing(
@@ -318,6 +358,7 @@ def test_threshold_main_cli_exits_one_when_model_version_missing(
         data_dir,
         tmp_path / "figures",
         tmp_path / "policy",
+        tmp_path / "reports",
     )
 
     assert result.returncode == 1, (
@@ -343,6 +384,7 @@ def test_threshold_main_cli_exits_one_when_costs_config_missing(
         data_dir,
         tmp_path / "figures",
         tmp_path / "policy",
+        tmp_path / "reports",
         extra_overrides=[f"paths.costs_config={missing_costs_path}"],
     )
 
@@ -373,6 +415,7 @@ def test_threshold_main_cli_exits_one_when_retention_rate_zero(
         data_dir,
         tmp_path / "figures",
         tmp_path / "policy",
+        tmp_path / "reports",
         extra_overrides=[f"paths.costs_config={costs_path}"],
     )
 
@@ -403,10 +446,39 @@ def test_threshold_main_cli_exits_one_when_t_star_at_least_one(
         data_dir,
         tmp_path / "figures",
         tmp_path / "policy",
+        tmp_path / "reports",
         extra_overrides=[f"paths.costs_config={costs_path}"],
     )
 
     assert result.returncode == 1, (
         f"threshold CLI should exit 1 when t* >= 1:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+def test_threshold_main_cli_exits_one_when_model_version_does_not_exist(
+    registered_threshold_model: tuple[str, str, str, Path],
+    tmp_path: Path,
+) -> None:
+    """A nonexistent registered model version must fail loudly, not silently
+    fall back to something else — ported from
+    test_calibration_screen_subprocess.py, since resolve_model_run_id is the
+    same resolve-by-explicit-version call the folded-in screen now shares."""
+    tracking_uri, registered_model_name, _model_version, data_dir = (
+        registered_threshold_model
+    )
+
+    result = _run_threshold_cli(
+        "999999",
+        tracking_uri,
+        registered_model_name,
+        data_dir,
+        tmp_path / "figures",
+        tmp_path / "policy",
+        tmp_path / "reports",
+    )
+
+    assert result.returncode == 1, (
+        f"threshold CLI should exit 1 for a nonexistent model version:\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )

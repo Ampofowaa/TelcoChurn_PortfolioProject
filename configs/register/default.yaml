@@ -1,0 +1,34 @@
+# Registry promotion configuration — see models/register.py.
+
+# telco-churn-pipeline version to register — required, e.g. `register.model_version=2`.
+# Never inferred from the challenger alias: register.py must act on the exact
+# version evaluate.py's promotion_decision.json was computed against.
+model_version: null
+
+# Require promotion_decision.json's review field to be "approved" before acting.
+# Phase 7 default: true (a human stamps the review in notebook 05). Phase 10's
+# weekly automated retrain sets this false — no human in the loop every cycle.
+require_review: true
+
+# Alias the flip targets on a pass. Parameterized rather than hard-coded so
+# Phase 10's shadow/canary staging can reuse promote_to_alias() unchanged.
+alias: champion
+
+# Absolute tolerance for the golden-parity smoke check (reload vs. calibrate.py's
+# in-memory reference scores). One order looser than calibrate.py's own
+# in-process check (1e-12) to allow for the cross-process/alias-resolution hop —
+# only meaningful under a pinned environment (see environment_packages below).
+golden_atol: 1.0e-9
+
+# Packages compared between the registered model's logged pip requirements and
+# what's actually installed, before the golden-parity check runs. A patch-level
+# drift in any of these shifts floating-point output in the same 1e-7-1e-9 range
+# as golden_atol, with no actual bug present.
+environment_packages:
+  - numpy
+  - scikit-learn
+  - lightgbm
+
+# Quantile bin count for drift_reference.py's numeric/score reference
+# distributions — matches build_reference's own default.
+drift_reference_n_bins: 10
