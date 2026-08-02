@@ -1,20 +1,16 @@
 """Pure plotting-data helpers for evaluate.py's curves and summary charts.
 
-Pure, side-effect-free — like models/diagnostics.py, this returns list[dict]
-rows a caller renders however it likes: a calibration notebook now, later
-evaluate.py's test-set reliability diagram, or a calibration-drift monitoring
-dashboard. No matplotlib import.
+Pure, side-effect-free (no matplotlib import) — like models/diagnostics.py,
+returns list[dict] rows a caller renders however it likes.
 
-Cost/EV curves and the r-sensitivity sweep are not duplicated here: both
+Cost/EV curves and the r-sensitivity sweep are not duplicated here: they
 already exist as pure functions in models.threshold (expected_value_curve,
-r_sensitivity_sweep), because threshold.py needs them internally to derive
-t* and its sensitivity plot. Callers wanting those series import them from
-there directly.
+r_sensitivity_sweep), which needs them internally to derive t*. Callers
+wanting those series import them from there directly.
 
-classification_summary_points has no randomness and computes point estimates
-only — bootstrap CIs on its precision/recall/F1 are the caller's job
-(utils.stats), attached afterward, so this module never needs a
-random_state parameter.
+classification_summary_points computes point estimates only — bootstrap CIs
+on its precision/recall/F1 are the caller's job (utils.stats), attached
+afterward, so this module never needs a random_state parameter.
 """
 
 from __future__ import annotations
@@ -43,10 +39,8 @@ def reliability_diagram_bins(
 
     Same edge construction (quantile or uniform, per strategy) as
     calibrate.expected_calibration_error, so a rendered diagram's bins match
-    exactly the ECE number computed alongside it, rather than an
-    independently tuned visualization. Empty bins are dropped rather than
-    returned as NaN — quantile edges on a skewed probability vector can
-    produce them, and a plotted NaN point is worse than one fewer marker.
+    the ECE number computed alongside it. Empty bins are dropped rather than
+    returned as NaN — a plotted NaN point is worse than one fewer marker.
     """
     p = np.asarray(proba, dtype=float)
     y = np.asarray(y_true, dtype=float)
@@ -81,10 +75,10 @@ def pr_curve_points(
 ) -> list[dict[str, float]]:
     """Precision-recall curve points, for rendering the PR curve behind PR-AUC.
 
-    One row per sklearn precision_recall_curve threshold, dropping the
-    trailing (precision=1, recall=0) point that has no corresponding
-    threshold — same convention diagnostics.py::fixed_recall_profile already
-    uses, so the two stay consistent about where the curve ends.
+    Drops the trailing (precision=1, recall=0) point that has no
+    corresponding threshold — same convention as
+    diagnostics.py::fixed_recall_profile, so the two agree on where the
+    curve ends.
     """
     precision, recall, thresholds = precision_recall_curve(
         np.asarray(y_true), np.asarray(proba)
@@ -102,8 +96,8 @@ def roc_curve_points(
     """ROC curve points, for rendering a labelled diagnostic curve.
 
     ROC-AUC is optimistic under this project's class imbalance and is not
-    used as a gate (ANALYSIS.md §0) — this curve is conventional and cheap to
-    produce, but the caller should never render it as the headline.
+    used as a gate — this curve is conventional and cheap to produce, but the
+    caller should never render it as the headline.
     """
     fpr, tpr, thresholds = roc_curve(np.asarray(y_true), np.asarray(proba))
     return [
@@ -117,23 +111,18 @@ def decile_lift_table(
 ) -> list[dict[str, float]]:
     """Decile-ranked lift/gains table, highest-predicted-probability decile first.
 
-    Sorts rows by proba descending and splits into 10 equal-sized groups
-    (np.array_split, so a non-multiple-of-10 n gives the leading groups one
-    extra row rather than an uneven remainder) — the "how much of the
-    model's value shows up in the top N% contacted" read a retention team
-    asks before a PR-AUC number means anything to them. Per decile: count,
-    n_churners, churn_rate, lift (churn_rate / overall base rate), and
-    cumulative_capture_rate (share of all churners found in this decile and
-    every higher-ranked decile). Ties in proba are broken by original row
-    order (stable sort), not randomly, so the table is deterministic.
+    Sorts by proba descending (stable sort, so tied rows keep their original
+    order) and splits into 10 groups via np.array_split — the "how much of
+    the model's value shows up in the top N% contacted" read a retention
+    team wants before a PR-AUC number means anything to them. Per decile:
+    count, n_churners, churn_rate, lift (churn_rate / base rate), and
+    cumulative_capture_rate (share of all churners found by this decile).
 
-    Also carries perfect_capture_rate — the share of churners a flawless
-    ranker (every churner outranks every non-churner) would have found by
-    this decile's cumulative population share — and headroom, the gap
-    between that ceiling and cumulative_capture_rate. A perfect ranker
-    reaches 100% capture once the contacted share passes the base rate, so
-    perfect_capture_rate saturates at 1.0 well before decile 10 whenever
-    base_rate < 1.
+    Also carries perfect_capture_rate — the capture rate a flawless ranker
+    would achieve at this decile's cumulative population share — and
+    headroom, the gap to that ceiling. perfect_capture_rate saturates at 1.0
+    once the contacted share passes the base rate, so it hits 1.0 well before
+    decile 10.
     """
     y = np.asarray(y_true, dtype=float)
     p = np.asarray(proba, dtype=float)
@@ -184,18 +173,16 @@ def classification_summary_points(
 ) -> list[dict[str, object]]:
     """Per-scenario confusion matrix, positive-class rates, support, and contact rate.
 
-    One row per named threshold in `thresholds` (scenario name -> cut) — the
-    data behind the classification_report_test.png panel: a confusion matrix
-    with row-normalised percentages (TP/FN as a share of actual churners,
-    FP/TN as a share of actual non-churners) beside positive-class precision/
-    recall/F1, support counts, and the threshold's implied contact rate.
+    One row per named threshold in `thresholds` — a confusion matrix with
+    row-normalised percentages (TP/FN as a share of actual churners, FP/TN
+    of actual non-churners) beside positive-class precision/recall/F1,
+    support, and contact rate.
 
-    Positive-class only, deliberately — this is the honest replacement for
-    sklearn.classification_report, whose negative-class row and macro/
-    weighted averages are dominated by the majority class at ~27% prevalence
-    and mislead exactly where nobody acts on a prediction (a customer who
-    will stay). Point estimates only; precision/recall/F1's bootstrap CIs are
-    computed by the caller and attached afterward.
+    Positive-class only, deliberately: sklearn.classification_report's
+    negative-class row and macro/weighted averages are dominated by the
+    majority class at ~27% prevalence and mislead exactly where nobody acts
+    on a prediction (a customer who will stay). Point estimates only —
+    bootstrap CIs are the caller's job.
     """
     y = np.asarray(y_true, dtype=float)
     p = np.asarray(proba, dtype=float)

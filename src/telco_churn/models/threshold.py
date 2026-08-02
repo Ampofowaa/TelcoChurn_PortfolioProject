@@ -1,37 +1,23 @@
-"""Derive the cost-sensitive operating threshold from a calibrated pipeline.
+"""Derive and validate the cost-sensitive decision threshold t* = c / (r × LTV).
 
-Contact a customer if and only if q·r·LTV > c (q = calibrated churn
-probability, r = retention success rate, LTV = discounted lifetime value,
-c = intervention cost) — solving for the break-even q gives the closed form
-this module ships: t* = c / (r × LTV).
+Contact a customer iff q·r·LTV > c (q = calibrated churn probability, r =
+retention success rate, LTV = discounted lifetime value, c = intervention
+cost); t* is the break-even q. This supersedes the classical
+C_FP/(C_FP + C_FN) rule, which assumes correct decisions are free — here
+cost attaches to the action of contacting, not to being wrong.
 
-This supersedes the classical C_FP/(C_FP + C_FN) rule, which assumes correct
-decisions are free; here contacting costs c regardless of whether the
-customer was going to churn, so cost attaches to the action, not the error.
+Leak-free by construction: no unconditional `.fit(` call and no sklearn
+estimator import. `run_threshold_step` only reads models.calibrate's
+already-computed OOF arrays and telco_churn.data.split's segment/protected
+columns — never the test partition.
 
-Leak-free by construction: no unconditional `.fit(` call, no sklearn
-estimator import. run_threshold_step reaches into models.calibrate for
-already-computed OOF arrays and into telco_churn.data.split only to read
-segment/protected columns for the dev-OOF screen below — never to fit or
-touch the test partition.
-
-Also runs Phase 7's pre-seal dev-OOF screen, as this module's last step:
-fetches calibrate.py's persisted dev-OOF vector (never recomputes it),
-screens calibrate.py's own already-logged aggregate calibration slope against
-ANALYSIS.md §0's [0.80, 1.25] band — read from calibration_summary.json, not
-recomputed, since calibrate.py already computed this exact number selecting
-and validating its calibration method — and computes V1 (segment collapse),
-V2 (fairness disparity), and V2b (per-group calibration collapse) on that
-same dev-OOF surface. This is the first point in the pipeline every one of
-those needs (the dev-OOF vector, the segment columns, and the shipped
-threshold t*) exists at once: t* is this module's own output, so the screen
-runs against it directly rather than reading configs/policy/threshold.yaml
-back. Writes reports/dev_oof_predictions.parquet and
-reports/dev_oof_diagnostics.json — both read back, never recomputed, by
-evaluate.py, error_analysis.py, and drift_reference.py's out-of-sample score
-baseline. Raises RuntimeError, after logging, if the slope's CI lies
-entirely outside the band — the audit trail records the failing attempt
-rather than it silently vanishing.
+Also runs Phase 7's pre-seal dev-OOF screen as its last step: re-screens
+calibrate.py's logged aggregate calibration slope against ANALYSIS.md §0's
+band, and computes V1 (segment collapse), V2 (fairness disparity), and V2b
+(per-group calibration collapse) on that same dev-OOF surface — writing
+reports/dev_oof_predictions.parquet and reports/dev_oof_diagnostics.json for
+evaluate.py, error_analysis.py, and drift_reference.py to read back. Raises
+RuntimeError, after logging, if the slope's CI lies entirely outside the band.
 """
 
 from __future__ import annotations
@@ -142,19 +128,14 @@ def load_costs_config(path: Path | None = None) -> DictConfig:
 def costs_config_hash(path: Path | None = None) -> str:
     """Return the sha256 content hash of configs/costs.yaml's resolved values.
 
-    configs/policy/threshold.yaml carries no model stamp — t* = c / (r × LTV)
-    is a pure function of costs.yaml, model-independent by construction — so
-    its provenance is pinned by this hash instead: same hash means the model
-    changed, a different hash means the cost assumptions did. path defaults
-    to the canonical project location; pass an explicit path in tests.
-
-    Hashes the *resolved* config values (via OmegaConf, JSON-encoded with
-    sorted keys), not the file's raw bytes: a purely cosmetic edit — a
-    comment, re-indentation, a CRLF/LF line-ending change from checking the
-    file out on a different OS — must not look like a cost-assumption
-    change, or it becomes a false provenance mismatch against the hash
-    already pinned in configs/policy/threshold.yaml. Same idiom as
-    tuning.py's _study_name content-addressing.
+    Pins provenance for configs/policy/threshold.yaml, which is model-
+    independent by construction (t* = c/(r × LTV) is a pure function of
+    costs.yaml) and so carries no model stamp: same hash means the model
+    changed, a different hash means the cost assumptions did. Hashes the
+    *resolved* values (OmegaConf, JSON-encoded with sorted keys), not the
+    file's raw bytes, so a cosmetic edit (comment, line-ending change) can't
+    register as a false cost-assumption change. Same idiom as tuning.py's
+    `_study_name` content-addressing.
     """
     content = OmegaConf.to_container(load_costs_config(path), resolve=True)
     encoded = json.dumps(content, sort_keys=True, default=str).encode()
@@ -418,8 +399,7 @@ def load_dev_oof_predictions(run_id: str, cfg: DictConfig) -> pd.DataFrame:
 
     Columns: customerid, y_true, p_hat — the winning calibration method's
     exact leak-free OOF vector, the one calibrate.py's own method selection
-    and t* validation rested on. Read here rather than recomputed
-    (CLAUDE.md § Persist the evidence, not just the conclusion): a
+    and t* validation rested on. Read here rather than recomputed: a
     recomputation is only sound while the dataset is static and CV folds are
     seeded, and silently diverges from the vector that cycle's decisions
     actually used once either stops holding (e.g. under Phase 10 retraining).
@@ -432,16 +412,12 @@ def load_dev_oof_predictions(run_id: str, cfg: DictConfig) -> pd.DataFrame:
 
 
 def load_policy_thresholds(cfg: DictConfig) -> DictConfig:
-    """Load the model-independent scenario thresholds from configs/policy/threshold.yaml.
+    """Load configs/policy/threshold.yaml — the model-independent scenario thresholds.
 
     Carries no model stamp by construction (t* = c/(r × LTV) is a pure
-    function of cost parameters, never of the model) — evaluate.py's
-    check_threshold_provenance is the model-dependent half of this same
-    guarantee, which this file structurally cannot provide itself. Lives
-    here rather than in evaluate.py because this module is the one that
-    writes the file in the first place (run_threshold_step below); reading
-    it back is the same writer/reader locality every other artifact in this
-    project follows.
+    function of cost parameters, never of the model). Lives here rather than
+    in evaluate.py because this module is the one that writes the file
+    (`run_threshold_step` below) — reading it back stays writer/reader local.
     """
     path = get_project_root() / str(cfg.paths.policy) / "threshold.yaml"
     loaded = OmegaConf.load(path)
@@ -452,12 +428,10 @@ def load_policy_thresholds(cfg: DictConfig) -> DictConfig:
 def resolve_policy_scenarios(policy: DictConfig) -> dict[str, CostScenario]:
     """Reconstruct each shipped scenario's CostScenario from configs/policy/threshold.yaml.
 
-    Reads the already-resolved cost/LTV/ARPU values run_threshold_step
-    persisted at calibration time, rather than recomputing ARPU quantiles
-    from dev-set MonthlyCharges a second time here — the shipped threshold
-    and the sealed-test business-impact figures must rest on the identical
-    cost parameters, and a second derivation risks silently drifting from
-    them if the dev partition or configs/costs.yaml has since changed.
+    Reads the already-resolved cost/LTV/ARPU values `run_threshold_step`
+    persisted at derivation time, rather than recomputing ARPU quantiles from
+    dev-set MonthlyCharges again — the shipped threshold and the sealed-test
+    business-impact figures must rest on identical cost parameters.
     """
     return {
         str(name): CostScenario(
@@ -497,11 +471,9 @@ def build_dev_oof_screen_frame(
 ) -> pd.DataFrame:
     """Join the already-aligned dev-OOF vector to the dev partition's segment/protected columns.
 
-    Takes run_threshold_step's own aligned (customerid, y_true, p_hat) —
-    built there from calibrate.py's persisted dev_oof_predictions.parquet —
-    rather than re-fetching that artifact a second time from MLflow: this
-    runs in the same process, immediately after that alignment already
-    happened.
+    Takes `run_threshold_step`'s own aligned (customerid, y_true, p_hat)
+    rather than re-fetching dev_oof_predictions.parquet from MLflow a second
+    time — this runs in the same process, right after that alignment.
     """
     dev_df = _load_dev_partition().set_index("customerid").reindex(customerid)
     segment_lookup = build_segment_lookup(dev_df)
@@ -641,14 +613,11 @@ def _save_scenario_ev_curve_plot(
     scenarios: dict[str, CostScenario],
     path: Path,
 ) -> None:
-    """Render and save each scenario's expected-value curve overlaid, with its
-    closed-form t* marked — where EV actually peaks vs. where the cost model
-    says to cut, for all three scenarios at once.
+    """Render and save each scenario's EV curve overlaid, with its closed-form t* marked.
 
     ev_curves is precomputed once by the caller and reused for both this plot
     and the persisted ev_curve.parquet artifact — not recomputed here, so the
-    picture can never silently diverge from the logged evidence (CLAUDE.md §
-    Persist the evidence, not just the conclusion).
+    picture can never silently diverge from the logged evidence.
     """
     fig, ax = plt.subplots(figsize=(7, 5))
     for name, (thresholds, ev) in ev_curves.items():
@@ -668,17 +637,12 @@ def _save_scenario_ev_curve_plot(
 def _load_and_align_dev_oof(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     """Resolve the model's run, load its dev-OOF probabilities, and align them to the dev partition.
 
-    Loads the same leak-free OOF probabilities calibrate.py's method
-    selection used, from its persisted dev_oof_predictions.parquet artifact
-    (over the method recorded in calibration_summary.json) rather than
-    recomputing them — this module never sees a fitted estimator or the raw
-    data split directly, and never re-derives the OOF vector calibrate.py
-    already logged.
-
-    Aligned by customerid rather than trusted positionally: dev_oof and
-    X_dev/y_dev are two independent loads (an MLflow artifact fetch and a
-    features.parquet read), and only their row order happening to match by
-    construction is not something a silent misalignment would ever surface.
+    Loads calibrate.py's persisted dev_oof_predictions.parquet (for the
+    method recorded in calibration_summary.json) rather than recomputing —
+    this module never sees a fitted estimator or the raw data split. Aligned
+    by customerid rather than trusted positionally: dev_oof and X_dev/y_dev
+    are two independent loads, and a silent misalignment between them would
+    otherwise never surface.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     run_id = resolve_model_run_id(model_version, cfg)
@@ -782,16 +746,13 @@ def _render_threshold_figures(
 ) -> dict[str, Any]:
     """Render the three threshold figures and the EV-curve series they (and the persisted artifact) share.
 
-    Three figures are logged onto the run's figures/ artifacts and mirrored
-    to reports/figures/: threshold_sensitivity.png (base's t* vs. retention
-    rate), threshold_by_scenario.png (closed-form t* vs. empirical argmax +
-    its bootstrap CI, all three scenarios), and
-    expected_value_by_scenario.png (each scenario's EV curve overlaid, with
-    its t* marked).
-
-    ev_curves is computed once, shared by the plot and the persisted
-    artifact — a second recomputation is exactly the risk CLAUDE.md's
-    "persist the evidence" rule exists to close off.
+    Logs threshold_sensitivity.png (base's t* vs. retention rate),
+    threshold_by_scenario.png (closed-form t* vs. empirical argmax + its
+    bootstrap CI, all scenarios), and expected_value_by_scenario.png (each
+    scenario's EV curve, its t* marked) onto the run's figures/ artifacts and
+    mirrors them to reports/figures/. ev_curves is computed once here and
+    shared with the persisted ev_curve.parquet artifact so the picture can
+    never diverge from the logged evidence.
     """
     results, base, scenarios = (
         derived["results"],
@@ -835,11 +796,11 @@ def _run_dev_oof_screen(
 ) -> dict[str, Any]:
     """Screen calibrate.py's logged calibration slope against ANALYSIS.md §0's band.
 
-    Reuses the aligned dev-OOF vector _load_and_align_dev_oof already built —
-    never re-fetches dev_oof_predictions.parquet a second time. Returns
-    screen_passed rather than raising: the caller must log and mirror the
-    audit trail first, and raise only afterward, so a failing screen is
-    recorded rather than silently vanishing (module docstring).
+    Reuses the aligned dev-OOF vector `_load_and_align_dev_oof` already
+    built, never re-fetching dev_oof_predictions.parquet. Returns
+    `screen_passed` rather than raising: the caller logs and mirrors the
+    audit trail first, and raises only afterward, so a failing screen is
+    recorded rather than silently vanishing.
     """
     dev_oof_screen_frame = build_dev_oof_screen_frame(
         loaded["customerid"], loaded["y_dev_arr"], loaded["oof_proba"]
@@ -874,28 +835,21 @@ def _assemble_threshold_payloads(
 ) -> dict[str, Any]:
     """Assemble threshold.json, threshold.yaml (policy), and threshold_validation.json.
 
-    What gets mirrored to disk splits along the line the closed form already
-    draws, because the two halves have different lifetimes:
-      - configs/policy/threshold.yaml — the policy: threshold/costs/
-        retention_rate_sensitivity, pure functions of configs/costs.yaml
-        (t* = c / (r × LTV) is model-independent by construction). Pinned by
-        a costs_config_hash, carries no model_run_id/model_version — a file
-        whose content is model-independent must not carry a model stamp, or
-        an emergency rollback to a different champion leaves it silently
-        describing the wrong model.
-      - threshold_validation.json — the model-dependent half (argmax-EV
-        threshold, its bootstrap CI, within_ci, implied contact rate,
-        dev_ev_at_t_star, calibration_method), logged only as an artifact on
-        this model's run — same rule as drift_reference.json: an artifact
-        describing a specific version travels with that version, never sits
-        at a fixed path a rollback could leave stale.
+    The two files on disk split along model-independence: configs/policy/
+    threshold.yaml carries only the pure functions of configs/costs.yaml
+    (threshold/costs/retention_rate_sensitivity), pinned by a
+    costs_config_hash and carrying no model_run_id/model_version — a
+    model-independent file must not carry a model stamp, or a rollback to a
+    different champion leaves it describing the wrong model.
+    threshold_validation.json carries the model-dependent half (argmax-EV
+    threshold, its bootstrap CI, calibration_method, ...) as an artifact on
+    this model's own run, so it travels with that version rather than
+    sitting at a fixed path a rollback could leave stale.
 
-    Every scenario's full diagnostic bundle ships in both threshold_payload
-    (unsplit) and validation_payload (model-dependent half only) — not just
-    its t* — conservative and optimistic are equally auditable, not merely
-    stored numbers nobody can validate later. base is still the only
-    scenario that drives the top-level threshold/within_ci warning: it is
-    the shipped operating point, the others are reference alternatives.
+    Every scenario's full diagnostic bundle ships in both payloads, not just
+    its t* — conservative and optimistic are equally auditable. `base` alone
+    drives the top-level threshold/within_ci fields: it is the shipped
+    operating point, the others are reference alternatives.
     """
     results, base, sweep = derived["results"], derived["base"], derived["sweep"]
     run_id, method = loaded["run_id"], loaded["method"]
@@ -1075,15 +1029,15 @@ def _write_threshold_reports(
 def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     """Derive and ship the cost-sensitive threshold for a registered calibrated model.
 
-    Resolved by explicit model_version, never the challenger alias: a
+    Resolved by explicit model_version, never the `challenger` alias: a
     re-calibration invalidates a previously-derived threshold, and an alias
     is a moving pointer that could later point at a different version.
 
-    Finally runs the dev-OOF screen (module docstring): screens calibrate.py's
-    logged calibration slope against ANALYSIS.md §0's band, computes V1/V2/V2b
-    on the same aligned dev-OOF vector this function already built for the
-    threshold derivation above (no second fetch of dev_oof_predictions.parquet),
-    and writes reports/dev_oof_predictions.parquet + reports/dev_oof_diagnostics.json.
+    Finally runs the dev-OOF screen: screens calibrate.py's logged
+    calibration slope against ANALYSIS.md §0's band and computes V1/V2/V2b on
+    the same aligned dev-OOF vector already built for the threshold
+    derivation above (no second fetch), writing
+    reports/dev_oof_predictions.parquet and reports/dev_oof_diagnostics.json.
     Raises RuntimeError, after logging, if the slope fails the band.
     """
     loaded = _load_and_align_dev_oof(model_version, cfg)

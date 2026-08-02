@@ -44,8 +44,8 @@ _RUN_DESCRIPTION = (
     "family."
 )
 
-# Flag-only characterization segments — never decide the model family (CLAUDE.md
-# one-metric invariant).
+# Flag-only characterization segments — diagnostics reported alongside the
+# comparison, never inputs to it; PR-AUC alone decides the model family.
 _ROBUSTNESS_SEGMENTS: tuple[str, ...] = (
     "contract_type",
     "tenure_cohort",
@@ -99,9 +99,7 @@ def bootstrap_comparison(
         "decision": decision,
         "decision_rule": decision_rule,
         "n_bootstrap": n_bootstrap,
-        "bootstrap_deltas": result[
-            "bootstrap_deltas"
-        ],  # raw distribution; used for plotting in run_comparison_step
+        "bootstrap_deltas": result["bootstrap_deltas"],
     }
 
 

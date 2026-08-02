@@ -63,10 +63,10 @@ def _cv_pr_auc_at_n_estimators(
     (shuffle, random_state) — never on X's column content — so passing the
     same y_dev with the same three parameters reproduces tuning.py's exact
     fold indices without threading them through tuning_result. This is the
-    two-count diagnostic (PROJECT_PLAN.md Fix 5): a confirmation that the
-    a-priori scaling rule holds on this project's own data, never a
-    selection — it fits plain estimators in memory and logs no MLflow model,
-    so it cannot mint a second registered candidate.
+    two-count diagnostic: a confirmation that the a-priori scaling rule holds
+    on this project's own data, never a selection — it fits plain estimators
+    in memory and logs no MLflow model, so it cannot mint a second registered
+    candidate.
 
     Preprocessing regime deliberately differs from a tuning trial's: with no
     early stopping here, there is no es_validation_size slice to carve out of
@@ -97,7 +97,7 @@ def _cv_pr_auc_at_n_estimators(
 def _scale_n_estimators(
     tuning_result: dict[str, Any], cfg: DictConfig, y_dev: pd.Series
 ) -> dict[str, Any]:
-    """Scale the raw early-stopped n_estimators median to the final-fit row count (PROJECT_PLAN.md Fix 5).
+    """Scale the raw early-stopped n_estimators median to the final-fit row count.
 
     n_estimators is an early-stopping *output*, derived on each fold's
     training partition after tuning.py carves out an es_validation_size
@@ -241,9 +241,9 @@ def _build_training_manifest(
         "tuning_summary": {
             **tuning_result["tuning_summary"],
             "selected_hyperparameters": selected_hyperparameters,
-            # Tree-count scaling correction provenance (Fix 5) — the derivation
-            # must be legible without re-deriving it: n_estimators is not a
-            # tuned hyperparameter, so its shipped value has no other audit trail.
+            # Tree-count scaling correction provenance — the derivation must be
+            # legible without re-deriving it: n_estimators is not a tuned
+            # hyperparameter, so its shipped value has no other audit trail.
             "n_estimators_es_median": scaling["n_estimators_es_median"],
             "n_fold_fit": scaling["n_fold_fit"],
             "n_final_fit": scaling["n_final_fit"],
@@ -326,8 +326,8 @@ def run_model_logging_step(
     that count was derived on each fold's *training* partition, smaller than
     this final fit by construction (tuning.py carves an es_validation_size
     slice out of every fold's training rows), so it is scaled by
-    n_final_fit / n_fold_fit before shipping (PROJECT_PLAN.md Fix 5). No
-    further early stopping happens here. Logged onto the same MLflow run as
+    n_final_fit / n_fold_fit before shipping. No further early stopping
+    happens here. Logged onto the same MLflow run as
     the Step 4 tuning_study parent, reopened via its run_id.
 
     Logs the full Pipeline (not the bare estimator) with a probability signature +
@@ -351,10 +351,10 @@ def run_model_logging_step(
     when calibration, threshold, and sealed-test results are real — not here.
 
     This artifact is uncalibrated, un-thresholded, and not evaluated on the
-    sealed test set — not a valid rollback target, and therefore not registered
-    (CLAUDE.md § Run artifacts vs. registry versions). Phase 6's calibrate.py
-    performs the training cycle's single registration, on the calibrated
-    artifact, resolved via this manifest's logged_model_uri.
+    sealed test set — not a valid rollback target, and therefore not
+    registered. Phase 6's calibrate.py performs the training cycle's single
+    registration, on the calibrated artifact, resolved via this manifest's
+    logged_model_uri.
 
     Returns {"run_id", "model_uri", "parity_ok", "training_manifest"}.
     """

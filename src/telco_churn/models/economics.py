@@ -1,20 +1,15 @@
 """Pure business-economics helpers for the sealed-test evaluation.
 
 No I/O, no MLflow, no estimator — arrays, a CostScenario, and cost parameters
-in; dollars and dicts out. models/evaluate.py is the only caller: it holds the
-sealed-test probability vector and the resolved CostScenario per scenario
-(models.threshold.resolve_all_scenarios), and calls these to build
-reports/economics.json and the EV/sensitivity figures PROJECT_PLAN.md §7
-specifies.
+in; dollars and dicts out. models/evaluate.py is the only caller: it builds
+reports/economics.json and the EV/sensitivity figures from these.
 
 Reuses models.threshold.CostScenario and expected_value_at_threshold rather
 than redefining p·r·LTV − c a second time — two implementations would agree
-only until one of them changed. expected_value_at_threshold returns the
-*per-customer average* EV (denominator n, the unit threshold.py's own
-closed-form derivation needs); the helpers below that report a dollar figure
-(expected_value, campaign_cost, ev_by_k) return *totals* instead — the unit a
-README or stakeholder actually wants — and are kept as separate functions so
-neither call site has to multiply/divide by n to get the number it needs.
+only until one of them changed. That function returns the *per-customer
+average* EV; the dollar-figure helpers below (expected_value, campaign_cost,
+ev_by_k) return *totals* instead — the unit stakeholders actually want — kept
+separate so neither call site has to multiply/divide by n itself.
 """
 
 from __future__ import annotations
@@ -89,20 +84,16 @@ def ev_by_k(
 ) -> list[dict[str, float]]:
     """Cumulative dollar EV from contacting the top-K highest-scored customers.
 
-    PROJECT_PLAN.md calls this "the single most business-legible artifact this
-    project can produce": rank customers by score, walk down the list, and
-    plot cumulative EV against K. At any budget the business reads off its own
-    number, no new model or threshold required, and the curve's unconstrained
-    peak is a free validation of the closed-form threshold — under scenario
-    costs it should land at K = the count implied by t*.
+    Rank customers by score and plot cumulative EV against K: at any budget
+    the business reads off its own number, and the curve's unconstrained peak
+    is a free check on the closed-form threshold (it should land at
+    K = the count implied by t*).
 
     Same sorted-cumulative-sum construction as threshold.py's
-    expected_value_curve (O(n log n), not a per-K mask loop), denominated in
-    contact count K instead of probability threshold, and returning the
-    cumulative dollar total rather than a per-customer average. One row per
-    distinct observed probability, matching expected_value_curve's tie
-    handling: a tied group can only be contacted all-or-nothing, so a K
-    strictly inside a tie group would be fiction.
+    expected_value_curve (O(n log n)), denominated in contact count K instead
+    of probability threshold. One row per distinct observed probability,
+    matching that function's tie handling — a tied group can only be
+    contacted all-or-nothing, so a K strictly inside one would be fiction.
     """
     order = np.argsort(-proba, kind="stable")
     proba_sorted = proba[order]
@@ -134,13 +125,11 @@ def break_even_retention_rate(
 ) -> float:
     """The retention rate r_min at which contacting at `threshold` breaks even (EV = 0).
 
-    Solved in closed form from ev(t) = tp·(r·LTV − c) − fp·c = 0, for the group
-    actually contacted at `threshold`: r_min = c·n_contacted / (tp·LTV). The
-    campaign is worth running iff the true r >= r_min — and unlike every other
-    number in this module, r_min is falsifiable after a single real campaign:
-    run it, count who stayed, and compare the realized rate to this one. tp=0
-    means no amount of retention success recoups the spend at this threshold —
-    returns +inf rather than dividing by zero.
+    Solved in closed form from ev(t) = tp·(r·LTV − c) − fp·c = 0:
+    r_min = c·n_contacted / (tp·LTV). The campaign is worth running iff the
+    true r >= r_min, and unlike every other number in this module, r_min is
+    falsifiable after a single real campaign. tp=0 returns +inf (no retention
+    rate recoups the spend) rather than dividing by zero.
     """
     contacted = proba >= threshold
     n_contacted = int(np.sum(contacted))
@@ -160,11 +149,10 @@ def sensitivity_oneway(
 ) -> list[dict[str, float]]:
     """EV at the fixed shipped threshold as one cost parameter varies, others held fixed.
 
-    `param` is "retention_rate" or "cost" — the two one-way sweeps
-    PROJECT_PLAN.md calls for (EV vs. r, EV vs. c). Swaps in each value via
-    dataclasses.replace so no other field of `scenario` drifts. r is the
-    parameter §0 asserts is the most consequential in the deployment decision;
-    this sweep is what lets that claim be checked rather than taken on trust.
+    `param` is "retention_rate" or "cost". Swaps in each value via
+    dataclasses.replace so no other field of `scenario` drifts. r is believed
+    to be the most consequential parameter in the deployment decision; this
+    sweep lets that claim be checked rather than taken on trust.
     """
     rows: list[dict[str, float]] = []
     for value in values:
@@ -222,12 +210,10 @@ def tornado(
     """Rank cost parameters by how far EV moves under a symmetric ± perturbation, one at a time.
 
     Perturbs retention_rate, cost, and ltv by pct_perturbation in each
-    direction, holding the other two at scenario's shipped values, and sorts
-    by the resulting EV spread — the chart PROJECT_PLAN.md expects to show r
-    dominating, making §0's central claim visible at a glance rather than
-    asserted in prose. arpu is excluded: it is not an independent input, it
-    determines ltv and cost through resolve_scenario, so perturbing it
-    alongside them would double-count the same underlying assumption.
+    direction (others held at scenario's shipped values) and sorts by the
+    resulting EV spread — making the "r dominates" claim visible rather than
+    asserted in prose. arpu is excluded: it determines ltv and cost through
+    resolve_scenario, so perturbing it too would double-count that assumption.
     """
     base_ev = expected_value_at_threshold(proba, y, scenario, threshold)
     rows: list[dict[str, float | str]] = []

@@ -606,11 +606,10 @@ def run_tuning_step(
     persists trial_count_below_threshold into tuning_summary and the
     trial_count_below_threshold MLflow metric — visible after the fact, not
     just in the log stream — but does not block selection: this step only
-    flags an untrustworthy result, it does not gate on it. (Enforcement
-    belongs at the point a tuned pipeline becomes a registered model — Phase
-    6's calibrate.py — not here; see PROJECT_PLAN.md Phase 6.) storage
-    defaults to a Postgres-backed study (see _build_optuna_storage); pass an
-    InMemoryStorage for tests.
+    flags an untrustworthy result, it does not gate on it. Enforcement
+    belongs at the point a tuned pipeline becomes a registered model —
+    Phase 6's calibrate.py — not here. storage defaults to a Postgres-backed
+    study (see _build_optuna_storage); pass an InMemoryStorage for tests.
 
     Idempotent against a study that already reached n_trials: only the trials
     still needed to reach n_trials are run, so re-running against a completed

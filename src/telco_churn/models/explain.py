@@ -1,30 +1,16 @@
-"""Pure SHAP helpers for the champion's error analysis.
+"""Pure SHAP summary helpers for error analysis.
 
-No I/O, no MLflow, no shap import — the same contract as diagnostics.py,
-economics.py, and plots.py. These take already-computed SHAP values (a shap
-library explainer call is I/O-adjacent: it resolves a fitted estimator and
-runs inference) and return summary statistics. models/error_analysis.py is
-the only caller: it resolves the champion pipeline, computes
-`shap.TreeExplainer(...)(...)` once on the sealed-test rows, and calls these
-functions on the result. Interpretability is its own discipline,
-distinct from performance measurement (evaluate.py) and from error diagnosis
-proper — it lives here so neither of those modules has to import shap.
+No I/O, no MLflow, no shap import (same contract as diagnostics.py,
+economics.py, plots.py) — these take already-computed SHAP values and return
+summary statistics. models/error_analysis.py is the sole caller: it runs
+`shap.TreeExplainer(...)(...)` once on the sealed-test rows and passes the
+result here.
 
-Direction, not magnitude, is what most of this module reports. Global mean
-|SHAP| (global_importance) says a feature matters; it has no sign by
-construction and cannot say *which way* it pushes a prediction. V3's veto
-("a top-8 feature whose effect direction contradicts the established EDA
-relationship") and the FN-cohort finding ("do the usual churn signals fire as
-strongly for the misses as for the catches?") both need the signed value,
-which is why dependence_points and cohort_shap report signed contributions
-rather than magnitudes.
-
-local_explanations returns everything a waterfall chart needs (base value,
-top-k contributions, an "other features" remainder, and the final
-prediction) — not because Phase 7 requires a waterfall figure, but because
-the illustrative FN/FP case studies the notebook renders are exactly what a
-waterfall is for, and Phase 9's serving UI will want the identical shape for
-a live customer later.
+Most functions report signed direction, not magnitude: global mean |SHAP|
+(global_importance) says a feature matters but has no sign by construction,
+while V3's veto (a top feature's effect direction contradicting the
+established EDA relationship) and the FN-cohort finding both need the sign —
+hence dependence_points and cohort_shap report signed contributions.
 """
 
 from __future__ import annotations
@@ -48,13 +34,10 @@ def global_importance(
 ) -> list[dict[str, Any]]:
     """Mean |SHAP| per feature, sorted descending.
 
-    Model documentation, not error analysis: it says what the champion keys
-    on, which the model card needs, and nothing about where the model is
-    wrong. Mirrors features.select.compute_shap_audit's mean(|SHAP|)
-    computation against the tuned champion rather than the default-config
-    candidate — but takes already-computed SHAP values rather than fitting a
-    model itself, since error_analysis.py already holds the champion's
-    shap_values in memory by the time this is called.
+    For the model card, not error diagnosis — magnitude says what the
+    champion keys on, not where it's wrong. Mirrors
+    features.select.compute_shap_audit's mean(|SHAP|) computation, but takes
+    already-computed SHAP values rather than fitting a model itself.
     """
     mean_abs = np.abs(shap_values).mean(axis=0)
     rows: list[dict[str, Any]] = [
@@ -83,14 +66,10 @@ def dependence_points(
 ) -> dict[str, Any]:
     """Paired (feature value, SHAP value) points for one feature, plus a signed direction summary.
 
-    V3's instrument: V3 vetoes on a top-8 feature whose effect direction
-    contradicts the established EDA relationship, and direction is unreadable
-    from mean |SHAP| (an absolute value, no sign by construction). `direction`
-    is the Pearson correlation between the raw feature value and its own SHAP
-    value across rows — its *sign* is what a caller checks against the
-    expected EDA relationship; the paired points are what a dependence plot
-    renders. A feature with zero variance in either array (degenerate input)
-    returns direction 0.0 rather than NaN — there is no direction to read.
+    Backs V3's veto, which checks a top feature's effect *sign* against the
+    expected EDA relationship — unreadable from mean |SHAP| alone. The paired
+    points are what a dependence plot renders; `direction` is 0.0 (not NaN)
+    when either array has zero variance.
     """
     direction = _signed_direction(feature_values, shap_values)
     return {
@@ -105,18 +84,12 @@ def binary_feature_effects(
 ) -> dict[str, Any]:
     """Signed SHAP summary for one 0/1-encoded feature, split by level.
 
-    A binary-encoded feature (e.g. gender, has_partner) has exactly one
-    column and exactly two possible raw values — dependence_points' full
-    point cloud is built for a continuous feature's scatter/dependence plot
-    and is the wrong shape for two levels, and mean |SHAP|
-    (global_importance) collapses the two levels together and loses the
-    sign entirely. This reports the two group means directly: the average
-    signed push toward/away from churn for the "1" level (e.g. Male) versus
-    the "0" level (e.g. Female), which is what a beeswarm's colour split
-    shows visually but a stakeholder-facing table needs as numbers. `n_at_1`
-    is the customer count for `feature_values == 1`; a group with zero rows
-    (a constant column) returns a NaN-free mean of 0.0 for that side, since
-    there is nothing to average.
+    A binary-encoded feature (e.g. gender) has two possible raw values —
+    dependence_points' point cloud is the wrong shape for that, and
+    global_importance collapses the levels and loses the sign. This reports
+    the mean signed push for the "1" level and the "0" level directly, what a
+    beeswarm's colour split shows visually but a stakeholder table needs as
+    numbers. A level with zero rows returns mean 0.0, not NaN.
     """
     at_1 = feature_values == 1
     at_0 = ~at_1
@@ -137,12 +110,9 @@ def cohort_shap(
 ) -> list[dict[str, Any]]:
     """Signed mean SHAP per feature within a single cohort.
 
-    Calling this once for the FN cohort and once for the TP cohort (or any
-    other two masks) and diffing the results is what surfaces "what pushed
-    this cohort's scores down": sign, not magnitude, answers the question —
-    mean |SHAP| (global_importance) would destroy exactly the information
-    needed, since magnitude only says a feature mattered, not which way it
-    argued.
+    Call once for the FN cohort and once for the TP cohort, then diff the
+    results, to see what pushed that cohort's scores down — sign, not
+    magnitude (global_importance), answers that question.
     """
     cohort_values = shap_values[cohort_mask]
     mean_signed = cohort_values.mean(axis=0)
@@ -162,25 +132,17 @@ def local_explanations(
 ) -> list[dict[str, Any]]:
     """Per-row waterfall-ready SHAP breakdown, for a handful of representative cases.
 
-    Strictly illustrative — an individual explanation is an anecdote (n=1, no
-    support) and must never be used as evidence in its own right; the
-    cohort-level functions above are what actually support a claim. Per-
-    customer explanation has a real home in Phase 9's serving UI ("top reasons
-    this customer was flagged"); here it exists only to make the cohort
-    finding concrete with a couple of illustrative FN/FP cases.
+    Illustrative only (n=1, no statistical support) — real evidence comes
+    from the cohort-level functions above; this exists to make a cohort
+    finding concrete with a couple of FN/FP case studies.
 
-    Returns four quantities per row that together draw a complete
-    base -> prediction waterfall without loss, even though only the top_k
-    features are labelled individually: `base_value` (shared across rows —
-    the explainer's expected output before any feature is considered),
-    `top_features` (top_k by |SHAP| magnitude, each carrying its signed
-    contribution and, when `feature_values` is supplied, the customer's raw
-    value for that feature — the "feature = value" label a waterfall
-    annotates each bar with), `other_contribution` (the summed SHAP of every
-    feature *not* shown individually, so the remaining bars collapse into one
-    honest "other features" bar rather than being silently dropped), and
-    `prediction` (base_value plus every feature's SHAP value, top_k or not —
-    the endpoint the waterfall's bars must sum to).
+    Returns, per row, everything a waterfall needs without loss: `base_value`
+    (shared, the explainer's expected output before any feature), `top_features`
+    (top_k by |SHAP| magnitude, with the customer's raw value attached when
+    `feature_values` is given), `other_contribution` (summed SHAP of every
+    feature not shown individually, so nothing is silently dropped), and
+    `prediction` (base_value plus every feature's SHAP value — the endpoint
+    the bars must sum to).
     """
     rows: list[dict[str, Any]] = []
     for idx in indices:

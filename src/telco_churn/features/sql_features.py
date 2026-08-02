@@ -10,6 +10,8 @@ from sqlalchemy.engine import Engine
 
 from telco_churn.utils.logging import get_logger
 
+__all__ = ["build_sql_features"]
+
 logger = get_logger(__name__)
 
 # Execution order matters: customer_features joins the preceding view.

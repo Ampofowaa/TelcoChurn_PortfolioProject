@@ -198,8 +198,9 @@ def bootstrap_metric_ci(
 
     Unlike paired_bootstrap_ci/paired_bootstrap_metric_ci (which bootstrap a Δ
     between two models), this reports one model's metric with a CI — what the
-    sealed-test "metrics of record" (ANALYSIS.md §0's absolute cold-start bars)
-    are checked against. Row-index resampling, not a per-row score mean: a
+    sealed-test metrics of record are checked against, i.e. the absolute
+    bars a model must clear on its own, independent of any incumbent
+    champion. Row-index resampling, not a per-row score mean: a
     set-level metric such as average precision has no per-row decomposition to
     bootstrap directly, the same reason paired_bootstrap_metric_ci resamples
     rows rather than reusing paired_bootstrap_ci's per-unit-score approach.

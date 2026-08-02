@@ -9,7 +9,16 @@ __all__ = ["get_project_root", "load_config", "compose_config"]
 
 
 def get_project_root() -> Path:
-    """Return the project root by searching upward for pyproject.toml."""
+    """Return the project root by searching upward for pyproject.toml.
+
+    Anchor point for all file I/O paths in src/ — never build a bare
+    relative path, always compose it from this root, so behavior is
+    identical regardless of the caller's CWD (DVC stage, Prefect worker,
+    CI runner, or Docker container).
+
+    Raises:
+        FileNotFoundError: No parent directory contains a pyproject.toml.
+    """
     for parent in Path(__file__).resolve().parents:
         if (parent / "pyproject.toml").exists():
             return parent

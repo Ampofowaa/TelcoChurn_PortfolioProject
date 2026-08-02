@@ -12,22 +12,19 @@ __all__ = ["configure_logging", "get_logger"]
 
 
 def configure_logging(log_level: str = "INFO", log_format: str | None = None) -> None:
-    """Configure structlog with JSON output for production and console output for development.
+    """Configure structlog with JSON or console rendering, and force UTF-8 stdio.
 
-    log_format selects the renderer: 'json' (structlog.processors.JSONRenderer, for
-    CloudWatch/Grafana ingestion in Phase 12+) or 'console' (structlog.dev.ConsoleRenderer,
-    colorized key=value pairs for a human reading a local terminal). Defaults to the
-    LOG_FORMAT env var, itself defaulting to 'console' — every __main__ entry point calls
-    configure_logging() with no arguments before Hydra config is composed, so this can't
-    be sourced from configs/config.yaml; an env var is the only signal available that early.
-    Production/CI environments set LOG_FORMAT=json explicitly (Phase 11+ CI, Phase 12 AWS).
+    log_format picks the renderer: 'json' for CloudWatch/Grafana ingestion in
+    prod/CI, 'console' for a human reading a local terminal. Defaults to the
+    LOG_FORMAT env var (itself defaulting to 'console') because every
+    __main__ entry point calls this before Hydra composes configs/config.yaml
+    — an env var is the only signal available that early.
 
-    Also reconfigures stdout/stderr to UTF-8: on Windows, a console's default
-    cp1252 encoding can't encode output some dependencies emit unprompted (e.g.
-    MLflow's emoji run-URL messages), crashing the process. reconfigure() takes
-    effect immediately, unlike PYTHONIOENCODING set via .env — that only affects
-    stream construction at interpreter startup, which has already happened by the
-    time a script's own code runs.
+    Also reconfigures stdout/stderr to UTF-8: Windows consoles default to
+    cp1252, which can't encode output some dependencies emit unprompted (e.g.
+    MLflow's emoji run-URL messages) and crashes the process. reconfigure()
+    takes effect immediately; PYTHONIOENCODING would not, since it only
+    affects streams at interpreter startup, before this function ever runs.
     """
     if (
         isinstance(sys.stdout, io.TextIOWrapper)

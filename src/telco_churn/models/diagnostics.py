@@ -1,27 +1,28 @@
 """Non-gating diagnostic helpers for model selection and evaluation.
 
-Pure, side-effect-free functions — no I/O, no config, no knowledge of which columns
-are segment axes. fixed_recall_profile, segment_oof_errors, and segment_bootstrap_delta
-are reused by models/train/comparison.py; generalization_gap and learning_curve_points
-are called directly from notebooks/03a-model-selection.ipynb. None of these decide the
-model family — that is the paired-bootstrap PR-AUC gate in
-models/train/comparison.py's bootstrap_comparison. They flag robustness/fairness
-concerns and characterize bias/variance for the analyst.
+Pure, side-effect-free — no I/O, no config, no knowledge of which columns are
+segment axes. fixed_recall_profile, segment_oof_errors, and
+segment_bootstrap_delta are reused by models/train/comparison.py;
+generalization_gap and learning_curve_points are called directly from
+notebooks/03a-model-selection.ipynb. None of these decide the model family —
+that's the paired-bootstrap PR-AUC gate in comparison.py's
+bootstrap_comparison. They flag robustness/fairness concerns and characterize
+bias/variance for the analyst.
 
-segment_bootstrap_ci and segment_decision_rates are Phase 7 additions consumed by
-models/evaluate.py (sealed-test slices) and models/threshold.py's dev-OOF screen
-(dev-OOF slices), both of which own loading their respective probability vectors and use
-build_segment_lookup below to join the segment-axis columns onto them before
-calling these. Unlike the family-selection helpers above, their outputs feed §0's
-V1/V2 veto-only guardrails — but the veto decision itself lives in models/gate.py,
-never here.
+segment_bootstrap_ci and segment_decision_rates are consumed by
+models/evaluate.py (sealed-test slices) and models/threshold.py's dev-OOF
+screen (dev-OOF slices), both of which use build_segment_lookup below to join
+the segment-axis columns onto their own probability vectors before calling
+these. Their outputs feed the fairness/robustness veto-only guardrails, but
+the veto decision itself lives in models/gate.py, never here.
 
-sliced_ranking_metrics/flag_segment_collapse (V1), sliced_decision_rates +
-equal_opportunity_difference_by_axis/demographic_parity_difference_by_axis (V2),
-and sliced_calibration/flag_calibration_collapse (V2b) are the per-axis wrappers
-both callers actually invoke — threshold.py's dev-OOF screen for the dev-OOF
-diagnostic pass it owns computing, and evaluate.py for the sealed-test reporting slices
-(which have no V1/V2/V2b flagging of their own; they are reported, not screened).
+sliced_ranking_metrics/flag_segment_collapse (segment collapse),
+sliced_decision_rates + equal_opportunity_difference_by_axis/
+demographic_parity_difference_by_axis (fairness disparity), and
+sliced_calibration/flag_calibration_collapse (per-group calibration) are the
+per-axis wrappers both callers invoke — threshold.py's dev-OOF screen for its
+own diagnostic pass, evaluate.py for the sealed-test reporting slices (which
+have no flagging of their own; they are reported, not screened).
 """
 
 from __future__ import annotations
@@ -60,12 +61,13 @@ __all__ = [
 
 _MIN_SEGMENT_SIZE = 10
 
-# Fairness/robustness slicing axes — ANALYSIS.md §0's V1/V2/V2b surface.
-# Shared by threshold.py's dev-OOF screen (dev-OOF V1/V2/V2b) and evaluate.py
-# (sealed-test reporting slices) — mirrors models.train.comparison's
-# _ROBUSTNESS_SEGMENTS/_FAIRNESS_SEGMENTS (a private, Phase-5-scoped pair,
-# used on data neither of these modules touches), duplicated rather than
-# imported for that reason.
+# Fairness/robustness slicing axes feeding the segment-collapse, fairness-
+# disparity, and per-group-calibration veto guardrails. Shared by
+# threshold.py's dev-OOF screen and evaluate.py's sealed-test reporting
+# slices — mirrors models.train.comparison's
+# _ROBUSTNESS_SEGMENTS/_FAIRNESS_SEGMENTS (a private pair scoped to model
+# family selection, used on data neither of these modules touches),
+# duplicated rather than imported for that reason.
 ROBUSTNESS_AXES: tuple[str, ...] = (
     "contract_type",
     "tenure_cohort",
@@ -83,12 +85,11 @@ def build_segment_lookup(df: pd.DataFrame) -> dict[str, pd.Series]:
     """{axis_name: Series} for every robustness/fairness axis, aligned to df's index.
 
     tenure_cohort is derived via pd.cut over the fixed TENURE_COHORT_EDGES
-    (the same domain-constant edges models.train.comparison already uses for
-    this) rather than read as a raw column — it doesn't exist as one. The
-    other six axes are raw columns in the engineered feature space. Shared by
-    models/evaluate.py (test-partition segments) and models/threshold.py's
-    dev-OOF screen (dev-partition segments) so the two surfaces are computed
-    by identical code.
+    (same edges models.train.comparison uses) rather than read as a raw
+    column — it doesn't exist as one. The other six axes are raw columns.
+    Shared by evaluate.py (test-partition segments) and threshold.py's
+    dev-OOF screen (dev-partition segments) so both surfaces are computed by
+    identical code.
     """
     tenure_cohort = (
         pd.cut(
@@ -210,15 +211,15 @@ def _segment_bootstrap(
 ) -> list[dict[str, object]]:
     """Shared per-segment percentile-bootstrap scaffolding.
 
-    score_fn(y_seg, *arrays_seg) -> float computes the observed statistic from
-    row-aligned, already segment-masked arrays — a bare PR-AUC for
-    segment_bootstrap_ci, a Δ between two candidates for segment_bootstrap_delta.
-    Each resample draws row indices once per segment and applies score_fn to the
-    identical resampled rows across every array, so a paired caller's shared
-    segment-level noise cancels in its delta rather than surviving into two
-    separately-resampled CIs. Segments smaller than _MIN_SEGMENT_SIZE, or a resample
-    with only one class present, are skipped — every caller's statistic is undefined
-    either way.
+    `score_fn(y_seg, *arrays_seg) -> float` computes the observed statistic
+    from row-aligned, already segment-masked arrays — a bare PR-AUC for
+    segment_bootstrap_ci, a Δ between two candidates for
+    segment_bootstrap_delta. Each resample draws row indices once per segment
+    and applies score_fn to the identical resampled rows across every array,
+    so a paired caller's shared segment-level noise cancels in its delta
+    instead of surviving into two separately-resampled CIs. Segments smaller
+    than _MIN_SEGMENT_SIZE, or a resample with only one class present, are
+    skipped — the statistic is undefined either way.
     """
     rng = np.random.default_rng(random_state)
     rows: list[dict[str, object]] = []
@@ -263,12 +264,11 @@ def segment_bootstrap_ci(
 ) -> list[dict[str, object]]:
     """Single-model per-segment PR-AUC with a percentile bootstrap CI.
 
-    Promotes the inline single-model bootstrap from ANALYSIS.md §4a's OOF
-    segment-profiling table into a tested function. Feeds §0's V1 veto (a segment's
-    PR-AUC CI lower bound falling below that segment's own churn-rate floor) and the
-    sealed-test per-slice ranking diagnostic. Unlike segment_bootstrap_delta, there is
-    no second candidate to pair against — this scores one model's probabilities in
-    isolation and never decides the model family.
+    Feeds the segment-collapse veto (a segment's PR-AUC CI lower bound
+    falling below that segment's own churn-rate floor) and the sealed-test
+    per-slice ranking diagnostic. Unlike segment_bootstrap_delta, there's no
+    second candidate to pair against — this scores one model's probabilities
+    in isolation and never decides the model family.
     """
     y_arr = np.asarray(y_true, dtype=float)
     proba_arr = np.asarray(proba, dtype=float)
@@ -302,14 +302,12 @@ def segment_bootstrap_delta(
 ) -> list[dict[str, object]]:
     """Paired row-level bootstrap CI on Δ = PR-AUC(LGBM) − PR-AUC(LogReg), per segment.
 
-    Mirrors bootstrap_comparison's pairing logic (models/train/comparison.py) at the
-    row level instead of the fold level: each resample draws row indices once per
-    segment and scores both candidates on the identical resampled rows, so shared
-    segment-level noise cancels in the delta rather than surviving into two separate
-    per-candidate CIs compared informally. Segments smaller than _MIN_SEGMENT_SIZE,
-    or a resample with only one class present, are skipped — delta is undefined
-    either way. Flag-only: never decides the model family (bootstrap_comparison's
-    fold-level test alone does that).
+    Mirrors bootstrap_comparison's pairing logic at the row level instead of
+    the fold level: each resample draws row indices once per segment and
+    scores both candidates on the identical resampled rows, so shared
+    segment-level noise cancels in the delta instead of surviving into two
+    separately-compared CIs. Flag-only: never decides the model family
+    (bootstrap_comparison's fold-level test alone does that).
     """
     y_arr = np.asarray(y_true, dtype=float)
     lgbm_arr = np.asarray(proba_lgbm, dtype=float)
@@ -347,7 +345,7 @@ def segment_decision_rates(
     PR-AUC parity cannot detect allocation harm: it is threshold-free and measures
     ranking within a group, but a customer is affected by the decision p >= threshold,
     not by the ranking. Returns, per segment, the selection rate (fraction contacted),
-    FNR, FPR, and precision at `threshold` — the rates §0's V2 (demographic-parity
+    FNR, FPR, and precision at `threshold` — the rates the V2 (demographic-parity
     diff = max selection-rate gap) and V2b veto criteria are computed from. FNR/FPR/
     precision fall back to NaN when their denominator (n_pos/n_neg/predicted-positive
     count) is zero in a segment, rather than raising.
@@ -441,7 +439,7 @@ def sliced_ranking_metrics(
     random_state: int,
 ) -> list[dict[str, object]]:
     """Per-segment PR-AUC with a bootstrap CI and its own churn-rate floor, across
-    every named axis — the surface V1 (ANALYSIS.md §0) flags a segment collapse
+    every named axis — the surface the V1 veto flags a segment collapse
     from. Reused for both the dev-OOF diagnostic pass (threshold.py's dev-OOF
     screen, reported, non-gating) and the sealed-test reporting pass (evaluate.py) — the
     caller decides which by what (y_true, proba, segment_lookup) it passes in.
@@ -471,11 +469,11 @@ def flag_segment_collapse(
 ) -> list[dict[str, object]]:
     """V1: rows whose PR-AUC 95% CI lower bound falls below the segment's own churn-rate floor.
 
-    Computed by threshold.py's dev-OOF screen on the dev-OOF surface
-    (ANALYSIS.md §0), non-gating — a model not distinguishable from random
-    inside a real cohort is worth flagging even though the sealed test set is
-    too thin to decide it there. Returns only the flagged rows; an empty list
-    means no segment is flagged.
+    Computed by threshold.py's dev-OOF screen on the dev-OOF surface,
+    non-gating — a model not distinguishable from random inside a real
+    cohort is worth flagging even though the sealed test set is too thin to
+    decide it there. Returns only the flagged rows; an empty list means no
+    segment is flagged.
     """
     return [
         row
@@ -492,7 +490,7 @@ def sliced_decision_rates(
     threshold: float,
 ) -> list[dict[str, object]]:
     """Per-segment selection rate/FNR/FPR/precision at `threshold`, across every
-    named axis — the surface V2 (ANALYSIS.md §0) reads. Reused for the dev-OOF
+    named axis — the surface the V2 veto reads. Reused for the dev-OOF
     diagnostic pass (threshold.py's dev-OOF screen) and the sealed-test
     reporting pass (evaluate.py), same convention as sliced_ranking_metrics.
     """
@@ -510,7 +508,7 @@ def sliced_decision_rates(
 def equal_opportunity_difference_by_axis(
     decision_rows: list[dict[str, object]],
 ) -> dict[str, float]:
-    """Max FNR gap within each axis's own groups — ANALYSIS.md §0's V2(a), per axis.
+    """Max FNR gap within each axis's own groups — the V2(a) equal-opportunity metric, per axis.
 
     Computed separately per axis, never pooled across axes: equal-opportunity
     difference is conventionally within one sensitive attribute (male vs.
@@ -534,7 +532,7 @@ def equal_opportunity_difference_by_axis(
 def demographic_parity_difference_by_axis(
     decision_rows: list[dict[str, object]],
 ) -> dict[str, float]:
-    """Max selection-rate gap within each axis's own groups — ANALYSIS.md §0's V2(b), per axis.
+    """Max selection-rate gap within each axis's own groups — the V2(b) demographic-parity metric, per axis.
 
     Same per-axis convention as equal_opportunity_difference_by_axis.
     """
@@ -559,7 +557,7 @@ def sliced_calibration(
     random_state: int,
 ) -> list[dict[str, object]]:
     """Per-segment calibration slope (with CI) and ECE, across every named axis —
-    the surface V2b (ANALYSIS.md §0) reads. A group whose slope CI falls
+    the surface the V2b veto reads. A group whose slope CI falls
     entirely outside [0.80, 1.25] is a group the shipped t* is systematically
     wrong for, in a direction no aggregate slope reveals. Segments smaller
     than _MIN_SEGMENT_SIZE, or with only one class present, are skipped —
@@ -598,8 +596,8 @@ def flag_calibration_collapse(
     """V2b: rows whose calibration-slope CI falls entirely outside `band`.
 
     Same pass-unless-the-CI-clears-it framing as gate.py's aggregate
-    calibration guardrail (ANALYSIS.md §0), applied per group instead of in
-    aggregate. Returns only the flagged rows; an empty list means V2b passes.
+    calibration guardrail, applied per group instead of in aggregate.
+    Returns only the flagged rows; an empty list means V2b passes.
     """
     lower, upper = band
     return [

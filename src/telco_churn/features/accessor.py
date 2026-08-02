@@ -50,12 +50,9 @@ def load_features(path: Path | None = None) -> pd.DataFrame:
 def features_sha256(path: Path | None = None) -> str:
     """Return the sha256 content hash of the processed features file on disk.
 
-    Not yet wired into a consistency assertion by any consumer — intended
-    for verifying the same features file backs training, calibration, and
-    evaluation within one cycle, which matters most once a Phase 10
-    recalibration flow (not yet designed) reuses a frozen feature spec
-    across cycles. Independent of DVC's own hash (models/train/common.py's
-    _dvc_hash), which is unavailable until the DVC pipeline wrap tracks the
-    file.
+    Not yet used by any consumer; intended to verify the same features file
+    backs training, calibration, and evaluation within one cycle. Independent
+    of DVC's own content hash, which is unavailable until the DVC pipeline
+    wrap tracks this file.
     """
     return hashlib.sha256(features_path(path).read_bytes()).hexdigest()
