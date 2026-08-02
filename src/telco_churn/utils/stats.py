@@ -79,9 +79,15 @@ def abs_corr(a: pd.Series, b: pd.Series) -> float:
     """Absolute Spearman rank correlation between two numeric series.
 
     Spearman is used over Pearson to catch monotone nonlinear relationships
-    (e.g. ratios, logs) that Pearson undershoots. Returns 0.0 when the result
-    is NaN (e.g. one series is constant).
+    (e.g. ratios, logs) that Pearson undershoots. A constant series has no
+    rank spread to correlate, so that case is checked upfront and short-
+    circuited to 0.0 rather than left to scipy's spearmanr, which raises
+    ConstantInputWarning and returns NaN for it. The NaN fallback below stays
+    as a catch-all for any other degenerate case (e.g. too few overlapping
+    non-null values) that isn't a plain constant series.
     """
+    if a.nunique() < 2 or b.nunique() < 2:
+        return 0.0
     val = a.corr(b, method="spearman")
     return abs(float(val)) if not np.isnan(val) else 0.0
 
