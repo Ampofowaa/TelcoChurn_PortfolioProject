@@ -158,12 +158,13 @@ def resolve_model_run_id(model_version: str, cfg: DictConfig) -> str:
 
 
 def resolve_logged_model_id(model_version: str, cfg: DictConfig) -> str:
-    """Read the model version's logged_model_id tag (set by calibrate.py at
-    registration) — the hop from "the version being evaluated/screened" to
-    the LoggedModel entity metrics attach to via log_metric(..., model_id=...,
-    dataset=...). ModelVersion.model_id does not auto-populate in OSS MLflow
-    3.14 (CLAUDE.md), so this tag is the only supported path. Shared by
-    evaluate.py (sealed-test metrics) and threshold.py (dev-OOF screen
+    """Read the model version's logged_model_id tag to find its LoggedModel entity.
+
+    ModelVersion.model_id does not auto-populate in OSS MLflow 3.14, so this
+    tag — set by calibrate.py at registration — is the only supported hop
+    from "the version being evaluated/screened" to the LoggedModel that
+    metrics attach to via log_metric(..., model_id=..., dataset=...). Shared
+    by evaluate.py (sealed-test metrics) and threshold.py (dev-OOF screen
     metrics) to attach to the same LoggedModel.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
@@ -181,15 +182,14 @@ def resolve_logged_model_id(model_version: str, cfg: DictConfig) -> str:
 
 
 def load_model_promotion_bars(cfg: DictConfig) -> GateBars:
-    """Load configs/model_promotion.yaml directly and construct the GateBars
-    decide_promotion applies, and threshold.py's dev-OOF screen checks its
-    calibration slope against.
+    """Load configs/model_promotion.yaml and build the GateBars it defines.
 
-    Loaded by path (OmegaConf.load), never through Hydra's defaults/CLI-
-    override composition — gate.py's own module docstring: a bar that
-    decides whether a model ships must not be movable by a command-line
-    override with no diff and no review, the same reason threshold.py's
-    load_policy_thresholds bypasses composition for costs.yaml's derivative.
+    Used by decide_promotion and by threshold.py's dev-OOF calibration-slope
+    screen. Loaded by path (OmegaConf.load), never through Hydra's
+    defaults/CLI-override composition: a bar that decides whether a model
+    ships must not be movable by a command-line override with no diff and no
+    review — the same reason threshold.py's load_policy_thresholds bypasses
+    composition for costs.yaml's derivative.
     """
     # Imported here, not at module level: telco_churn.models.gate is a
     # submodule of telco_churn.models, and importing any submodule of a
@@ -213,6 +213,7 @@ def load_model_promotion_bars(cfg: DictConfig) -> GateBars:
         ),
         pr_auc_materiality_threshold=float(loaded.pr_auc_materiality_threshold),
         brier_non_inferiority_margin=float(loaded.brier_non_inferiority_margin),
+        recall_non_inferiority_margin=float(loaded.recall_non_inferiority_margin),
     )
 
 

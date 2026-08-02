@@ -21,7 +21,7 @@ import math
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import matplotlib.pyplot as plt
 import mlflow
@@ -120,6 +120,7 @@ __all__ = [
     "load_test_segment_lookup",
     "load_threshold_validation",
     "resolve_champion_version",
+    "resolve_incumbent_summary",
     "resolve_logged_model_id",
     "resolve_model_run_id",
     "resolve_policy_scenarios",
@@ -158,22 +159,6 @@ _RUN_DESCRIPTION = (
     "promotion gate verdict via gate.py::decide_promotion and persists "
     "promotion_decision.json. The sealed test set is touched here, and only "
     "here."
-)
-
-# decide_promotion's `incumbent` parameter exists only to select the regime
-# via an `is None` check (gate.py's own docstring: "incumbent's own metrics
-# are not read here") — the comparative Δ fields already live on `candidate`,
-# computed by comparative_deltas below. This constant's field values are
-# therefore never inspected by decide_promotion; it exists only to be a
-# non-None GateInputs, so a caller need not fabricate a second real
-# computation nothing consumes.
-_INCUMBENT_EXISTS_MARKER = GateInputs(
-    pr_auc=0.0,
-    recall=0.0,
-    bss=0.0,
-    calibration_slope=0.0,
-    calibration_slope_ci_lower=0.0,
-    calibration_slope_ci_upper=0.0,
 )
 
 # Contacting "everyone"/"no one" is expressed as an extreme threshold on the
@@ -227,9 +212,11 @@ def load_test_customer_ids() -> pd.Series:
 
 
 def load_test_segment_lookup() -> dict[str, pd.Series]:
-    """The sealed-test partition's robustness/fairness segment axes, row-order-aligned
-    with load_test_features/load_test_customer_ids (all three derive from the same
-    _load_test_partition() call)."""
+    """Return the sealed-test robustness/fairness segment axes.
+
+    Row-order-aligned with load_test_features/load_test_customer_ids — all
+    three derive from the same _load_test_partition() call.
+    """
     return build_segment_lookup(_load_test_partition())
 
 
@@ -294,29 +281,22 @@ def sealed_test_business_impact(
 ) -> dict[str, Any]:
     """Per-scenario dollar impact at the shipped operating point, plus the two policy baselines.
 
-    Reports, per scenario: net expected value (with a sampling-uncertainty
-    bootstrap CI), gross campaign cost, gross retained revenue, the number
-    and rate contacted, and the break-even retention rate — the full
-    picture, not net EV alone, since "this costs $C to run and returns $R"
-    is the sentence Finance asks for and a net figure cannot answer it.
-
-    Also reports each scenario's ev_treat_all (contacting everyone, at
-    _CONTACT_ALL_THRESHOLD) and ev_treat_none (contacting no one, at
-    _CONTACT_NONE_THRESHOLD — always exactly 0 by construction, reported for
-    completeness rather than because it varies). The model is expected to
-    beat both.
+    Reports net EV (with a bootstrap CI), gross campaign cost, gross
+    retained revenue, contacted count/rate, and break-even retention rate
+    per scenario — the full picture, since "this costs $C and returns $R"
+    is what Finance asks for and net EV alone can't answer it. Also reports
+    each scenario's ev_treat_all/ev_treat_none baselines (contact
+    everyone/no one); the model is expected to beat both.
 
     ⚠ ev_bracket is the min-max across scenarios' point estimates, not a
-    statistical interval. ANALYSIS.md §0 is explicit that the three
-    scenarios are not an ordered min/mid/max — their parameters partially
-    offset — so this brackets whatever they turn out to be rather than
-    assuming "conservative" is the floor. parameter_spread_dominates_sampling
-    flags whether that bracket is wider than the widest within-scenario
-    bootstrap CI: when False, the scenarios in configs/costs.yaml are too
-    narrow to express the real uncertainty in r, and the headline EV bracket
-    would be published with its dominant error source invisible. This
-    function only computes the diagnostic; the caller decides whether to log
-    a warning on it.
+    statistical interval — the three cost scenarios are not an ordered
+    min/mid/max (their parameters partially offset; ANALYSIS.md §0), so this
+    brackets whatever they turn out to be. parameter_spread_dominates_sampling
+    flags whether that bracket exceeds the widest within-scenario bootstrap
+    CI: False means configs/costs.yaml's scenarios are too narrow to express
+    the real uncertainty in r, hiding the EV bracket's dominant error source.
+    This function only computes the diagnostic; the caller decides whether
+    to warn on it.
     """
     y = y_test.to_numpy(dtype=np.int64)
     p = np.asarray(proba, dtype=float)
@@ -593,14 +573,10 @@ def sealed_test_decile_lift(
     return decile_lift_table(y_test.tolist(), proba.tolist())
 
 
-# sliced_ranking_metrics/flag_segment_collapse (V1), sliced_decision_rates +
-# equal_opportunity_difference_by_axis/demographic_parity_difference_by_axis (V2),
-# and sliced_calibration/flag_calibration_collapse (V2b) now live in diagnostics.py —
-# threshold.py's dev-OOF screen owns computing them on the dev-OOF surface; this
-# module only re-imports the five still needed for its own sealed-test slices below
-# (sliced_ranking_metrics, sliced_decision_rates, sliced_calibration,
-# equal_opportunity_difference_by_axis, demographic_parity_difference_by_axis) —
-# flag_segment_collapse/flag_calibration_collapse have no sealed-test use.
+# The V1/V2/V2b slicing helpers (and their collapse flags) live in
+# diagnostics.py, owned by threshold.py's dev-OOF screen. This module only
+# re-imports the five it needs for sealed-test slices below; the collapse
+# flags have no sealed-test use.
 
 
 def sliced_business_impact(
@@ -656,18 +632,28 @@ def sliced_business_impact(
 
 
 def resolve_champion_version(cfg: DictConfig) -> str | None:
-    """Resolve the `champion` alias to an explicit version number, once — a
-    read of "does a champion currently exist" and "which version is it,
-    right now", never re-read as a moving pointer afterward. Returns None
-    when no champion alias exists yet (cold start): the registered model
-    itself may not exist yet either, and both cases mean the same thing here.
+    """Resolve the `champion` alias to an explicit version number, once.
+
+    A single read of "does a champion exist, and which version" — never
+    re-read afterward as a moving pointer. Returns None on cold start (no
+    champion alias yet); a not-yet-registered model means the same thing.
+
+    MLflow's SqlAlchemy-backed registry reports these two cold-start shapes
+    with different error codes — RESOURCE_DOES_NOT_EXIST when the model was
+    never registered, INVALID_PARAMETER_VALUE when it exists but no
+    `champion` alias was ever set — so both, and only both, are read as "no
+    champion." Any other MlflowException (a transient/auth/server failure)
+    must propagate rather than be misread as cold start, which would
+    silently switch the gate to the wrong regime.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     registered_model_name = str(cfg.mlflow.registered_model_name)
     client = mlflow.tracking.MlflowClient()
     try:
         version = client.get_model_version_by_alias(registered_model_name, "champion")
-    except MlflowException:
+    except MlflowException as exc:
+        if exc.error_code not in ("RESOURCE_DOES_NOT_EXIST", "INVALID_PARAMETER_VALUE"):
+            raise
         return None
     return str(version.version)
 
@@ -692,24 +678,103 @@ def load_incumbent_proba(champion_version: str, cfg: DictConfig) -> NDArray[np.f
     return proba
 
 
+def resolve_incumbent_summary(
+    champion_version: str, cfg: DictConfig
+) -> dict[str, float | str]:
+    """Read the champion's own gate-criteria tags and cost-config provenance,
+    for side-by-side reporting.
+
+    Every version that has ever gone through evaluate.py carries the four
+    gate-criteria tags and eval_run_id (_tag_evaluated_model_version sets
+    them unconditionally, not only on promotion), so the current champion —
+    itself a prior evaluate.py candidate — always has them. Reading tags off
+    the already-resolved version number, never re-reading the `champion`
+    alias, matches load_incumbent_proba's own rule.
+
+    costs_config_hash is a run tag, not a model-version tag (set on the
+    evaluation run itself, not the registry entry — see _log_evaluation_run),
+    so it's fetched via the version's own eval_run_id. Included so a reviewer
+    can compare it against the candidate's own costs_config_hash tag: the
+    recall-delta guardrail runs both models through the *current* t*, but
+    this incumbent number was tagged under whatever costs.yaml was live at
+    its own promotion — a different hash means it was never actually served
+    under today's cost assumptions.
+    """
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+    client = mlflow.tracking.MlflowClient()
+    tags = client.get_model_version(registered_model_name, champion_version).tags
+
+    missing = [
+        key
+        for key in (
+            "test_pr_auc",
+            "test_recall",
+            "test_brier",
+            "test_calibration_slope",
+            "eval_run_id",
+        )
+        if key not in tags
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Champion model version {champion_version!r} is missing gate-"
+            f"criteria tags {missing} — every version evaluate.py has scored "
+            "should carry these. Re-run models.evaluate for that version."
+        )
+
+    eval_run_tags = client.get_run(tags["eval_run_id"]).data.tags
+    if "costs_config_hash" not in eval_run_tags:
+        raise RuntimeError(
+            f"Champion model version {champion_version!r}'s evaluation run "
+            f"{tags['eval_run_id']!r} is missing the costs_config_hash tag "
+            "— every evaluation run sets it. Re-run models.evaluate for "
+            "that version."
+        )
+
+    return {
+        "version": champion_version,
+        "pr_auc": float(tags["test_pr_auc"]),
+        "recall": float(tags["test_recall"]),
+        "brier": float(tags["test_brier"]),
+        "calibration_slope": float(tags["test_calibration_slope"]),
+        "costs_config_hash": eval_run_tags["costs_config_hash"],
+    }
+
+
 def comparative_deltas(
     y_test: pd.Series,
     candidate_proba: NDArray[np.float64],
     incumbent_proba: NDArray[np.float64],
+    base_threshold: float,
     n_bootstrap: int,
     random_state: int,
 ) -> dict[str, float]:
-    """Paired-bootstrap Δ = candidate − incumbent on PR-AUC and Brier, over the
-    identical sealed-test rows — the two fields gate.py's comparative regime
-    needs and cannot compute itself (it never sees the probability vectors;
-    see GateInputs' own docstring).
+    """Paired-bootstrap Δ = candidate − incumbent on PR-AUC, Brier, and recall
+    at the shipped operating threshold, over the identical sealed-test rows —
+    the three fields gate.py's comparative regime needs and cannot compute
+    itself (it never sees the probability vectors; see GateInputs' own
+    docstring).
 
     PR-AUC has no per-row decomposition, so its Δ goes through
     paired_bootstrap_metric_ci (row-resampled, recomputing average_precision_
     score on each resampled set for both models). Brier is a per-row proper
     score, so its Δ goes through the cheaper paired_bootstrap_ci directly on
     each model's own per-row squared error — the same distinction utils.stats'
-    two functions exist to make.
+    two functions exist to make. Recall, like PR-AUC, is a ratio (TP / (TP +
+    FN)) with no per-row decomposition, so it also goes through
+    paired_bootstrap_metric_ci.
+
+    base_threshold is the "base" scenario's t* — the same shipped operating
+    point build_gate_inputs reads candidate recall from — applied to *both*
+    models, not each one's own threshold: t* = c/(r×LTV) (threshold.py) is a
+    pure function of configs/costs.yaml, not of any model's own probability
+    distribution, so a single shared threshold is the theoretically correct
+    comparison, not an approximation. This also means the comparison is
+    against the incumbent's recall *today*, under this cycle's cost
+    assumptions, rather than a stale number from whichever cycle it was last
+    evaluated in — consistent with costs_config_hash tracking assumption
+    changes separately from model changes elsewhere in this module.
     """
     y = y_test.to_numpy(dtype=float)
     pr_auc_delta = paired_bootstrap_metric_ci(
@@ -725,6 +790,14 @@ def comparative_deltas(
     brier_delta = paired_bootstrap_ci(
         candidate_brier_terms, incumbent_brier_terms, n_bootstrap, random_state
     )
+    recall_delta = paired_bootstrap_metric_ci(
+        y,
+        candidate_proba,
+        incumbent_proba,
+        lambda y_arr, p_arr: _precision_recall_f1_at(y_arr, p_arr, base_threshold)[1],
+        n_bootstrap,
+        random_state,
+    )
     return {
         "pr_auc_delta_obs": pr_auc_delta["delta_obs"],
         "pr_auc_delta_ci_lower": pr_auc_delta["delta_ci_lower"],
@@ -732,6 +805,9 @@ def comparative_deltas(
         "brier_delta_obs": brier_delta["delta_obs"],
         "brier_delta_ci_lower": brier_delta["delta_ci_lower"],
         "brier_delta_ci_upper": brier_delta["delta_ci_upper"],
+        "recall_delta_obs": recall_delta["delta_obs"],
+        "recall_delta_ci_lower": recall_delta["delta_ci_lower"],
+        "recall_delta_ci_upper": recall_delta["delta_ci_upper"],
     }
 
 
@@ -794,13 +870,21 @@ def sealed_test_promotion_decision(
     the returned verdict to reports/promotion_decision.json; this function
     does not write anything.
     """
-    deltas = (
-        None
-        if incumbent_proba is None
-        else comparative_deltas(
-            y_test, candidate_proba, incumbent_proba, n_bootstrap, random_state
+    deltas = None
+    if incumbent_proba is not None:
+        base_threshold = next(
+            cast(float, row["threshold"])
+            for row in classification_rows
+            if row["scenario"] == base_scenario_name
         )
-    )
+        deltas = comparative_deltas(
+            y_test,
+            candidate_proba,
+            incumbent_proba,
+            base_threshold,
+            n_bootstrap,
+            random_state,
+        )
     candidate_inputs = build_gate_inputs(
         ranking_metrics,
         classification_rows,
@@ -808,8 +892,10 @@ def sealed_test_promotion_decision(
         base_scenario_name,
         deltas,
     )
-    incumbent = None if incumbent_proba is None else _INCUMBENT_EXISTS_MARKER
-    return decide_promotion(candidate_inputs, incumbent, bars)
+    regime: Literal["cold_start", "comparative"] = (
+        "cold_start" if incumbent_proba is None else "comparative"
+    )
+    return decide_promotion(candidate_inputs, regime, bars)
 
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1265,20 @@ def _compute_core_test_metrics(
     business_impact = sealed_test_business_impact(
         y_test, proba, scenarios, thresholds, n_bootstrap, random_state
     )
+    if not business_impact["parameter_spread_dominates_sampling"]:
+        logger.warning(
+            "cost_scenario_spread_too_narrow",
+            ev_spread=business_impact["ev_spread"],
+            widest_within_scenario_ci_width=business_impact[
+                "widest_within_scenario_ci_width"
+            ],
+            hint=(
+                "EV bracket across cost scenarios is narrower than the widest "
+                "within-scenario bootstrap CI — configs/costs.yaml's scenarios "
+                "are too narrow to express the real uncertainty in r, hiding "
+                "the EV bracket's dominant error source."
+            ),
+        )
 
     return {
         "ranking_metrics": ranking_metrics,
@@ -1307,6 +1407,11 @@ def _compute_promotion_decision(
         if champion_version is None
         else load_incumbent_proba(champion_version, cfg)
     )
+    incumbent_summary = (
+        None
+        if champion_version is None
+        else resolve_incumbent_summary(champion_version, cfg)
+    )
     decision = sealed_test_promotion_decision(
         y_test,
         proba,
@@ -1323,6 +1428,7 @@ def _compute_promotion_decision(
     return {
         "dev_oof_diagnostics": dev_oof_diagnostics,
         "champion_version": champion_version,
+        "incumbent_summary": incumbent_summary,
         "decision": decision,
     }
 
@@ -1346,6 +1452,7 @@ def _assemble_metrics_and_economics_payloads(
         "model_version": model_version,
         "run_id": run_id,
         "champion_version": decision_result["champion_version"],
+        "incumbent_summary": decision_result["incumbent_summary"],
         "ranking": core_metrics["ranking_metrics"],
         "classification": core_metrics["classification_rows"],
         "fixed_recall_profile": core_metrics["fixed_recall_rows"],
@@ -1724,38 +1831,21 @@ def _write_reports_mirror(
 
 
 def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
-    """Sealed-test evaluation, gate decision, and MLflow logging — the single
-    pass CLAUDE.md's "test set touched once" invariant permits.
+    """Run the full sealed-test evaluation cycle and log it to a dedicated `evaluation` run.
 
-    Resolves `model_version` explicitly (never an alias), checks threshold
-    provenance, scores the sealed test set exactly once, and from that one
-    probability vector computes every block this module exposes: ranking,
-    per-scenario classification, the fixed-recall profile, the calibration
-    report, the decile lift table, the business-impact block, the
-    sensitivity suite, the sealed-test disaggregated slices, and — from the
-    dev-OOF probability vector calibrate.py already persisted, joined to the
-    dev partition's segment columns — the V1/V2/V2b diagnostics (reported,
-    non-gating). Resolves
-    the incumbent champion (if any) once, scores it on the identical test
-    rows, and calls gate.py::decide_promotion.
+    Resolves `model_version` explicitly (never an alias), scores the sealed
+    test set exactly once, computes every metrics/economics/slice block from
+    that one probability vector, resolves the incumbent champion (if any) to
+    score on the identical rows, and calls gate.py::decide_promotion — the
+    single pass CLAUDE.md's "test set touched once" invariant permits.
 
-    Logs a dedicated `evaluation` run (a sibling of Phase 5/6's runs, never
-    appended to the dev model's own run — CLAUDE.md), writes
-    reports/metrics.json, reports/economics.json,
-    reports/promotion_decision.json, and reports/test_predictions.parquet
-    (mirrored onto the run as artifacts), tags the dev model version with the
-    four gate criteria (alongside its existing training_data_scope: dev), and eight
-    figures into the run's figures/ artifacts: the PR curve (operating points
-    and prevalence baseline marked), the ROC curve, the classification-report
-    panels, the sealed-test reliability diagram, the EV-vs-budget curve (t*
-    and the EV-maximising K marked, one line per scenario), the r×c
-    break-even heatmap, the sensitivity tornado diagram, and the cumulative
-    gains/lift chart. Notebooks in this project never render their own
-    matplotlib figures — 04-calibration-and-threshold.ipynb only
-    mlflow.artifacts.download_artifacts + IPython.display.Image's what a
-    pipeline module already produced — so this module is where every one of
-    these figures is built; the eventual 05-evaluation-and-error-analysis.ipynb
-    will only display them, following that same convention.
+    Logs a dedicated `evaluation` run (never appended to the dev model's own
+    run — CLAUDE.md), mirrors metrics.json/economics.json/
+    promotion_decision.json/test_predictions.parquet to reports/, tags the
+    model version with the four gate criteria, and renders all eight
+    evaluation figures — this module builds them directly rather than a
+    notebook, matching this project's convention that notebooks only
+    display pipeline-produced figures, never render their own.
     """
     loaded = _load_and_score_candidate(model_version, cfg)
     y_test, proba = loaded["y_test"], loaded["proba"]

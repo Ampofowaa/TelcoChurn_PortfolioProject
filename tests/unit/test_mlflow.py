@@ -211,6 +211,9 @@ def test_load_model_promotion_bars_matches_yaml_file() -> None:
     assert bars.brier_non_inferiority_margin == pytest.approx(
         float(raw.brier_non_inferiority_margin)
     )
+    assert bars.recall_non_inferiority_margin == pytest.approx(
+        float(raw.recall_non_inferiority_margin)
+    )
 
 
 # ---------------------------------------------------------------------------

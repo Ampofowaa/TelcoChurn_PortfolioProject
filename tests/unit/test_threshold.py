@@ -539,6 +539,7 @@ def model_promotion_config_path(tmp_path_factory: pytest.TempPathFactory) -> Pat
                 "calibration_slope_band": [0.80, 1.25],
                 "pr_auc_materiality_threshold": 0.005,
                 "brier_non_inferiority_margin": 0.005,
+                "recall_non_inferiority_margin": 0.01,
             }
         ),
         path,

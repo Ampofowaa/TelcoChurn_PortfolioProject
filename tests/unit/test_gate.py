@@ -11,6 +11,9 @@ from telco_churn.models.gate import (
     record_review,
 )
 
+COLD_START = "cold_start"
+COMPARATIVE = "comparative"
+
 # Local test fixture values — deliberately not imported from configs/ or from
 # gate.py: the mechanism under test must hold for whatever bars it is handed,
 # not merely for today's policy numbers. If ANALYSIS.md §0's bars change,
@@ -19,6 +22,7 @@ PR_AUC_BAR = 0.60
 RECALL_BAR = 0.65
 PR_AUC_MATERIALITY_THRESHOLD = 0.005
 BRIER_NON_INFERIORITY_MARGIN = 0.005
+RECALL_NON_INFERIORITY_MARGIN = 0.03
 
 BARS = GateBars(
     pr_auc_bar=PR_AUC_BAR,
@@ -26,6 +30,7 @@ BARS = GateBars(
     calibration_slope_band=(0.80, 1.25),
     pr_auc_materiality_threshold=PR_AUC_MATERIALITY_THRESHOLD,
     brier_non_inferiority_margin=BRIER_NON_INFERIORITY_MARGIN,
+    recall_non_inferiority_margin=RECALL_NON_INFERIORITY_MARGIN,
 )
 
 
@@ -56,6 +61,9 @@ def _passing_comparative_inputs(**overrides: float) -> GateInputs:
         "brier_delta_obs": -0.01,
         "brier_delta_ci_lower": -0.02,
         "brier_delta_ci_upper": 0.0,
+        "recall_delta_obs": 0.01,
+        "recall_delta_ci_lower": -0.005,
+        "recall_delta_ci_upper": 0.03,
     }
     defaults.update(overrides)
     return GateInputs(**defaults)
@@ -80,7 +88,7 @@ def test_gate_bars_has_no_defaults() -> None:
 
 def test_cold_start_all_criteria_passing_gives_pass() -> None:
     """A model clearing every bar passes the cold-start gate."""
-    decision = decide_promotion(_passing_cold_start_inputs(), None, BARS)
+    decision = decide_promotion(_passing_cold_start_inputs(), COLD_START, BARS)
     assert decision["regime"] == "cold_start"
     assert decision["gate"] == "pass"
     assert decision["review"] == "pending"
@@ -88,7 +96,9 @@ def test_cold_start_all_criteria_passing_gives_pass() -> None:
 
 def test_cold_start_failing_pr_auc_fails_selection_and_gate() -> None:
     """PR-AUC below the bar fails selection, and the gate overall."""
-    decision = decide_promotion(_passing_cold_start_inputs(pr_auc=0.50), None, BARS)
+    decision = decide_promotion(
+        _passing_cold_start_inputs(pr_auc=0.50), COLD_START, BARS
+    )
     assert decision["criteria"]["pr_auc"]["passed"] is False
     assert decision["gate"] == "fail"
 
@@ -96,7 +106,9 @@ def test_cold_start_failing_pr_auc_fails_selection_and_gate() -> None:
 def test_cold_start_recall_guardrail_vetoes_a_pr_auc_passing_model() -> None:
     """The guardrail's veto power under test: PR-AUC clears its bar but recall
     does not — the model is still rejected overall."""
-    decision = decide_promotion(_passing_cold_start_inputs(recall=0.40), None, BARS)
+    decision = decide_promotion(
+        _passing_cold_start_inputs(recall=0.40), COLD_START, BARS
+    )
     assert decision["criteria"]["pr_auc"]["passed"] is True
     assert decision["criteria"]["recall"]["passed"] is False
     assert decision["gate"] == "fail"
@@ -104,14 +116,14 @@ def test_cold_start_recall_guardrail_vetoes_a_pr_auc_passing_model() -> None:
 
 def test_cold_start_bss_guardrail_vetoes() -> None:
     """A non-positive Brier skill score vetoes even with PR-AUC passing."""
-    decision = decide_promotion(_passing_cold_start_inputs(bss=-0.01), None, BARS)
+    decision = decide_promotion(_passing_cold_start_inputs(bss=-0.01), COLD_START, BARS)
     assert decision["criteria"]["brier_skill_score"]["passed"] is False
     assert decision["gate"] == "fail"
 
 
 def test_cold_start_bss_exactly_zero_fails() -> None:
     """The bar is strict '> 0' — exactly zero does not pass."""
-    decision = decide_promotion(_passing_cold_start_inputs(bss=0.0), None, BARS)
+    decision = decide_promotion(_passing_cold_start_inputs(bss=0.0), COLD_START, BARS)
     assert decision["criteria"]["brier_skill_score"]["passed"] is False
 
 
@@ -130,7 +142,7 @@ def test_cold_start_calibration_slope_guardrail_vetoes_on_material_evidence(
         _passing_cold_start_inputs(
             calibration_slope_ci_lower=ci_lower, calibration_slope_ci_upper=ci_upper
         ),
-        None,
+        COLD_START,
         BARS,
     )
     assert decision["criteria"]["calibration_slope"]["passed"] is False
@@ -144,7 +156,7 @@ def test_cold_start_calibration_slope_ci_merely_touching_band_does_not_veto() ->
         _passing_cold_start_inputs(
             calibration_slope_ci_lower=0.70, calibration_slope_ci_upper=1.30
         ),
-        None,
+        COLD_START,
         BARS,
     )
     assert decision["criteria"]["calibration_slope"]["passed"] is True
@@ -161,7 +173,7 @@ def test_cold_start_no_guardrail_alone_can_flip_a_failed_selection_to_pass() -> 
             calibration_slope_ci_lower=0.99,
             calibration_slope_ci_upper=1.01,
         ),
-        None,
+        COLD_START,
         BARS,
     )
     assert decision["gate"] == "fail"
@@ -180,11 +192,11 @@ def test_cold_start_no_guardrail_value_alone_flips_rejection_into_promotion(
     """Property check: across the guardrail input space, no value of recall or
     Brier alone turns a failing gate into a passing one when selection failed."""
     decision_selection_failed = decide_promotion(
-        _passing_cold_start_inputs(pr_auc=0.10, **{field: good_value}), None, BARS
+        _passing_cold_start_inputs(pr_auc=0.10, **{field: good_value}), COLD_START, BARS
     )
     assert decision_selection_failed["gate"] == "fail"
     decision_still_failed = decide_promotion(
-        _passing_cold_start_inputs(pr_auc=0.10, **{field: bad_value}), None, BARS
+        _passing_cold_start_inputs(pr_auc=0.10, **{field: bad_value}), COLD_START, BARS
     )
     assert decision_still_failed["gate"] == "fail"
 
@@ -197,8 +209,7 @@ def test_cold_start_no_guardrail_value_alone_flips_rejection_into_promotion(
 def test_comparative_all_criteria_passing_gives_pass() -> None:
     """A challenger with a materially, confidently better PR-AUC and passing
     guardrails is promoted."""
-    incumbent = _passing_cold_start_inputs()
-    decision = decide_promotion(_passing_comparative_inputs(), incumbent, BARS)
+    decision = decide_promotion(_passing_comparative_inputs(), COMPARATIVE, BARS)
     assert decision["regime"] == "comparative"
     assert decision["gate"] == "pass"
 
@@ -214,7 +225,7 @@ def test_comparative_ci_straddling_zero_is_not_promoted_despite_delta_above_mate
             pr_auc_delta_ci_lower=-0.001,
             pr_auc_delta_ci_upper=0.02,
         ),
-        _passing_cold_start_inputs(),
+        COMPARATIVE,
         BARS,
     )
     assert decision["criteria"]["pr_auc"]["passed"] is False
@@ -230,22 +241,109 @@ def test_comparative_tight_ci_below_materiality_is_not_promoted() -> None:
             pr_auc_delta_ci_lower=0.0001,
             pr_auc_delta_ci_upper=0.0009,
         ),
-        _passing_cold_start_inputs(),
+        COMPARATIVE,
         BARS,
     )
     assert decision["criteria"]["pr_auc"]["passed"] is False
     assert decision["gate"] == "fail"
 
 
+def test_comparative_pr_auc_below_absolute_bar_vetoes_despite_material_delta() -> None:
+    """A candidate whose own PR-AUC sits below the cold-start bar is not
+    promoted even with a materially, confidently better Δ vs the incumbent —
+    the absolute floor is a second necessary condition, not a fallback the Δ
+    can substitute for. Guards against bar creep: if `pr_auc_bar` is later
+    raised past a weak incumbent's own PR-AUC, comparative candidates must
+    still clear the new floor, not merely out-pace the weak incumbent."""
+    decision = decide_promotion(
+        _passing_comparative_inputs(pr_auc=PR_AUC_BAR - 0.05),
+        COMPARATIVE,
+        BARS,
+    )
+    assert decision["criteria"]["pr_auc"]["passed"] is False
+    assert decision["gate"] == "fail"
+
+
+def test_comparative_pr_auc_at_bar_with_material_delta_passes() -> None:
+    """The floor is inclusive (`>=`), matching the cold-start rule."""
+    decision = decide_promotion(
+        _passing_comparative_inputs(pr_auc=PR_AUC_BAR),
+        COMPARATIVE,
+        BARS,
+    )
+    assert decision["criteria"]["pr_auc"]["passed"] is True
+    assert decision["gate"] == "pass"
+
+
 def test_comparative_recall_guardrail_vetoes_a_pr_auc_passing_challenger() -> None:
     """The guardrail is absolute in the comparative regime too — it does not
     relax just because selection passed."""
     decision = decide_promotion(
-        _passing_comparative_inputs(recall=0.10), _passing_cold_start_inputs(), BARS
+        _passing_comparative_inputs(recall=0.10), COMPARATIVE, BARS
     )
     assert decision["criteria"]["pr_auc"]["passed"] is True
     assert decision["criteria"]["recall"]["passed"] is False
     assert decision["gate"] == "fail"
+
+
+def test_comparative_recall_guardrail_vetoes_on_material_regression_despite_clearing_floor() -> (
+    None
+):
+    """A candidate can clear the absolute recall floor while still being a
+    large regression from the incumbent (recall 0.90 -> 0.66 both clear 0.65)
+    — the non-inferiority check catches what the absolute floor alone
+    cannot."""
+    decision = decide_promotion(
+        _passing_comparative_inputs(
+            recall=RECALL_BAR + 0.01,
+            recall_delta_obs=-0.20,
+            recall_delta_ci_lower=-0.25,
+            recall_delta_ci_upper=-0.15,
+        ),
+        COMPARATIVE,
+        BARS,
+    )
+    assert decision["criteria"]["recall"]["passed"] is False
+    assert decision["gate"] == "fail"
+
+
+def test_comparative_recall_guardrail_does_not_veto_for_want_of_evidence() -> None:
+    """Non-inferiority, burden of proof on the accuser: a CI overlapping the
+    margin (not entirely below it) does not veto, even if the point estimate
+    is on the worse side."""
+    decision = decide_promotion(
+        _passing_comparative_inputs(
+            recall=RECALL_BAR + 0.05,
+            recall_delta_obs=-0.02,
+            recall_delta_ci_lower=-0.05,
+            recall_delta_ci_upper=0.01,
+        ),
+        COMPARATIVE,
+        BARS,
+    )
+    assert decision["criteria"]["recall"]["passed"] is True
+    assert decision["gate"] == "pass"
+
+
+def test_comparative_missing_recall_delta_raises() -> None:
+    """Calling the comparative regime without the required recall Δ fields
+    raises rather than silently treating None as some default."""
+    incomplete = GateInputs(
+        pr_auc=0.65,
+        recall=0.70,
+        bss=0.1,
+        calibration_slope=1.0,
+        calibration_slope_ci_lower=0.9,
+        calibration_slope_ci_upper=1.1,
+        pr_auc_delta_obs=0.01,
+        pr_auc_delta_ci_lower=0.001,
+        pr_auc_delta_ci_upper=0.02,
+        brier_delta_obs=-0.01,
+        brier_delta_ci_lower=-0.02,
+        brier_delta_ci_upper=0.0,
+    )
+    with pytest.raises(ValueError, match="recall_delta"):
+        decide_promotion(incomplete, COMPARATIVE, BARS)
 
 
 def test_comparative_brier_guardrail_vetoes_when_ci_entirely_above_margin() -> None:
@@ -257,7 +355,7 @@ def test_comparative_brier_guardrail_vetoes_when_ci_entirely_above_margin() -> N
             brier_delta_ci_lower=BRIER_NON_INFERIORITY_MARGIN + 0.001,
             brier_delta_ci_upper=0.02,
         ),
-        _passing_cold_start_inputs(),
+        COMPARATIVE,
         BARS,
     )
     assert decision["criteria"]["brier"]["passed"] is False
@@ -274,10 +372,36 @@ def test_comparative_brier_guardrail_does_not_veto_for_want_of_evidence() -> Non
             brier_delta_ci_lower=-0.01,
             brier_delta_ci_upper=0.02,
         ),
-        _passing_cold_start_inputs(),
+        COMPARATIVE,
         BARS,
     )
     assert decision["criteria"]["brier"]["passed"] is True
+
+
+def test_comparative_bss_guardrail_vetoes_despite_passing_brier_delta() -> None:
+    """A non-positive BSS vetoes even when the Brier Δ vs the incumbent shows
+    no material regression — the absolute floor is a second necessary
+    condition, not subsumed by the non-inferiority check. Guards against
+    biocreep: a lineage that is merely non-inferior to its immediate
+    predecessor every cycle can still drift below a fixed reference over
+    many cycles with nothing else to catch it."""
+    decision = decide_promotion(
+        _passing_comparative_inputs(bss=-0.01),
+        COMPARATIVE,
+        BARS,
+    )
+    assert decision["criteria"]["brier"]["passed"] is False
+    assert decision["gate"] == "fail"
+
+
+def test_comparative_bss_exactly_zero_fails() -> None:
+    """The bar is strict '> 0', matching the cold-start rule."""
+    decision = decide_promotion(
+        _passing_comparative_inputs(bss=0.0),
+        COMPARATIVE,
+        BARS,
+    )
+    assert decision["criteria"]["brier"]["passed"] is False
 
 
 def test_comparative_calibration_slope_guardrail_is_absolute_not_relative() -> None:
@@ -288,7 +412,7 @@ def test_comparative_calibration_slope_guardrail_is_absolute_not_relative() -> N
         _passing_comparative_inputs(
             calibration_slope_ci_lower=1.30, calibration_slope_ci_upper=1.50
         ),
-        _passing_cold_start_inputs(),
+        COMPARATIVE,
         BARS,
     )
     assert decision["criteria"]["calibration_slope"]["passed"] is False
@@ -307,7 +431,7 @@ def test_comparative_missing_pr_auc_delta_raises() -> None:
         calibration_slope_ci_upper=1.1,
     )
     with pytest.raises(ValueError, match="pr_auc_delta"):
-        decide_promotion(incomplete, _passing_cold_start_inputs(), BARS)
+        decide_promotion(incomplete, COMPARATIVE, BARS)
 
 
 def test_comparative_missing_brier_delta_raises() -> None:
@@ -324,7 +448,7 @@ def test_comparative_missing_brier_delta_raises() -> None:
         pr_auc_delta_ci_upper=0.02,
     )
     with pytest.raises(ValueError, match="brier_delta"):
-        decide_promotion(incomplete, _passing_cold_start_inputs(), BARS)
+        decide_promotion(incomplete, COMPARATIVE, BARS)
 
 
 @pytest.mark.parametrize(
@@ -346,13 +470,13 @@ def test_comparative_no_guardrail_value_alone_flips_a_failed_selection_to_pass(
     }
     decision_good = decide_promotion(
         _passing_comparative_inputs(**{field: good_value}, **failing_selection_kwargs),
-        _passing_cold_start_inputs(),
+        COMPARATIVE,
         BARS,
     )
     assert decision_good["gate"] == "fail"
     decision_bad = decide_promotion(
         _passing_comparative_inputs(**{field: bad_value}, **failing_selection_kwargs),
-        _passing_cold_start_inputs(),
+        COMPARATIVE,
         BARS,
     )
     assert decision_bad["gate"] == "fail"
@@ -366,7 +490,7 @@ def test_comparative_no_guardrail_value_alone_flips_a_failed_selection_to_pass(
 def test_record_review_stamps_all_fields() -> None:
     """The returned dict carries the verdict, notes, approver, timestamp, and
     the direction sanity check's veto outcome."""
-    decision = decide_promotion(_passing_cold_start_inputs(), None, BARS)
+    decision = decide_promotion(_passing_cold_start_inputs(), COLD_START, BARS)
     stamped = record_review(
         decision,
         verdict="approved",
@@ -385,7 +509,7 @@ def test_record_review_does_not_mutate_original_decision() -> None:
     """record_review returns a new dict — the caller's original decision object
     (and, structurally, whatever pending-review copy is on disk before this
     call) is left untouched."""
-    decision = decide_promotion(_passing_cold_start_inputs(), None, BARS)
+    decision = decide_promotion(_passing_cold_start_inputs(), COLD_START, BARS)
     original_review = decision["review"]
     record_review(
         decision,
@@ -401,7 +525,7 @@ def test_record_review_does_not_mutate_original_decision() -> None:
 def test_record_review_preserves_gate_verdict_fields() -> None:
     """The original gate/regime/criteria fields survive the stamp unchanged —
     record_review adds fields, it does not overwrite the gate's own verdict."""
-    decision = decide_promotion(_passing_cold_start_inputs(), None, BARS)
+    decision = decide_promotion(_passing_cold_start_inputs(), COLD_START, BARS)
     stamped = record_review(
         decision,
         verdict="approved",

@@ -3,18 +3,31 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
+import mlflow.artifacts
+import mlflow.sklearn
+import mlflow.tracking
 import numpy as np
 import pandas as pd
 import pytest
+from mlflow.exceptions import MlflowException
+from mlflow.protos.databricks_pb2 import INTERNAL_ERROR
 from omegaconf import DictConfig, OmegaConf
+from sklearn.linear_model import LogisticRegression
 
+import telco_churn.models.evaluate as evaluate
 from telco_churn.models.diagnostics import build_segment_lookup
 from telco_churn.models.evaluate import (
     build_gate_inputs,
     check_threshold_provenance,
     comparative_deltas,
+    content_hash,
     load_model_promotion_bars,
+    resolve_champion_version,
+    resolve_incumbent_summary,
     resolve_policy_scenarios,
     resolve_policy_thresholds_by_scenario,
     sealed_test_business_impact,
@@ -27,7 +40,7 @@ from telco_churn.models.evaluate import (
     sealed_test_sensitivity_analysis,
     sliced_business_impact,
 )
-from telco_churn.models.gate import GateBars
+from telco_churn.models.gate import GateBars, decide_promotion
 from telco_churn.models.threshold import CostScenario
 
 _N_BOOTSTRAP = 200
@@ -42,6 +55,7 @@ _BARS = GateBars(
     calibration_slope_band=(0.80, 1.25),
     pr_auc_materiality_threshold=0.005,
     brier_non_inferiority_margin=0.005,
+    recall_non_inferiority_margin=0.03,
 )
 
 
@@ -651,6 +665,197 @@ def test_load_model_promotion_bars_reads_real_config() -> None:
     assert bars.calibration_slope_band[1] == pytest.approx(1.25)
     assert bars.pr_auc_materiality_threshold == pytest.approx(0.005)
     assert bars.brier_non_inferiority_margin == pytest.approx(0.005)
+    assert bars.recall_non_inferiority_margin == pytest.approx(0.01)
+
+
+# ---------------------------------------------------------------------------
+# resolve_champion_version
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_champion_version_returns_none_when_model_never_registered(
+    mlflow_test_experiment: Callable[[str], str],
+) -> None:
+    """A genuinely never-registered model raises RESOURCE_DOES_NOT_EXIST — the
+    first of the two real cold-start shapes MLflow's SqlAlchemy-backed
+    registry reports — and must resolve to None.
+    """
+    tracking_uri = mlflow_test_experiment("test_resolve_champion_version")
+    cfg = OmegaConf.create(
+        {
+            "mlflow": {
+                "tracking_uri": tracking_uri,
+                "registered_model_name": "never-registered-model",
+            }
+        }
+    )
+    assert resolve_champion_version(cfg) is None
+
+
+def test_resolve_champion_version_returns_none_when_alias_never_set(
+    mlflow_test_experiment: Callable[[str], str],
+) -> None:
+    """A registered model with no champion alias ever set raises
+    INVALID_PARAMETER_VALUE, not RESOURCE_DOES_NOT_EXIST — the second real
+    cold-start shape — and must also resolve to None.
+    """
+    tracking_uri = mlflow_test_experiment("test_resolve_champion_version")
+    registered_model_name = "registered-no-alias"
+    mlflow.tracking.MlflowClient().create_registered_model(registered_model_name)
+    cfg = OmegaConf.create(
+        {
+            "mlflow": {
+                "tracking_uri": tracking_uri,
+                "registered_model_name": registered_model_name,
+            }
+        }
+    )
+    assert resolve_champion_version(cfg) is None
+
+
+def test_resolve_champion_version_reraises_non_not_found_mlflow_errors(
+    monkeypatch: pytest.MonkeyPatch, mlflow_test_experiment: Callable[[str], str]
+) -> None:
+    """A transient/auth/server MLflow failure must propagate, not be read as
+    'no champion' — silently swallowing it would flip evaluate.py from the
+    comparative gate regime to cold-start against a perfectly healthy
+    incumbent.
+    """
+
+    def _raise_transient(
+        self: mlflow.tracking.MlflowClient, name: str, alias: str
+    ) -> None:
+        raise MlflowException("temporarily unavailable", error_code=INTERNAL_ERROR)
+
+    monkeypatch.setattr(
+        mlflow.tracking.MlflowClient, "get_model_version_by_alias", _raise_transient
+    )
+    tracking_uri = mlflow_test_experiment("test_resolve_champion_version")
+    cfg = OmegaConf.create(
+        {
+            "mlflow": {
+                "tracking_uri": tracking_uri,
+                "registered_model_name": "telco-churn-pipeline",
+            }
+        }
+    )
+    with pytest.raises(MlflowException, match="temporarily unavailable"):
+        resolve_champion_version(cfg)
+
+
+# ---------------------------------------------------------------------------
+# resolve_incumbent_summary
+# ---------------------------------------------------------------------------
+
+
+def _tag_incumbent_version(
+    registered_model_name: str,
+    version: str,
+    eval_run_id: str,
+    *,
+    include_costs_hash: bool = True,
+) -> None:
+    """Mint the tag set _tag_evaluated_model_version + _log_evaluation_run
+    would leave on a real champion: the four gate criteria and eval_run_id
+    on the version, costs_config_hash on the run itself.
+    """
+    client = mlflow.tracking.MlflowClient()
+    client.set_model_version_tag(registered_model_name, version, "test_pr_auc", "0.7")
+    client.set_model_version_tag(registered_model_name, version, "test_recall", "0.8")
+    client.set_model_version_tag(registered_model_name, version, "test_brier", "0.15")
+    client.set_model_version_tag(
+        registered_model_name, version, "test_calibration_slope", "1.02"
+    )
+    client.set_model_version_tag(
+        registered_model_name, version, "eval_run_id", eval_run_id
+    )
+    if include_costs_hash:
+        client.set_tag(eval_run_id, "costs_config_hash", "deadbeef")
+
+
+def test_resolve_incumbent_summary_returns_expected_fields(
+    mlflow_test_experiment: Callable[[str], str],
+) -> None:
+    """Reads the four gate-criteria tags off the version plus
+    costs_config_hash off its eval_run_id's own run — the field a reviewer
+    needs to tell "recall regressed" apart from "recall was never measured
+    under today's cost assumptions."
+    """
+    tracking_uri = mlflow_test_experiment("test_resolve_incumbent_summary")
+    registered_model_name = "incumbent-summary-model"
+    version, _model_id = _register_trivial_model(registered_model_name)
+    with mlflow.start_run() as run:
+        eval_run_id = run.info.run_id
+    _tag_incumbent_version(registered_model_name, version, eval_run_id)
+
+    cfg = OmegaConf.create(
+        {
+            "mlflow": {
+                "tracking_uri": tracking_uri,
+                "registered_model_name": registered_model_name,
+            }
+        }
+    )
+    summary = resolve_incumbent_summary(version, cfg)
+
+    assert summary == {
+        "version": version,
+        "pr_auc": 0.7,
+        "recall": 0.8,
+        "brier": 0.15,
+        "calibration_slope": 1.02,
+        "costs_config_hash": "deadbeef",
+    }
+
+
+def test_resolve_incumbent_summary_raises_on_missing_gate_tags(
+    mlflow_test_experiment: Callable[[str], str],
+) -> None:
+    """A version that never went through evaluate.py's tagging step (or was
+    tagged before eval_run_id existed) must fail loudly, not silently report
+    a partial/None summary a caller could mistake for a real one.
+    """
+    tracking_uri = mlflow_test_experiment("test_resolve_incumbent_summary")
+    registered_model_name = "incumbent-summary-untagged"
+    version, _model_id = _register_trivial_model(registered_model_name)
+
+    cfg = OmegaConf.create(
+        {
+            "mlflow": {
+                "tracking_uri": tracking_uri,
+                "registered_model_name": registered_model_name,
+            }
+        }
+    )
+    with pytest.raises(RuntimeError, match="missing gate-criteria tags"):
+        resolve_incumbent_summary(version, cfg)
+
+
+def test_resolve_incumbent_summary_raises_on_missing_costs_config_hash(
+    mlflow_test_experiment: Callable[[str], str],
+) -> None:
+    """A pre-existing champion whose eval run predates the costs_config_hash
+    tag must fail loudly rather than silently omitting the field.
+    """
+    tracking_uri = mlflow_test_experiment("test_resolve_incumbent_summary")
+    registered_model_name = "incumbent-summary-no-cost-hash"
+    version, _model_id = _register_trivial_model(registered_model_name)
+    with mlflow.start_run() as run:
+        eval_run_id = run.info.run_id
+    _tag_incumbent_version(
+        registered_model_name, version, eval_run_id, include_costs_hash=False
+    )
+
+    cfg = OmegaConf.create(
+        {
+            "mlflow": {
+                "tracking_uri": tracking_uri,
+                "registered_model_name": registered_model_name,
+            }
+        }
+    )
+    with pytest.raises(RuntimeError, match="missing the costs_config_hash tag"):
+        resolve_incumbent_summary(version, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -658,17 +863,25 @@ def test_load_model_promotion_bars_reads_real_config() -> None:
 # ---------------------------------------------------------------------------
 
 
+_BASE_THRESHOLD = 0.3
+
+
 def test_comparative_deltas_returns_expected_keys(
     y_proba_fixture: tuple[pd.Series, np.ndarray],
 ) -> None:
-    """All six delta fields are present."""
+    """All nine delta fields are present."""
     y, candidate_proba = y_proba_fixture
     rng = np.random.default_rng(20)
     incumbent_proba = np.clip(
         candidate_proba + rng.normal(0, 0.05, len(y)), 0.001, 0.999
     )
     deltas = comparative_deltas(
-        y, candidate_proba, incumbent_proba, _N_BOOTSTRAP, _RANDOM_STATE
+        y,
+        candidate_proba,
+        incumbent_proba,
+        _BASE_THRESHOLD,
+        _N_BOOTSTRAP,
+        _RANDOM_STATE,
     )
     assert {
         "pr_auc_delta_obs",
@@ -677,17 +890,23 @@ def test_comparative_deltas_returns_expected_keys(
         "brier_delta_obs",
         "brier_delta_ci_lower",
         "brier_delta_ci_upper",
+        "recall_delta_obs",
+        "recall_delta_ci_lower",
+        "recall_delta_ci_upper",
     } <= set(deltas)
 
 
 def test_comparative_deltas_zero_when_models_identical(
     y_proba_fixture: tuple[pd.Series, np.ndarray],
 ) -> None:
-    """Comparing a model against itself gives a zero observed delta on both metrics."""
+    """Comparing a model against itself gives a zero observed delta on every metric."""
     y, proba = y_proba_fixture
-    deltas = comparative_deltas(y, proba, proba, _N_BOOTSTRAP, _RANDOM_STATE)
+    deltas = comparative_deltas(
+        y, proba, proba, _BASE_THRESHOLD, _N_BOOTSTRAP, _RANDOM_STATE
+    )
     assert deltas["pr_auc_delta_obs"] == pytest.approx(0.0)
     assert deltas["brier_delta_obs"] == pytest.approx(0.0)
+    assert deltas["recall_delta_obs"] == pytest.approx(0.0)
 
 
 def test_comparative_deltas_pr_auc_positive_when_candidate_better(
@@ -702,10 +921,38 @@ def test_comparative_deltas_pr_auc_positive_when_candidate_better(
     candidate_proba = np.clip(y_arr * 0.6 + rng.normal(0.2, 0.1, n), 0.001, 0.999)
     incumbent_proba = np.clip(rng.random(n), 0.001, 0.999)
     deltas = comparative_deltas(
-        y, candidate_proba, incumbent_proba, _N_BOOTSTRAP, _RANDOM_STATE
+        y,
+        candidate_proba,
+        incumbent_proba,
+        _BASE_THRESHOLD,
+        _N_BOOTSTRAP,
+        _RANDOM_STATE,
     )
     assert deltas["pr_auc_delta_obs"] > 0.0
     assert deltas["pr_auc_delta_ci_lower"] > 0.0
+
+
+def test_comparative_deltas_recall_positive_when_candidate_better(
+    y_proba_fixture: tuple[pd.Series, np.ndarray],
+) -> None:
+    """A candidate that ranks true churners above the threshold more often
+    than a no-signal incumbent scores a positive recall delta at that
+    threshold."""
+    y, _ = y_proba_fixture
+    rng = np.random.default_rng(21)
+    n = len(y)
+    y_arr = y.to_numpy()
+    candidate_proba = np.clip(y_arr * 0.6 + rng.normal(0.2, 0.1, n), 0.001, 0.999)
+    incumbent_proba = np.clip(rng.random(n), 0.001, 0.999)
+    deltas = comparative_deltas(
+        y,
+        candidate_proba,
+        incumbent_proba,
+        _BASE_THRESHOLD,
+        _N_BOOTSTRAP,
+        _RANDOM_STATE,
+    )
+    assert deltas["recall_delta_obs"] > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -718,9 +965,9 @@ def _gate_fixture_blocks() -> (
 ):
     ranking_metrics = {"pr_auc": 0.65}
     classification_rows: list[dict[str, object]] = [
-        {"scenario": "conservative", "recall": 0.80},
-        {"scenario": "base", "recall": 0.70},
-        {"scenario": "optimistic", "recall": 0.55},
+        {"scenario": "conservative", "recall": 0.80, "threshold": 0.20},
+        {"scenario": "base", "recall": 0.70, "threshold": 0.30},
+        {"scenario": "optimistic", "recall": 0.55, "threshold": 0.45},
     ]
     calibration_report: dict[str, object] = {
         "bss": 0.30,
@@ -867,3 +1114,314 @@ def test_promotion_decision_cold_start_gate_fails_below_pr_auc_bar(
     )
     assert result["gate"] == "fail"
     assert result["criteria"]["pr_auc"]["passed"] is False
+
+
+# ---------------------------------------------------------------------------
+# MLflow orchestration: _log_evaluation_run / _tag_evaluated_model_version
+#
+# Real tmp-scoped MLflow experiment (conftest.py::mlflow_test_experiment),
+# not a Mock client — same convention test_calibrate.py's run_calibration_step
+# tests and test_mlflow.py's registry_cfg tests already use, since the
+# (model, dataset) metric-attachment contract and the tag-based registry
+# rollback rule can only be verified against a real store.
+# ---------------------------------------------------------------------------
+
+
+def _register_trivial_model(registered_model_name: str) -> tuple[str, str]:
+    """Fit a trivial LogisticRegression, log + register it, return (version, model_id).
+
+    Same shape as test_mlflow.py's _log_and_register — resolve_logged_model_id
+    (called inside _log_evaluation_run) reads a real tag off a real registered
+    version, a contract a mocked client can't verify.
+    """
+    X = pd.DataFrame({"x": [1.0, 2.0, 3.0, 4.0]})
+    model = LogisticRegression().fit(X, [0, 1, 0, 1])
+    with mlflow.start_run():
+        model_info = mlflow.sklearn.log_model(
+            sk_model=model, name="model", registered_model_name=registered_model_name
+        )
+    return str(model_info.registered_model_version), str(model_info.model_id)
+
+
+def _build_evaluation_orchestration_inputs(
+    tracking_uri: str,
+    experiment_name: str,
+    registered_model_name: str,
+    version: str,
+    y_proba_fixture: tuple[pd.Series, np.ndarray],
+    policy_fixture: DictConfig,
+    eval_cfg: DictConfig,
+    tmp_path: Path,
+) -> dict[str, Any]:
+    """Build _log_evaluation_run/_tag_evaluated_model_version's inputs from the
+    same pure functions run_evaluation_step itself calls, so their shapes are
+    exactly production shapes rather than a hand-typed guess that could drift
+    from what _build_scalar_metrics/_tag_evaluated_model_version actually read.
+    """
+    y, proba = y_proba_fixture
+    scenarios = resolve_policy_scenarios(policy_fixture)
+    thresholds = resolve_policy_thresholds_by_scenario(policy_fixture)
+    policy_ctx = {
+        "scenarios": scenarios,
+        "thresholds": thresholds,
+        "base_scenario": scenarios["base"],
+        "base_threshold": thresholds["base"],
+        "n_bootstrap": _N_BOOTSTRAP,
+        "random_state": _RANDOM_STATE,
+    }
+
+    ranking_metrics = sealed_test_ranking_metrics(y, proba, _N_BOOTSTRAP, _RANDOM_STATE)
+    classification_rows = sealed_test_classification_report(
+        y, proba, thresholds, _N_BOOTSTRAP, _RANDOM_STATE
+    )
+    calibration_report = sealed_test_calibration_report(
+        y, proba, eval_cfg, _N_BOOTSTRAP, _RANDOM_STATE
+    )
+    business_impact = sealed_test_business_impact(
+        y, proba, scenarios, thresholds, _N_BOOTSTRAP, _RANDOM_STATE
+    )
+    core_metrics = {
+        "ranking_metrics": ranking_metrics,
+        "classification_rows": classification_rows,
+        "fixed_recall_rows": [],
+        "calibration_report": calibration_report,
+        "decile_rows": [],
+        "business_impact": business_impact,
+    }
+    # Only the two keys _build_scalar_metrics reads off `sliced` — the full
+    # fairness-slice shape belongs to _compute_sliced_diagnostics, which this
+    # test deliberately doesn't exercise (it reads real feature data on disk;
+    # the orchestration seam under test here doesn't care about its content).
+    sliced = {
+        "test_equal_opportunity_diff": 0.04,
+        "test_demographic_parity_diff": 0.02,
+    }
+
+    gate_inputs = build_gate_inputs(
+        ranking_metrics, classification_rows, calibration_report, "base", None
+    )
+    decision = decide_promotion(gate_inputs, "cold_start", _BARS)
+
+    metrics_payload: dict[str, Any] = {
+        "model_version": version,
+        "champion_version": None,
+    }
+    economics_payload: dict[str, Any] = {"note": "test economics payload"}
+    promotion_decision_payload = {
+        **decision,
+        "model_version": version,
+        "metrics_content_hash": content_hash(metrics_payload),
+    }
+    payloads = {
+        "metrics_payload": metrics_payload,
+        "economics_payload": economics_payload,
+        "promotion_decision_payload": promotion_decision_payload,
+    }
+
+    X_test = pd.DataFrame({"feature_a": np.arange(len(y), dtype=float)})
+    loaded = {
+        "X_test": X_test,
+        "y_test": y,
+        "proba": proba,
+        "customer_ids": pd.Series([f"cust-{i:04d}" for i in range(len(y))]),
+    }
+
+    sensitivity_block = {
+        "costs_cfg": OmegaConf.create({"gross_margin": 0.6, "contact_capacity": 500})
+    }
+
+    figure_keys = (
+        "pr_curve_path",
+        "roc_curve_path",
+        "classification_report_path",
+        "reliability_path",
+        "ev_by_budget_path",
+        "breakeven_heatmap_path",
+        "sensitivity_tornado_path",
+        "gains_lift_path",
+    )
+    figures: dict[str, Path] = {}
+    for key in figure_keys:
+        path = tmp_path / f"{key}.png"
+        path.write_bytes(b"fake-figure-bytes")
+        figures[key] = path
+
+    cfg = OmegaConf.create(
+        {
+            "mlflow": {
+                "tracking_uri": tracking_uri,
+                "experiment_name": experiment_name,
+                "registered_model_name": registered_model_name,
+            },
+            "paths": {"costs_config": "configs/costs.yaml"},
+        }
+    )
+
+    return {
+        "loaded": loaded,
+        "core_metrics": core_metrics,
+        "sliced": sliced,
+        "sensitivity_block": sensitivity_block,
+        "payloads": payloads,
+        "figures": figures,
+        "policy_ctx": policy_ctx,
+        "cfg": cfg,
+    }
+
+
+def test_log_evaluation_run_wires_model_id_dataset_and_tags_correctly(
+    mlflow_test_experiment: Callable[[str], str],
+    y_proba_fixture: tuple[pd.Series, np.ndarray],
+    policy_fixture: DictConfig,
+    eval_cfg: DictConfig,
+    tmp_path: Path,
+) -> None:
+    """_log_evaluation_run must attach metrics to the resolved model_id/dataset
+    pair (not just the run), stamp eval_run_id into the persisted decision
+    before logging it, and tag gate_regime/gate_result from the actual
+    decision — the wiring a mocked client can't verify, since MLflow raises
+    on none of these getting mixed up; only the end state tells you.
+    """
+    experiment_name = "test_log_evaluation_run"
+    tracking_uri = mlflow_test_experiment(experiment_name)
+    registered_model_name = "test-eval-orchestration"
+    version, model_id = _register_trivial_model(registered_model_name)
+    mlflow.tracking.MlflowClient().set_model_version_tag(
+        registered_model_name, version, "logged_model_id", model_id
+    )
+
+    inputs = _build_evaluation_orchestration_inputs(
+        tracking_uri,
+        experiment_name,
+        registered_model_name,
+        version,
+        y_proba_fixture,
+        policy_fixture,
+        eval_cfg,
+        tmp_path,
+    )
+
+    eval_run_id, test_predictions = evaluate._log_evaluation_run(
+        version,
+        inputs["loaded"],
+        inputs["core_metrics"],
+        inputs["sliced"],
+        inputs["sensitivity_block"],
+        inputs["payloads"],
+        inputs["figures"],
+        inputs["policy_ctx"],
+        inputs["cfg"],
+    )
+    decision = inputs["payloads"]["promotion_decision_payload"]
+
+    # eval_run_id was stamped into the decision before it was persisted, not
+    # left at whatever value the caller happened to pass in.
+    persisted_decision = mlflow.artifacts.load_dict(
+        f"runs:/{eval_run_id}/promotion_decision.json"
+    )
+    assert persisted_decision["eval_run_id"] == eval_run_id
+
+    # gate_regime/gate_result tags reflect the actual decision, not a
+    # default/stale value.
+    run = mlflow.tracking.MlflowClient().get_run(eval_run_id)
+    assert run.data.tags["gate_regime"] == decision["regime"]
+    assert run.data.tags["gate_result"] == decision["gate"]
+
+    # Metrics attached to the resolved model_id, on the "sealed_test" dataset
+    # — the exact (model, dataset) pairing CLAUDE.md requires so metrics are
+    # attributable to the LoggedModel rather than only to the run that
+    # happened to compute them.
+    logged_model = mlflow.get_logged_model(model_id)
+    metric_by_name = {
+        m.key: m for m in (logged_model.metrics or []) if m.run_id == eval_run_id
+    }
+    assert metric_by_name["test_pr_auc"].value == pytest.approx(
+        inputs["core_metrics"]["ranking_metrics"]["pr_auc"]
+    )
+    assert all(m.dataset_name == "sealed_test" for m in metric_by_name.values())
+
+    # test_predictions round-trips the exact proba/customer_ids handed in.
+    assert list(test_predictions["customerid"]) == list(
+        inputs["loaded"]["customer_ids"]
+    )
+    np.testing.assert_allclose(
+        test_predictions["p_hat"].to_numpy(), inputs["loaded"]["proba"]
+    )
+
+
+def test_tag_evaluated_model_version_failure_leaves_no_partial_tags(
+    mlflow_test_experiment: Callable[[str], str],
+    y_proba_fixture: tuple[pd.Series, np.ndarray],
+    policy_fixture: DictConfig,
+    eval_cfg: DictConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registry failure while tagging the evaluated model version must not
+    leave it half-tagged, and must not corrupt the evaluation run's own
+    already-logged artifacts.
+
+    Mirrors test_calibrate.py's
+    test_run_calibration_step_parity_failure_leaves_tagged_pending_orphan:
+    force the downstream step to fail and assert the resulting state is
+    safe, not merely that nothing crashed. Here, the evaluation run
+    (_log_evaluation_run) is a complete, valid record even though the
+    version-to-run link failed to attach — recovering only requires
+    re-running _tag_evaluated_model_version, not re-evaluating.
+    """
+    experiment_name = "test_tag_evaluated_model_version_failure"
+    tracking_uri = mlflow_test_experiment(experiment_name)
+    registered_model_name = "test-eval-orchestration-failure"
+    version, model_id = _register_trivial_model(registered_model_name)
+    mlflow.tracking.MlflowClient().set_model_version_tag(
+        registered_model_name, version, "logged_model_id", model_id
+    )
+
+    inputs = _build_evaluation_orchestration_inputs(
+        tracking_uri,
+        experiment_name,
+        registered_model_name,
+        version,
+        y_proba_fixture,
+        policy_fixture,
+        eval_cfg,
+        tmp_path,
+    )
+    eval_run_id, _test_predictions = evaluate._log_evaluation_run(
+        version,
+        inputs["loaded"],
+        inputs["core_metrics"],
+        inputs["sliced"],
+        inputs["sensitivity_block"],
+        inputs["payloads"],
+        inputs["figures"],
+        inputs["policy_ctx"],
+        inputs["cfg"],
+    )
+
+    def _raise_transient(*args: object, **kwargs: object) -> None:
+        raise MlflowException(
+            "registry temporarily unavailable", error_code=INTERNAL_ERROR
+        )
+
+    monkeypatch.setattr(
+        mlflow.tracking.MlflowClient, "set_model_version_tag", _raise_transient
+    )
+
+    with pytest.raises(MlflowException, match="registry temporarily unavailable"):
+        evaluate._tag_evaluated_model_version(
+            version, eval_run_id, registered_model_name, inputs["core_metrics"]
+        )
+
+    monkeypatch.undo()
+    client = mlflow.tracking.MlflowClient()
+    version_info = client.get_model_version(registered_model_name, version)
+    assert "eval_run_id" not in version_info.tags
+    assert "test_pr_auc" not in version_info.tags
+
+    # The run _log_evaluation_run already produced is untouched by the
+    # tagging failure that happened after it.
+    persisted_decision = mlflow.artifacts.load_dict(
+        f"runs:/{eval_run_id}/promotion_decision.json"
+    )
+    assert persisted_decision["eval_run_id"] == eval_run_id
