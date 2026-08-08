@@ -1,6 +1,6 @@
 # Permutation-importance feature selector — see features/select.py for the
 # selection rule and rescue logic these values feed. Shared by two callers:
-# models/train/feature_freeze.py's live per-cycle diagnostic (reported, never
+# models/train/feature_audit.py's live per-cycle diagnostic (reported, never
 # gating — features/schema.py::COMMITTED_FEATURES is the actual committed set,
 # a hand-maintained constant these values never override) and
 # notebooks/03b-feature-selection.ipynb's on-demand ablation review (ANALYSIS.md

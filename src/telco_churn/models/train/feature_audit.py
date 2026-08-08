@@ -1,4 +1,4 @@
-"""Step 3: freeze the committed feature set and log the permutation-importance diagnostic."""
+"""Step 3: audit the already-frozen committed feature set and log the permutation-importance/SHAP diagnostic — does not decide the feature set itself."""
 
 from __future__ import annotations
 
@@ -31,13 +31,13 @@ __all__ = ["run_feature_audit_step"]
 logger = get_logger(__name__)
 
 _RUN_DESCRIPTION = (
-    "Feature selection diagnostic — permutation importance against a "
+    "Feature selection audit diagnostic — permutation importance against a "
     "noise-decoy column, fit once on all of development. Committed feature "
     "set is read from features/schema.py::COMMITTED_FEATURES, frozen by the "
-    "Step 3 ablation (notebooks/03b-feature-selection.ipynb §2, ANALYSIS.md "
-    "§4b) rather than recomputed here; this run logs the permutation-"
-    "importance table and a non-gating SHAP audit for the model actually "
-    "being promoted this cycle."
+    "feature selection process (notebooks/03b-feature-selection.ipynb §2, "
+    "ANALYSIS.md §4b) rather than recomputed here; this run logs the "
+    "permutation-importance table and a non-gating SHAP audit for the model "
+    "actually being promoted this cycle."
 )
 
 

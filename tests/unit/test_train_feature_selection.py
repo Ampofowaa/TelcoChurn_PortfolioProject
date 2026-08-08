@@ -159,7 +159,7 @@ def test_run_feature_selection_step_permutation_importance_table_covers_full_fea
 ) -> None:
     """permutation_importance_table (aggregated across run_selection_cv's own
     100 folds, not a second mint_committed_list fit) has one row per source
-    feature, the same diagnostic-audit-trail contract feature_freeze.py's own
+    feature, the same diagnostic-audit-trail contract feature_audit.py's own
     table has."""
     feature_selection_cfg.mlflow.tracking_uri = feature_selection_mlflow_uri
     X_dev, y_dev = dev_split
@@ -334,7 +334,7 @@ def test_run_feature_selection_step_tags_stage_git_sha_and_dvc_hash(
 ) -> None:
     """The run carries the same stage/git_sha/dvc_data_hash tag contract every
     other training-package step run carries (candidates.py, comparison.py,
-    feature_freeze.py, tuning.py)."""
+    feature_audit.py, tuning.py)."""
     feature_selection_cfg.mlflow.tracking_uri = feature_selection_mlflow_uri
     X_dev, y_dev = dev_split
 

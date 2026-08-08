@@ -1228,7 +1228,7 @@ def _log_calibration_run(
         # calibration_summary.json remains the audit record — these duplicate a
         # handful of its fields so BSS/ECE/Brier/slope are plottable as a series
         # across cycles (Phase 10), the same pattern Phase 5's candidates.py/
-        # tuning.py/feature_freeze.py already follow and Phase 6 had skipped.
+        # tuning.py/feature_audit.py already follow and Phase 6 had skipped.
         winning_diagnostics = calibration_summary["diagnostics"][method]
         mlflow.log_metrics(
             {

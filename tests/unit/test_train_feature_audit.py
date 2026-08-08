@@ -1,4 +1,4 @@
-"""Unit tests for telco_churn.models.train.feature_freeze — Step 3 orchestrator (B6).
+"""Unit tests for telco_churn.models.train.feature_audit — Step 3 orchestrator (B6).
 
 features/select.py's own units (PermutationImportanceSelector, decide_survivors,
 mint_committed_list, ...) are covered in test_select.py. These tests instead cover
@@ -18,7 +18,7 @@ import pandas as pd
 import pytest
 from omegaconf import OmegaConf
 
-import telco_churn.models.train.feature_freeze as feature_freeze
+import telco_churn.models.train.feature_audit as feature_audit
 from telco_churn.features.accessor import features_path
 from telco_churn.features.build import COMMITTED_FEATURES, FEATURE_SCHEMA
 
@@ -77,7 +77,7 @@ def test_run_feature_audit_step_returns_expected_keys(
     selection_cfg.mlflow.tracking_uri = selection_mlflow_uri
     X_dev, y_dev = dev_split
 
-    result = feature_freeze.run_feature_audit_step(X_dev, y_dev, selection_cfg)
+    result = feature_audit.run_feature_audit_step(X_dev, y_dev, selection_cfg)
 
     assert set(result) == {
         "committed_features",
@@ -102,7 +102,7 @@ def test_run_feature_audit_step_committed_features_matches_the_schema_constant(
     selection_cfg.mlflow.tracking_uri = selection_mlflow_uri
     X_dev, y_dev = dev_split
 
-    result = feature_freeze.run_feature_audit_step(X_dev, y_dev, selection_cfg)
+    result = feature_audit.run_feature_audit_step(X_dev, y_dev, selection_cfg)
 
     assert result["committed_features"] == list(COMMITTED_FEATURES)
 
@@ -118,7 +118,7 @@ def test_run_feature_audit_step_permutation_importance_table_covers_full_feature
     selection_cfg.mlflow.tracking_uri = selection_mlflow_uri
     X_dev, y_dev = dev_split
 
-    result = feature_freeze.run_feature_audit_step(X_dev, y_dev, selection_cfg)
+    result = feature_audit.run_feature_audit_step(X_dev, y_dev, selection_cfg)
 
     all_features = set(
         FEATURE_SCHEMA.binary + FEATURE_SCHEMA.multi_cat + FEATURE_SCHEMA.numeric
@@ -138,7 +138,7 @@ def test_run_feature_audit_step_shap_audit_covers_full_feature_space(
     selection_cfg.mlflow.tracking_uri = selection_mlflow_uri
     X_dev, y_dev = dev_split
 
-    result = feature_freeze.run_feature_audit_step(X_dev, y_dev, selection_cfg)
+    result = feature_audit.run_feature_audit_step(X_dev, y_dev, selection_cfg)
 
     all_features = set(
         FEATURE_SCHEMA.binary + FEATURE_SCHEMA.multi_cat + FEATURE_SCHEMA.numeric
@@ -160,7 +160,7 @@ def test_run_feature_audit_step_logs_selection_artifacts(
     selection_cfg.mlflow.tracking_uri = selection_mlflow_uri
     X_dev, y_dev = dev_split
 
-    result = feature_freeze.run_feature_audit_step(X_dev, y_dev, selection_cfg)
+    result = feature_audit.run_feature_audit_step(X_dev, y_dev, selection_cfg)
 
     client = mlflow.tracking.MlflowClient()
     experiment = client.get_experiment_by_name("test_run_feature_audit_step")
@@ -201,7 +201,7 @@ def test_run_feature_audit_step_tags_stage_git_sha_and_dvc_hash(
     selection_cfg.mlflow.tracking_uri = selection_mlflow_uri
     X_dev, y_dev = dev_split
 
-    feature_freeze.run_feature_audit_step(X_dev, y_dev, selection_cfg)
+    feature_audit.run_feature_audit_step(X_dev, y_dev, selection_cfg)
 
     client = mlflow.tracking.MlflowClient()
     experiment = client.get_experiment_by_name("test_run_feature_audit_step")
@@ -225,7 +225,7 @@ def test_run_feature_audit_step_logs_dataset_source_via_accessor(
     selection_cfg.mlflow.tracking_uri = selection_mlflow_uri
     X_dev, y_dev = dev_split
 
-    feature_freeze.run_feature_audit_step(X_dev, y_dev, selection_cfg)
+    feature_audit.run_feature_audit_step(X_dev, y_dev, selection_cfg)
 
     client = mlflow.tracking.MlflowClient()
     experiment = client.get_experiment_by_name("test_run_feature_audit_step")

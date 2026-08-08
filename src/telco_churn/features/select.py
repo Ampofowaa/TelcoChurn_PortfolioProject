@@ -3,7 +3,7 @@
 Two distinct things live here, on purpose. (1) The **live diagnostic**
 (mint_committed_list, compute_shap_audit, decide_survivors,
 flag_high_shap_dropouts) — cheap, runs every training cycle via
-models/train/feature_freeze.py, reported not gating: it feeds the model card,
+models/train/feature_audit.py, reported not gating: it feeds the model card,
 error_analysis.py, and stakeholder explanation. models/train/feature_selection.py
 reuses the same three functions (not a rewrite) to characterize what *would*
 be committed under its own ablation's conclusion, on-demand rather than every

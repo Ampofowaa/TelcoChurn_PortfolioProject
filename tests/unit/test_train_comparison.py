@@ -523,7 +523,7 @@ def test_run_comparison_step_tags_stage_git_sha_and_dvc_hash(
     comparison_cfg: OmegaConf,
 ) -> None:
     """The run carries the same stage/git_sha/dvc_data_hash tag contract every other
-    Phase 5 step run carries (candidates.py, feature_freeze.py, tuning.py).
+    Phase 5 step run carries (candidates.py, feature_audit.py, tuning.py).
     """
     comparison_cfg.mlflow.tracking_uri = comparison_mlflow_uri
     X_dev, y_dev = dev_split

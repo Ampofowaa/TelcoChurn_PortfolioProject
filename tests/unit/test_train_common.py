@@ -207,7 +207,7 @@ def test_load_dev_features_never_touches_test_partition(
 
 # ---------------------------------------------------------------------------
 # _log_dev_input (Fix 6: dataset lineage shared by comparison.py,
-# feature_freeze.py, and tuning.py — candidates.py builds its own copy since
+# feature_audit.py, and tuning.py — candidates.py builds its own copy since
 # each of its three candidate runs needs its own log_input call)
 # ---------------------------------------------------------------------------
 
@@ -225,7 +225,7 @@ def test_log_dev_input_source_resolves_to_accessor_canonical_path(
     """The logged dataset's source resolves to features_path() — the
     accessor's single canonical location — not a hand-assembled copy that
     could silently go stale at Phase 8's CSV -> parquet rename. This is the
-    one test of the shared implementation; comparison.py/feature_freeze.py/
+    one test of the shared implementation; comparison.py/feature_audit.py/
     tuning.py's own tests only need to confirm they call this, not re-prove
     the source resolution themselves.
     """

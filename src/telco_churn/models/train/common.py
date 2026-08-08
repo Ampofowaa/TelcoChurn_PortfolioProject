@@ -1,7 +1,7 @@
 """Shared helpers for the model training pipeline.
 
 Data loading, DVC/git metadata resolution, and the LightGBM knob builders
-reused across every step (candidates.py, feature_freeze.py, tuning.py,
+reused across every step (candidates.py, feature_audit.py, tuning.py,
 log_model.py) so each step's fit is representative of the one that ships.
 MLflow tracking-URI resolution lives in telco_churn.utils.mlflow — shared
 outside the training package (models/calibrate.py is the second consumer).
@@ -145,7 +145,7 @@ def _build_dev_dataset(X_dev: pd.DataFrame, y_dev: pd.Series) -> PandasDataset:
 def _log_dev_input(X_dev: pd.DataFrame, y_dev: pd.Series, context: str) -> None:
     """Log the dev-partition dataset as an MLflow run input — call from inside an active run.
 
-    Shared by comparison.py, feature_freeze.py, and tuning.py (candidates.py
+    Shared by comparison.py, feature_audit.py, and tuning.py (candidates.py
     calls _build_dev_dataset directly instead, since each of its three
     candidate runs needs its own log_input call against one shared dataset
     object, not a fresh build-and-log per run).
@@ -216,7 +216,7 @@ def _plot_shap_audit(
 ) -> Figure:
     """Horizontal bar chart of mean(|SHAP|) per feature — colour = flag_column, dropouts flagged.
 
-    Shared by feature_freeze.py's per-cycle diagnostic and feature_selection.py's
+    Shared by feature_audit.py's per-cycle diagnostic and feature_selection.py's
     ablation review (twice, for the latter — once coloured by committed, once by
     §3's permutation-importance survived, via flag_column) — all call
     features.select.compute_shap_audit / flag_high_shap_dropouts against their
@@ -259,7 +259,7 @@ def _plot_permutation_importance(
 ) -> Figure:
     """Horizontal bar chart of real permutation importance vs. the decoy floor — colour = survived.
 
-    Shared by feature_freeze.py's per-cycle diagnostic (features.select.mint_committed_list's
+    Shared by feature_audit.py's per-cycle diagnostic (features.select.mint_committed_list's
     single all-dev fit) and feature_selection.py's ablation review
     (features.select.run_selection_cv's cross-fold-averaged fit) — both produce a table
     shaped feature/real_importance/importance_floor/survived and plot the identical shape;
@@ -292,7 +292,7 @@ def _plot_stability(
     """Horizontal bar chart of per-fold selection stability — colour = survived (stability >= threshold).
 
     feature_selection.py-only: per-fold survival only exists for the cross-fold ablation
-    (features.select.run_selection_cv); feature_freeze.py's single all-dev fit
+    (features.select.run_selection_cv); feature_audit.py's single all-dev fit
     (mint_committed_list) has no fold dimension to plot here. Answers a different question
     from the permutation-importance chart above: not "how big is this feature's importance
     on one fit," but "does the selector keep choosing this feature fold to fold, or does the

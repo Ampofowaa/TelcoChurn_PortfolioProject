@@ -2,7 +2,7 @@
 
 1. candidates.py — CV-score Dummy / LogReg / LightGBM on the dev set.
 2. comparison.py — paired-bootstrap family decision, plus non-gating diagnostics.
-3. feature_freeze.py — permutation-importance/SHAP audit of the already-frozen
+3. feature_audit.py — permutation-importance/SHAP audit of the already-frozen
    input space (committed via features/schema.py::COMMITTED_FEATURES, edited
    only by a human after an on-demand notebook review — never recomputed here).
 4. tuning.py — Optuna hyperparameter search on the frozen feature set.
@@ -40,7 +40,7 @@ from telco_churn.models.train.comparison import (  # noqa: E402
     run_comparison_step,
     run_diagnostics_step,
 )
-from telco_churn.models.train.feature_freeze import run_feature_audit_step  # noqa: E402
+from telco_churn.models.train.feature_audit import run_feature_audit_step  # noqa: E402
 from telco_churn.models.train.feature_selection import (  # noqa: E402
     run_feature_selection_step,
 )

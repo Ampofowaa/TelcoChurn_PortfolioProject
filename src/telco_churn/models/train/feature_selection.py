@@ -17,7 +17,7 @@ never recomputed live. Same footing as candidates.py/comparison.py's
 model-family decision: called only from notebooks/03b-feature-selection.ipynb
 §2, on a real trigger (a new engineered feature, a per-feature drift signal,
 or a scheduled periodic review), not on every retrain. Lives beside
-feature_freeze.py rather than inside it — feature_freeze.py is Step 3's
+feature_audit.py rather than inside it — feature_audit.py is Step 3's
 per-cycle diagnostic, auditing the already-frozen list every training cycle;
 it never decides membership. This module is the one place membership
 actually gets decided, and only when re-run deliberately.
@@ -139,7 +139,7 @@ def run_feature_selection_step(
            zero features.
        features.select.compute_shap_audit and flag_high_shap_dropouts then run
        against that recommended list — the same diagnostic surface
-       feature_freeze.py logs every cycle, so a human reviewing this decision
+       feature_audit.py logs every cycle, so a human reviewing this decision
        sees the full picture, not just the bare Δ. The logged
        permutation-importance table's survived column, the SHAP audit's
        committed flag, and recommended_committed_features all agree with one
