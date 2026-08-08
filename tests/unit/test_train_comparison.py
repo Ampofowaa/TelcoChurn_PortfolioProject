@@ -206,7 +206,10 @@ def test_run_diagnostics_step_covers_all_candidates(
 
     with mlflow.start_run():
         result = comparison.run_diagnostics_step(
-            X_dev, diagnostics_candidate_results, cfg
+            X_dev,
+            diagnostics_candidate_results,
+            cfg,
+            segment_n_bootstrap=int(cfg.training_setup.segment_bootstrap_n_samples),
         )
 
     candidates_seen = {row["candidate"] for row in result["fixed_recall"]}
@@ -233,7 +236,10 @@ def test_run_diagnostics_step_fixed_recall_row_count(
 
     with mlflow.start_run():
         result = comparison.run_diagnostics_step(
-            X_dev, diagnostics_candidate_results, cfg
+            X_dev,
+            diagnostics_candidate_results,
+            cfg,
+            segment_n_bootstrap=int(cfg.training_setup.segment_bootstrap_n_samples),
         )
 
     assert len(result["fixed_recall"]) == 3 * len(recall_targets)
@@ -258,7 +264,10 @@ def test_run_diagnostics_step_includes_tenure_cohort_segment(
 
     with mlflow.start_run():
         result = comparison.run_diagnostics_step(
-            X_dev, diagnostics_candidate_results, cfg
+            X_dev,
+            diagnostics_candidate_results,
+            cfg,
+            segment_n_bootstrap=int(cfg.training_setup.segment_bootstrap_n_samples),
         )
 
     assert any(row["segment"] == "tenure_cohort" for row in result["robustness"])
@@ -283,7 +292,10 @@ def test_run_diagnostics_step_covers_all_robustness_and_fairness_segments(
 
     with mlflow.start_run():
         result = comparison.run_diagnostics_step(
-            X_dev, diagnostics_candidate_results, cfg
+            X_dev,
+            diagnostics_candidate_results,
+            cfg,
+            segment_n_bootstrap=int(cfg.training_setup.segment_bootstrap_n_samples),
         )
 
     robustness_segments = {row["segment"] for row in result["robustness"]}
@@ -311,7 +323,10 @@ def test_run_diagnostics_step_includes_segment_delta_cis(
 
     with mlflow.start_run():
         result = comparison.run_diagnostics_step(
-            X_dev, diagnostics_candidate_results, cfg
+            X_dev,
+            diagnostics_candidate_results,
+            cfg,
+            segment_n_bootstrap=int(cfg.training_setup.segment_bootstrap_n_samples),
         )
 
     assert "candidate" not in result["robustness_delta"][0]
@@ -376,7 +391,14 @@ def test_run_comparison_step_returns_bootstrap_and_diagnostics_keys(
     X_dev, y_dev = dev_split
 
     result = comparison.run_comparison_step(
-        X_dev, y_dev, diagnostics_candidate_results, comparison_cfg
+        X_dev,
+        y_dev,
+        diagnostics_candidate_results,
+        comparison_cfg,
+        n_bootstrap=int(comparison_cfg.training_setup.bootstrap_n_samples),
+        segment_n_bootstrap=int(
+            comparison_cfg.training_setup.segment_bootstrap_n_samples
+        ),
     )
 
     assert set(result) == {
@@ -389,6 +411,7 @@ def test_run_comparison_step_returns_bootstrap_and_diagnostics_keys(
         "n_bootstrap",
         "bootstrap_deltas",
         "diagnostics",
+        "run_id",
     }
     assert set(result["diagnostics"]) == {
         "fixed_recall",
@@ -414,7 +437,12 @@ def test_run_comparison_step_decision_matches_bootstrap_comparison(
     ts = comparison_cfg.training_setup
 
     result = comparison.run_comparison_step(
-        X_dev, y_dev, diagnostics_candidate_results, comparison_cfg
+        X_dev,
+        y_dev,
+        diagnostics_candidate_results,
+        comparison_cfg,
+        n_bootstrap=int(ts.bootstrap_n_samples),
+        segment_n_bootstrap=int(ts.segment_bootstrap_n_samples),
     )
 
     expected = comparison.bootstrap_comparison(
@@ -444,7 +472,14 @@ def test_run_comparison_step_logs_comparison_and_diagnostics_artifacts(
     X_dev, y_dev = dev_split
 
     comparison.run_comparison_step(
-        X_dev, y_dev, diagnostics_candidate_results, comparison_cfg
+        X_dev,
+        y_dev,
+        diagnostics_candidate_results,
+        comparison_cfg,
+        n_bootstrap=int(comparison_cfg.training_setup.bootstrap_n_samples),
+        segment_n_bootstrap=int(
+            comparison_cfg.training_setup.segment_bootstrap_n_samples
+        ),
     )
 
     client = mlflow.tracking.MlflowClient()
@@ -494,7 +529,14 @@ def test_run_comparison_step_tags_stage_git_sha_and_dvc_hash(
     X_dev, y_dev = dev_split
 
     comparison.run_comparison_step(
-        X_dev, y_dev, diagnostics_candidate_results, comparison_cfg
+        X_dev,
+        y_dev,
+        diagnostics_candidate_results,
+        comparison_cfg,
+        n_bootstrap=int(comparison_cfg.training_setup.bootstrap_n_samples),
+        segment_n_bootstrap=int(
+            comparison_cfg.training_setup.segment_bootstrap_n_samples
+        ),
     )
 
     client = mlflow.tracking.MlflowClient()
@@ -521,7 +563,14 @@ def test_run_comparison_step_logs_dataset_source_via_accessor(
     X_dev, y_dev = dev_split
 
     comparison.run_comparison_step(
-        X_dev, y_dev, diagnostics_candidate_results, comparison_cfg
+        X_dev,
+        y_dev,
+        diagnostics_candidate_results,
+        comparison_cfg,
+        n_bootstrap=int(comparison_cfg.training_setup.bootstrap_n_samples),
+        segment_n_bootstrap=int(
+            comparison_cfg.training_setup.segment_bootstrap_n_samples
+        ),
     )
 
     client = mlflow.tracking.MlflowClient()

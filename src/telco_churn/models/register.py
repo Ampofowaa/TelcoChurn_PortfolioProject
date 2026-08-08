@@ -1654,20 +1654,25 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
 
     from telco_churn.utils.logging import configure_logging
-    from telco_churn.utils.paths import compose_config
+    from telco_churn.utils.paths import activate_config, compose_config
 
     load_dotenv()
     configure_logging()
 
-    try:
-        cfg = compose_config(overrides=sys.argv[1:] or None)
-        cli_model_version = cfg.register.model_version
-        if cli_model_version is None:
+    def _require_model_version(cfg: DictConfig) -> str:
+        """Return register.model_version, raising if the CLI override was not supplied."""
+        if cfg.register.model_version is None:
             raise ValueError(
                 "register.model_version is required, e.g. `python -m "
                 "telco_churn.models.register register.model_version=2`"
             )
-        result = run_registration_step(str(cli_model_version), cfg)
+        return str(cfg.register.model_version)
+
+    try:
+        cfg = compose_config(overrides=sys.argv[1:] or None)
+        activate_config(cfg)
+        cli_model_version = _require_model_version(cfg)
+        result = run_registration_step(cli_model_version, cfg)
         logger.info("registration_step_done", **result)
     except EnvironmentMismatchError as e:
         logger.error("registration_environment_mismatch", error=str(e), exc_info=True)

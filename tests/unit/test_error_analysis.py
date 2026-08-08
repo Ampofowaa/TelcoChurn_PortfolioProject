@@ -21,6 +21,7 @@ import telco_churn.models.evaluate as evaluate
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
+from telco_churn.features.accessor import FEATURES_FILENAME
 from telco_churn.features.schema import FEATURE_SCHEMA
 from telco_churn.models.error_analysis import (
     _COLUMN_DISPLAY_NAMES,
@@ -35,7 +36,7 @@ from telco_churn.models.error_analysis import (
     near_miss_band_from_validation,
     value_weighted_error_profile,
 )
-from telco_churn.utils.paths import compose_config
+from telco_churn.utils.paths import activate_config, compose_config, reset_active_config
 
 # ---------------------------------------------------------------------------
 # error_confidence_profile
@@ -751,9 +752,9 @@ def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame
 def _seed_processed_data(
     out_dir: Path, n: int = 300, seed: int = 0
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Write a processed CSV + matching canonical split manifest into out_dir."""
+    """Write a processed features file + matching canonical split manifest into out_dir."""
     df = _make_synthetic_processed_frame(n=n, seed=seed)
-    df.to_csv(out_dir / "telco_churn_processed.csv", index=False)
+    df.to_parquet(out_dir / FEATURES_FILENAME, index=False)
     manifest = make_split(
         ids=df["customerid"], labels=df["churn"], test_size=0.2, random_state=42
     )
@@ -800,7 +801,7 @@ def evaluated_model(
 ) -> Iterator[dict[str, object]]:
     """Seed a real registered, calibrated, thresholded, and evaluated model —
     the production chain up to (not including) error_analysis.py — via direct
-    in-process calls, then leave PROCESSED_DATA_DIR set so the test body's own
+    in-process calls, then leave the config installed so the test body's own
     call into run_error_analysis_step resolves the same synthetic features.
 
     Self-contained: a throwaway SQLite MLflow store, no Docker — mirrors
@@ -812,16 +813,14 @@ def evaluated_model(
     (run_error_analysis_step is re-invoked, deterministically, by each test
     body) rather than mutating it, so the full train->calibrate->threshold->
     evaluate chain — ~65s of real model fitting — is built once per module
-    instead of once per test. tmp_path/monkeypatch are function-scoped
-    fixtures and can't be depended on by a module-scoped one, hence
-    tmp_path_factory and a manually-managed MonkeyPatch here.
+    instead of once per test. activate_config's installed config is a
+    process-global, not tied to any fixture scope, so nothing here depends on
+    tmp_path/monkeypatch's function scoping the way the old env-var version did.
     """
-    mp = pytest.MonkeyPatch()
     tmp_path = tmp_path_factory.mktemp("evaluated_model")
     data_dir = tmp_path / "processed"
     data_dir.mkdir()
     df, manifest = _seed_processed_data(data_dir)
-    mp.setenv("PROCESSED_DATA_DIR", str(data_dir))
 
     # Must match cfg.mlflow.experiment_name's own default (not an arbitrary
     # name): log_model.run_model_logging_step calls mlflow.set_experiment(cfg
@@ -851,11 +850,13 @@ def evaluated_model(
             f"paths.figures={figures_dir}",
             f"paths.policy={policy_dir}",
             f"paths.reports={reports_dir}",
+            f"paths.processed_data={data_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
             *_FAST_EVALUATE_OVERRIDES,
             *_FAST_THRESHOLD_OVERRIDES,
         ]
     )
+    activate_config(cfg)
 
     dev_df, _test_df = partition(df, manifest)
     feature_cols = [c for c in df.columns if c not in ("customerid", "churn")]
@@ -892,20 +893,9 @@ def evaluated_model(
             "boundary_hits": {"num_leaves": False},
         },
     }
-    comparison_result = {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result["parent_run_id"] = run.info.run_id
-    log_result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, cfg
-    )
+    log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
     cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
     model_version = str(cal_result["model_version"])
 
@@ -925,7 +915,34 @@ def evaluated_model(
             "registered_model_name": registered_model_name,
         }
     finally:
-        mp.undo()
+        reset_active_config()
+
+
+@pytest.fixture(autouse=True)
+def _reactivate_evaluated_model_config(
+    request: pytest.FixtureRequest,
+) -> Iterator[None]:
+    """Re-install evaluated_model's cfg for each test body that uses it.
+
+    evaluated_model is module-scoped, so its own activate_config() call is
+    undone by tests/unit/conftest.py's autouse _reset_active_config (function-
+    scoped, and same-scope conftest fixtures instantiate before same-scope
+    fixtures declared in the test module itself — so it runs after
+    evaluated_model's setup but before every test body). Re-installing here,
+    at the same function scope but declared in this file, runs after that
+    reset and is what makes the config survive for the test body. Guarded on
+    request.fixturenames so tests that don't use evaluated_model — most of
+    this module — never pay for building it.
+    """
+    if "evaluated_model" not in request.fixturenames:
+        yield
+        return
+    cfg = cast(DictConfig, request.getfixturevalue("evaluated_model")["cfg"])
+    activate_config(cfg)
+    try:
+        yield
+    finally:
+        reset_active_config()
 
 
 def test_run_error_analysis_step_returns_expected_keys_and_writes_report(

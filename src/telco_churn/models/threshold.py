@@ -1100,20 +1100,25 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
 
     from telco_churn.utils.logging import configure_logging
-    from telco_churn.utils.paths import compose_config
+    from telco_churn.utils.paths import activate_config, compose_config
 
     load_dotenv()
     configure_logging()
 
-    try:
-        cfg = compose_config(overrides=sys.argv[1:] or None)
-        cli_model_version = cfg.threshold.model_version
-        if cli_model_version is None:
+    def _require_model_version(cfg: DictConfig) -> str:
+        """Return threshold.model_version, raising if the CLI override was not supplied."""
+        if cfg.threshold.model_version is None:
             raise ValueError(
                 "threshold.model_version is required, e.g. `python -m "
                 "telco_churn.models.threshold threshold.model_version=1`"
             )
-        result = run_threshold_step(str(cli_model_version), cfg)
+        return str(cfg.threshold.model_version)
+
+    try:
+        cfg = compose_config(overrides=sys.argv[1:] or None)
+        activate_config(cfg)
+        cli_model_version = _require_model_version(cfg)
+        result = run_threshold_step(cli_model_version, cfg)
         logger.info(
             "threshold_step_done",
             threshold=result["threshold_payload"]["threshold"],

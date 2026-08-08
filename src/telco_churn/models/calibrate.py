@@ -129,7 +129,7 @@ def load_training_manifest(run_id: str, cfg: DictConfig) -> dict[str, Any]:
 
 
 def committed_features_from_manifest(manifest: dict[str, Any]) -> list[str]:
-    """Return run_selection_step's frozen input space — the columns the logged pipeline expects."""
+    """Return run_feature_audit_step's frozen input space — the columns the logged pipeline expects."""
     return list(manifest["feature_selection"]["model_features"])
 
 
@@ -1433,20 +1433,25 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
 
     from telco_churn.utils.logging import configure_logging
-    from telco_churn.utils.paths import compose_config
+    from telco_churn.utils.paths import activate_config, compose_config
 
     load_dotenv()
     configure_logging()
 
-    try:
-        cfg = compose_config(overrides=sys.argv[1:] or None)
-        cli_run_id = cfg.calibration.run_id
-        if cli_run_id is None:
+    def _require_run_id(cfg: DictConfig) -> str:
+        """Return calibration.run_id, raising if the CLI override was not supplied."""
+        if cfg.calibration.run_id is None:
             raise ValueError(
                 "calibration.run_id is required, e.g. `python -m "
                 "telco_churn.models.calibrate calibration.run_id=<tuning_study_run_id>`"
             )
-        result = run_calibration_step(str(cli_run_id), cfg)
+        return str(cfg.calibration.run_id)
+
+    try:
+        cfg = compose_config(overrides=sys.argv[1:] or None)
+        activate_config(cfg)
+        cli_run_id = _require_run_id(cfg)
+        result = run_calibration_step(cli_run_id, cfg)
         logger.info(
             "calibration_step_done",
             run_id=result["run_id"],

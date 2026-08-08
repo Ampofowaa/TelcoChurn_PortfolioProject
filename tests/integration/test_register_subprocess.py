@@ -47,7 +47,13 @@ import telco_churn.models.gate as gate
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
-from telco_churn.utils.paths import compose_config, get_project_root
+from telco_churn.features.accessor import FEATURES_FILENAME
+from telco_churn.utils.paths import (
+    activate_config,
+    compose_config,
+    get_project_root,
+    reset_active_config,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -122,9 +128,9 @@ def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame
 def _seed_processed_data(
     out_dir: Path, n: int = 300, seed: int = 0
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Write a processed CSV + matching canonical split manifest into out_dir."""
+    """Write a processed features file + matching canonical split manifest into out_dir."""
     df = _make_synthetic_processed_frame(n=n, seed=seed)
-    df.to_csv(out_dir / "telco_churn_processed.csv", index=False)
+    df.to_parquet(out_dir / FEATURES_FILENAME, index=False)
     manifest = make_split(
         ids=df["customerid"], labels=df["churn"], test_size=0.2, random_state=42
     )
@@ -205,6 +211,7 @@ def reviewed_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object
             f"paths.figures={figures_dir}",
             f"paths.policy={policy_dir}",
             f"paths.reports={reports_dir}",
+            f"paths.processed_data={data_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
             *_FAST_EVALUATE_OVERRIDES,
         ]
@@ -245,22 +252,11 @@ def reviewed_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object
             "boundary_hits": {"num_leaves": False},
         },
     }
-    comparison_result = {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("PROCESSED_DATA_DIR", str(data_dir))
+    activate_config(cfg)
+    try:
         with mlflow.start_run(run_name="tuning_study") as run:
             tuning_result["parent_run_id"] = run.info.run_id
-        log_result = log_model.run_model_logging_step(
-            X_dev, y_dev, comparison_result, tuning_result, cfg
-        )
+        log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
         cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
         model_version = str(cal_result["model_version"])
 
@@ -275,6 +271,8 @@ def reviewed_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object
             pass
         evaluate.run_evaluation_step(model_version, cfg)
         error_analysis.run_error_analysis_step(model_version, cfg)
+    finally:
+        reset_active_config()
 
     decision_path = reports_dir / "promotion_decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -315,6 +313,7 @@ def reviewed_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object
             f"paths.figures={figures_dir}",
             f"paths.policy={policy_dir}",
             f"paths.reports={reports_dir}",
+            f"paths.processed_data={data_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
             *_FAST_EVALUATE_OVERRIDES,
         ],
@@ -369,9 +368,11 @@ def _mint_second_pending_version(fixture: dict[str, object]) -> str:
     """
     overrides = cast("list[str]", fixture["cfg_overrides"])
     cfg = compose_config(overrides=overrides)
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("PROCESSED_DATA_DIR", str(fixture["data_dir"]))
+    activate_config(cfg)
+    try:
         cal_result = calibrate.run_calibration_step(str(fixture["run_id"]), cfg)
+    finally:
+        reset_active_config()
     return str(cal_result["model_version"])
 
 
@@ -386,6 +387,7 @@ def _run_register_cli(
         f"mlflow.tracking_uri={fixture['tracking_uri']}",
         f"mlflow.registered_model_name={fixture['registered_model_name']}",
         f"paths.reports={fixture['reports_dir']}",
+        f"paths.processed_data={fixture['data_dir']}",
     ]
     if model_version is not None:
         overrides.append(f"register.model_version={model_version}")
@@ -393,7 +395,6 @@ def _run_register_cli(
 
     env = {
         **os.environ,
-        "PROCESSED_DATA_DIR": str(fixture["data_dir"]),
         "MLFLOW_TRACKING_URI": str(fixture["tracking_uri"]),
     }
     return subprocess.run(

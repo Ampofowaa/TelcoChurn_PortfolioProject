@@ -5,9 +5,16 @@
 # version evaluate.py's promotion_decision.json was computed against.
 model_version: null
 
-# Require promotion_decision.json's review field to be "approved" before acting.
-# Phase 7 default: true (a human stamps the review in notebook 05). Phase 10's
-# weekly automated retrain sets this false — no human in the loop every cycle.
+# Require an approved human review before acting. True is the attended default:
+# a reviewer stamps the verdict via notebook 05 or the review CLI each cycle.
+# What Phase 10's weekly unattended retrain sets this to is NOT yet decided —
+# earlier drafts asserted false here, but that was residue from the review
+# mechanism being Jupyter-bound (an unattended flow cannot open JupyterLab), not
+# a judgment that a weekly cycle needs no human. The CLI removes that constraint.
+# Do not set false in an automated flow on the strength of this comment; see the
+# require_review open question in PROJECT_PLAN.md's Phase 10 section. Note also
+# that a cold start — no version tagged promotion_status: promoted — must force
+# true regardless, since there is no rollback target if the gate admits a bad one.
 require_review: true
 
 # Alias the flip targets on a pass. Parameterized rather than hard-coded so

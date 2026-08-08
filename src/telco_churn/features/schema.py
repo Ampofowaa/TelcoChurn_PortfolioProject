@@ -21,6 +21,9 @@ from pandera.typing import Series
 from telco_churn.data.schema import YES_NO, YES_NO_NO_INTERNET, YES_NO_NO_PHONE
 
 __all__ = [
+    "COMMITTED_FEATURES",
+    "COMMITTED_FEATURES_DECISION",
+    "COMMITTED_FEATURES_DECISION_RUN_ID",
     "CustomerFeaturesSchema",
     "FeatureOutputSchema",
     "FeatureSchema",
@@ -155,4 +158,37 @@ FEATURE_SCHEMA = FeatureSchema(
         "totalcharges",
         "charge_per_service",
     ),
+)
+
+# The Step 3 selection decision itself ('full' vs. 'reduced') — same role
+# models/train/common.py::COMMITTED_MODEL_FAMILY plays for the model-family
+# decision. 'full' means COMMITTED_FEATURES below equals the entire
+# FEATURE_SCHEMA space; 'reduced' means it is a proper subset (this flag alone
+# doesn't carry the membership — COMMITTED_FEATURES does). Decided by the
+# keep-vs-reduce ablation (features/select.py::run_selection_cv +
+# reduced_set_bootstrap_test), run only from notebooks/03b-feature-selection.ipynb
+# §2's on-demand review — never recomputed live. 'N/A' is the pre-decision
+# bootstrap value (no frozen decision exists yet); this project's decision is
+# already made (run `de4fac8e` found the full set wins: paired-bootstrap
+# Δ = 0.008, CI [0.005, 0.011], p < 0.001 — see ANALYSIS.md §4b), so it is not
+# 'N/A' here.
+COMMITTED_FEATURES_DECISION: str = "full"
+
+# The selection_review MLflow run (telco-churn-feature-selection-review
+# experiment) whose logged Δ/CI back the decision above — same "resolvable
+# reference, not a number retyped from ANALYSIS.md" discipline
+# models/train/common.py::COMMITTED_MODEL_FAMILY_DECISION_RUN_ID documents.
+COMMITTED_FEATURES_DECISION_RUN_ID: str = "b918a87ef6e3425f992ccd1f7c714a1b"
+
+# The model's actual input space — a subset of FEATURE_SCHEMA (FEATURE_SCHEMA is
+# every feature discovery adopted and selection *considered*; this is what
+# selection *committed to*). Frozen alongside COMMITTED_FEATURES_DECISION above,
+# not recomputed per training cycle. Edit this constant — never FEATURE_SCHEMA —
+# if a re-run of the ablation concludes a different set should ship; same
+# "explicit code changes, never accidental side-effects" discipline FeatureSchema
+# itself documents above.
+COMMITTED_FEATURES: tuple[str, ...] = (
+    *FEATURE_SCHEMA.binary,
+    *FEATURE_SCHEMA.multi_cat,
+    *FEATURE_SCHEMA.numeric,
 )

@@ -39,7 +39,13 @@ import telco_churn.models.calibrate as calibrate
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
-from telco_churn.utils.paths import compose_config, get_project_root
+from telco_churn.features.accessor import FEATURES_FILENAME
+from telco_churn.utils.paths import (
+    activate_config,
+    compose_config,
+    get_project_root,
+    reset_active_config,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -128,9 +134,9 @@ def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame
 def _seed_processed_data(
     out_dir: Path, n: int = 300, seed: int = 0
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Write a processed CSV + matching canonical split manifest into out_dir."""
+    """Write a processed features file + matching canonical split manifest into out_dir."""
     df = _make_synthetic_processed_frame(n=n, seed=seed)
-    df.to_csv(out_dir / "telco_churn_processed.csv", index=False)
+    df.to_parquet(out_dir / FEATURES_FILENAME, index=False)
     manifest = make_split(
         ids=df["customerid"], labels=df["churn"], test_size=0.2, random_state=42
     )
@@ -216,6 +222,7 @@ def registered_evaluation_model(
             f"paths.figures={figures_dir}",
             f"paths.policy={policy_dir}",
             f"paths.reports={reports_dir}",
+            f"paths.processed_data={data_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
         ]
     )
@@ -255,32 +262,22 @@ def registered_evaluation_model(
             "boundary_hits": {"num_leaves": False},
         },
     }
-    comparison_result = {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
     # calibrate.run_calibration_step/threshold.run_threshold_step re-derive the
-    # dev partition themselves (load_features() -> partition()), reading
-    # PROCESSED_DATA_DIR from the *current* environment rather than from
-    # `cfg` — unlike run_model_logging_step, which only ever sees the X_dev/
-    # y_dev this fixture builds explicitly above. Without this, they would
+    # dev partition themselves (load_features() -> partition()), reading their
+    # config via load_config() rather than the `cfg` passed in — unlike
+    # run_model_logging_step, which only ever sees the X_dev/y_dev this
+    # fixture builds explicitly above. activate_config() is what makes that
+    # internal read see paths.processed_data above; without it, they would
     # silently fall back to the real project's own datasets/processed/ (if
     # present on the machine) instead of this seeded synthetic frame, and
     # calibrate's dev_oof_predictions.parquet would carry real customerids
     # that can never match evaluate.py's later, correctly-scoped subprocess
     # read of this same synthetic data.
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("PROCESSED_DATA_DIR", str(data_dir))
+    activate_config(cfg)
+    try:
         with mlflow.start_run(run_name="tuning_study") as run:
             tuning_result["parent_run_id"] = run.info.run_id
-        log_result = log_model.run_model_logging_step(
-            X_dev, y_dev, comparison_result, tuning_result, cfg
-        )
+        log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
         cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
         model_version = str(cal_result["model_version"])
 
@@ -293,6 +290,8 @@ def registered_evaluation_model(
             # dev_oof_diagnostics.json are written before that raise, so
             # evaluate.py's later reads are unaffected either way.
             pass
+    finally:
+        reset_active_config()
 
     return {
         "tracking_uri": tracking_uri,
@@ -335,6 +334,7 @@ def _run_evaluate_cli(
         f"paths.policy={fixture['policy_dir']}",
         f"paths.figures={fixture['figures_dir']}",
         f"paths.reports={reports_dir}",
+        f"paths.processed_data={fixture['data_dir']}",
         *_FAST_EVALUATE_OVERRIDES,
     ]
     if model_version is not None:
@@ -343,7 +343,6 @@ def _run_evaluate_cli(
 
     env = {
         **os.environ,
-        "PROCESSED_DATA_DIR": str(fixture["data_dir"]),
         "MLFLOW_TRACKING_URI": str(fixture["tracking_uri"]),
     }
     return subprocess.run(

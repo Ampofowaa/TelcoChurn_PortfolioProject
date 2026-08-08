@@ -7,8 +7,9 @@ from telco_churn.models.train import (
     run_candidate_step,
     run_comparison_step,
     run_diagnostics_step,
+    run_feature_audit_step,
+    run_feature_selection_step,
     run_model_logging_step,
-    run_selection_step,
     run_tuning_step,
     select_best_trial,
 )
@@ -20,8 +21,9 @@ __all__ = [
     "run_candidate_step",
     "run_comparison_step",
     "run_diagnostics_step",
+    "run_feature_audit_step",
+    "run_feature_selection_step",
     "run_model_logging_step",
-    "run_selection_step",
     "run_tuning_step",
     "select_best_trial",
 ]

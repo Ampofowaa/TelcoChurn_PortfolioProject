@@ -9,7 +9,6 @@ from unittest.mock import Mock
 
 import mlflow
 import pandas as pd
-import pandera as pa
 import pytest
 from lightgbm import LGBMClassifier
 from omegaconf import OmegaConf
@@ -128,8 +127,6 @@ def test_compose_config_loads_expected_structure() -> None:
 
     assert str(cfg.mlflow.registered_model_name) == "telco-churn-pipeline"
     assert str(cfg.mlflow.experiment_name) == "telco-churn-training"
-    assert int(cfg.training_setup.cv_folds) == 10
-    assert int(cfg.training_setup.cv_repeats) == 10
     assert float(cfg.training_setup.delta_threshold) == pytest.approx(0.005)
     assert int(cfg.training.candidate.n_estimators) == 100
     assert int(cfg.logreg.Cs) == 10
@@ -152,39 +149,12 @@ def test_compose_config_accepts_cli_overrides() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _load_processed — schema guard (B3a)
-# ---------------------------------------------------------------------------
-
-
-def test_load_processed_raises_on_schema_violation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, feature_df: pd.DataFrame
-) -> None:
-    """A processed CSV that violates FeatureOutputSchema aborts the load."""
-    bad_df = feature_df.copy()
-    bad_df.loc[0, "contract_type"] = "Not-a-real-contract"
-    bad_df.to_csv(tmp_path / "telco_churn_processed.csv", index=False)
-    monkeypatch.setattr(common, "get_project_root", lambda: tmp_path)
-    cfg = OmegaConf.create({"paths": {"processed_data": "."}})
-
-    with pytest.raises(pa.errors.SchemaError):
-        common._load_processed(cfg)
-
-
-def test_load_processed_passes_on_clean_data(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, feature_df: pd.DataFrame
-) -> None:
-    """A schema-conformant processed CSV loads without error."""
-    feature_df.to_csv(tmp_path / "telco_churn_processed.csv", index=False)
-    monkeypatch.setattr(common, "get_project_root", lambda: tmp_path)
-    cfg = OmegaConf.create({"paths": {"processed_data": "."}})
-
-    df = common._load_processed(cfg)
-
-    assert len(df) == len(feature_df)
-
-
-# ---------------------------------------------------------------------------
 # _load_dev_features
+#
+# Schema-guard behavior (a schema-violating file aborts the load, a clean one
+# loads without error) is owned by test_accessor.py's load_features() tests
+# now that _load_dev_features routes through the shared accessor rather than
+# a train-package-local CSV reader.
 # ---------------------------------------------------------------------------
 #
 # Split reproducibility/integrity (determinism, disjointness, stratification) is
@@ -214,10 +184,10 @@ def test_load_dev_features_returns_only_dev_rows(
     """_load_dev_features returns exactly the dev-partition rows and feature columns."""
     dev_df = feature_df.iloc[:96].reset_index(drop=True)
     test_df = feature_df.iloc[96:].reset_index(drop=True)
-    monkeypatch.setattr(common, "_load_processed", lambda cfg: feature_df)
+    monkeypatch.setattr(common, "load_features", lambda: feature_df)
     monkeypatch.setattr(common, "partition", lambda df: (dev_df, test_df))
 
-    X_dev, y_dev = common._load_dev_features(cfg=None)
+    X_dev, y_dev = common._load_dev_features()
 
     assert len(X_dev) == len(dev_df) == len(y_dev)
     assert set(X_dev.columns) == set(common._FEATURE_COLS)
@@ -229,10 +199,10 @@ def test_load_dev_features_never_touches_test_partition(
 ) -> None:
     """The test-partition frame returned by partition() must never be read."""
     dev_df = feature_df.iloc[:96].reset_index(drop=True)
-    monkeypatch.setattr(common, "_load_processed", lambda cfg: feature_df)
+    monkeypatch.setattr(common, "load_features", lambda: feature_df)
     monkeypatch.setattr(common, "partition", lambda df: (dev_df, _PoisonFrame()))
 
-    common._load_dev_features(cfg=None)  # raises AssertionError if test_df is touched
+    common._load_dev_features()  # raises AssertionError if test_df is touched
 
 
 # ---------------------------------------------------------------------------

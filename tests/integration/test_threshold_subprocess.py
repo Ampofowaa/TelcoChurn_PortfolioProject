@@ -27,7 +27,13 @@ from omegaconf import OmegaConf
 import telco_churn.models.calibrate as calibrate
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
-from telco_churn.utils.paths import compose_config, get_project_root
+from telco_churn.features.accessor import FEATURES_FILENAME
+from telco_churn.utils.paths import (
+    activate_config,
+    compose_config,
+    get_project_root,
+    reset_active_config,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -86,14 +92,14 @@ def _make_synthetic_processed_frame(n: int = 150, seed: int = 0) -> pd.DataFrame
 def _seed_processed_data(
     out_dir: Path, n: int = 150, seed: int = 0
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Write a processed CSV + matching canonical split manifest into out_dir.
+    """Write a processed features file + matching canonical split manifest into out_dir.
 
     Returns (df, manifest) — the manifest must be passed explicitly to
     partition() later; partition()'s default reads load_split(), which is the
     real project's split_manifest.parquet, not this seeded one.
     """
     df = _make_synthetic_processed_frame(n=n, seed=seed)
-    df.to_csv(out_dir / "telco_churn_processed.csv", index=False)
+    df.to_parquet(out_dir / FEATURES_FILENAME, index=False)
     manifest = make_split(
         ids=df["customerid"], labels=df["churn"], test_size=0.2, random_state=42
     )
@@ -199,42 +205,34 @@ def registered_threshold_model(
             "boundary_hits": {"num_leaves": False},
         },
     }
-    comparison_result = {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
     # calibrate.run_calibration_step (unlike log_model.run_model_logging_step,
     # which takes X_dev/y_dev explicitly) loads dev data itself internally via
     # load_dev_features()/load_dev_customer_ids() — both resolve
-    # cfg.paths.processed_data = ${oc.env:PROCESSED_DATA_DIR,datasets/processed/}.
-    # Composing cfg and calling calibration inside this scoped env override
-    # (rather than after, as a bare compose_config() call would do) is
-    # load-bearing: without it, this in-process call silently reads the real
+    # cfg.paths.processed_data via load_config() rather than the `cfg` passed
+    # in. activate_config(cfg) below is what makes that internal read see the
+    # override: without it, this in-process call silently reads the real
     # project's datasets/processed/ instead of this fixture's seeded data,
     # logging dev_oof_predictions.parquet against real customerids that share
     # no overlap with the synthetic cust-NNNN ids the subprocess below
-    # computes (via the same env var, correctly set for it) — surfacing as a
-    # dev-partition mismatch assertion failure in threshold.py, not here.
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("PROCESSED_DATA_DIR", str(data_dir))
-        cfg = compose_config(
-            overrides=[
-                f"mlflow.tracking_uri={tracking_uri}",
-                f"mlflow.registered_model_name={registered_model_name}",
-                *_FAST_CALIBRATION_OVERRIDES,
-            ]
-        )
+    # computes (via its own paths.processed_data override, correctly set) —
+    # surfacing as a dev-partition mismatch assertion failure in
+    # threshold.py, not here.
+    cfg = compose_config(
+        overrides=[
+            f"mlflow.tracking_uri={tracking_uri}",
+            f"mlflow.registered_model_name={registered_model_name}",
+            f"paths.processed_data={data_dir}",
+            *_FAST_CALIBRATION_OVERRIDES,
+        ]
+    )
+    activate_config(cfg)
+    try:
         with mlflow.start_run(run_name="tuning_study") as run:
             tuning_result["parent_run_id"] = run.info.run_id
-        log_result = log_model.run_model_logging_step(
-            X_dev, y_dev, comparison_result, tuning_result, cfg
-        )
+        log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
         cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
+    finally:
+        reset_active_config()
 
     return (
         tracking_uri,
@@ -268,6 +266,7 @@ def _run_threshold_cli(
         f"paths.figures={figures_dir}",
         f"paths.policy={policy_dir}",
         f"paths.reports={reports_dir}",
+        f"paths.processed_data={data_dir}",
     ]
     if model_version is not None:
         overrides.append(f"threshold.model_version={model_version}")
@@ -275,7 +274,6 @@ def _run_threshold_cli(
 
     env = {
         **os.environ,
-        "PROCESSED_DATA_DIR": str(data_dir),
         "MLFLOW_TRACKING_URI": tracking_uri,
     }
     return subprocess.run(

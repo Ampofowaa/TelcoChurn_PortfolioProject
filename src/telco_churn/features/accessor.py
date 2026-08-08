@@ -1,9 +1,11 @@
 """Single accessor for the processed features table — path, format, and content hash.
 
-The DVC pipeline wrap replaces telco_churn_processed.csv with telco_churn_features.parquet; every
-consumer added after that decision (calibrate.py, evaluate.py, threshold.py)
-reads through load_features() so the swap is a one-function edit instead of a rewrite
-across modules.
+Reads telco_churn_features.parquet, written by features/build.py's __main__
+(`make features`) — the file Phase 8's dvc.yaml will declare as the `features`
+stage's output once that wiring lands. Every consumer (train/common.py,
+calibrate.py, evaluate.py, threshold.py) reads through load_features() rather
+than constructing the path/format inline, so a future format change is a
+one-function edit instead of a rewrite across modules.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from telco_churn.utils.paths import get_project_root, load_config
 
 __all__ = ["FEATURES_FILENAME", "features_path", "load_features", "features_sha256"]
 
-FEATURES_FILENAME = "telco_churn_processed.csv"
+FEATURES_FILENAME = "telco_churn_features.parquet"
 
 
 def _default_features_path() -> Path:
@@ -43,7 +45,7 @@ def load_features(path: Path | None = None) -> pd.DataFrame:
     tests. Validated against FeatureOutputSchema so a schema-drifted or stale
     file fails loudly here rather than downstream in a consumer.
     """
-    df = pd.read_csv(features_path(path))
+    df = pd.read_parquet(features_path(path))
     return FeatureOutputSchema.validate(df)
 
 

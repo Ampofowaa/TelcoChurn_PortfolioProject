@@ -10,7 +10,7 @@ timeout_seconds: 5400   # 90 min; generous multiple of expected 50-trial runtime
 # Floor on completed trials before trusting the selection_rule pick — below it, a warning flags the pick as unreliable instead of blocking it. null disables the check.
 min_completed_trials: 10   # 20% of n_trials
 
-# Decoupled from training_setup.cv_folds — this cost compounds across n_trials, so it stays cheap. No cv_repeats for the same reason.
+# Decoupled from candidates.py's _FAMILY_REVIEW_CV_FOLDS (notebook-only, Phase 5's model-family comparison) — this cost compounds across n_trials, so it stays cheap. No cv_repeats for the same reason.
 cv_folds: 5
 random_state: 42
 

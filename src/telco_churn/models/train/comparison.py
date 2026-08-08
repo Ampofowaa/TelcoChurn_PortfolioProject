@@ -1,4 +1,12 @@
-"""Step 2: paired-bootstrap comparison + decision rule, plus non-gating diagnostics."""
+"""Step 2: paired-bootstrap comparison + decision rule, plus non-gating diagnostics.
+
+Not wired into the automated pipeline (models/train/__main__.py) — the family
+decision it produces is frozen into common.py::COMMITTED_MODEL_FAMILY by a
+human, via a reviewed code change, never recomputed live. Called only from
+notebooks/03a-model-selection.ipynb, alongside candidates.py::run_candidate_step
+— see that module's docstring and common.py::COMMITTED_MODEL_FAMILY for the
+full rationale.
+"""
 
 from __future__ import annotations
 
@@ -9,11 +17,7 @@ import mlflow
 import numpy as np
 import pandas as pd
 from omegaconf import DictConfig
-from sklearn.metrics import (
-    PrecisionRecallDisplay,
-    average_precision_score,
-    roc_auc_score,
-)
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 from telco_churn.features.preprocessing import TENURE_COHORT_EDGES, TENURE_COHORT_LABELS
 from telco_churn.models.diagnostics import (
@@ -26,6 +30,7 @@ from telco_churn.models.train.common import (
     _git_sha,
     _log_dev_input,
     _plot_bootstrap_delta,
+    _plot_pr_curves,
 )
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import ensure_experiment_metadata, set_run_description
@@ -57,6 +62,13 @@ _FAIRNESS_SEGMENTS: tuple[str, ...] = (
     "has_partner",
     "dependents",
 )
+
+# Family-review-only (notebooks/03a-model-selection.ipynb), not read from Hydra
+# config: nothing in the automated pipeline calls run_comparison_step, so
+# there is no CLI-override use case — same module-constant pattern as
+# features/select.py::ABLATION_N_BOOTSTRAP.
+_FAMILY_REVIEW_N_BOOTSTRAP: int = 10_000
+_FAMILY_REVIEW_SEGMENT_N_BOOTSTRAP: int = 1_000
 
 
 def bootstrap_comparison(
@@ -107,6 +119,7 @@ def run_diagnostics_step(
     X_dev: pd.DataFrame,
     candidate_results: dict[str, dict[str, Any]],
     cfg: DictConfig,
+    segment_n_bootstrap: int = _FAMILY_REVIEW_SEGMENT_N_BOOTSTRAP,
 ) -> dict[str, list[dict[str, Any]]]:
     """Compute the fixed-recall profile, robustness/fairness segment flags, and
     per-segment paired-bootstrap delta CIs.
@@ -115,6 +128,9 @@ def run_diagnostics_step(
     (that's bootstrap_comparison's job alone). Must be called from inside
     run_comparison_step's active MLflow run — logs five artifacts onto that same
     run so the model card can read them by run_id without a second lookup.
+
+    segment_n_bootstrap defaults to the family-review constant above (notebook
+    call sites take the default); overridable for fast test fixtures.
 
     Returns {"fixed_recall": [...], "robustness": [...], "fairness": [...],
     "robustness_delta": [...], "fairness_delta": [...]}, each a flat row list — the
@@ -166,7 +182,7 @@ def run_diagnostics_step(
 
     lgbm_res = candidate_results["lgbm_default"]
     logreg_res = candidate_results["logreg_cv"]
-    n_segment_bootstrap = int(cfg.training_setup.segment_bootstrap_n_samples)
+    n_segment_bootstrap = segment_n_bootstrap
     random_state = int(cfg.random_seed)
 
     robustness_delta_rows: list[dict[str, Any]] = [
@@ -278,12 +294,10 @@ def _plot_comparison_figures(
     lgbm_res = candidate_results["lgbm_default"]
     logreg_res = candidate_results["logreg_cv"]
 
-    fig_pr, ax_pr = plt.subplots(figsize=(6, 5))
-    for label, res in [("LightGBM", lgbm_res), ("LogReg", logreg_res)]:
-        PrecisionRecallDisplay.from_predictions(
-            res["oof_true"], res["oof_proba"], name=label, ax=ax_pr
-        )
-    ax_pr.set_title("OOF Precision-Recall Curves (dev set)")
+    fig_pr = _plot_pr_curves(
+        {"LightGBM": lgbm_res, "LogReg": logreg_res},
+        title="OOF Precision-Recall Curves (dev set)",
+    )
 
     fig_bs = _plot_bootstrap_delta(
         bootstrap["bootstrap_deltas"],
@@ -301,6 +315,8 @@ def run_comparison_step(
     y_dev: pd.Series,
     candidate_results: dict[str, dict[str, Any]],
     cfg: DictConfig,
+    n_bootstrap: int = _FAMILY_REVIEW_N_BOOTSTRAP,
+    segment_n_bootstrap: int = _FAMILY_REVIEW_SEGMENT_N_BOOTSTRAP,
 ) -> dict[str, Any]:
     """Run the paired-bootstrap decision on candidate_results and log a comparison run.
 
@@ -311,8 +327,14 @@ def run_comparison_step(
     run_diagnostics_step inside the same run — the fixed-recall/fairness/
     robustness diagnostics.
 
+    n_bootstrap/segment_n_bootstrap default to the family-review constants
+    above (notebook call sites take the defaults); overridable for fast test
+    fixtures. segment_n_bootstrap is threaded through to run_diagnostics_step.
+
     Returns bootstrap_comparison's dict (see its docstring) plus a "diagnostics" key
-    holding run_diagnostics_step's return value.
+    holding run_diagnostics_step's return value, and "run_id" — the model_comparison
+    run just logged, so the caller resolves it directly rather than re-querying
+    MLflow by name/recency afterward.
     """
     ts = cfg.training_setup
     random_state = int(cfg.random_seed)
@@ -323,7 +345,7 @@ def run_comparison_step(
     bootstrap = bootstrap_comparison(
         scores_lgbm=lgbm_res["pr_auc_scores"],
         scores_logreg=logreg_res["pr_auc_scores"],
-        n_bootstrap=int(ts.bootstrap_n_samples),
+        n_bootstrap=n_bootstrap,
         delta_threshold=float(ts.delta_threshold),
         random_state=random_state,
     )
@@ -347,7 +369,7 @@ def run_comparison_step(
 
     ensure_experiment_metadata(cfg)
 
-    with mlflow.start_run(run_name="model_comparison"):
+    with mlflow.start_run(run_name="model_comparison") as run:
         set_run_description(_RUN_DESCRIPTION)
         mlflow.set_tags(
             {
@@ -360,7 +382,7 @@ def run_comparison_step(
         mlflow.log_params(
             {
                 "delta_threshold": float(ts.delta_threshold),
-                "bootstrap_n_samples": int(ts.bootstrap_n_samples),
+                "bootstrap_n_samples": n_bootstrap,
                 "decision": bootstrap["decision"],
                 "decision_rule": bootstrap["decision_rule"],
             }
@@ -386,7 +408,9 @@ def run_comparison_step(
         plt.close(fig_pr)
         plt.close(fig_bs)
 
-        diagnostics = run_diagnostics_step(X_dev, candidate_results, cfg)
+        diagnostics = run_diagnostics_step(
+            X_dev, candidate_results, cfg, segment_n_bootstrap=segment_n_bootstrap
+        )
 
     logger.info(
         "comparison_step_done",
@@ -394,5 +418,6 @@ def run_comparison_step(
         decision_rule=bootstrap["decision_rule"],
         delta_obs=bootstrap["delta_obs"],
         p_value=bootstrap["p_value"],
+        run_id=run.info.run_id,
     )
-    return {**bootstrap, "diagnostics": diagnostics}
+    return {**bootstrap, "diagnostics": diagnostics, "run_id": run.info.run_id}

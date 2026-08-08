@@ -4,8 +4,9 @@
 model_version: null
 
 # Bootstrap resample count for every reported metric's CI (PR-AUC, recall, precision,
-# F1, BSS, calibration slope, EV). Distinct from training_setup.bootstrap_n_samples
-# (Phase 5's model-family comparison uses a different count for a different decision).
+# F1, BSS, calibration slope, EV). Distinct from comparison.py's
+# _FAMILY_REVIEW_N_BOOTSTRAP (Phase 5's notebook-only model-family comparison
+# uses a different count for a different decision).
 n_bootstrap: 1000
 
 # Bootstrap resampling seed.

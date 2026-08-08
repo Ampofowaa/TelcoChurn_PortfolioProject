@@ -48,12 +48,17 @@ if __name__ == "__main__":
 
     from telco_churn.utils.db import get_engine
     from telco_churn.utils.logging import configure_logging
-    from telco_churn.utils.paths import get_project_root, load_config
+    from telco_churn.utils.paths import (
+        activate_config,
+        compose_config,
+        get_project_root,
+    )
 
     load_dotenv()
     configure_logging()
 
-    cfg = load_config()
+    cfg = compose_config(overrides=sys.argv[1:] or None)
+    activate_config(cfg)
 
     try:
         build_sql_features(

@@ -277,6 +277,7 @@ def test_permutation_importance_selector_keeps_informative_drops_noise(
         multi_cat=_MULTI_CAT,
         numeric=_NUMERIC,
         estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
         n_repeats=15,
         noise_floor_margin=0.005,
         random_state=42,
@@ -289,6 +290,68 @@ def test_permutation_importance_selector_keeps_informative_drops_noise(
     assert "noise_num" not in selector.survivors_
     assert "noise_bin" not in selector.survivors_
     assert "noise_cat" not in selector.survivors_
+
+
+def test_permutation_importance_selector_records_group_importance_for_correlated_group(
+    synthetic_data: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """group_importance_ is populated with the joint permutation importance for a
+    correlated_groups entry once every member fails the individual floor — the
+    number decide_survivors' rescue test is judged against.
+    """
+    from telco_churn.features.preprocessing import build_preprocessor
+
+    X, y = synthetic_data
+    preprocessor = build_preprocessor(_BINARY, _MULTI_CAT, _NUMERIC)
+    preprocessor.set_output(transform="pandas")
+    Xt = preprocessor.fit_transform(X, y)
+
+    selector = PermutationImportanceSelector(
+        binary=_BINARY,
+        multi_cat=_MULTI_CAT,
+        numeric=_NUMERIC,
+        estimator_params=_FAST_ESTIMATOR_PARAMS,
+        n_repeats=15,
+        noise_floor_margin=0.005,
+        # noise_num/noise_bin both fail the individual floor (asserted above for
+        # this exact fixture/param combination), which is the rescue's trigger.
+        correlated_groups=(("noise_num", "noise_bin"),),
+        random_state=42,
+    )
+    selector.fit(Xt, y)
+
+    assert isinstance(selector.group_importance_, dict)
+    assert ("noise_num", "noise_bin") in selector.group_importance_
+    assert isinstance(selector.group_importance_[("noise_num", "noise_bin")], float)
+
+
+def test_permutation_importance_selector_group_importance_empty_when_no_rescue_needed(
+    synthetic_data: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """No joint permutation runs (group_importance_ stays empty) when every
+    declared group already has a member that survives individually.
+    """
+    from telco_churn.features.preprocessing import build_preprocessor
+
+    X, y = synthetic_data
+    preprocessor = build_preprocessor(_BINARY, _MULTI_CAT, _NUMERIC)
+    preprocessor.set_output(transform="pandas")
+    Xt = preprocessor.fit_transform(X, y)
+
+    selector = PermutationImportanceSelector(
+        binary=_BINARY,
+        multi_cat=_MULTI_CAT,
+        numeric=_NUMERIC,
+        estimator_params=_FAST_ESTIMATOR_PARAMS,
+        n_repeats=15,
+        noise_floor_margin=0.005,
+        # informative_num survives individually, so the group never needs rescuing.
+        correlated_groups=(("informative_num", "noise_num"),),
+        random_state=42,
+    )
+    selector.fit(Xt, y)
+
+    assert selector.group_importance_ == {}
 
 
 def test_permutation_importance_selector_transform_drops_noise_output_columns(
@@ -307,6 +370,7 @@ def test_permutation_importance_selector_transform_drops_noise_output_columns(
         multi_cat=_MULTI_CAT,
         numeric=_NUMERIC,
         estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
         n_repeats=15,
         noise_floor_margin=0.005,
         random_state=42,
@@ -335,6 +399,7 @@ def test_permutation_importance_selector_table_covers_all_features(
         multi_cat=_MULTI_CAT,
         numeric=_NUMERIC,
         estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
         n_repeats=10,
         noise_floor_margin=0.005,
         random_state=42,
@@ -398,6 +463,7 @@ def test_permutation_importance_selector_empty_dataframe_raises() -> None:
         multi_cat=[],
         numeric=["tenure"],
         estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
         n_repeats=5,
         random_state=42,
     )
@@ -408,7 +474,36 @@ def test_permutation_importance_selector_empty_dataframe_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# run_selection_cv — leak-free-by-refit + per-fold stability
+# mint_committed_list — fit once on all-dev
+# ---------------------------------------------------------------------------
+
+
+def test_mint_committed_list_returns_fitted_selector(
+    synthetic_data: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    X, y = synthetic_data
+    selector = mint_committed_list(
+        X,
+        y,
+        binary=_BINARY,
+        multi_cat=_MULTI_CAT,
+        numeric=_NUMERIC,
+        estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
+        n_repeats=15,
+        noise_floor_margin=0.005,
+        random_state=42,
+    )
+    assert isinstance(selector, PermutationImportanceSelector)
+    assert isinstance(selector.survivors_, list)
+    assert set(selector.permutation_importance_table_["feature"]) == set(
+        _BINARY + _MULTI_CAT + _NUMERIC
+    )
+
+
+# ---------------------------------------------------------------------------
+# run_selection_cv — ablation-only (notebooks/03b-feature-selection.ipynb §3),
+# leak-free-by-refit + per-fold stability
 # ---------------------------------------------------------------------------
 
 
@@ -444,6 +539,7 @@ def test_run_selection_cv_fits_selector_once_per_fold(
         multi_cat=_MULTI_CAT,
         numeric=_NUMERIC,
         estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
         n_repeats=10,
         noise_floor_margin=0.005,
         random_state=42,
@@ -490,6 +586,7 @@ def test_run_selection_cv_uses_distinct_seed_per_fold(
         multi_cat=_MULTI_CAT,
         numeric=_NUMERIC,
         estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
         n_repeats=10,
         noise_floor_margin=0.005,
         random_state=42,
@@ -512,6 +609,7 @@ def test_run_selection_cv_uses_distinct_seed_per_fold(
         multi_cat=_MULTI_CAT,
         numeric=_NUMERIC,
         estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
         n_repeats=10,
         noise_floor_margin=0.005,
         random_state=42,
@@ -534,6 +632,7 @@ def test_run_selection_cv_returns_one_score_and_survivor_list_per_fold(
         multi_cat=_MULTI_CAT,
         numeric=_NUMERIC,
         estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
         n_repeats=10,
         noise_floor_margin=0.005,
         random_state=42,
@@ -562,6 +661,7 @@ def test_run_selection_cv_returns_oof_predictions_aligned_to_row_order(
         multi_cat=_MULTI_CAT,
         numeric=_NUMERIC,
         estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
         n_repeats=10,
         noise_floor_margin=0.005,
         random_state=42,
@@ -586,6 +686,7 @@ def test_run_selection_cv_stability_covers_all_features_and_is_bounded(
         multi_cat=_MULTI_CAT,
         numeric=_NUMERIC,
         estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
         n_repeats=10,
         noise_floor_margin=0.005,
         random_state=42,
@@ -612,6 +713,7 @@ def test_run_selection_cv_parallel_matches_sequential(
         multi_cat=_MULTI_CAT,
         numeric=_NUMERIC,
         estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(),
         n_repeats=10,
         noise_floor_margin=0.005,
         random_state=42,
@@ -626,33 +728,69 @@ def test_run_selection_cv_parallel_matches_sequential(
     assert sequential["fold_scores"] == parallel["fold_scores"]
     assert sequential["fold_survivors"] == parallel["fold_survivors"]
     assert sequential["oof_proba"] == parallel["oof_proba"]
+    assert sequential["importance_table"] == parallel["importance_table"]
+    assert sequential["group_importance"] == parallel["group_importance"]
 
 
-# ---------------------------------------------------------------------------
-# mint_committed_list — fit once on all-dev
-# ---------------------------------------------------------------------------
-
-
-def test_mint_committed_list_returns_fitted_selector(
+def test_run_selection_cv_importance_table_covers_all_features_with_finite_means(
     synthetic_data: tuple[pd.DataFrame, pd.Series],
 ) -> None:
+    """importance_table has one row per source feature, aggregated (mean) across
+    every fold's own PermutationImportanceSelector fit — not a second,
+    separately-fit single all-dev estimate."""
     X, y = synthetic_data
-    selector = mint_committed_list(
+    cv = RepeatedStratifiedKFold(n_splits=2, n_repeats=1, random_state=42)
+
+    result = run_selection_cv(
         X,
         y,
+        cv,
         binary=_BINARY,
         multi_cat=_MULTI_CAT,
         numeric=_NUMERIC,
         estimator_params=_FAST_ESTIMATOR_PARAMS,
-        n_repeats=15,
+        correlated_groups=(),
+        n_repeats=10,
         noise_floor_margin=0.005,
         random_state=42,
     )
-    assert isinstance(selector, PermutationImportanceSelector)
-    assert isinstance(selector.survivors_, list)
-    assert set(selector.permutation_importance_table_["feature"]) == set(
-        _BINARY + _MULTI_CAT + _NUMERIC
+
+    all_source_cols = set(_BINARY + _MULTI_CAT + _NUMERIC)
+    importance_table = {row["feature"]: row for row in result["importance_table"]}
+    assert set(importance_table) == all_source_cols
+    for row in importance_table.values():
+        assert np.isfinite(row["real_importance"])
+        assert np.isfinite(row["decoy_importance"])
+        assert np.isfinite(row["importance_floor"])
+
+
+def test_run_selection_cv_group_importance_averages_only_fired_folds(
+    synthetic_data: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """group_importance is keyed by member tuple, averaged only across the folds
+    where the rescue actually fired (every member failed the floor that fold) —
+    noise_bin/noise_cat/noise_num carry no real signal by construction, so the
+    rescue should fire on at least one fold."""
+    X, y = synthetic_data
+    cv = RepeatedStratifiedKFold(n_splits=2, n_repeats=2, random_state=42)
+    noise_group = ("noise_bin", "noise_cat", "noise_num")
+
+    result = run_selection_cv(
+        X,
+        y,
+        cv,
+        binary=_BINARY,
+        multi_cat=_MULTI_CAT,
+        numeric=_NUMERIC,
+        estimator_params=_FAST_ESTIMATOR_PARAMS,
+        correlated_groups=(noise_group,),
+        n_repeats=10,
+        noise_floor_margin=0.005,
+        random_state=42,
     )
+
+    assert noise_group in result["group_importance"]
+    assert np.isfinite(result["group_importance"][noise_group])
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +867,8 @@ def test_flag_high_shap_dropouts_empty_when_all_features_committed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# reduced_set_bootstrap_test — paired-difference keep-vs-reduce decision
+# reduced_set_bootstrap_test — ablation-only (notebooks/03b-feature-selection.
+# ipynb §3), paired-difference keep-vs-reduce decision
 # ---------------------------------------------------------------------------
 
 

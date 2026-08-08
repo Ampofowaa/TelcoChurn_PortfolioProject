@@ -1070,19 +1070,6 @@ def tuning_result(dev_split: tuple[pd.DataFrame, pd.Series]) -> dict[str, Any]:
 
 
 @pytest.fixture
-def comparison_result() -> dict[str, Any]:
-    """A plausible Step 2 output — the fields run_model_logging_step reads."""
-    return {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
-
-@pytest.fixture
 def sandboxed_dev_features(
     monkeypatch: pytest.MonkeyPatch, dev_split: tuple[pd.DataFrame, pd.Series]
 ) -> None:
@@ -1114,7 +1101,6 @@ def sandboxed_dev_features(
 
 def _log_parent_run(
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict[str, Any],
     tuning_result: dict[str, Any],
     cfg: DictConfig,
 ) -> str:
@@ -1125,9 +1111,7 @@ def _log_parent_run(
     X_dev, y_dev = dev_split
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result = {**tuning_result, "parent_run_id": run.info.run_id}
-    result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, cfg
-    )
+    result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
     return str(result["run_id"])
 
 
@@ -1236,23 +1220,9 @@ def _shared_tuning_result(
 
 
 @pytest.fixture(scope="module")
-def _shared_comparison_result() -> dict[str, Any]:
-    """Module-scoped mirror of comparison_result — see calibrated_run."""
-    return {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
-
-@pytest.fixture(scope="module")
 def calibrated_run(
     _shared_registration_cfg: DictConfig,
     _module_dev_split: tuple[pd.DataFrame, pd.Series],
-    _shared_comparison_result: dict[str, Any],
     _shared_tuning_result: dict[str, Any],
 ) -> Iterator[dict[str, Any]]:
     """The real, unmocked run_calibration_step(sigmoid, default cfg) result —
@@ -1275,7 +1245,7 @@ def calibrated_run(
       result["model_version"] == "1" — requires being the first-ever
       registration under this registered_model_name.
     All three keep their own function-scoped registration_cfg/tuning_result/
-    comparison_result/sandboxed_dev_features (above), untouched by this
+    sandboxed_dev_features (above), untouched by this
     fixture and its separate "test_run_calibration_step_shared" experiment.
     """
     mp = pytest.MonkeyPatch()
@@ -1296,7 +1266,6 @@ def calibrated_run(
 
     run_id = _log_parent_run(
         _module_dev_split,
-        _shared_comparison_result,
         _shared_tuning_result,
         _shared_registration_cfg,
     )
@@ -1444,7 +1413,6 @@ def test_run_calibration_step_logs_dev_oof_predictions(
 def test_run_calibration_step_calibration_summary_has_calibration_spec(
     registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict[str, Any],
     tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
@@ -1455,9 +1423,7 @@ def test_run_calibration_step_calibration_summary_has_calibration_spec(
     pinned fixture, since a pinned fixture would pass vacuously.
     """
     registration_cfg.calibration.method = "auto"
-    run_id = _log_parent_run(
-        dev_split, comparison_result, tuning_result, registration_cfg
-    )
+    run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
 
     result = calibrate.run_calibration_step(run_id, registration_cfg)
 
@@ -1558,7 +1524,6 @@ def test_run_calibration_step_calibration_summary_has_mean_p_hat_fields(
 def test_run_calibration_step_blocks_on_low_trial_count(
     registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict[str, Any],
     tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
@@ -1567,9 +1532,7 @@ def test_run_calibration_step_blocks_on_low_trial_count(
     registration outright.
     """
     tuning_result["tuning_summary"]["trial_count_below_threshold"] = True
-    run_id = _log_parent_run(
-        dev_split, comparison_result, tuning_result, registration_cfg
-    )
+    run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
 
     with pytest.raises(RuntimeError, match="trial_count_below_threshold"):
         calibrate.run_calibration_step(run_id, registration_cfg)
@@ -1581,7 +1544,6 @@ def test_run_calibration_step_blocks_on_low_trial_count(
 def test_run_calibration_step_override_trial_count_gate(
     registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict[str, Any],
     tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
@@ -1589,9 +1551,7 @@ def test_run_calibration_step_override_trial_count_gate(
     warning — an explicit human override, not a silent bypass."""
     tuning_result["tuning_summary"]["trial_count_below_threshold"] = True
     registration_cfg.calibration.override_trial_count_gate = True
-    run_id = _log_parent_run(
-        dev_split, comparison_result, tuning_result, registration_cfg
-    )
+    run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
 
     result = calibrate.run_calibration_step(run_id, registration_cfg)
 
@@ -1601,7 +1561,6 @@ def test_run_calibration_step_override_trial_count_gate(
 def test_run_calibration_step_parity_failure_leaves_tagged_pending_orphan(
     registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict[str, Any],
     tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -1623,9 +1582,7 @@ def test_run_calibration_step_parity_failure_leaves_tagged_pending_orphan(
             AssertionError("forced parity failure")
         ),
     )
-    run_id = _log_parent_run(
-        dev_split, comparison_result, tuning_result, registration_cfg
-    )
+    run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
 
     with pytest.raises(AssertionError, match="forced parity failure"):
         calibrate.run_calibration_step(run_id, registration_cfg)

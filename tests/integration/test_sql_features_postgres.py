@@ -18,6 +18,7 @@ from testcontainers.postgres import PostgresContainer
 from telco_churn.data.ingest import ingest
 from telco_churn.features import (
     FEATURE_SCHEMA,
+    FEATURES_FILENAME,
     SQL_FEATURE_COLS,
     build_feature_df,
     build_sql_features,
@@ -96,8 +97,7 @@ def test_charge_per_service_positive(seeded_engine: Engine) -> None:
     with seeded_engine.connect() as conn:
         non_pos = conn.execute(
             text(
-                "SELECT COUNT(*) FROM charge_per_service "
-                "WHERE charge_per_service <= 0"
+                "SELECT COUNT(*) FROM charge_per_service WHERE charge_per_service <= 0"
             )
         ).scalar()
     # No zero-monthlycharges row in the sample; 0.0 / N = 0.0 would be flagged by this assertion.
@@ -248,18 +248,18 @@ def test_pipeline_no_unexpected_nulls(feature_df: pd.DataFrame) -> None:
     assert not feature_df[non_nullable].isnull().any().any()
 
 
-def test_pipeline_csv_write_shape(
+def test_pipeline_parquet_write_shape(
     seeded_engine: Engine, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """Pipeline output written to CSV has the expected shape."""
+    """Pipeline output written to Parquet has the expected shape."""
     df_raw = pd.read_sql_table(
         "customer_features", seeded_engine, columns=SQL_FEATURE_COLS
     )
     df_out = build_feature_df(df_raw)
-    out_path = tmp_path_factory.mktemp("out") / "processed.csv"
-    df_out.to_csv(out_path, index=False)
+    out_path = tmp_path_factory.mktemp("out") / "processed.parquet"
+    df_out.to_parquet(out_path, index=False)
 
-    df_loaded = pd.read_csv(out_path)
+    df_loaded = pd.read_parquet(out_path)
     expected_cols = (
         len(
             list(
@@ -274,8 +274,8 @@ def test_pipeline_csv_write_shape(
 
 
 # ---------------------------------------------------------------------------
-# __main__ CLI composition: load_dotenv → OmegaConf.load → get_engine →
-#   read_sql_table → build_feature_df → CSV write
+# __main__ CLI composition: load_dotenv → compose_config → activate_config →
+#   get_engine → read_sql_table → build_feature_df → Parquet write
 # ---------------------------------------------------------------------------
 
 
@@ -284,7 +284,7 @@ def test_build_main_cli_composition(
     pg_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
-    """Full build.py __main__ composition runs end-to-end and produces the expected CSV.
+    """Full build.py __main__ composition runs end-to-end and produces the expected Parquet file.
 
     CLAUDE.md: every __main__ entry point requires an integration test exercising the
     full composition path (DB read → transform → file write). seeded_engine ensures
@@ -292,9 +292,14 @@ def test_build_main_cli_composition(
     """
     out_dir = tmp_path_factory.mktemp("build_cli")
 
-    env = {**os.environ, "POSTGRES_URL": pg_url, "PROCESSED_DATA_DIR": str(out_dir)}
+    env = {**os.environ, "POSTGRES_URL": pg_url}
     result = subprocess.run(
-        [sys.executable, "-m", "telco_churn.features.build"],
+        [
+            sys.executable,
+            "-m",
+            "telco_churn.features.build",
+            f"paths.processed_data={out_dir}",
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -305,9 +310,9 @@ def test_build_main_cli_composition(
         result.returncode == 0
     ), f"build CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
 
-    out_path = out_dir / "telco_churn_processed.csv"
-    assert out_path.exists(), "processed CSV was not written by the CLI"
-    df = pd.read_csv(out_path)
+    out_path = out_dir / FEATURES_FILENAME
+    assert out_path.exists(), "processed features file was not written by the CLI"
+    df = pd.read_parquet(out_path)
     expected_cols = (
         len(
             list(

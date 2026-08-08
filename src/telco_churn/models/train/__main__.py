@@ -1,4 +1,10 @@
-"""CLI entry point: `python -m telco_churn.models.train` runs Steps 1-5 in sequence."""
+"""CLI entry point: `python -m telco_churn.models.train` runs Steps 3-5 in sequence.
+
+Steps 1-2 (candidate comparison, model-family decision) are notebook-only —
+see models/train/common.py::COMMITTED_MODEL_FAMILY and
+notebooks/03a-model-selection.ipynb. This entry point builds directly against
+the frozen family; it does not re-decide it.
+"""
 
 from __future__ import annotations
 
@@ -8,15 +14,13 @@ import pandera as pa
 from dotenv import load_dotenv
 
 from telco_churn.models.train import (
-    run_candidate_step,
-    run_comparison_step,
+    run_feature_audit_step,
     run_model_logging_step,
-    run_selection_step,
     run_tuning_step,
 )
 from telco_churn.models.train.common import _load_dev_features
 from telco_churn.utils.logging import configure_logging, get_logger
-from telco_churn.utils.paths import compose_config
+from telco_churn.utils.paths import activate_config, compose_config
 
 logger = get_logger(__name__)
 
@@ -25,7 +29,8 @@ configure_logging()
 
 try:
     cfg = compose_config(overrides=sys.argv[1:] or None)
-    X_dev, y_dev = _load_dev_features(cfg)
+    activate_config(cfg)
+    X_dev, y_dev = _load_dev_features()
 
     logger.info(
         "data_split_ready",
@@ -33,24 +38,20 @@ try:
         churn_rate_dev=round(float(y_dev.mean()), 4),
     )
 
-    candidate_results = run_candidate_step(X_dev, y_dev, cfg)
-    comparison = run_comparison_step(X_dev, y_dev, candidate_results, cfg)
-
-    if comparison["decision"] == "lgbm":
-        selection = run_selection_step(X_dev, y_dev, candidate_results, cfg)
-        tuning = run_tuning_step(X_dev, y_dev, selection["committed_features"], cfg)
-        run_model_logging_step(X_dev, y_dev, comparison, tuning, cfg)
-    else:
-        logger.warning(
-            "selection_skipped_logreg_winner",
-            decision_rule=comparison["decision_rule"],
-            hint=(
-                "Step 3's permutation-importance selector is model-agnostic, but "
-                "this pipeline still fits LightGBM internally and Step 4 tuning "
-                "is LightGBM-only; a LogReg winner still needs a linear-model "
-                "pipeline built before Steps 3-5 can run."
-            ),
-        )
+    # Steps 3-5 of the five-step pipeline (see models/train/__init__.py's docstring
+    # for the full list, incl. the notebook-only Steps 1-2). Every call below
+    # builds directly against frozen, human-reviewed constants — nothing here
+    # re-decides the model family or the feature set, on this run or any retrain.
+    #   3. run_feature_audit_step  — audits the already-frozen COMMITTED_FEATURES
+    #      (permutation-importance + SHAP), logs the diagnostic; does not select.
+    #   4. run_tuning_step         — Optuna hyperparameter search against
+    #      COMMITTED_MODEL_FAMILY (LightGBM), scored by CV PR-AUC.
+    #   5. run_model_logging_step  — the actual fit: [preprocessor -> LightGBM]
+    #      trained on all of X_dev/y_dev with the tuned hyperparameters, logged
+    #      to MLflow (uncalibrated, unregistered — calibrate.py picks it up next).
+    selection = run_feature_audit_step(X_dev, y_dev, cfg)
+    tuning = run_tuning_step(X_dev, y_dev, selection["committed_features"], cfg)
+    run_model_logging_step(X_dev, y_dev, tuning, cfg)
 
 except FileNotFoundError as e:
     logger.error(
@@ -67,7 +68,10 @@ except pa.errors.SchemaError as e:
     logger.error("processed_data_schema_invalid", error=str(e), exc_info=True)
     sys.exit(1)
 except AssertionError as e:
-    logger.error("leakage_canary_failed", error=str(e), exc_info=True)
+    # Steps 1-2's leakage canary no longer runs here (notebook-only, see module
+    # docstring) — the reachable case today is Step 5's log->reload->predict_proba
+    # parity check in log_model.py.
+    logger.error("training_assertion_failed", error=str(e), exc_info=True)
     sys.exit(1)
 except Exception as e:
     logger.error("train_failed", error=str(e), exc_info=True)

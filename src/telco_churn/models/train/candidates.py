@@ -1,4 +1,15 @@
-"""Step 1: candidate training — CV-score Dummy / LogReg / LightGBM on the dev set."""
+"""Step 1: candidate training — CV-score Dummy / LogReg / LightGBM on the dev set.
+
+Not wired into the automated pipeline (models/train/__main__.py) — the family
+decision it feeds is frozen into common.py::COMMITTED_MODEL_FAMILY by a human,
+via a reviewed code change, never recomputed live. This is a design-time /
+periodic-review tool, called only from notebooks/03a-model-selection.ipynb, on
+the same footing as features/select.py's retired keep-vs-reduce ablation. See
+common.py::COMMITTED_MODEL_FAMILY and ANALYSIS.md §4a for the frozen decision
+and its run id. Re-run the comparison (03a) only on a real trigger — a new
+candidate family, a drift signal, or a scheduled periodic review — not on
+every retrain.
+"""
 
 from __future__ import annotations
 
@@ -38,6 +49,22 @@ _DUMMY_ROC_AUC_TARGET = 0.5
 _DUMMY_ROC_AUC_TOL = 0.05
 _DUMMY_PR_AUC_TOL = 0.03
 
+# Family-review-only (notebooks/03a-model-selection.ipynb), not read from Hydra
+# config: nothing in the automated pipeline calls run_candidate_step, so there
+# is no CLI-override use case — same module-constant pattern as
+# features/select.py::ABLATION_N_BOOTSTRAP.
+_FAMILY_REVIEW_CV_FOLDS: int = 10
+_FAMILY_REVIEW_CV_REPEATS: int = 10
+
+# n_jobs=-1 (process-based parallelism) was tried for logreg_cv's folds — its
+# internal Cs-search makes each fit expensive enough that this looked
+# worthwhile on paper. Re-measured on real dev data at the production fold
+# count (10x10=100 folds): only a ~1.26x wall-clock gain (105.0s -> 83.4s),
+# not the ~2.5x an earlier measurement had suggested, while per-fold
+# train_time_s became contention-noisy (1.0s -> 4-8s, varying run to run) and
+# no longer comparable to the other two candidates' sequential timings. Not
+# worth it — all three candidates stay sequential.
+
 
 def _assert_dummy_canary(dummy_result: dict[str, Any], y_dev: pd.Series) -> None:
     """Abort the run if the feature-blind dummy_prior candidate scores off chance.
@@ -66,20 +93,32 @@ def run_candidate_step(
     X_dev: pd.DataFrame,
     y_dev: pd.Series,
     cfg: DictConfig,
+    cv_folds: int = _FAMILY_REVIEW_CV_FOLDS,
+    cv_repeats: int = _FAMILY_REVIEW_CV_REPEATS,
 ) -> dict[str, dict[str, Any]]:
     """Train and CV-score the dummy_prior / logreg_cv / lgbm_default candidates.
 
     Shares one RepeatedStratifiedKFold instance across all three so every candidate
     trains and validates on identical folds. Each candidate is logged as its own
-    MLflow run under cfg.mlflow.experiment_name.
+    MLflow run under cfg.mlflow.experiment_name, with the model-construction kwargs
+    it was actually fit with (configs/training/logreg.yaml, configs/training/
+    lightgbm.yaml) logged as params alongside the generic CV-setup ones — so a
+    config edit between cycles is legible on the run, not just inferable from
+    the resulting PR-AUC.
+
+    cv_folds/cv_repeats default to the family-review constants above (notebook
+    call sites take the defaults); overridable for fast test fixtures.
 
     Returns per-candidate result dicts keyed by run name, for Step 2 comparison.
+    Each dict carries cv_score_candidate's keys plus "run_id" (the MLflow run
+    just logged) — the caller resolves its own runs directly rather than
+    re-querying MLflow by name/recency afterward.
     """
     random_state = int(cfg.random_seed)
     cc = cfg.training_setup
     cv = RepeatedStratifiedKFold(
-        n_splits=int(cc.cv_folds),
-        n_repeats=int(cc.cv_repeats),
+        n_splits=cv_folds,
+        n_repeats=cv_repeats,
         random_state=random_state,
     )
 
@@ -87,23 +126,33 @@ def run_candidate_step(
     multi_cat = list(FEATURE_SCHEMA.multi_cat)
     numeric = list(FEATURE_SCHEMA.numeric)
 
+    logreg_params = logreg_default_params(cfg, random_state)
+    lgbm_params = lgbm_default_params(cfg, random_state)
+
     candidates: dict[str, Any] = {
         "dummy_prior": DummyClassifier(strategy="prior", random_state=random_state),
         "logreg_cv": Pipeline(
             [
                 ("preprocessor", build_linear_preprocessor(binary, multi_cat, numeric)),
-                (
-                    "model",
-                    LogisticRegressionCV(**logreg_default_params(cfg, random_state)),
-                ),
+                ("model", LogisticRegressionCV(**logreg_params)),
             ]
         ),
         "lgbm_default": Pipeline(
             [
                 ("preprocessor", build_preprocessor(binary, multi_cat, numeric)),
-                ("model", LGBMClassifier(**lgbm_default_params(cfg, random_state))),
+                ("model", LGBMClassifier(**lgbm_params)),
             ]
         ),
+    }
+
+    # Model-construction kwargs, logged alongside the generic CV-setup params below
+    # so a config edit (configs/training/logreg.yaml, configs/training/lightgbm.yaml)
+    # is legible on the run itself, not just inferable from the estimator it produced.
+    # class_weight is dropped here — already logged once, generically, below.
+    _model_construction_params: dict[str, dict[str, Any]] = {
+        "dummy_prior": {},
+        "logreg_cv": {k: v for k, v in logreg_params.items() if k != "class_weight"},
+        "lgbm_default": {k: v for k, v in lgbm_params.items() if k != "class_weight"},
     }
 
     ensure_experiment_metadata(cfg)
@@ -122,7 +171,6 @@ def run_candidate_step(
         "logreg_cv": "comparison",
         "lgbm_default": "comparison",
     }
-
     results: dict[str, dict[str, Any]] = {}
 
     for name, estimator in candidates.items():
@@ -138,13 +186,8 @@ def run_candidate_step(
             mlflow.log_input(_dev_dataset, context="training")
             logger.info("candidate_cv_start", candidate=name)
 
-            # n_jobs left at cv_score_candidate's sequential default: each fold here is
-            # a single cheap fit (~0.25s) — too light for joblib's process-based
-            # parallelism to pay off on Windows (spawn-based worker startup + per-task
-            # dispatch overhead measured ~2x slower than sequential for this workload).
-            # Feature selection's much heavier per-fold cost (feature_freeze.py) is
-            # where cv_n_jobs is actually applied.
             result = cv_score_candidate(estimator, X_dev, y_dev, cv)
+            result["run_id"] = run.info.run_id
             results[name] = result
 
             if name == "dummy_prior":
@@ -153,12 +196,14 @@ def run_candidate_step(
             mlflow.log_params(
                 {
                     "candidate": name,
-                    "cv_n_splits": int(cc.cv_folds),
-                    "cv_n_repeats": int(cc.cv_repeats),
+                    "cv_n_splits": cv_folds,
+                    "cv_n_repeats": cv_repeats,
                     "cv_random_state": random_state,
                     "class_weight": str(cc.class_weight),
                 }
             )
+            if _model_construction_params[name]:
+                mlflow.log_params(_model_construction_params[name])
             mlflow.log_metrics(
                 {
                     "cv_pr_auc_mean": round(result["pr_auc_mean"], 3),

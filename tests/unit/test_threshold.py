@@ -724,24 +724,10 @@ def tuning_result(_module_dev_split: tuple[pd.DataFrame, pd.Series]) -> dict:
 
 
 @pytest.fixture(scope="module")
-def comparison_result() -> dict:
-    """A plausible Step 2 output — the fields run_model_logging_step reads."""
-    return {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
-
-@pytest.fixture(scope="module")
 def registered_model_version(
     full_cfg: OmegaConf,
     _module_dev_split: tuple[pd.DataFrame, pd.Series],
     _module_feature_df: pd.DataFrame,
-    comparison_result: dict,
     tuning_result: dict,
 ) -> Iterator[str]:
     """Register a real calibrated model version via the actual production chain
@@ -807,9 +793,7 @@ def registered_model_version(
 
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result = {**tuning_result, "parent_run_id": run.info.run_id}
-    log_result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, full_cfg
-    )
+    log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, full_cfg)
     cal_result = calibrate.run_calibration_step(log_result["run_id"], full_cfg)
     try:
         yield str(cal_result["model_version"])

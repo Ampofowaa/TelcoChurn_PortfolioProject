@@ -13,7 +13,13 @@ from pathlib import Path
 
 import pytest
 
-from telco_churn.utils.paths import compose_config, get_project_root, load_config
+from telco_churn.utils.paths import (
+    activate_config,
+    compose_config,
+    get_project_root,
+    load_config,
+    reset_active_config,
+)
 
 # ---------------------------------------------------------------------------
 # get_project_root
@@ -99,3 +105,31 @@ def test_compose_config_safe_to_call_repeatedly() -> None:
     first = compose_config()
     second = compose_config()
     assert first.random_seed == second.random_seed == 42
+
+
+# ---------------------------------------------------------------------------
+# activate_config / reset_active_config
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_returns_installed_config_once_activated() -> None:
+    """The installed config must take precedence over a fresh on-disk read —
+    this is the mechanism a test's paths.processed_data=<tmp> override relies
+    on to reach accessor modules that call load_config() internally."""
+    installed = compose_config(overrides=["random_seed=7"])
+    activate_config(installed)
+    assert load_config().random_seed == 7
+
+
+def test_reset_active_config_reverts_load_config_to_disk_read() -> None:
+    activate_config(compose_config(overrides=["random_seed=7"]))
+    reset_active_config()
+    assert load_config().random_seed == 42
+
+
+def test_load_config_with_no_active_config_reads_disk_as_before() -> None:
+    """Baseline: with nothing installed (the autouse fixture's steady state),
+    load_config() behaves exactly as it did before activate_config existed."""
+    cfg = load_config()
+    assert cfg.random_seed == 42
+    assert "training" not in cfg

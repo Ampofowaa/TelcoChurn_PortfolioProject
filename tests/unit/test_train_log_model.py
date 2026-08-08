@@ -119,25 +119,11 @@ def tuning_result(dev_split: tuple[pd.DataFrame, pd.Series]) -> dict:
     }
 
 
-@pytest.fixture
-def comparison_result() -> dict:
-    """A plausible Step 2 output — the fields run_model_logging_step reads for training_manifest.json."""
-    return {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
-
 def test_run_model_logging_step_returns_expected_keys(
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
     registration_cfg: OmegaConf,
     tuning_result: dict,
-    comparison_result: dict,
 ) -> None:
     """run_model_logging_step logs and reloads, returning the documented keys —
     no 'version', since this step never registers.
@@ -147,7 +133,7 @@ def test_run_model_logging_step_returns_expected_keys(
     tuning_result["parent_run_id"] = _start_parent_run()
 
     result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
+        X_dev, y_dev, tuning_result, registration_cfg
     )
 
     assert set(result) == {
@@ -165,10 +151,9 @@ def test_run_model_logging_step_training_manifest_has_expected_fields(
     dev_split: tuple[pd.DataFrame, pd.Series],
     registration_cfg: OmegaConf,
     tuning_result: dict,
-    comparison_result: dict,
 ) -> None:
     """training_manifest.json is grouped one section per pipeline step —
-    model_comparison, feature_selection, training_summary, tuning_summary —
+    model_family_committed, feature_selection, training_summary, tuning_summary —
     with a logged_model_uri, but no 'alias', since this step never registers.
     """
     registration_cfg.mlflow.tracking_uri = tuning_mlflow_uri
@@ -176,7 +161,7 @@ def test_run_model_logging_step_training_manifest_has_expected_fields(
     tuning_result["parent_run_id"] = _start_parent_run()
 
     result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
+        X_dev, y_dev, tuning_result, registration_cfg
     )
 
     manifest = result["training_manifest"]
@@ -199,9 +184,10 @@ def test_run_model_logging_step_training_manifest_has_expected_fields(
     )
     assert "num_leaves" not in manifest["training_summary"]["fixed_hyperparameters"]
 
-    # model_comparison: Step 2's decision, not tuning's.
-    assert manifest["model_comparison"]["decision_rule"] == "tie"
-    assert manifest["model_comparison"]["delta_ci_lower"] == -0.01
+    # model_family_committed: Steps 1-2's frozen decision, referenced not recomputed.
+    assert manifest["model_family_committed"]["model_family"] == "lightgbm"
+    assert manifest["model_family_committed"]["decision_reference"] == "ANALYSIS.md §4a"
+    assert manifest["model_family_committed"]["decision_run_id"]
 
     # feature_selection: Step 3's frozen input space.
     assert (
@@ -240,7 +226,6 @@ def test_run_model_logging_step_does_not_register(
     dev_split: tuple[pd.DataFrame, pd.Series],
     registration_cfg: OmegaConf,
     tuning_result: dict,
-    comparison_result: dict,
 ) -> None:
     """No registry version is created — the registry stays empty until Phase 6's
     calibrate.py performs the training cycle's single registration.
@@ -252,9 +237,7 @@ def test_run_model_logging_step_does_not_register(
     X_dev, y_dev = dev_split
     tuning_result["parent_run_id"] = _start_parent_run()
 
-    log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
-    )
+    log_model.run_model_logging_step(X_dev, y_dev, tuning_result, registration_cfg)
 
     client = mlflow.tracking.MlflowClient()
     assert client.search_registered_models() == []
@@ -265,7 +248,6 @@ def test_run_model_logging_step_signature_declares_float_output(
     dev_split: tuple[pd.DataFrame, pd.Series],
     registration_cfg: OmegaConf,
     tuning_result: dict,
-    comparison_result: dict,
 ) -> None:
     """The logged signature declares a float probability output, not int64 —
     proof pyfunc_predict_fn="predict_proba" is actually wired, not just the
@@ -277,7 +259,7 @@ def test_run_model_logging_step_signature_declares_float_output(
     tuning_result["parent_run_id"] = _start_parent_run()
 
     result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
+        X_dev, y_dev, tuning_result, registration_cfg
     )
 
     model_info = mlflow.models.get_model_info(result["model_uri"])
@@ -292,7 +274,6 @@ def test_run_model_logging_step_parity_failure_raises(
     dev_split: tuple[pd.DataFrame, pd.Series],
     registration_cfg: OmegaConf,
     tuning_result: dict,
-    comparison_result: dict,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A reload that disagrees with the in-memory model aborts logging."""
@@ -309,9 +290,7 @@ def test_run_model_logging_step_parity_failure_raises(
     )
 
     with pytest.raises(AssertionError, match="Reload parity check failed"):
-        log_model.run_model_logging_step(
-            X_dev, y_dev, comparison_result, tuning_result, registration_cfg
-        )
+        log_model.run_model_logging_step(X_dev, y_dev, tuning_result, registration_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +303,6 @@ def test_run_model_logging_step_scales_n_estimators(
     dev_split: tuple[pd.DataFrame, pd.Series],
     registration_cfg: OmegaConf,
     tuning_result: dict,
-    comparison_result: dict,
 ) -> None:
     """The shipped n_estimators is the scaled value, not the raw early-stopped
     median — asserted against this fixture's real fold/final sizes (120 dev
@@ -336,7 +314,7 @@ def test_run_model_logging_step_scales_n_estimators(
     tuning_result["parent_run_id"] = _start_parent_run()
 
     result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
+        X_dev, y_dev, tuning_result, registration_cfg
     )
     tuning_summary = result["training_manifest"]["tuning_summary"]
 
@@ -375,7 +353,6 @@ def test_run_model_logging_step_records_two_count_diagnostic(
     dev_split: tuple[pd.DataFrame, pd.Series],
     registration_cfg: OmegaConf,
     tuning_result: dict,
-    comparison_result: dict,
 ) -> None:
     """cv_pr_auc_at_n_es_median / cv_pr_auc_at_n_scaled land in tuning_summary
     and as MLflow metrics — the diagnostic confirming the scaling rule against
@@ -386,7 +363,7 @@ def test_run_model_logging_step_records_two_count_diagnostic(
     tuning_result["parent_run_id"] = _start_parent_run()
 
     result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
+        X_dev, y_dev, tuning_result, registration_cfg
     )
     tuning_summary = result["training_manifest"]["tuning_summary"]
 
@@ -407,7 +384,6 @@ def test_run_model_logging_step_two_count_diagnostic_mints_no_model(
     dev_split: tuple[pd.DataFrame, pd.Series],
     registration_cfg: OmegaConf,
     tuning_result: dict,
-    comparison_result: dict,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Exactly one mlflow.sklearn.log_model call per cycle — the two-count
@@ -428,9 +404,7 @@ def test_run_model_logging_step_two_count_diagnostic_mints_no_model(
 
     monkeypatch.setattr(log_model.mlflow.sklearn, "log_model", _counting_log_model)
 
-    log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
-    )
+    log_model.run_model_logging_step(X_dev, y_dev, tuning_result, registration_cfg)
 
     assert call_count == 1
 
@@ -440,7 +414,6 @@ def test_run_model_logging_step_warns_when_scaling_regresses(
     dev_split: tuple[pd.DataFrame, pd.Series],
     registration_cfg: OmegaConf,
     tuning_result: dict,
-    comparison_result: dict,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A scaled count that scores worse than the raw median logs a warning for
@@ -472,8 +445,6 @@ def test_run_model_logging_step_warns_when_scaling_regresses(
         lambda event, **kwargs: warning_events.append(event),
     )
 
-    log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, registration_cfg
-    )
+    log_model.run_model_logging_step(X_dev, y_dev, tuning_result, registration_cfg)
 
     assert "n_estimators_scaling_regressed" in warning_events

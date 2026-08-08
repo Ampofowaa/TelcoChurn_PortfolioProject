@@ -149,11 +149,29 @@ def test_run_candidate_step_logs_metric_contract(
     monkeypatch.setattr(candidates, "_git_sha", lambda: "deadbeef")
     monkeypatch.setattr(candidates, "_dvc_hash", lambda cfg: "unknown")
 
-    results = candidates.run_candidate_step(X_dev, y_dev, cfg)
+    results = candidates.run_candidate_step(
+        X_dev,
+        y_dev,
+        cfg,
+        cv_folds=int(cfg.training_setup.cv_folds),
+        cv_repeats=int(cfg.training_setup.cv_repeats),
+    )
 
     assert set(results) == {"dummy_prior", "logreg_cv", "lgbm_default"}
-    logged_candidates = {p["candidate"] for p in logged_params}
+    logged_candidates = {p["candidate"] for p in logged_params if "candidate" in p}
     assert logged_candidates == {"dummy_prior", "logreg_cv", "lgbm_default"}
+
+    # logreg_cv/lgbm_default each get a second log_params call for their
+    # model-construction kwargs (configs/training/logreg.yaml,lightgbm.yaml) —
+    # class_weight is deliberately excluded there, already logged generically above.
+    model_param_calls = [p for p in logged_params if "candidate" not in p]
+    assert len(model_param_calls) == 2
+    for params in model_param_calls:
+        assert "class_weight" not in params
+    logreg_model_params = next(p for p in model_param_calls if "solver" in p)
+    assert logreg_model_params["Cs"] == 2
+    lgbm_model_params = next(p for p in model_param_calls if "num_leaves" in p)
+    assert lgbm_model_params["n_estimators"] == 10
     for metrics in logged_metrics:
         assert {
             "cv_pr_auc_mean",
@@ -236,6 +254,12 @@ def test_run_candidate_step_dataset_source_uses_accessor_canonical_path(
     monkeypatch.setattr(candidates, "_git_sha", lambda: "deadbeef")
     monkeypatch.setattr(candidates, "_dvc_hash", lambda cfg: "unknown")
 
-    candidates.run_candidate_step(X_dev, y_dev, cfg)
+    candidates.run_candidate_step(
+        X_dev,
+        y_dev,
+        cfg,
+        cv_folds=int(cfg.training_setup.cv_folds),
+        cv_repeats=int(cfg.training_setup.cv_repeats),
+    )
 
     assert captured_sources == [str(features_path())]

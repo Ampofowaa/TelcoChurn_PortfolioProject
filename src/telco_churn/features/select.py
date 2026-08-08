@@ -1,10 +1,32 @@
-"""Step 3 — permutation-importance feature selector (freezes the input space).
+"""Step 3 — permutation-importance feature selector.
 
-Selection lives inside a [tree_preprocessor -> selector -> model] Pipeline so
-run_selection_cv refits it per fold — leak-free by construction. Survival is
-decided against a synthetic noise-decoy column using the same
-IMPORTANCE_NOISE_FLOOR_MARGIN rule as feature discovery (features/generate.py
-Screen 4), so both stages share one threshold.
+Two distinct things live here, on purpose. (1) The **live diagnostic**
+(mint_committed_list, compute_shap_audit, decide_survivors,
+flag_high_shap_dropouts) — cheap, runs every training cycle via
+models/train/feature_freeze.py, reported not gating: it feeds the model card,
+error_analysis.py, and stakeholder explanation. models/train/feature_selection.py
+reuses the same three functions (not a rewrite) to characterize what *would*
+be committed under its own ablation's conclusion, on-demand rather than every
+cycle. (2) The **keep-vs-reduce
+ablation** (run_selection_cv, reduced_set_bootstrap_test) — the expensive
+100-fold paired-bootstrap test that actually decides the committed feature
+set. This is *not* wired into the automated pipeline: it is a design-time /
+periodic-review tool, called only from models/train/feature_selection.py (in
+turn triggered on demand from notebooks/03b-feature-selection.ipynb §2), on
+the same footing as features/generate.py's discovery machinery (also
+notebook-only). The committed set it produces is frozen into
+features/schema.py::COMMITTED_FEATURES (and its sibling
+COMMITTED_FEATURES_DECISION/COMMITTED_FEATURES_DECISION_RUN_ID) by a human,
+via a reviewed code change — never recomputed live; see ANALYSIS.md §4b for
+the standing decision's rationale. Re-run the ablation (§2 of the notebook)
+only on a real trigger — a new engineered feature, a per-feature drift
+signal, or a scheduled periodic review — not on every retrain.
+
+Selection lives inside a [tree_preprocessor -> selector] Pipeline (plus a
+model step for the ablation) so both the diagnostic and the ablation refit
+leak-free per fold/fit. Survival is decided against a synthetic noise-decoy
+column using the same IMPORTANCE_NOISE_FLOOR_MARGIN rule as feature discovery
+(features/generate.py Screen 4), so both stages share one threshold.
 """
 
 from __future__ import annotations
@@ -26,8 +48,8 @@ from telco_churn.features.generate import IMPORTANCE_NOISE_FLOOR_MARGIN
 from telco_churn.features.preprocessing import build_preprocessor
 
 __all__ = [
+    "ABLATION_N_BOOTSTRAP",
     "DECOY_FEATURE",
-    "DEFAULT_CORRELATED_GROUPS",
     "PermutationImportanceSelector",
     "compute_shap_audit",
     "decide_survivors",
@@ -41,22 +63,11 @@ __all__ = [
 # output or the committed feature list.
 DECOY_FEATURE = "_permutation_decoy"
 
-# Correlated per the heatmap and VIF check (§8a/§8b notebooks/01-eda.ipynb); importance
-# can concentrate on one member and starve the others below the decoy floor.
-DEFAULT_CORRELATED_GROUPS: tuple[tuple[str, ...], ...] = (
-    ("tenure", "totalcharges", "monthlycharges"),
-    # internetservice_No propagates identically across all six add-on columns
-    # (VIF = inf, §8b) whenever a customer has no internet service.
-    (
-        "internetservice",
-        "onlinesecurity",
-        "onlinebackup",
-        "deviceprotection",
-        "techsupport",
-        "streamingtv",
-        "streamingmovies",
-    ),
-)
+# Ablation-only (notebooks/03b-feature-selection.ipynb §2), not read from Hydra
+# config: nothing in the automated pipeline calls run_selection_cv, so there is
+# no CLI-override use case — matches features/generate.py's module-constant
+# pattern for its own notebook-only thresholds (CORR_THRESHOLD, MIN_PR_AUC_DELTA).
+ABLATION_N_BOOTSTRAP: int = 10_000
 
 
 def _build_column_map(
@@ -194,6 +205,12 @@ class PermutationImportanceSelector(BaseEstimator, TransformerMixin):  # type: i
     a downstream model has nothing to fit on otherwise. This is a floor applied after
     decide_survivors, not a second decision path; decide_survivors' own floor logic
     is unchanged.
+
+    group_importance_ (populated after fit()) holds the joint permutation importance
+    computed for every correlated_groups entry where every member failed the floor
+    individually — the number decide_survivors' rescue test is judged against, keyed
+    by the member tuple. Empty for a group whose rescue never fires (i.e. any member
+    already survives alone) or that has no real signal to rescue.
     """
 
     def __init__(
@@ -202,9 +219,9 @@ class PermutationImportanceSelector(BaseEstimator, TransformerMixin):  # type: i
         multi_cat: list[str],
         numeric: list[str],
         estimator_params: dict[str, Any],
+        correlated_groups: tuple[tuple[str, ...], ...],
         n_repeats: int = 50,
         noise_floor_margin: float = IMPORTANCE_NOISE_FLOOR_MARGIN,
-        correlated_groups: tuple[tuple[str, ...], ...] = DEFAULT_CORRELATED_GROUPS,
         inner_val_size: float = 0.2,
         random_state: int = 42,
     ) -> None:
@@ -212,9 +229,9 @@ class PermutationImportanceSelector(BaseEstimator, TransformerMixin):  # type: i
         self.multi_cat = multi_cat
         self.numeric = numeric
         self.estimator_params = estimator_params
+        self.correlated_groups = correlated_groups
         self.n_repeats = n_repeats
         self.noise_floor_margin = noise_floor_margin
-        self.correlated_groups = correlated_groups
         self.inner_val_size = inner_val_size
         self.random_state = random_state
 
@@ -265,6 +282,7 @@ class PermutationImportanceSelector(BaseEstimator, TransformerMixin):  # type: i
             )
             group_importance[members] = float(joint_result["_rescue_group"])
 
+        self.group_importance_ = group_importance
         self.permutation_importance_table_ = decide_survivors(
             real_importance,
             decoy_importance,
@@ -319,9 +337,8 @@ def _build_selector(
 ) -> tuple[ColumnTransformer, PermutationImportanceSelector]:
     """Build the unfitted [tree_preprocessor, PermutationImportanceSelector] pair.
 
-    Shared by _build_selection_pipeline (adds an LGBMClassifier model step) and
-    mint_committed_list (fits the pair alone, no model step needed to freeze
-    survivors_).
+    Used by mint_committed_list, which fits the pair alone (no model step needed
+    to freeze survivors_).
     """
     preprocessor = build_preprocessor(binary, multi_cat, numeric)
     selector = PermutationImportanceSelector(
@@ -338,6 +355,43 @@ def _build_selector(
     return preprocessor, selector
 
 
+def mint_committed_list(
+    X: pd.DataFrame,
+    y: pd.Series,
+    binary: list[str],
+    multi_cat: list[str],
+    numeric: list[str],
+    estimator_params: dict[str, Any],
+    correlated_groups: tuple[tuple[str, ...], ...],
+    n_repeats: int = 50,
+    noise_floor_margin: float = IMPORTANCE_NOISE_FLOOR_MARGIN,
+    inner_val_size: float = 0.2,
+    random_state: int = 42,
+) -> PermutationImportanceSelector:
+    """Fit the selector once on all of development to freeze the committed feature list.
+
+    Not a leakage risk despite the single all-dev fit: the boundary that matters is
+    development vs. the sealed test, which this never touches. survivors_ on the
+    returned selector is the frozen feature_columns.txt list;
+    permutation_importance_table_ is its audit trail.
+    """
+    preprocessor, selector = _build_selector(
+        binary,
+        multi_cat,
+        numeric,
+        estimator_params,
+        n_repeats,
+        noise_floor_margin,
+        correlated_groups,
+        inner_val_size,
+        random_state,
+    )
+    pipeline = Pipeline([("preprocessor", preprocessor), ("selector", selector)])
+    pipeline.fit(X, y)
+    fitted_selector: PermutationImportanceSelector = pipeline.named_steps["selector"]
+    return fitted_selector
+
+
 def _build_selection_pipeline(
     binary: list[str],
     multi_cat: list[str],
@@ -349,7 +403,12 @@ def _build_selection_pipeline(
     inner_val_size: float,
     random_state: int,
 ) -> Pipeline:
-    """Build [tree_preprocessor -> PermutationImportanceSelector -> LightGBM] as one Pipeline."""
+    """Build [tree_preprocessor -> PermutationImportanceSelector -> LightGBM] as one Pipeline.
+
+    Ablation-only (notebooks/03b-feature-selection.ipynb §2) — shares
+    _build_selector with mint_committed_list, adding the model step the
+    full-vs-reduced comparison needs to score each fold.
+    """
     preprocessor, selector = _build_selector(
         binary,
         multi_cat,
@@ -381,12 +440,19 @@ def _fit_and_score_selection_fold(
     correlated_groups: tuple[tuple[str, ...], ...],
     inner_val_size: float,
     random_state: int,
-) -> tuple[float, list[str], np.ndarray[Any, Any]]:
+) -> tuple[
+    float, list[str], np.ndarray[Any, Any], pd.DataFrame, dict[tuple[str, ...], float]
+]:
     """Fit one fold's [preprocessor -> selector -> model] pipeline and score it.
 
-    Returns (fold_pr_auc, survivors, val_proba). Builds a fresh pipeline (no
-    object shared across folds), so this is safe to run concurrently: each call
-    only reads its own X_tr/X_val slice and returns its own result.
+    Returns (fold_pr_auc, survivors, val_proba, permutation_importance_table,
+    group_importance) — the last two read straight off the fold's own fitted
+    PermutationImportanceSelector rather than discarded, so run_selection_cv can
+    aggregate real per-fold importance magnitudes (not just survive/fail) across
+    all folds; see its docstring for why this replaces a second, separately-fit
+    mint_committed_list call. Builds a fresh pipeline (no object shared across
+    folds), so this is safe to run concurrently: each call only reads its own
+    X_tr/X_val slice and returns its own result.
     """
     pipeline = _build_selection_pipeline(
         binary,
@@ -402,8 +468,15 @@ def _fit_and_score_selection_fold(
     pipeline.fit(X_tr, y_tr)
     proba = pipeline.predict_proba(X_val)[:, 1]
     fold_score = float(average_precision_score(y_val, proba))
-    survivors = list(pipeline.named_steps["selector"].survivors_)
-    return fold_score, survivors, proba
+    selector = pipeline.named_steps["selector"]
+    survivors = list(selector.survivors_)
+    return (
+        fold_score,
+        survivors,
+        proba,
+        selector.permutation_importance_table_,
+        selector.group_importance_,
+    )
 
 
 def run_selection_cv(
@@ -414,18 +487,22 @@ def run_selection_cv(
     multi_cat: list[str],
     numeric: list[str],
     estimator_params: dict[str, Any],
+    correlated_groups: tuple[tuple[str, ...], ...],
     n_repeats: int = 50,
     noise_floor_margin: float = IMPORTANCE_NOISE_FLOOR_MARGIN,
-    correlated_groups: tuple[tuple[str, ...], ...] = DEFAULT_CORRELATED_GROUPS,
     inner_val_size: float = 0.2,
     random_state: int = 42,
     n_jobs: int = 1,
 ) -> dict[str, Any]:
     """Score the reduced feature set through CV and record each fold's survivors.
 
-    Pass the same cv instance/params used for the full-feature candidate
-    (train.run_candidate_step) so fold indices are identical and the per-fold
-    scores are directly paired by reduced_set_bootstrap_test.
+    Ablation-only (models/train/feature_selection.py, triggered from
+    notebooks/03b-feature-selection.ipynb §2) — not called from the automated
+    pipeline. Pass the same cv instance/params used for the full-feature
+    candidate (feature_selection.py's own cv_score_candidate call, not Step 1's
+    train.run_candidate_step — a different candidate, a different question) so
+    fold indices are identical and the per-fold scores are directly paired by
+    reduced_set_bootstrap_test.
 
     n_jobs — folds run independently (each builds its own pipeline instance and
     fits on its own data), so joblib.Parallel(n_jobs=...) changes only wall-clock
@@ -434,11 +511,18 @@ def run_selection_cv(
 
     Returns fold_scores (reduced-set per-fold PR-AUC), fold_survivors (one list of
     surviving source columns per fold — the per-fold stability input), stability
-    (per-feature survival rate across folds), and oof_proba/oof_true (reduced-set
-    out-of-fold predictions, averaged across repeats the same way
-    train.common.cv_score_candidate does for the full-feature candidates — lets
-    run_selection_step render a full-vs-reduced OOF precision-recall curve using
-    the same mechanism as Step 2's candidate comparison).
+    (per-feature survival rate across folds), importance_table (per-feature
+    real_importance/decoy_importance/importance_floor, each the mean across all
+    folds — a genuinely 100-fold-averaged magnitude, not a second, separately-fit
+    single all-dev estimate that could disagree with the fold-survival picture:
+    every fold's own PermutationImportanceSelector already computes these values
+    while deciding that fold's survivors, so this aggregates numbers already
+    produced rather than re-fitting), group_importance (per correlated-group
+    tuple, the mean joint importance across only the folds where the rescue
+    actually fired — absent for a group that never triggered on any fold), and
+    oof_proba/oof_true (reduced-set out-of-fold predictions, averaged across
+    repeats the same way train.common.cv_score_candidate does for the
+    full-feature candidates).
     """
     fold_indices = list(cv.split(X, y))
     # Each fold gets its own child seed (spawned from one SeedSequence) rather
@@ -473,10 +557,14 @@ def run_selection_cv(
 
     fold_scores = [r[0] for r in fold_results]
     fold_survivors = [r[1] for r in fold_results]
+    fold_importance_tables = [r[3] for r in fold_results]
+    fold_group_importances = [r[4] for r in fold_results]
 
     oof_proba_sum = np.zeros(len(X))
     oof_counts = np.zeros(len(X), dtype=int)
-    for (_, val_idx), (_, _, proba) in zip(fold_indices, fold_results, strict=True):
+    for (_, val_idx), (_, _, proba, _, _) in zip(
+        fold_indices, fold_results, strict=True
+    ):
         oof_proba_sum[val_idx] += proba
         oof_counts[val_idx] += 1
 
@@ -496,50 +584,40 @@ def run_selection_cv(
         for col in source_columns
     ]
 
+    # Mean of each fold's own real_importance/decoy_importance/importance_floor
+    # per feature — every fold already computed these while deciding that
+    # fold's survivors_ (see _fit_and_score_selection_fold), so this aggregates
+    # 100 already-produced values rather than re-fitting a second, separately-
+    # drawn single estimate (the "minting defect" a lone all-dev fit risks).
+    importance_table = (
+        pd.concat(fold_importance_tables, ignore_index=True)
+        .groupby("feature", as_index=False)[
+            ["real_importance", "decoy_importance", "importance_floor"]
+        ]
+        .mean()
+    )
+
+    # Sparse by construction: a group's key is present only on folds where every
+    # member failed the individual floor and the rescue fired — averaged over
+    # just those folds, never treated as 0 on the folds where it didn't fire.
+    group_importance_samples: dict[tuple[str, ...], list[float]] = {}
+    for fold_group_importance in fold_group_importances:
+        for members, importance in fold_group_importance.items():
+            group_importance_samples.setdefault(members, []).append(importance)
+    group_importance = {
+        members: float(np.mean(values))
+        for members, values in group_importance_samples.items()
+    }
+
     return {
         "fold_scores": fold_scores,
         "fold_survivors": fold_survivors,
         "stability": stability,
+        "importance_table": importance_table.to_dict("records"),
+        "group_importance": group_importance,
         "oof_proba": (oof_proba_sum / oof_counts).tolist(),
         "oof_true": y.tolist(),
     }
-
-
-def mint_committed_list(
-    X: pd.DataFrame,
-    y: pd.Series,
-    binary: list[str],
-    multi_cat: list[str],
-    numeric: list[str],
-    estimator_params: dict[str, Any],
-    n_repeats: int = 50,
-    noise_floor_margin: float = IMPORTANCE_NOISE_FLOOR_MARGIN,
-    correlated_groups: tuple[tuple[str, ...], ...] = DEFAULT_CORRELATED_GROUPS,
-    inner_val_size: float = 0.2,
-    random_state: int = 42,
-) -> PermutationImportanceSelector:
-    """Fit the selector once on all of development to freeze the committed feature list.
-
-    Not a leakage risk despite the single all-dev fit: the boundary that matters is
-    development vs. the sealed test, which this never touches. survivors_ on the
-    returned selector is the frozen feature_columns.txt list;
-    permutation_importance_table_ is its audit trail.
-    """
-    preprocessor, selector = _build_selector(
-        binary,
-        multi_cat,
-        numeric,
-        estimator_params,
-        n_repeats,
-        noise_floor_margin,
-        correlated_groups,
-        inner_val_size,
-        random_state,
-    )
-    pipeline = Pipeline([("preprocessor", preprocessor), ("selector", selector)])
-    pipeline.fit(X, y)
-    fitted_selector: PermutationImportanceSelector = pipeline.named_steps["selector"]
-    return fitted_selector
 
 
 def compute_shap_audit(
@@ -618,11 +696,14 @@ def reduced_set_bootstrap_test(
 ) -> dict[str, Any]:
     """Paired-bootstrap test on Δ = mean(AP_full) − mean(AP_reduced).
 
-    Mirrors train.comparison.bootstrap_comparison's Step 2 test: pairs fold i of
-    the full-feature model against fold i of the reduced-feature model (both use
-    the same RepeatedStratifiedKFold instance, so fold indices line up), which
-    cancels intra-fold variance and gives more power than testing whether the
-    reduced mean merely falls inside the full model's own unpaired CI.
+    Ablation-only (models/train/feature_selection.py, triggered from
+    notebooks/03b-feature-selection.ipynb §2) — not called from the automated
+    pipeline. Mirrors train.comparison.bootstrap_comparison's
+    Step 2 test: pairs fold i of the full-feature model against fold i of the
+    reduced-feature model (both use the same RepeatedStratifiedKFold instance,
+    so fold indices line up), which cancels intra-fold variance and gives more
+    power than testing whether the reduced mean merely falls inside the full
+    model's own unpaired CI.
 
     Default is the simpler reduced set; only a materially and significantly worse
     reduced set overrides it:
