@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from pathlib import Path
 from unittest.mock import Mock
 
 import mlflow
 import pandas as pd
 import pytest
 from lightgbm import LGBMClassifier
-from omegaconf import OmegaConf
 from sklearn.dummy import DummyClassifier
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.pipeline import Pipeline
@@ -23,9 +21,11 @@ from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.models.train.common import cv_score_candidate
 
 # ---------------------------------------------------------------------------
-# _git_sha / _dvc_hash — audit-trail metadata resolution (QA finding #4:
-# failures are logged, not silently swallowed into an indistinguishable
-# 'unknown', since these values feed training_manifest.json's audit trail)
+# _git_sha — audit-trail metadata resolution (QA finding #4: failures are
+# logged, not silently swallowed into an indistinguishable 'unknown', since
+# this value feeds training_manifest.json's audit trail). Its former
+# companion, _dvc_hash, is retired — data_content_hash now comes from
+# features/accessor.py::features_sha256(), covered by test_accessor.py.
 # ---------------------------------------------------------------------------
 
 
@@ -56,57 +56,6 @@ def test_git_sha_returns_unknown_and_warns_on_failure(
     assert result == "unknown"
     warning_mock.assert_called_once()
     assert warning_mock.call_args.args[0] == "git_sha_unavailable"
-    assert warning_mock.call_args.kwargs["exc_info"] is True
-
-
-def test_dvc_hash_returns_unknown_and_logs_debug_when_file_missing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A missing .dvc file (DVC not tracked yet — the routine pre-Phase-8 case)
-    returns 'unknown' and logs at debug only, never a warning.
-    """
-    monkeypatch.setattr(common, "get_project_root", lambda: tmp_path)
-    cfg = OmegaConf.create({"paths": {"processed_data": "."}})
-    debug_mock = Mock()
-    warning_mock = Mock()
-    monkeypatch.setattr(common.logger, "debug", debug_mock)
-    monkeypatch.setattr(common.logger, "warning", warning_mock)
-
-    result = common._dvc_hash(cfg)
-
-    assert result == "unknown"
-    debug_mock.assert_called_once()
-    assert debug_mock.call_args.args[0] == "dvc_hash_not_tracked"
-    warning_mock.assert_not_called()
-
-
-def test_dvc_hash_returns_hash_when_file_present(tmp_path: Path) -> None:
-    """A well-formed .dvc file returns its recorded md5 hash."""
-    dvc_file = tmp_path / "telco_churn_processed.csv.dvc"
-    dvc_file.write_text("outs:\n- md5: deadbeef1234\n")
-    cfg = OmegaConf.create({"paths": {"processed_data": str(tmp_path)}})
-
-    assert common._dvc_hash(cfg) == "deadbeef1234"  # pragma: allowlist secret
-
-
-def test_dvc_hash_returns_unknown_and_warns_on_malformed_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A .dvc file that exists but doesn't have the expected structure returns
-    'unknown' and logs a warning — distinct from the missing-file debug case,
-    since this signals a genuine problem worth a human look.
-    """
-    dvc_file = tmp_path / "telco_churn_processed.csv.dvc"
-    dvc_file.write_text("not_outs: []\n")
-    cfg = OmegaConf.create({"paths": {"processed_data": str(tmp_path)}})
-    warning_mock = Mock()
-    monkeypatch.setattr(common.logger, "warning", warning_mock)
-
-    result = common._dvc_hash(cfg)
-
-    assert result == "unknown"
-    warning_mock.assert_called_once()
-    assert warning_mock.call_args.args[0] == "dvc_hash_unexpected_error"
     assert warning_mock.call_args.kwargs["exc_info"] is True
 
 

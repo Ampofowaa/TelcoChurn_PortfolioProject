@@ -13,6 +13,7 @@ import pytest
 from omegaconf import DictConfig, OmegaConf
 
 import telco_churn.models.train.tuning as tuning
+from telco_churn.utils.paths import activate_config, reset_active_config
 
 # ---------------------------------------------------------------------------
 # select_best_trial
@@ -281,6 +282,48 @@ def test_build_optuna_storage_isolates_schema_when_postgres_url_is_set(
         url="postgresql://user:pass@host/db",  # pragma: allowlist secret
         engine_kwargs={"connect_args": {"options": "-csearch_path=optuna"}},
     )
+
+
+# ---------------------------------------------------------------------------
+# _study_name — data_content_hash regression coverage
+# ---------------------------------------------------------------------------
+
+
+def test_study_name_changes_when_features_content_changes(
+    tuning_cfg: DictConfig, tmp_path: Path
+) -> None:
+    """Holding cfg.tuning and committed_features fixed, pointing at two
+    different-content features files must mint two different study names.
+
+    Regression test for the data_content_hash fix: the retired _dvc_hash
+    read a .dvc sidecar that never existed and was permanently 'unknown', so
+    a genuine data change never changed the study name and _study_name
+    would silently resume a study built on stale data (see tuning.py's
+    module docstring / PROJECT_PLAN.md's Phase 8 prerequisites section).
+    """
+    committed_features = ["tenure", "monthlycharges"]
+
+    dir_a = tmp_path / "content_a"
+    dir_a.mkdir()
+    (dir_a / "telco_churn_features.parquet").write_bytes(b"content-a")
+    dir_b = tmp_path / "content_b"
+    dir_b.mkdir()
+    (dir_b / "telco_churn_features.parquet").write_bytes(b"content-b")
+
+    try:
+        activate_config(OmegaConf.create({"paths": {"processed_data": str(dir_a)}}))
+        name_a = tuning._study_name(tuning_cfg, committed_features)
+
+        activate_config(OmegaConf.create({"paths": {"processed_data": str(dir_b)}}))
+        name_b = tuning._study_name(tuning_cfg, committed_features)
+
+        activate_config(OmegaConf.create({"paths": {"processed_data": str(dir_a)}}))
+        name_a_again = tuning._study_name(tuning_cfg, committed_features)
+    finally:
+        reset_active_config()
+
+    assert name_a != name_b
+    assert name_a == name_a_again  # unchanged data resumes the same study
 
 
 # ---------------------------------------------------------------------------

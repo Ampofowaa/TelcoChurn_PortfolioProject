@@ -146,6 +146,32 @@ def test_run_model_logging_step_returns_expected_keys(
     assert result["parity_ok"] is True
 
 
+def test_run_model_logging_step_raises_on_hyperparameter_collision(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    registration_cfg: OmegaConf,
+    tuning_result: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fixed_hyperparameters key colliding with a selected_hyperparameters key
+    (best_params or the derived n_estimators) raises, naming the offending key
+    — guards the fixed: block's override precedence against silently deciding
+    a value Optuna also searched.
+    """
+    registration_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    tuning_result["parent_run_id"] = _start_parent_run()
+
+    monkeypatch.setattr(
+        log_model,
+        "_lgbm_fixed_knobs",
+        lambda cfg, random_state: {"num_leaves": 99, "n_jobs": 1},
+    )
+
+    with pytest.raises(ValueError, match="num_leaves"):
+        log_model.run_model_logging_step(X_dev, y_dev, tuning_result, registration_cfg)
+
+
 def test_run_model_logging_step_training_manifest_has_expected_fields(
     tuning_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
@@ -199,7 +225,7 @@ def test_run_model_logging_step_training_manifest_has_expected_fields(
     )
 
     assert "git_sha" in manifest
-    assert "dvc_data_hash" in manifest
+    assert "data_content_hash" in manifest
     assert manifest["logged_model_uri"] == result["model_uri"]
     # LoggedModel.model_id — distinct from run_id and not auto-populated onto
     # ModelVersion in OSS MLflow 3.14; must be persisted here or the registry

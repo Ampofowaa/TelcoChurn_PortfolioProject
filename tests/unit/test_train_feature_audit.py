@@ -191,12 +191,12 @@ def test_run_feature_audit_step_logs_selection_artifacts(
     )
 
 
-def test_run_feature_audit_step_tags_stage_git_sha_and_dvc_hash(
+def test_run_feature_audit_step_tags_stage_git_sha_and_data_content_hash(
     selection_mlflow_uri: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
     selection_cfg: OmegaConf,
 ) -> None:
-    """The run carries the same stage/git_sha/dvc_data_hash tag contract every other
+    """The run carries the same stage/git_sha/data_content_hash tag contract every other
     Phase 5 step run carries (candidates.py, comparison.py, tuning.py)."""
     selection_cfg.mlflow.tracking_uri = selection_mlflow_uri
     X_dev, y_dev = dev_split
@@ -209,7 +209,7 @@ def test_run_feature_audit_step_tags_stage_git_sha_and_dvc_hash(
 
     assert run.data.tags["stage"] == "selection"
     assert "git_sha" in run.data.tags
-    assert "dvc_data_hash" in run.data.tags
+    assert "data_content_hash" in run.data.tags
 
 
 def test_run_feature_audit_step_logs_dataset_source_via_accessor(

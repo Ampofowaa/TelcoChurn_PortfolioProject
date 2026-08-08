@@ -17,7 +17,6 @@ import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import pandas as pd
-import yaml
 from joblib import Parallel, delayed
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
@@ -33,7 +32,6 @@ from telco_churn.data.split import partition
 from telco_churn.features.accessor import features_path, load_features
 from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.paths import get_project_root
 
 __all__ = [
     "COMMITTED_MODEL_FAMILY",
@@ -85,34 +83,6 @@ def _git_sha() -> str:
         ).strip()
     except Exception as e:
         logger.warning("git_sha_unavailable", error=str(e), exc_info=True)
-        return "unknown"
-
-
-def _dvc_hash(cfg: DictConfig) -> str:
-    """Return the DVC content hash of the processed CSV, or 'unknown' if not tracked.
-
-    A missing .dvc file is the expected, common case before Phase 8 wires up DVC
-    tracking — logged at debug only, not a warning. Any other failure (corrupted
-    YAML, unexpected file structure, a cfg missing paths.processed_data) is
-    logged as a warning so it doesn't masquerade as the same routine
-    'not tracked yet' fallback. The path construction stays inside the try along
-    with the file read — cfg.paths.processed_data can itself raise (e.g. a
-    minimal test cfg with no paths key), and that failure must be caught here
-    too, not just the file-open step.
-    """
-    try:
-        dvc_file = (
-            get_project_root()
-            / cfg.paths.processed_data
-            / "telco_churn_processed.csv.dvc"
-        )
-        with open(dvc_file) as f:
-            return str(yaml.safe_load(f)["outs"][0]["md5"])
-    except FileNotFoundError as e:
-        logger.debug("dvc_hash_not_tracked", error=str(e))
-        return "unknown"
-    except Exception as e:
-        logger.warning("dvc_hash_unexpected_error", error=str(e), exc_info=True)
         return "unknown"
 
 

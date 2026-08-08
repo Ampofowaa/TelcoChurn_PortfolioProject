@@ -32,7 +32,7 @@ test-features: ## Run features package tests with scoped coverage
 		--cov=src/telco_churn/features --cov-report=term-missing
 
 test-models: ## Run models package tests with scoped coverage
-	$(RUN) pytest tests/unit/test_train_common.py tests/unit/test_train_candidates.py tests/unit/test_train_comparison.py tests/unit/test_train_feature_audit.py tests/unit/test_train_tuning.py tests/unit/test_train_log_model.py tests/unit/test_diagnostics.py tests/unit/test_calibrate.py tests/unit/test_threshold.py tests/unit/test_economics.py tests/unit/test_error_analysis.py tests/unit/test_evaluate.py tests/unit/test_explain.py tests/unit/test_gate.py tests/unit/test_plots.py tests/unit/test_register.py tests/unit/test_drift_reference.py \
+	$(RUN) pytest tests/unit/test_train_common.py tests/unit/test_train_candidates.py tests/unit/test_train_comparison.py tests/unit/test_train_feature_audit.py tests/unit/test_train_feature_selection.py tests/unit/test_train_tuning.py tests/unit/test_train_log_model.py tests/unit/test_diagnostics.py tests/unit/test_calibrate.py tests/unit/test_threshold.py tests/unit/test_economics.py tests/unit/test_error_analysis.py tests/unit/test_evaluate.py tests/unit/test_explain.py tests/unit/test_gate.py tests/unit/test_plots.py tests/unit/test_register.py tests/unit/test_drift_reference.py \
 		--override-ini="addopts=" \
 		--cov=src/telco_churn/models --cov-report=term-missing
 

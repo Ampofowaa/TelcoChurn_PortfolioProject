@@ -38,6 +38,7 @@ from omegaconf import DictConfig
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.pipeline import Pipeline
 
+from telco_churn.features.accessor import features_sha256
 from telco_churn.features.build import FEATURE_SCHEMA
 from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.features.select import (
@@ -48,7 +49,6 @@ from telco_churn.features.select import (
     run_selection_cv,
 )
 from telco_churn.models.train.common import (
-    _dvc_hash,
     _git_sha,
     _log_dev_input,
     _plot_bootstrap_delta,
@@ -307,7 +307,7 @@ def run_feature_selection_step(
                 "stage": "selection_review",
                 "triggered_by": "manual",
                 "git_sha": _git_sha(),
-                "dvc_data_hash": _dvc_hash(cfg),
+                "data_content_hash": features_sha256(),
             }
         )
         _log_dev_input(X_dev, y_dev, context="review")

@@ -22,10 +22,10 @@ from sklearn.metrics import average_precision_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sqlalchemy import create_engine, text
 
+from telco_churn.features.accessor import features_sha256
 from telco_churn.features.build import FEATURE_SCHEMA
 from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.models.train.common import (
-    _dvc_hash,
     _git_sha,
     _lgbm_fixed_knobs,
     _log_dev_input,
@@ -296,18 +296,26 @@ def _build_optuna_storage() -> optuna.storages.RDBStorage:
 def _study_name(cfg: DictConfig, committed_features: list[str]) -> str:
     """Content-addressed study name: same inputs resume the same study.
 
-    Hashes data version, frozen features, and the tuning config (search space,
-    CV scheme, early-stopping settings, pruner) — everything that must stay fixed
-    across a study's trials for Optuna's per-parameter distributions to stay valid,
-    plus pruner (including its n_warmup_steps): a trial pruned under one policy
-    and a trial that ran unpruned under another aren't a fair comparison, so
-    mixing them into one pool would let 1-SE selection silently compare apples
-    to oranges. Any change to these starts a fresh study instead of silently
-    mixing incompatible trials into an old one.
+    Two independent hashes, not one combined digest, so the name itself is
+    legible: a human scanning the `optuna` schema or the MLflow UI can tell
+    at a glance whether a new study came from a data change or a config
+    change without decoding anything. `data_hash` is the processed-features
+    file's own sha256 (features/accessor.py::features_sha256) — real and
+    unconditional, unlike the retired `_dvc_hash`, which read a `.dvc`
+    sidecar that never existed for a pipeline-stage output and was
+    permanently `"unknown"`. `config_digest` hashes frozen features plus the
+    tuning config (search space, CV scheme, early-stopping settings, pruner)
+    — everything that must stay fixed across a study's trials for Optuna's
+    per-parameter distributions to stay valid, plus the pruner's
+    n_warmup_steps: a trial pruned under one policy and a trial that ran
+    unpruned under another aren't a fair comparison, so mixing them into one
+    pool would let 1-SE selection silently compare apples to oranges. A
+    change to either hash starts a fresh study instead of silently mixing
+    incompatible trials into an old one.
     """
+    data_hash = features_sha256()
     tuning_cfg = cfg.tuning
-    key = {
-        "dvc_hash": _dvc_hash(cfg),
+    config_key = {
         "committed_features": sorted(committed_features),
         "search_space": OmegaConf.to_container(tuning_cfg.search_space, resolve=True),
         "cv_folds": int(tuning_cfg.cv_folds),
@@ -318,10 +326,10 @@ def _study_name(cfg: DictConfig, committed_features: list[str]) -> str:
         "pruner": str(tuning_cfg.pruner),
         "pruner_n_warmup_steps": int(tuning_cfg.pruner_n_warmup_steps),
     }
-    digest = hashlib.sha256(
-        json.dumps(key, sort_keys=True, default=str).encode()
-    ).hexdigest()[:16]
-    return f"tuning_{digest}"
+    config_digest = hashlib.sha256(
+        json.dumps(config_key, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    return f"tuning_{data_hash[:8]}_{config_digest[:8]}"
 
 
 def _build_optuna_study(
@@ -652,7 +660,7 @@ def run_tuning_step(
             {
                 "stage": "tuning",
                 "git_sha": _git_sha(),
-                "dvc_data_hash": _dvc_hash(cfg),
+                "data_content_hash": features_sha256(),
             }
         )
         # Also covers log_model.py's "model" and calibrate.py's "calibrated_model"

@@ -18,12 +18,12 @@ from sklearn.metrics import average_precision_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 
+from telco_churn.features.accessor import features_sha256
 from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.models.train.common import (
     COMMITTED_MODEL_FAMILY,
     COMMITTED_MODEL_FAMILY_DECISION_RUN_ID,
-    _dvc_hash,
     _git_sha,
     _lgbm_fixed_knobs,
 )
@@ -224,7 +224,7 @@ def _build_training_manifest(
         "model_name": str(cfg.mlflow.registered_model_name),
         "model_family": COMMITTED_MODEL_FAMILY,
         "git_sha": _git_sha(),
-        "dvc_data_hash": _dvc_hash(cfg),
+        "data_content_hash": features_sha256(),
         "model_family_committed": {
             "model_family": COMMITTED_MODEL_FAMILY,
             "decision_reference": "ANALYSIS.md §4a",
@@ -386,6 +386,15 @@ def run_model_logging_step(
         "n_estimators": scaling["n_estimators_final"],
         **best_params,
     }
+    _colliding_keys = set(selected_hyperparameters) & set(fixed_hyperparameters)
+    if _colliding_keys:
+        raise ValueError(
+            "selected_hyperparameters and fixed_hyperparameters collide on "
+            f"{sorted(_colliding_keys)} — fixed: knobs must be non-negotiable "
+            "against any search result, so a key present in both means the "
+            "merge below is silently letting the fixed: block override a "
+            "value Optuna also searched, rather than a knob Optuna never saw."
+        )
     model_params = {**selected_hyperparameters, **fixed_hyperparameters}
 
     fitted = _fit_committed_pipeline(

@@ -147,7 +147,6 @@ def test_run_candidate_step_logs_metric_contract(
     monkeypatch.setattr(candidates.mlflow, "log_metric", lambda *a, **k: None)
     monkeypatch.setattr(common, "mlflow_from_pandas", lambda *a, **k: MagicMock())
     monkeypatch.setattr(candidates, "_git_sha", lambda: "deadbeef")
-    monkeypatch.setattr(candidates, "_dvc_hash", lambda cfg: "unknown")
 
     results = candidates.run_candidate_step(
         X_dev,
@@ -252,7 +251,6 @@ def test_run_candidate_step_dataset_source_uses_accessor_canonical_path(
     monkeypatch.setattr(candidates.mlflow, "log_metric", lambda *a, **k: None)
     monkeypatch.setattr(common, "mlflow_from_pandas", _fake_from_pandas)
     monkeypatch.setattr(candidates, "_git_sha", lambda: "deadbeef")
-    monkeypatch.setattr(candidates, "_dvc_hash", lambda cfg: "unknown")
 
     candidates.run_candidate_step(
         X_dev,

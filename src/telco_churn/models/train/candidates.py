@@ -25,6 +25,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.pipeline import Pipeline
 
+from telco_churn.features.accessor import features_sha256
 from telco_churn.features.build import FEATURE_SCHEMA
 from telco_churn.features.preprocessing import (
     build_linear_preprocessor,
@@ -32,7 +33,6 @@ from telco_churn.features.preprocessing import (
 )
 from telco_churn.models.train.common import (
     _build_dev_dataset,
-    _dvc_hash,
     _git_sha,
     cv_score_candidate,
     lgbm_default_params,
@@ -158,7 +158,7 @@ def run_candidate_step(
     ensure_experiment_metadata(cfg)
 
     git_sha = _git_sha()
-    dvc_hash = _dvc_hash(cfg)
+    data_content_hash = features_sha256()
     _dev_dataset = _build_dev_dataset(X_dev, y_dev)
 
     _model_family = {
@@ -180,7 +180,7 @@ def run_candidate_step(
                     "stage": _stage[name],
                     "model_family": _model_family[name],
                     "git_sha": git_sha,
-                    "dvc_data_hash": dvc_hash,
+                    "data_content_hash": data_content_hash,
                 }
             )
             mlflow.log_input(_dev_dataset, context="training")

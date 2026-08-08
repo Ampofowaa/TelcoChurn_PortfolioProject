@@ -205,11 +205,6 @@ def test_every_compose_config_call_site_also_calls_activate_config() -> None:
 _PROCESSED_DATA_PATH_READERS = {
     "features/accessor.py",
     "data/split.py",
-    # models/train/common.py::_dvc_hash reads this directly to locate
-    # telco_churn_processed.csv.dvc. Retired alongside the data_content_hash
-    # fix (PHASE_8_PREREQ_TASKS.md), not landed yet — remove this exception
-    # when that fix lands.
-    "models/train/common.py",
 }
 
 

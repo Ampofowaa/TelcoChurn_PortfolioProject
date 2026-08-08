@@ -19,6 +19,7 @@ import pandas as pd
 from omegaconf import DictConfig
 from sklearn.metrics import average_precision_score, roc_auc_score
 
+from telco_churn.features.accessor import features_sha256
 from telco_churn.features.preprocessing import TENURE_COHORT_EDGES, TENURE_COHORT_LABELS
 from telco_churn.models.diagnostics import (
     fixed_recall_profile,
@@ -26,7 +27,6 @@ from telco_churn.models.diagnostics import (
     segment_oof_errors,
 )
 from telco_churn.models.train.common import (
-    _dvc_hash,
     _git_sha,
     _log_dev_input,
     _plot_bootstrap_delta,
@@ -375,7 +375,7 @@ def run_comparison_step(
             {
                 "stage": "comparison",
                 "git_sha": _git_sha(),
-                "dvc_data_hash": _dvc_hash(cfg),
+                "data_content_hash": features_sha256(),
             }
         )
         _log_dev_input(X_dev, y_dev, context="training")

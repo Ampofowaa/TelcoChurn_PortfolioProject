@@ -9,6 +9,7 @@ import mlflow
 import pandas as pd
 from omegaconf import DictConfig
 
+from telco_churn.features.accessor import features_sha256
 from telco_churn.features.build import COMMITTED_FEATURES, FEATURE_SCHEMA
 from telco_churn.features.select import (
     compute_shap_audit,
@@ -16,7 +17,6 @@ from telco_churn.features.select import (
     mint_committed_list,
 )
 from telco_churn.models.train.common import (
-    _dvc_hash,
     _git_sha,
     _log_dev_input,
     _plot_permutation_importance,
@@ -102,7 +102,7 @@ def _log_selection_run(
             {
                 "stage": "selection",
                 "git_sha": _git_sha(),
-                "dvc_data_hash": _dvc_hash(cfg),
+                "data_content_hash": features_sha256(),
             }
         )
         _log_dev_input(X_dev, y_dev, context="training")
