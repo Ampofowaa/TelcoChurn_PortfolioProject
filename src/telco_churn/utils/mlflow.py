@@ -96,13 +96,18 @@ _EXPERIMENT_TAGS = {
 # this is static, idempotent text describing the run as a whole rather than
 # a per-step fragment any one of the three would overwrite the others' with.
 TRAINING_CYCLE_RUN_DESCRIPTION = (
-    "Training-cycle run. Optuna PR-AUC tuning of the frozen LightGBM spec "
-    "and the final tuned pipeline (logged as pyfunc with "
-    "training_manifest.json); calibration method selection and the cycle's "
-    "single registry registration (calibrate.py); cost-sensitive threshold "
-    "derivation and the pre-seal dev-OOF calibration/fairness screen "
-    "(threshold.py). This is the version aliased 'challenger', and - if it "
-    "clears the sealed-test gate - 'champion'."
+    "Training-cycle run. LightGBM's hyperparameters are searched against the "
+    "frozen feature set, scored on PR-AUC (tuning.py), and the winning "
+    "configuration is refit on the full development set and logged as a "
+    "deployable model with its full audit trail in training_manifest.json "
+    "(log_model.py). calibrate.py then turns the model's raw scores into "
+    "honest probabilities and performs the cycle's single registry "
+    "registration. threshold.py turns those probabilities into a decision - "
+    "the cost-sensitive cutoff at which a customer is worth contacting - "
+    "while re-checking that the calibration is still trustworthy and fair "
+    "before anything moves further. All four steps write to this same run. "
+    "The result is registered as 'challenger', and - if it clears the "
+    "sealed-test gate - 'champion'."
 )
 
 

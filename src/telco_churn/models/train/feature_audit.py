@@ -31,13 +31,14 @@ __all__ = ["run_feature_audit_step"]
 logger = get_logger(__name__)
 
 _RUN_DESCRIPTION = (
-    "Feature selection audit diagnostic — permutation importance against a "
-    "noise-decoy column, fit once on all of development. Committed feature "
-    "set is read from features/schema.py::COMMITTED_FEATURES, frozen by the "
-    "feature selection process (notebooks/03b-feature-selection.ipynb §2, "
-    "ANALYSIS.md §4b) rather than recomputed here; this run logs the "
-    "permutation-importance table and a non-gating SHAP audit for the model "
-    "actually being promoted this cycle."
+    "Per-cycle feature audit — not a selection step. The input feature set is "
+    "fixed (features/schema.py::COMMITTED_FEATURES, decided separately by the "
+    "feature-selection process — 03b §2, ANALYSIS.md §4b); this run doesn't "
+    "touch that decision, it explains it: which features actually carry "
+    "signal, checked by shuffling each one against a synthetic noise column, "
+    "and how the model leans on each one, via a non-gating SHAP audit. Feeds "
+    "the model card and error analysis for whichever model is promoted this "
+    "cycle."
 )
 
 
@@ -96,7 +97,7 @@ def _log_selection_run(
 
     ensure_experiment_metadata(cfg)
 
-    with mlflow.start_run(run_name="feature_selection"):
+    with mlflow.start_run(run_name="feature_audit"):
         set_run_description(_RUN_DESCRIPTION)
         mlflow.set_tags(
             {
@@ -181,7 +182,7 @@ def run_feature_audit_step(
     actually being promoted, not a stale snapshot from whenever COMMITTED_FEATURES
     was last decided.
 
-    Logs a 'feature_selection' MLflow run with the permutation-importance table
+    Logs a 'feature_audit' MLflow run with the permutation-importance table
     and its rendered chart (figures/permutation_importance.png — colour =
     survived, black dashed line = decoy floor), the SHAP audit and its rendered
     chart (figures/shap_importance_audit.png — features.select.compute_shap_audit's

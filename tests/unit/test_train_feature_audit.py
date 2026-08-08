@@ -153,7 +153,7 @@ def test_run_feature_audit_step_logs_selection_artifacts(
     dev_split: tuple[pd.DataFrame, pd.Series],
     selection_cfg: OmegaConf,
 ) -> None:
-    """The feature_selection run carries the permutation-importance table, SHAP
+    """The feature_audit run carries the permutation-importance table, SHAP
     audit, dropouts, committed list, and group-importance evidence — the full
     artifact contract documented in run_feature_audit_step's docstring.
     """
