@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from pathlib import Path
 from urllib.parse import urlparse
 
 import mlflow
@@ -18,12 +19,18 @@ import telco_churn.utils.mlflow as tc_mlflow
 from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
     load_model_promotion_bars,
+    read_calibrate_receipt,
+    read_train_receipt,
     resolve_logged_model_id,
+    resolve_model_identifier,
     resolve_model_run_id,
+    resolve_model_version_from_run_id,
     resolve_tracking_uri,
     set_logged_model_description,
     set_registered_model_description,
     set_run_description,
+    write_calibrate_receipt,
+    write_train_receipt,
 )
 from telco_churn.utils.paths import get_project_root
 
@@ -180,6 +187,181 @@ def test_resolve_logged_model_id_raises_when_tag_missing(
 
     with pytest.raises(ValueError, match="no logged_model_id tag"):
         resolve_logged_model_id(version, registry_cfg)
+
+
+# ---------------------------------------------------------------------------
+# resolve_model_version_from_run_id
+# ---------------------------------------------------------------------------
+
+
+def _log_and_register_with_run_id(registry_cfg: DictConfig) -> tuple[str, str]:
+    """Like _log_and_register, but also returns the registering run's run_id."""
+    mlflow.set_tracking_uri(str(registry_cfg.mlflow.tracking_uri))
+    registered_name = str(registry_cfg.mlflow.registered_model_name)
+    X = pd.DataFrame({"x": [1.0, 2.0, 3.0, 4.0]})
+    model = LogisticRegression().fit(X, [0, 1, 0, 1])
+    with mlflow.start_run() as run:
+        model_info = mlflow.sklearn.log_model(
+            sk_model=model, name="model", registered_model_name=registered_name
+        )
+    return run.info.run_id, str(model_info.registered_model_version)
+
+
+def test_resolve_model_version_from_run_id_returns_registered_version(
+    registry_cfg: DictConfig,
+) -> None:
+    """The reverse of resolve_model_run_id — a real registry round trip."""
+    run_id, version = _log_and_register_with_run_id(registry_cfg)
+
+    resolved = resolve_model_version_from_run_id(run_id, registry_cfg)
+
+    assert resolved == version
+
+
+def test_resolve_model_version_from_run_id_raises_on_no_match(
+    registry_cfg: DictConfig,
+) -> None:
+    """A run_id with no registered version (e.g. models.calibrate never ran
+    for it) must raise, not silently return an empty/garbage value."""
+    mlflow.set_tracking_uri(str(registry_cfg.mlflow.tracking_uri))
+    with mlflow.start_run() as run:
+        unregistered_run_id = run.info.run_id
+
+    with pytest.raises(ValueError, match="No registered version"):
+        resolve_model_version_from_run_id(unregistered_run_id, registry_cfg)
+
+
+def test_resolve_model_version_from_run_id_raises_on_multiple_matches(
+    registry_cfg: DictConfig,
+) -> None:
+    """Registering the same run's model twice mints two versions sharing one
+    run_id — an ambiguous case the reverse lookup must refuse to guess at."""
+    mlflow.set_tracking_uri(str(registry_cfg.mlflow.tracking_uri))
+    registered_name = str(registry_cfg.mlflow.registered_model_name)
+    X = pd.DataFrame({"x": [1.0, 2.0, 3.0, 4.0]})
+    model = LogisticRegression().fit(X, [0, 1, 0, 1])
+    with mlflow.start_run() as run:
+        model_info = mlflow.sklearn.log_model(sk_model=model, name="model")
+        run_id = run.info.run_id
+        mlflow.register_model(model_info.model_uri, registered_name)
+        mlflow.register_model(model_info.model_uri, registered_name)
+
+    with pytest.raises(ValueError, match="Multiple registered versions"):
+        resolve_model_version_from_run_id(run_id, registry_cfg)
+
+
+# ---------------------------------------------------------------------------
+# resolve_model_identifier
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_model_identifier_raises_when_both_given(
+    registry_cfg: DictConfig,
+) -> None:
+    """Ambiguous input is refused outright — never silently resolved in one
+    direction over the other. No registry call is needed to reach this raise."""
+    with pytest.raises(ValueError, match="Both an explicit run_id"):
+        resolve_model_identifier("some_run_id", "3", registry_cfg)
+
+
+def test_resolve_model_identifier_resolves_from_explicit_model_version(
+    registry_cfg: DictConfig,
+) -> None:
+    run_id, version = _log_and_register_with_run_id(registry_cfg)
+    registered_name = str(registry_cfg.mlflow.registered_model_name)
+
+    resolved_run_id, resolved_version, resolved_uri = resolve_model_identifier(
+        None, version, registry_cfg
+    )
+
+    assert resolved_run_id == run_id
+    assert resolved_version == version
+    assert resolved_uri == f"models:/{registered_name}/{version}"
+
+
+def test_resolve_model_identifier_resolves_from_explicit_run_id(
+    registry_cfg: DictConfig,
+) -> None:
+    run_id, version = _log_and_register_with_run_id(registry_cfg)
+    registered_name = str(registry_cfg.mlflow.registered_model_name)
+
+    resolved_run_id, resolved_version, resolved_uri = resolve_model_identifier(
+        run_id, None, registry_cfg
+    )
+
+    assert resolved_run_id == run_id
+    assert resolved_version == version
+    assert resolved_uri == f"models:/{registered_name}/{version}"
+
+
+def test_resolve_model_identifier_resolves_from_receipt_when_neither_given(
+    registry_cfg: DictConfig, tmp_path: Path
+) -> None:
+    """The fully-automatic path — nothing explicit given, resolves from
+    calibrate.py's receipt rather than the registry."""
+    receipt_cfg = OmegaConf.merge(
+        registry_cfg, {"paths": {"reports": str(tmp_path / "reports")}}
+    )
+    assert isinstance(receipt_cfg, DictConfig)
+    write_calibrate_receipt(
+        "receipt_run_id",
+        "7",
+        "receipt_model_id",
+        "runs:/receipt_run_id/calibrated_model",
+        receipt_cfg,
+    )
+
+    resolved_run_id, resolved_version, resolved_uri = resolve_model_identifier(
+        None, None, receipt_cfg
+    )
+
+    assert resolved_run_id == "receipt_run_id"
+    assert resolved_version == "7"
+    assert resolved_uri == "runs:/receipt_run_id/calibrated_model"
+
+
+# ---------------------------------------------------------------------------
+# train/calibrate receipts
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def reports_cfg(tmp_path: Path) -> DictConfig:
+    """Minimal cfg carrying only paths.reports, for the receipt read/write tests."""
+    return OmegaConf.create({"paths": {"reports": str(tmp_path / "reports")}})
+
+
+def test_write_and_read_train_receipt_round_trips(reports_cfg: DictConfig) -> None:
+    write_train_receipt("a_run_id", reports_cfg)
+
+    receipt = read_train_receipt(reports_cfg)
+
+    assert receipt == {"run_id": "a_run_id"}
+
+
+def test_read_train_receipt_raises_when_absent(reports_cfg: DictConfig) -> None:
+    with pytest.raises(FileNotFoundError, match="calibration.run_id"):
+        read_train_receipt(reports_cfg)
+
+
+def test_write_and_read_calibrate_receipt_round_trips(reports_cfg: DictConfig) -> None:
+    write_calibrate_receipt(
+        "a_run_id", "3", "a_model_id", "models:/telco-churn-pipeline/3", reports_cfg
+    )
+
+    receipt = read_calibrate_receipt(reports_cfg)
+
+    assert receipt == {
+        "run_id": "a_run_id",
+        "model_version": "3",
+        "logged_model_id": "a_model_id",
+        "model_uri": "models:/telco-churn-pipeline/3",
+    }
+
+
+def test_read_calibrate_receipt_raises_when_absent(reports_cfg: DictConfig) -> None:
+    with pytest.raises(FileNotFoundError, match="run_id/model_version"):
+        read_calibrate_receipt(reports_cfg)
 
 
 # ---------------------------------------------------------------------------

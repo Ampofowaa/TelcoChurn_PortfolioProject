@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import mlflow
 import numpy as np
 import pandas as pd
@@ -39,7 +42,7 @@ def tuning_mlflow_uri(tmp_path_factory: pytest.TempPathFactory) -> str:
 
 
 @pytest.fixture
-def registration_cfg() -> OmegaConf:
+def registration_cfg(tmp_path: Path) -> OmegaConf:
     """Minimal cfg for run_model_logging_step — training.fixed + a registry name."""
     return OmegaConf.create(
         {
@@ -65,6 +68,7 @@ def registration_cfg() -> OmegaConf:
                 "experiment_name": "test_run_model_logging_step",
                 "registered_model_name": "test-telco-churn-pipeline",
             },
+            "paths": {"reports": str(tmp_path / "reports")},
         }
     )
 
@@ -144,6 +148,29 @@ def test_run_model_logging_step_returns_expected_keys(
     }
     assert result["run_id"] == tuning_result["parent_run_id"]
     assert result["parity_ok"] is True
+
+
+def test_run_model_logging_step_writes_train_receipt(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    registration_cfg: OmegaConf,
+    tuning_result: dict,
+) -> None:
+    """reports/train_receipt.json is written with this run's run_id — the
+    pointer calibrate.py's __main__ reads by default when no explicit
+    calibration.run_id override is given."""
+    registration_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    tuning_result["parent_run_id"] = _start_parent_run()
+
+    result = log_model.run_model_logging_step(
+        X_dev, y_dev, tuning_result, registration_cfg
+    )
+
+    receipt_path = Path(str(registration_cfg.paths.reports)) / "train_receipt.json"
+    assert receipt_path.exists()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt == {"run_id": result["run_id"]}
 
 
 def test_run_model_logging_step_raises_on_hyperparameter_collision(

@@ -12,8 +12,11 @@ own last step) -> evaluate.run_evaluation_step — one step further down the
 pipeline than test_evaluate_subprocess.py's own precedent. Only
 error_analysis.py itself crosses the subprocess boundary. A dev-OOF screen
 failure (a real slope outside the band on this synthetic fixture) is
-tolerated during seeding — its artifacts are written before it raises, so
-evaluate.py's read just after is unaffected either way.
+tolerated during seeding — its artifacts are written before it raises. Since
+PR B0, though, evaluate.run_evaluation_step (called next in this same
+fixture) independently re-checks the screen's verdict and will itself raise
+if it failed — a screen failure now cascades and blocks the whole fixture,
+not just threshold's own step (see the fixture's own inline comment).
 """
 
 from __future__ import annotations
@@ -261,18 +264,23 @@ def evaluated_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, objec
             tuning_result["parent_run_id"] = run.info.run_id
         log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
         cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
+        run_id = str(cal_result["run_id"])
         model_version = str(cal_result["model_version"])
+        model_uri = str(cal_result["model_uri"])
 
-        try:
-            threshold.run_threshold_step(model_version, cfg)
-        except RuntimeError:
-            # A dev-OOF screen failure (the real slope on this synthetic
-            # fixture lying outside the band) is a legitimate outcome, not a
-            # setup bug — reports/dev_oof_predictions.parquet and
-            # dev_oof_diagnostics.json are written before that raise, so
-            # evaluate.py's read just below is unaffected either way.
-            pass
-        evaluate.run_evaluation_step(model_version, cfg)
+        # A dev-OOF screen failure used to be tolerated here (threshold.py's
+        # own RuntimeError, swallowed) since it didn't block evaluate.py.
+        # Since PR B0, evaluate.py/error_analysis.py both independently
+        # re-check screen_passed via check_threshold_screen_passed and raise
+        # RuntimeError too — a screen failure now cascades and blocks every
+        # downstream step in this fixture, so it is no longer a tolerable
+        # outcome to swallow here. The same seeded synthetic fixture passes
+        # the screen deterministically in test_error_analysis.py's in-process
+        # equivalent (no try/except needed there), so this is expected to
+        # succeed; a real failure here means the synthetic data or the real
+        # calibration slope changed and needs investigating, not silencing.
+        threshold.run_threshold_step(run_id, model_version, cfg)
+        evaluate.run_evaluation_step(run_id, model_version, model_uri, cfg)
     finally:
         reset_active_config()
 
@@ -293,15 +301,26 @@ def _run_error_analysis_cli(
     fixture: dict[str, object],
     extra_overrides: list[str] | None = None,
     timeout: int = 300,
+    reports_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Invoke error_analysis.py's CLI as a real subprocess with sandboxed output paths."""
+    """Invoke error_analysis.py's CLI as a real subprocess with sandboxed output paths.
+
+    reports_dir defaults to fixture["reports_dir"] — the same directory
+    calibrate.run_calibration_step wrote reports/calibrate_receipt.json into
+    during fixture setup, so omitting model_version resolves via that
+    receipt by default. A caller testing the no-receipt case passes a fresh
+    empty directory instead.
+    """
+    resolved_reports_dir = (
+        reports_dir if reports_dir is not None else fixture["reports_dir"]
+    )
     overrides = [
         f"mlflow.tracking_uri={fixture['tracking_uri']}",
         f"mlflow.registered_model_name={fixture['registered_model_name']}",
         f"paths.costs_config={fixture['costs_path']}",
         f"paths.policy={fixture['policy_dir']}",
         f"paths.figures={fixture['figures_dir']}",
-        f"paths.reports={fixture['reports_dir']}",
+        f"paths.reports={resolved_reports_dir}",
         f"paths.processed_data={fixture['data_dir']}",
     ]
     if model_version is not None:
@@ -423,16 +442,41 @@ def test_error_analysis_main_cli_exits_zero_and_writes_report(
     assert version.tags.get("error_analysis_run_id") == runs[0].info.run_id
 
 
-def test_error_analysis_main_cli_exits_one_when_model_version_missing(
+def test_error_analysis_main_cli_resolves_from_receipt_when_model_version_missing(
     evaluated_model: dict[str, object],
 ) -> None:
-    """error_analysis.py __main__ exits 1 when error_analysis.model_version is
-    not provided — never inferred from 'latest'."""
-    result = _run_error_analysis_cli(None, evaluated_model, timeout=60)
+    """error_analysis.py __main__ falls back to reports/calibrate_receipt.json
+    (written by calibrate.run_calibration_step during fixture setup, into the
+    same reports dir this CLI call points at) when neither
+    error_analysis.model_version nor error_analysis.run_id is provided —
+    never inferred from the `challenger`/`champion` alias, but no longer a
+    required CLI argument either, since PR B0."""
+    result = _run_error_analysis_cli(None, evaluated_model, timeout=300)
+
+    assert result.returncode == 0, (
+        f"error_analysis CLI should resolve via the receipt and succeed when "
+        f"model_version is omitted:\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+    assert "error_analysis_step_done" in result.stdout
+
+
+def test_error_analysis_main_cli_exits_one_when_no_override_and_no_receipt(
+    evaluated_model: dict[str, object], tmp_path: Path
+) -> None:
+    """Without an explicit override, and with no calibrate_receipt.json on
+    disk either, the CLI still fails loudly rather than guessing."""
+    empty_reports_dir = tmp_path / "empty_reports"
+    empty_reports_dir.mkdir()
+
+    result = _run_error_analysis_cli(
+        None, evaluated_model, timeout=60, reports_dir=empty_reports_dir
+    )
 
     assert result.returncode == 1, (
-        f"error_analysis CLI should exit 1 when error_analysis.model_version "
-        f"is missing:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        f"error_analysis CLI should exit 1 when neither an explicit override "
+        f"nor a calibrate_receipt.json is available:\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
     )
 
 

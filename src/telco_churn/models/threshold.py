@@ -65,7 +65,7 @@ from telco_churn.utils.mlflow import (
     TRAINING_CYCLE_RUN_DESCRIPTION,
     load_model_promotion_bars,
     resolve_logged_model_id,
-    resolve_model_run_id,
+    resolve_model_identifier,
     resolve_tracking_uri,
     set_run_description,
 )
@@ -634,8 +634,8 @@ def _save_scenario_ev_curve_plot(
     plt.close(fig)
 
 
-def _load_and_align_dev_oof(model_version: str, cfg: DictConfig) -> dict[str, Any]:
-    """Resolve the model's run, load its dev-OOF probabilities, and align them to the dev partition.
+def _load_and_align_dev_oof(run_id: str, cfg: DictConfig) -> dict[str, Any]:
+    """Load the model's dev-OOF probabilities and align them to the dev partition.
 
     Loads calibrate.py's persisted dev_oof_predictions.parquet (for the
     method recorded in calibration_summary.json) rather than recomputing —
@@ -645,7 +645,6 @@ def _load_and_align_dev_oof(model_version: str, cfg: DictConfig) -> dict[str, An
     otherwise never surface.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    run_id = resolve_model_run_id(model_version, cfg)
 
     manifest = load_training_manifest(run_id, cfg)
     calibration_summary = load_calibration_summary(run_id, cfg)
@@ -831,6 +830,7 @@ def _assemble_threshold_payloads(
     loaded: dict[str, Any],
     derived: dict[str, Any],
     model_version: str,
+    screen_passed: bool,
     cfg: DictConfig,
 ) -> dict[str, Any]:
     """Assemble threshold.json, threshold.yaml (policy), and threshold_validation.json.
@@ -838,13 +838,18 @@ def _assemble_threshold_payloads(
     The two files on disk split along model-independence: configs/policy/
     threshold.yaml carries only the pure functions of configs/costs.yaml
     (threshold/costs/retention_rate_sensitivity), pinned by a
-    costs_config_hash and carrying no model_run_id/model_version — a
+    costs_config_hash and carrying no model_run_id/logged_model_id — a
     model-independent file must not carry a model stamp, or a rollback to a
     different champion leaves it describing the wrong model.
     threshold_validation.json carries the model-dependent half (argmax-EV
-    threshold, its bootstrap CI, calibration_method, ...) as an artifact on
-    this model's own run, so it travels with that version rather than
-    sitting at a fixed path a rollback could leave stale.
+    threshold, its bootstrap CI, calibration_method, screen_passed, ...) as
+    an artifact on this model's own run, so it travels with that version
+    rather than sitting at a fixed path a rollback could leave stale.
+
+    Stamped with logged_model_id, not model_version: a LoggedModel is the
+    actual scored artifact evaluate.py/error_analysis.py compare against
+    (check_threshold_provenance) — model_run_id is kept as a locator only,
+    no longer load-bearing.
 
     Every scenario's full diagnostic bundle ships in both payloads, not just
     its t* — conservative and optimistic are equally auditable. `base` alone
@@ -853,6 +858,7 @@ def _assemble_threshold_payloads(
     """
     results, base, sweep = derived["results"], derived["base"], derived["sweep"]
     run_id, method = loaded["run_id"], loaded["method"]
+    logged_model_id = resolve_logged_model_id(model_version, cfg)
 
     threshold_payload: dict[str, Any] = {
         "threshold": base["threshold"],
@@ -865,7 +871,7 @@ def _assemble_threshold_payloads(
         "scenarios": results,
         "retention_rate_sensitivity": sweep,
         "model_run_id": run_id,
-        "model_version": str(model_version),
+        "logged_model_id": logged_model_id,
     }
 
     costs_hash = costs_config_hash(get_project_root() / str(cfg.paths.costs_config))
@@ -887,12 +893,17 @@ def _assemble_threshold_payloads(
     }
     validation_payload: dict[str, Any] = {
         "model_run_id": run_id,
-        "model_version": str(model_version),
+        "logged_model_id": logged_model_id,
         "calibration_method": method,
         "argmax_ev_threshold": base["argmax_ev_threshold"],
         "argmax_ev_bootstrap_ci": base["argmax_ev_bootstrap_ci"],
         "within_ci": base["within_ci"],
         "implied_contact_rate": base["implied_contact_rate"],
+        # The model-dependent half of the dev-OOF calibration screen —
+        # evaluate.py/error_analysis.py re-check this independently via
+        # check_threshold_screen_passed, on top of the RuntimeError
+        # run_threshold_step itself already raises when it's False.
+        "screen_passed": screen_passed,
         "scenarios": {
             name: {
                 "scenario": name,
@@ -1026,12 +1037,16 @@ def _write_threshold_reports(
         json.dump(dev_oof_diagnostics, f, indent=2, default=str)
 
 
-def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+def run_threshold_step(
+    run_id: str, model_version: str, cfg: DictConfig
+) -> dict[str, Any]:
     """Derive and ship the cost-sensitive threshold for a registered calibrated model.
 
-    Resolved by explicit model_version, never the `challenger` alias: a
-    re-calibration invalidates a previously-derived threshold, and an alias
-    is a moving pointer that could later point at a different version.
+    Takes `run_id`/`model_version` already resolved by the caller
+    (utils.mlflow.resolve_model_identifier — an explicit override, never the
+    `challenger` alias, or calibrate.py's receipt): a re-calibration
+    invalidates a previously-derived threshold, and an alias is a moving
+    pointer that could later point at a different version.
 
     Finally runs the dev-OOF screen: screens calibrate.py's logged
     calibration slope against ANALYSIS.md §0's band and computes V1/V2/V2b on
@@ -1040,7 +1055,7 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     reports/dev_oof_predictions.parquet and reports/dev_oof_diagnostics.json.
     Raises RuntimeError, after logging, if the slope fails the band.
     """
-    loaded = _load_and_align_dev_oof(model_version, cfg)
+    loaded = _load_and_align_dev_oof(run_id, cfg)
     derived = _derive_scenario_thresholds(
         loaded["X_dev"], loaded["y_dev"], loaded["oof_proba"], loaded["y_dev_arr"], cfg
     )
@@ -1051,7 +1066,9 @@ def run_threshold_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     screen = _run_dev_oof_screen(
         loaded, float(derived["base"]["threshold"]), cfg, random_state
     )
-    payloads = _assemble_threshold_payloads(loaded, derived, model_version, cfg)
+    payloads = _assemble_threshold_payloads(
+        loaded, derived, model_version, screen["screen_passed"], cfg
+    )
     _log_threshold_run(loaded, derived, figures, payloads, screen, model_version, cfg)
     _write_threshold_reports(
         loaded, payloads["policy_payload"], screen["dev_oof_diagnostics"], cfg
@@ -1105,24 +1122,17 @@ if __name__ == "__main__":
     load_dotenv()
     configure_logging()
 
-    def _require_model_version(cfg: DictConfig) -> str:
-        """Return threshold.model_version, raising if the CLI override was not supplied."""
-        if cfg.threshold.model_version is None:
-            raise ValueError(
-                "threshold.model_version is required, e.g. `python -m "
-                "telco_churn.models.threshold threshold.model_version=1`"
-            )
-        return str(cfg.threshold.model_version)
-
     try:
         cfg = compose_config(overrides=sys.argv[1:] or None)
         activate_config(cfg)
-        cli_model_version = _require_model_version(cfg)
-        result = run_threshold_step(cli_model_version, cfg)
+        cli_run_id, cli_model_version, _cli_model_uri = resolve_model_identifier(
+            cfg.threshold.run_id, cfg.threshold.model_version, cfg
+        )
+        result = run_threshold_step(cli_run_id, cli_model_version, cfg)
         logger.info(
             "threshold_step_done",
             threshold=result["threshold_payload"]["threshold"],
-            model_version=result["threshold_payload"]["model_version"],
+            model_version=cli_model_version,
         )
     except FileNotFoundError as e:
         logger.error("threshold_data_not_found", error=str(e), exc_info=True)

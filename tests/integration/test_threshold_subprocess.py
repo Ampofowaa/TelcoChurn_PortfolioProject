@@ -222,6 +222,12 @@ def registered_threshold_model(
             f"mlflow.tracking_uri={tracking_uri}",
             f"mlflow.registered_model_name={registered_model_name}",
             f"paths.processed_data={data_dir}",
+            # calibrate.run_calibration_step now writes reports/
+            # calibrate_receipt.json — must be sandboxed here or it leaks a
+            # write into the real project's reports/ directory (paths.reports
+            # is otherwise untouched by this fixture, unlike the sibling
+            # subprocess fixtures which already sandbox it for other reasons).
+            f"paths.reports={seed_root / 'reports'}",
             *_FAST_CALIBRATION_OVERRIDES,
         ]
     )

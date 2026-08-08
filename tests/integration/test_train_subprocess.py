@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -129,6 +130,7 @@ def test_train_main_cli_exits_zero(tmp_path: Path) -> None:
     data_dir = tmp_path / "processed"
     data_dir.mkdir()
     _seed_processed_data(data_dir)
+    reports_dir = tmp_path / "reports"
     mlflow_db = tmp_path / "mlflow.db"
     tracking_uri = f"sqlite:///{mlflow_db}"
 
@@ -148,6 +150,13 @@ def test_train_main_cli_exits_zero(tmp_path: Path) -> None:
             "-m",
             "telco_churn.models.train",
             f"paths.processed_data={data_dir}",
+            # Sandboxes run_model_logging_step's write_train_receipt call
+            # (Phase 8 PR B0) away from the real project reports/ — without
+            # this override it defaults to config.yaml's plain "reports"
+            # literal, resolved against the real project root regardless of
+            # cwd, and this test would leak a real reports/train_receipt.json
+            # into the tracked working directory on every run.
+            f"paths.reports={reports_dir}",
             *_FAST_OVERRIDES,
         ],
         env=env,
@@ -162,12 +171,19 @@ def test_train_main_cli_exits_zero(tmp_path: Path) -> None:
         result.returncode == 0
     ), f"train CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     assert "model_logged" in result.stdout
+    assert "train_step_done" in result.stdout
 
     # Real SQLite-backed registry, not a mock — the CI guard that Step 5 never
     # registers (CLAUDE.md: an uncalibrated pipeline is a stage of construction,
     # never a registry version).
     client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
     assert client.search_registered_models() == []
+
+    receipt = json.loads(
+        (reports_dir / "train_receipt.json").read_text(encoding="utf-8")
+    )
+    assert set(receipt) == {"run_id"}
+    assert receipt["run_id"]
 
 
 def test_train_main_cli_exits_one_when_processed_data_missing(tmp_path: Path) -> None:

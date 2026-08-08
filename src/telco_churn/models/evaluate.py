@@ -92,7 +92,7 @@ from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
     load_model_promotion_bars,
     resolve_logged_model_id,
-    resolve_model_run_id,
+    resolve_model_identifier,
     resolve_tracking_uri,
     set_run_description,
 )
@@ -106,6 +106,7 @@ from telco_churn.utils.stats import (
 __all__ = [
     "build_gate_inputs",
     "check_threshold_provenance",
+    "check_threshold_screen_passed",
     "comparative_deltas",
     "content_hash",
     "demographic_parity_difference_by_axis",
@@ -122,7 +123,6 @@ __all__ = [
     "resolve_champion_version",
     "resolve_incumbent_summary",
     "resolve_logged_model_id",
-    "resolve_model_run_id",
     "resolve_policy_scenarios",
     "resolve_policy_thresholds_by_scenario",
     "run_evaluation_step",
@@ -171,12 +171,17 @@ _CONTACT_ALL_THRESHOLD = 0.0
 _CONTACT_NONE_THRESHOLD = 1.0 + 1e-9
 
 
-def load_fitted_model(model_version: str, cfg: DictConfig) -> Pipeline:
-    """Load the calibrated pipeline for an explicit registered version — never an alias."""
-    registered_model_name = str(cfg.mlflow.registered_model_name)
-    model: Pipeline = mlflow.sklearn.load_model(
-        f"models:/{registered_model_name}/{model_version}"
-    )
+def load_fitted_model(model_uri: str, cfg: DictConfig) -> Pipeline:
+    """Load the calibrated pipeline from an explicit model URI — never an alias.
+
+    model_uri is caller-resolved (resolve_model_identifier): the immutable
+    registry URI (models:/<name>/<version>) on an explicit run_id/
+    model_version override, or calibrate.py's receipt's own stored
+    run-scoped URI on the fully-automatic (neither given) path — the latter
+    never touches the registry version pointer at all.
+    """
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    model: Pipeline = mlflow.sklearn.load_model(model_uri)
     return model
 
 
@@ -247,7 +252,7 @@ def load_dev_oof_diagnostics(run_id: str, cfg: DictConfig) -> dict[str, Any]:
 
 
 def check_threshold_provenance(
-    validation_payload: dict[str, Any], run_id: str, model_version: str
+    validation_payload: dict[str, Any], logged_model_id: str
 ) -> None:
     """Raise ValueError if the threshold's model stamp doesn't match the model being evaluated.
 
@@ -258,16 +263,39 @@ def check_threshold_provenance(
     own docstring) is aspirational until something checks it — this is that
     check. Applying a threshold derived against a different calibration map
     would otherwise produce plausible, wrong numbers with nothing raised.
+
+    Compares on logged_model_id, not (run_id, model_version): a LoggedModel
+    is the actual scored artifact, and model_run_id is kept in
+    validation_payload as a locator only (see threshold.py's payload
+    assembly) — no longer load-bearing here.
     """
-    stamped_run_id = str(validation_payload["model_run_id"])
-    stamped_version = str(validation_payload["model_version"])
-    if stamped_run_id != run_id or stamped_version != model_version:
+    stamped_model_id = str(validation_payload["logged_model_id"])
+    if stamped_model_id != logged_model_id:
         raise ValueError(
             "threshold_validation.json's model stamp "
-            f"(run_id={stamped_run_id!r}, version={stamped_version!r}) does not "
-            f"match the model being evaluated (run_id={run_id!r}, "
-            f"version={model_version!r}) — the threshold was derived against a "
-            "different calibration map. Re-run models.threshold before evaluating."
+            f"(logged_model_id={stamped_model_id!r}) does not match the model "
+            f"being evaluated (logged_model_id={logged_model_id!r}) — the "
+            "threshold was derived against a different calibration map. "
+            "Re-run models.threshold before evaluating."
+        )
+
+
+def check_threshold_screen_passed(validation_payload: dict[str, Any]) -> None:
+    """Raise RuntimeError if threshold.py's dev-OOF calibration screen failed.
+
+    validation_payload["screen_passed"] is the model-dependent half of
+    threshold.py's dev-OOF screen (slope-band check) — this is an
+    independent re-check at every downstream reader (evaluate.py,
+    error_analysis.py), not a replacement for the RuntimeError
+    run_threshold_step itself already raises when the screen fails. No
+    override flag: a failed screen means the calibration is not trustworthy,
+    and nothing downstream may proceed against it regardless.
+    """
+    if not bool(validation_payload["screen_passed"]):
+        raise RuntimeError(
+            "threshold_validation.json's screen_passed is False — "
+            "threshold.py's dev-OOF calibration screen failed for this "
+            "model. Re-calibrate before evaluating or running error analysis."
         )
 
 
@@ -672,7 +700,10 @@ def load_incumbent_proba(champion_version: str, cfg: DictConfig) -> NDArray[np.f
     robust to that mismatch, rather than assuming the two share one
     committed_features list.
     """
-    incumbent_model = load_fitted_model(champion_version, cfg)
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+    incumbent_model = load_fitted_model(
+        f"models:/{registered_model_name}/{champion_version}", cfg
+    )
     test_df = _load_test_partition()
     proba: NDArray[np.float64] = incumbent_model.predict_proba(test_df)[:, 1]
     return proba
@@ -1197,18 +1228,21 @@ def _save_gains_lift_plot(decile_rows: list[dict[str, float]], path: Path) -> No
     plt.close(fig)
 
 
-def _load_and_score_candidate(model_version: str, cfg: DictConfig) -> dict[str, Any]:
-    """Resolve the candidate's run, check threshold provenance, and score the sealed test set once."""
+def _load_and_score_candidate(
+    run_id: str, model_version: str, model_uri: str, cfg: DictConfig
+) -> dict[str, Any]:
+    """Check threshold provenance/screen status, and score the sealed test set once."""
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     registered_model_name = str(cfg.mlflow.registered_model_name)
 
-    run_id = resolve_model_run_id(model_version, cfg)
     validation_payload = load_threshold_validation(run_id, cfg)
-    check_threshold_provenance(validation_payload, run_id, model_version)
+    logged_model_id = resolve_logged_model_id(model_version, cfg)
+    check_threshold_provenance(validation_payload, logged_model_id)
+    check_threshold_screen_passed(validation_payload)
 
     manifest = load_training_manifest(run_id, cfg)
     committed_features = committed_features_from_manifest(manifest)
-    model = load_fitted_model(model_version, cfg)
+    model = load_fitted_model(model_uri, cfg)
 
     X_test, y_test = load_test_features(committed_features)
     proba: NDArray[np.float64] = model.predict_proba(X_test)[:, 1]
@@ -1744,6 +1778,11 @@ def _log_evaluation_run(
                     "customerid": loaded["customer_ids"],
                     "y_true": y_test.reset_index(drop=True),
                     "p_hat": proba,
+                    # Stamped so error_analysis.py can detect a stale local
+                    # reports/test_predictions.parquet copy left over from a
+                    # different (e.g. rolled-back) model version — closes the
+                    # stale-copy-on-hand-run-rollback hole.
+                    "logged_model_id": model_id,
                 }
             )
             test_predictions.to_parquet(predictions_path, index=False)
@@ -1830,14 +1869,19 @@ def _write_reports_mirror(
     test_predictions.to_parquet(reports_dir / "test_predictions.parquet", index=False)
 
 
-def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+def run_evaluation_step(
+    run_id: str, model_version: str, model_uri: str, cfg: DictConfig
+) -> dict[str, Any]:
     """Run the full sealed-test evaluation cycle and log it to a dedicated `evaluation` run.
 
-    Resolves `model_version` explicitly (never an alias), scores the sealed
-    test set exactly once, computes every metrics/economics/slice block from
-    that one probability vector, resolves the incumbent champion (if any) to
-    score on the identical rows, and calls gate.py::decide_promotion — the
-    single pass CLAUDE.md's "test set touched once" invariant permits.
+    Takes `run_id`/`model_version`/`model_uri` already resolved by the
+    caller (utils.mlflow.resolve_model_identifier — an explicit run_id/
+    model_version override, never an alias, or calibrate.py's receipt),
+    scores the sealed test set exactly once, computes every metrics/
+    economics/slice block from that one probability vector, resolves the
+    incumbent champion (if any) to score on the identical rows, and calls
+    gate.py::decide_promotion — the single pass CLAUDE.md's "test set
+    touched once" invariant permits.
 
     Logs a dedicated `evaluation` run (never appended to the dev model's own
     run — CLAUDE.md), mirrors metrics.json/economics.json/
@@ -1847,7 +1891,7 @@ def run_evaluation_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
     notebook, matching this project's convention that notebooks only
     display pipeline-produced figures, never render their own.
     """
-    loaded = _load_and_score_candidate(model_version, cfg)
+    loaded = _load_and_score_candidate(run_id, model_version, model_uri, cfg)
     y_test, proba = loaded["y_test"], loaded["proba"]
 
     policy_ctx = _load_policy_context(cfg)
@@ -1923,20 +1967,13 @@ if __name__ == "__main__":
     load_dotenv()
     configure_logging()
 
-    def _require_model_version(cfg: DictConfig) -> str:
-        """Return evaluate.model_version, raising if the CLI override was not supplied."""
-        if cfg.evaluate.model_version is None:
-            raise ValueError(
-                "evaluate.model_version is required, e.g. `python -m "
-                "telco_churn.models.evaluate evaluate.model_version=1`"
-            )
-        return str(cfg.evaluate.model_version)
-
     try:
         cfg = compose_config(overrides=sys.argv[1:] or None)
         activate_config(cfg)
-        cli_model_version = _require_model_version(cfg)
-        result = run_evaluation_step(cli_model_version, cfg)
+        cli_run_id, cli_model_version, cli_model_uri = resolve_model_identifier(
+            cfg.evaluate.run_id, cfg.evaluate.model_version, cfg
+        )
+        result = run_evaluation_step(cli_run_id, cli_model_version, cli_model_uri, cfg)
         logger.info(
             "evaluation_step_done",
             model_version=result["model_version"],

@@ -51,7 +51,14 @@ try:
     #      to MLflow (uncalibrated, unregistered — calibrate.py picks it up next).
     selection = run_feature_audit_step(X_dev, y_dev, cfg)
     tuning = run_tuning_step(X_dev, y_dev, selection["committed_features"], cfg)
-    run_model_logging_step(X_dev, y_dev, tuning, cfg)
+    logging_result = run_model_logging_step(X_dev, y_dev, tuning, cfg)
+
+    logger.info(
+        "train_step_done",
+        run_id=logging_result["run_id"],
+        model_uri=logging_result["model_uri"],
+        parity_ok=logging_result["parity_ok"],
+    )
 
 except FileNotFoundError as e:
     logger.error(

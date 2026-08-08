@@ -1,7 +1,13 @@
 # Threshold derivation configuration — see models/threshold.py.
 
-# telco-churn-pipeline version to derive the threshold for — required, e.g. `threshold.model_version=1`.
+# telco-churn-pipeline version to derive the threshold for, e.g. `threshold.model_version=1`.
+# Giving both this and run_id is an error (ambiguous, never silently resolved
+# in one direction). Giving neither falls back to reports/calibrate_receipt.json.
 model_version: null
+
+# telco-churn-pipeline run_id to derive the threshold for, e.g. `threshold.run_id=<id>`.
+# Alternative to model_version above — see its comment for the both/neither rules.
+run_id: null
 
 # argmax-EV bootstrap CI resampling seed (see costs.yaml's argmax_ev_bootstrap_n_samples for the resample count).
 random_state: 42

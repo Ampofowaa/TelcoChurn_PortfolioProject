@@ -44,10 +44,12 @@ from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (
     TRAINING_CYCLE_RUN_DESCRIPTION,
     ensure_experiment_metadata,
+    read_train_receipt,
     resolve_tracking_uri,
     set_logged_model_description,
     set_registered_model_description,
     set_run_description,
+    write_calibrate_receipt,
 )
 from telco_churn.utils.paths import get_project_root
 from telco_churn.utils.stats import paired_bootstrap_ci
@@ -1368,6 +1370,12 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     reference scores on them, captured before log_model/pickling touches
     anything) — the independent reference register.py's serving-parity
     smoke check verifies against, and Phase 9's API parity test reuses.
+
+    Writes reports/calibrate_receipt.json ({"run_id", "model_version",
+    "logged_model_id", "model_uri"}) — the pointer threshold.py/evaluate.py/
+    error_analysis.py's __main__ blocks read by default when no explicit
+    run_id/model_version override is given (see utils/mlflow.py's module
+    docstring for why a local receipt is safe here).
     """
     manifest = load_training_manifest(run_id, cfg)
     _check_trial_count_gate(manifest, run_id, cfg)
@@ -1407,6 +1415,10 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     )
     _point_challenger_alias(cfg, version)
 
+    write_calibrate_receipt(
+        run_id, version, model_info.model_id, model_info.model_uri, cfg
+    )
+
     logger.info(
         "calibration_registered",
         run_id=run_id,
@@ -1438,19 +1450,22 @@ if __name__ == "__main__":
     load_dotenv()
     configure_logging()
 
-    def _require_run_id(cfg: DictConfig) -> str:
-        """Return calibration.run_id, raising if the CLI override was not supplied."""
-        if cfg.calibration.run_id is None:
-            raise ValueError(
-                "calibration.run_id is required, e.g. `python -m "
-                "telco_churn.models.calibrate calibration.run_id=<tuning_study_run_id>`"
-            )
-        return str(cfg.calibration.run_id)
+    def _resolve_run_id(cfg: DictConfig) -> str:
+        """Return calibration.run_id if given, else train.py's receipt's run_id.
+
+        No both-given ambiguity guard applies here (unlike
+        threshold.py/evaluate.py/error_analysis.py's model_version/run_id
+        pair) — calibrate.py has exactly one upstream identifier axis, since
+        nothing is registered yet at this point in the pipeline.
+        """
+        if cfg.calibration.run_id is not None:
+            return str(cfg.calibration.run_id)
+        return str(read_train_receipt(cfg)["run_id"])
 
     try:
         cfg = compose_config(overrides=sys.argv[1:] or None)
         activate_config(cfg)
-        cli_run_id = _require_run_id(cfg)
+        cli_run_id = _resolve_run_id(cfg)
         result = run_calibration_step(cli_run_id, cfg)
         logger.info(
             "calibration_step_done",

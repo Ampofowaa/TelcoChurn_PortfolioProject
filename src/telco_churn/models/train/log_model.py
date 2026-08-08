@@ -33,6 +33,7 @@ from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
     set_logged_model_description,
     set_run_description,
+    write_train_receipt,
 )
 
 __all__ = ["run_model_logging_step"]
@@ -356,6 +357,11 @@ def run_model_logging_step(
     registration, on the calibrated artifact, resolved via this manifest's
     logged_model_uri.
 
+    Writes reports/train_receipt.json ({"run_id"}) — the pointer
+    calibrate.py's __main__ reads by default when no explicit
+    calibration.run_id override is given (see utils/mlflow.py's module
+    docstring for why a local receipt is safe here).
+
     Returns {"run_id", "model_uri", "parity_ok", "training_manifest"}.
     """
     random_state = int(cfg.random_seed)
@@ -439,6 +445,8 @@ def run_model_logging_step(
         "from the in-memory pipeline on the same input sample — the serialized "
         "model is not safe to log."
     )
+
+    write_train_receipt(run_id, cfg)
 
     logger.info(
         "model_logged",

@@ -66,6 +66,8 @@ from telco_churn.models.calibrate import (
 )
 from telco_churn.models.evaluate import (
     check_threshold_provenance,
+    check_threshold_screen_passed,
+    load_dev_oof_diagnostics,
     load_fitted_model,
     load_threshold_validation,
 )
@@ -85,7 +87,7 @@ from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
     resolve_logged_model_id,
-    resolve_model_run_id,
+    resolve_model_identifier,
     resolve_tracking_uri,
     set_run_description,
 )
@@ -110,6 +112,15 @@ _RUN_DESCRIPTION = (
     "review stamped onto promotion_decision.json. Writes "
     "error_analysis.json, later read into model_card.json at promotion."
 )
+
+# Sentinel for a dev_oof_diagnostics key that postdates an older logged
+# threshold/dev_oof_diagnostics.json artifact — never [] or {}, which read as
+# "assessed, nothing flagged" and are indistinguishable from an honest empty
+# result. None of today's four v1/v2/v2b keys need it (threshold.py's dev-OOF
+# screen always produces all four together), but the mechanism exists so a
+# future added key follows this rule instead of reintroducing the encoding
+# defect this replaces.
+_NOT_ASSESSED = "not_assessed"
 
 # MLflow metric names allow only alphanumerics, underscores, dashes, periods,
 # spaces, and slashes — one-hot feature names from ColumnTransformer.
@@ -1165,8 +1176,10 @@ def _save_value_weighted_plot(rows: list[dict[str, Any]], path: Path) -> None:
     plt.close(fig)
 
 
-def _load_error_analysis_inputs(model_version: str, cfg: DictConfig) -> dict[str, Any]:
-    """Resolve the model's run, load test/dev-OOF predictions, and join raw feature values.
+def _load_error_analysis_inputs(
+    run_id: str, model_version: str, model_uri: str, cfg: DictConfig
+) -> dict[str, Any]:
+    """Check threshold provenance/screen status, load test/dev-OOF predictions, and join raw feature values.
 
     Reads reports/test_predictions.parquet (evaluate.py) + the dev-OOF vector
     (threshold.py's dev-OOF screen, fetched by run_id from calibrate.py's
@@ -1176,15 +1189,26 @@ def _load_error_analysis_inputs(model_version: str, cfg: DictConfig) -> dict[str
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     registered_model_name = str(cfg.mlflow.registered_model_name)
 
-    run_id = resolve_model_run_id(model_version, cfg)
     validation_payload = load_threshold_validation(run_id, cfg)
-    check_threshold_provenance(validation_payload, run_id, model_version)
+    logged_model_id = resolve_logged_model_id(model_version, cfg)
+    check_threshold_provenance(validation_payload, logged_model_id)
+    check_threshold_screen_passed(validation_payload)
     manifest = load_training_manifest(run_id, cfg)
     committed_features = committed_features_from_manifest(manifest)
-    model = load_fitted_model(model_version, cfg)
+    model = load_fitted_model(model_uri, cfg)
 
     reports_dir = get_project_root() / str(cfg.paths.reports)
     test_predictions = pd.read_parquet(reports_dir / "test_predictions.parquet")
+    stamped_model_ids = test_predictions["logged_model_id"].unique()
+    if list(stamped_model_ids) != [logged_model_id]:
+        raise ValueError(
+            "reports/test_predictions.parquet is stamped with "
+            f"logged_model_id={list(stamped_model_ids)!r}, which does not "
+            f"match the model being analyzed (logged_model_id="
+            f"{logged_model_id!r}) — this is a stale local copy left over "
+            "from a different evaluate.py cycle (e.g. a rolled-back "
+            "champion). Re-run models.evaluate for this model_version first."
+        )
     dev_oof_predictions = load_dev_oof_predictions(run_id, cfg)
 
     test_features_df = _features_by_customer_id(test_predictions["customerid"])
@@ -1482,19 +1506,6 @@ def _compute_error_concentration(
     }
 
 
-def _load_dev_oof_diagnostics_carrythrough(reports_dir: Path) -> dict[str, Any]:
-    """Read metrics.json's sliced.dev_oof_diagnostics, if evaluate.py has already run."""
-    metrics_path = reports_dir / "metrics.json"
-    if not metrics_path.exists():
-        return {}
-    with open(metrics_path, encoding="utf-8") as f:
-        existing_metrics = json.load(f)
-    result: dict[str, Any] = existing_metrics.get("sliced", {}).get(
-        "dev_oof_diagnostics", {}
-    )
-    return result
-
-
 def _assemble_error_analysis_payload(
     model_version: str,
     run_id: str,
@@ -1552,15 +1563,22 @@ def _assemble_error_analysis_payload(
             "annual_contract_fn_vs_tn_monthlycharges": subgroup["finding"],
         },
         "direction_sanity_check": shap_diag["v3_result"],
+        # Direct indexing, not .get(key, [])/.get(key, {}): dev_oof_diagnostics
+        # is now always a live, this-cycle fetch of threshold.py's own
+        # dev_oof_diagnostics.json (via load_dev_oof_diagnostics(run_id, cfg)),
+        # so a missing key is a genuine pipeline defect and must raise
+        # KeyError, never silently render "nothing flagged" — see _NOT_ASSESSED
+        # above for the sentinel a future key that postdates an older artifact
+        # version should use instead.
         "dev_oof_diagnostics_carried_through": {
-            "v1_flagged": dev_oof_diagnostics.get("v1_flagged", []),
-            "v2_equal_opportunity_flagged": dev_oof_diagnostics.get(
-                "v2_equal_opportunity_flagged", {}
-            ),
-            "v2_demographic_parity_flagged": dev_oof_diagnostics.get(
-                "v2_demographic_parity_flagged", {}
-            ),
-            "v2b_flagged": dev_oof_diagnostics.get("v2b_flagged", []),
+            "v1_flagged": dev_oof_diagnostics["v1_flagged"],
+            "v2_equal_opportunity_flagged": dev_oof_diagnostics[
+                "v2_equal_opportunity_flagged"
+            ],
+            "v2_demographic_parity_flagged": dev_oof_diagnostics[
+                "v2_demographic_parity_flagged"
+            ],
+            "v2b_flagged": dev_oof_diagnostics["v2b_flagged"],
         },
     }
 
@@ -1818,14 +1836,18 @@ def _tag_and_write_error_analysis_reports(
         json.dump(error_analysis_payload, f, indent=2, default=str)
 
 
-def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+def run_error_analysis_step(
+    run_id: str, model_version: str, model_uri: str, cfg: DictConfig
+) -> dict[str, Any]:
     """Run the full error-diagnosis pass and write reports/error_analysis.json.
 
-    Resolves `model_version` explicitly (never an alias), checks threshold
-    provenance (a stale threshold_validation.json would otherwise silently
-    derive the near-miss band from the wrong model's CI), loads the
-    champion, and reads the sealed-test and dev-OOF prediction artifacts —
-    the only route this module reaches evaluation data through.
+    Takes `run_id`/`model_version`/`model_uri` already resolved by the
+    caller (utils.mlflow.resolve_model_identifier — an explicit override,
+    never an alias, or calibrate.py's receipt), checks threshold provenance
+    (a stale threshold_validation.json would otherwise silently derive the
+    near-miss band from the wrong model's CI), loads the champion, and reads
+    the sealed-test and dev-OOF prediction artifacts — the only route this
+    module reaches evaluation data through.
 
     Computes SHAP once on the sealed-test rows (`_compute_shap_diagnostics`)
     and derives every SHAP-based diagnostic from that single call: global
@@ -1851,7 +1873,7 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
     so a stale cutoff would otherwise silently narrow or widen a chart's
     feature set with nothing to flag it.
     """
-    loaded = _load_error_analysis_inputs(model_version, cfg)
+    loaded = _load_error_analysis_inputs(run_id, model_version, model_uri, cfg)
     run_id = loaded["run_id"]
     base_threshold = loaded["base_threshold"]
     y_test, proba_test = loaded["y_test"], loaded["proba_test"]
@@ -1922,7 +1944,7 @@ def run_error_analysis_step(model_version: str, cfg: DictConfig) -> dict[str, An
         y_dev, proba_dev, base_threshold, loaded["dev_features_df"], ea_cfg
     )
 
-    dev_oof_diagnostics = _load_dev_oof_diagnostics_carrythrough(loaded["reports_dir"])
+    dev_oof_diagnostics = load_dev_oof_diagnostics(run_id, cfg)
 
     error_analysis_payload = _assemble_error_analysis_payload(
         model_version,
@@ -2001,20 +2023,15 @@ if __name__ == "__main__":
     load_dotenv()
     configure_logging()
 
-    def _require_model_version(cfg: DictConfig) -> str:
-        """Return error_analysis.model_version, raising if the CLI override was not supplied."""
-        if cfg.error_analysis.model_version is None:
-            raise ValueError(
-                "error_analysis.model_version is required, e.g. `python -m "
-                "telco_churn.models.error_analysis error_analysis.model_version=1`"
-            )
-        return str(cfg.error_analysis.model_version)
-
     try:
         cfg = compose_config(overrides=sys.argv[1:] or None)
         activate_config(cfg)
-        cli_model_version = _require_model_version(cfg)
-        result = run_error_analysis_step(cli_model_version, cfg)
+        cli_run_id, cli_model_version, cli_model_uri = resolve_model_identifier(
+            cfg.error_analysis.run_id, cfg.error_analysis.model_version, cfg
+        )
+        result = run_error_analysis_step(
+            cli_run_id, cli_model_version, cli_model_uri, cfg
+        )
         logger.info(
             "error_analysis_step_done",
             model_version=result["model_version"],

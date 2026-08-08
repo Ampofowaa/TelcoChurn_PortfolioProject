@@ -23,6 +23,7 @@ from telco_churn.models.diagnostics import build_segment_lookup
 from telco_churn.models.evaluate import (
     build_gate_inputs,
     check_threshold_provenance,
+    check_threshold_screen_passed,
     comparative_deltas,
     content_hash,
     load_model_promotion_bars,
@@ -144,50 +145,60 @@ def segment_fixture() -> tuple[pd.Series, np.ndarray, dict[str, pd.Series]]:
 
 def test_check_threshold_provenance_matching_stamp_does_not_raise() -> None:
     """A validation payload whose stamp matches the model being evaluated passes silently."""
-    payload = {"model_run_id": "abc123", "model_version": "1"}
-    check_threshold_provenance(payload, run_id="abc123", model_version="1")
+    payload = {"model_run_id": "abc123", "logged_model_id": "m-1"}
+    check_threshold_provenance(payload, logged_model_id="m-1")
 
 
-def test_check_threshold_provenance_mismatched_run_id_raises() -> None:
-    """A stamp naming a different run_id raises — the threshold was derived
-    against a different calibration map."""
-    payload = {"model_run_id": "old_run", "model_version": "1"}
+def test_check_threshold_provenance_mismatched_logged_model_id_raises() -> None:
+    """A stamp naming a different logged_model_id raises — the threshold was
+    derived against a different calibration map. model_run_id is a locator
+    only and plays no part in the comparison."""
+    payload = {"model_run_id": "old_run", "logged_model_id": "m-1"}
     with pytest.raises(ValueError, match="does not match the model being evaluated"):
-        check_threshold_provenance(payload, run_id="new_run", model_version="1")
-
-
-def test_check_threshold_provenance_mismatched_version_raises() -> None:
-    """A stamp naming a different model version raises, even with a matching run_id."""
-    payload = {"model_run_id": "abc123", "model_version": "1"}
-    with pytest.raises(ValueError, match="does not match the model being evaluated"):
-        check_threshold_provenance(payload, run_id="abc123", model_version="2")
-
-
-def test_check_threshold_provenance_both_mismatched_raises() -> None:
-    """A stamp naming neither the right run_id nor version raises."""
-    payload = {"model_run_id": "old_run", "model_version": "1"}
-    with pytest.raises(ValueError, match="does not match the model being evaluated"):
-        check_threshold_provenance(payload, run_id="new_run", model_version="2")
+        check_threshold_provenance(payload, logged_model_id="m-2")
 
 
 def test_check_threshold_provenance_compares_as_strings() -> None:
-    """An integer model_version in the payload still matches a string model_version
-    argument — the comparison is coerced to strings, not type-sensitive."""
-    payload = {"model_run_id": "abc123", "model_version": 1}
-    check_threshold_provenance(payload, run_id="abc123", model_version="1")
+    """An integer logged_model_id in the payload still matches a string
+    logged_model_id argument — the comparison is coerced to strings, not
+    type-sensitive."""
+    payload = {"model_run_id": "abc123", "logged_model_id": 1}
+    check_threshold_provenance(payload, logged_model_id="1")
 
 
 def test_check_threshold_provenance_error_message_includes_both_stamps() -> None:
-    """The raised error names both the stamped and the actual run_id/version, so
-    the mismatch is diagnosable from the message alone."""
-    payload = {"model_run_id": "old_run", "model_version": "1"}
+    """The raised error names both the stamped and the actual logged_model_id,
+    so the mismatch is diagnosable from the message alone."""
+    payload = {"model_run_id": "old_run", "logged_model_id": "m-1"}
     with pytest.raises(ValueError, match="does not match") as exc_info:
-        check_threshold_provenance(payload, run_id="new_run", model_version="2")
+        check_threshold_provenance(payload, logged_model_id="m-2")
     message = str(exc_info.value)
-    assert "old_run" in message
-    assert "new_run" in message
-    assert "1" in message
-    assert "2" in message
+    assert "m-1" in message
+    assert "m-2" in message
+
+
+# ---------------------------------------------------------------------------
+# check_threshold_screen_passed
+# ---------------------------------------------------------------------------
+
+
+def test_check_threshold_screen_passed_true_does_not_raise() -> None:
+    check_threshold_screen_passed({"screen_passed": True})
+
+
+def test_check_threshold_screen_passed_false_raises() -> None:
+    """No override flag — a failed dev-OOF calibration screen must always
+    block downstream evaluation/error analysis."""
+    with pytest.raises(RuntimeError, match="screen_passed is False"):
+        check_threshold_screen_passed({"screen_passed": False})
+
+
+def test_check_threshold_screen_passed_missing_key_raises_key_error() -> None:
+    """Direct indexing, not .get(...): an older threshold_validation.json
+    artifact predating this field is a genuine incompatibility, not an
+    implicit pass."""
+    with pytest.raises(KeyError):
+        check_threshold_screen_passed({})
 
 
 # ---------------------------------------------------------------------------

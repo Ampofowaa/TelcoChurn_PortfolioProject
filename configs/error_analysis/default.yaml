@@ -1,7 +1,13 @@
 # Error-diagnosis step configuration — see models/error_analysis.py.
 
-# telco-churn-pipeline version to run error analysis on — required, e.g. `error_analysis.model_version=1`.
+# telco-churn-pipeline version to run error analysis on, e.g. `error_analysis.model_version=1`.
+# Giving both this and run_id is an error (ambiguous, never silently resolved
+# in one direction). Giving neither falls back to reports/calibrate_receipt.json.
 model_version: null
+
+# telco-churn-pipeline run_id to run error analysis on, e.g. `error_analysis.run_id=<id>`.
+# Alternative to model_version above — see its comment for the both/neither rules.
+run_id: null
 
 # Fallback score band (+/- around t*) a false negative/positive must fall within to
 # count as a near-miss (threshold artifact) rather than a confident failure (model

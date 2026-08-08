@@ -13,8 +13,10 @@ gate.record_review (mirroring notebook 05's own closing cell) — one step
 further down the pipeline than test_error_analysis_subprocess.py's own
 precedent. Only register.py itself crosses the subprocess boundary. A
 dev-OOF screen failure (a real slope outside the band on this synthetic
-fixture) is tolerated during seeding — its artifacts are written before it
-raises, so evaluate.py's read just after is unaffected either way.
+fixture) used to be tolerated during seeding — since PR B0, evaluate.py and
+error_analysis.py both independently re-check the screen's verdict and raise
+too, so a screen failure now cascades and blocks the whole fixture (see the
+fixture's own inline comment); no longer swallowed here.
 
 The seeded decision's gate outcome is forced to "pass" after the real chain
 runs: evaluate.py's cold-start gate on this synthetic fixture is not
@@ -258,19 +260,21 @@ def reviewed_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object
             tuning_result["parent_run_id"] = run.info.run_id
         log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
         cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
+        run_id = str(cal_result["run_id"])
         model_version = str(cal_result["model_version"])
+        model_uri = str(cal_result["model_uri"])
 
-        try:
-            threshold.run_threshold_step(model_version, cfg)
-        except RuntimeError:
-            # A dev-OOF screen failure (the real slope on this synthetic
-            # fixture lying outside the band) is a legitimate outcome, not a
-            # setup bug — reports/dev_oof_predictions.parquet and
-            # dev_oof_diagnostics.json are written before that raise, so
-            # evaluate.py's read just below is unaffected either way.
-            pass
-        evaluate.run_evaluation_step(model_version, cfg)
-        error_analysis.run_error_analysis_step(model_version, cfg)
+        # A dev-OOF screen failure used to be tolerated here (threshold.py's
+        # own RuntimeError, swallowed) since it didn't block evaluate.py.
+        # Since PR B0, evaluate.py/error_analysis.py both independently
+        # re-check screen_passed via check_threshold_screen_passed and raise
+        # RuntimeError too — a screen failure now cascades and blocks every
+        # downstream step in this fixture, so it is no longer a tolerable
+        # outcome to swallow here (see test_error_analysis_subprocess.py's
+        # identical fixture for the same reasoning).
+        threshold.run_threshold_step(run_id, model_version, cfg)
+        evaluate.run_evaluation_step(run_id, model_version, model_uri, cfg)
+        error_analysis.run_error_analysis_step(run_id, model_version, model_uri, cfg)
     finally:
         reset_active_config()
 

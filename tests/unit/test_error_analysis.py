@@ -897,15 +897,19 @@ def evaluated_model(
         tuning_result["parent_run_id"] = run.info.run_id
     log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
     cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
+    run_id = str(cal_result["run_id"])
     model_version = str(cal_result["model_version"])
+    model_uri = str(cal_result["model_uri"])
 
-    threshold.run_threshold_step(model_version, cfg)
-    evaluate.run_evaluation_step(model_version, cfg)
+    threshold.run_threshold_step(run_id, model_version, cfg)
+    evaluate.run_evaluation_step(run_id, model_version, model_uri, cfg)
 
     try:
         yield {
             "cfg": cfg,
+            "run_id": run_id,
             "model_version": model_version,
+            "model_uri": model_uri,
             "data_dir": data_dir,
             "reports_dir": reports_dir,
             "figures_dir": figures_dir,
@@ -952,9 +956,13 @@ def test_run_error_analysis_step_returns_expected_keys_and_writes_report(
     OOF for error concentration, and writes reports/error_analysis.json — the
     artifact register.py aborts without."""
     cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
     model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
 
-    result = error_analysis.run_error_analysis_step(model_version, cfg)
+    result = error_analysis.run_error_analysis_step(
+        run_id, model_version, model_uri, cfg
+    )
 
     assert result["model_version"] == model_version
     assert result["error_analysis_run_id"]
@@ -984,9 +992,13 @@ def test_run_error_analysis_step_shap_payload_has_expected_shape(
     """The shap sub-payload carries every field the notebook and model_card
     assembly (register.py) read, including both cohort-gap rankings."""
     cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
     model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
 
-    result = error_analysis.run_error_analysis_step(model_version, cfg)
+    result = error_analysis.run_error_analysis_step(
+        run_id, model_version, model_uri, cfg
+    )
     payload = cast(dict[str, Any], result["error_analysis"])
     shap_payload = payload["shap"]
 
@@ -1017,9 +1029,11 @@ def test_run_error_analysis_step_writes_all_figures(
     """Every figure the notebook embeds is written to paths.figures, not left
     to be regenerated ad hoc."""
     cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
     model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
 
-    error_analysis.run_error_analysis_step(model_version, cfg)
+    error_analysis.run_error_analysis_step(run_id, model_version, model_uri, cfg)
 
     figures_dir = Path(str(evaluated_model["figures_dir"]))
     for filename in (
@@ -1049,9 +1063,13 @@ def test_run_error_analysis_step_logs_mlflow_run_and_direction_tag(
     run) tagged with the V3 direction-sanity verdict, with error_analysis.json
     and the figures/ folder attached as artifacts."""
     cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
     model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
 
-    result = error_analysis.run_error_analysis_step(model_version, cfg)
+    result = error_analysis.run_error_analysis_step(
+        run_id, model_version, model_uri, cfg
+    )
 
     client = mlflow.tracking.MlflowClient(
         tracking_uri=str(evaluated_model["tracking_uri"])
@@ -1079,7 +1097,9 @@ def test_run_error_analysis_step_raises_when_prediction_artifacts_missing(
     loudly rather than silently reaching for the test split some other way —
     mirrors test_error_analysis_subprocess.py's exit-1 CLI case, one layer
     closer to the code that actually raises."""
+    run_id = str(evaluated_model["run_id"])
     model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
     empty_reports_dir = tmp_path / "empty_reports"
     empty_reports_dir.mkdir()
     cfg_with_empty_reports = compose_config(
@@ -1097,4 +1117,64 @@ def test_run_error_analysis_step_raises_when_prediction_artifacts_missing(
     )
 
     with pytest.raises(FileNotFoundError):
-        error_analysis.run_error_analysis_step(model_version, cfg_with_empty_reports)
+        error_analysis.run_error_analysis_step(
+            run_id, model_version, model_uri, cfg_with_empty_reports
+        )
+
+
+def test_run_error_analysis_step_raises_on_missing_dev_oof_diagnostics_key(
+    evaluated_model: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dev_oof_diagnostics.json missing one of the four v1/v2/v2b keys raises
+    KeyError — a genuine pipeline defect now that this dict is always a live,
+    this-cycle MLflow fetch, never silently rendered as "nothing flagged"."""
+    cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
+    model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
+
+    def _incomplete_dev_oof_diagnostics(
+        _run_id: str, _cfg: DictConfig
+    ) -> dict[str, Any]:
+        return {
+            "v1_flagged": [],
+            "v2_equal_opportunity_flagged": {},
+            "v2_demographic_parity_flagged": {},
+            # v2b_flagged deliberately omitted
+        }
+
+    monkeypatch.setattr(
+        error_analysis, "load_dev_oof_diagnostics", _incomplete_dev_oof_diagnostics
+    )
+
+    with pytest.raises(KeyError, match="v2b_flagged"):
+        error_analysis.run_error_analysis_step(run_id, model_version, model_uri, cfg)
+
+
+def test_run_error_analysis_step_raises_on_stale_test_predictions_stamp(
+    evaluated_model: dict[str, object],
+) -> None:
+    """reports/test_predictions.parquet stamped with a different logged_model_id
+    than the model being analyzed raises — the stale-copy-on-hand-run-rollback
+    hole the stamp exists to close."""
+    cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
+    model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
+    reports_dir = Path(str(evaluated_model["reports_dir"]))
+
+    predictions_path = reports_dir / "test_predictions.parquet"
+    original = pd.read_parquet(predictions_path)
+    stale = original.copy()
+    stale["logged_model_id"] = "a-different-logged-model-id"
+    stale.to_parquet(predictions_path, index=False)
+
+    try:
+        with pytest.raises(ValueError, match="a-different-logged-model-id"):
+            error_analysis.run_error_analysis_step(
+                run_id, model_version, model_uri, cfg
+            )
+    finally:
+        # evaluated_model is module-scoped and shared with later tests —
+        # restore the real stamp so this test's mutation doesn't poison them.
+        original.to_parquet(predictions_path, index=False)

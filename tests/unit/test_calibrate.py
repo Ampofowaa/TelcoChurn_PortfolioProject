@@ -1027,7 +1027,10 @@ def registration_cfg(calibration_mlflow_uri: str, tmp_path: Path) -> DictConfig:
                 "experiment_name": "test_run_calibration_step",
                 "registered_model_name": "test-telco-churn-pipeline",
             },
-            "paths": {"figures": str(tmp_path / "figures")},
+            "paths": {
+                "figures": str(tmp_path / "figures"),
+                "reports": str(tmp_path / "reports"),
+            },
         }
     )
 
@@ -1138,6 +1141,7 @@ def _shared_registration_cfg(
 ) -> DictConfig:
     """Module-scoped mirror of registration_cfg — see calibrated_run."""
     figures_dir = tmp_path_factory.mktemp("calibrated_run_figures")
+    reports_dir = tmp_path_factory.mktemp("calibrated_run_reports")
     return OmegaConf.create(
         {
             "random_seed": 42,
@@ -1175,7 +1179,7 @@ def _shared_registration_cfg(
                 "experiment_name": "test_run_calibration_step_shared",
                 "registered_model_name": "test-telco-churn-pipeline",
             },
-            "paths": {"figures": str(figures_dir)},
+            "paths": {"figures": str(figures_dir), "reports": str(reports_dir)},
         }
     )
 

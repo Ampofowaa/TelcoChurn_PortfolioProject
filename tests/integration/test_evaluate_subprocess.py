@@ -12,7 +12,12 @@ test_threshold_subprocess.py's own precedent one step further down the
 pipeline. Only evaluate.py itself crosses the subprocess boundary. A dev-OOF
 screen failure (a real slope outside the band on this synthetic fixture) is
 tolerated during seeding — its artifacts are written before it raises, so
-evaluate.py's later reads are unaffected either way.
+fixture setup completes either way. Since PR B0, evaluate.py's own subprocess
+calls independently re-check the screen's verdict (check_threshold_screen_passed)
+and will exit 1 if it failed here — this fixture's synthetic data passes the
+screen deterministically in practice (see test_error_analysis.py's in-process
+equivalent), so this is not expected to matter, but it is no longer a case
+evaluate.py is agnostic to.
 
 No `champion` alias exists anywhere in this throwaway registry, so every test
 here exercises the cold-start regime (ANALYSIS.md §0) — the comparative
@@ -279,16 +284,23 @@ def registered_evaluation_model(
             tuning_result["parent_run_id"] = run.info.run_id
         log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
         cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
+        run_id = str(cal_result["run_id"])
         model_version = str(cal_result["model_version"])
 
         try:
-            threshold.run_threshold_step(model_version, cfg)
+            threshold.run_threshold_step(run_id, model_version, cfg)
         except RuntimeError:
             # A dev-OOF screen failure (the real slope on this synthetic
             # fixture lying outside the band) is a legitimate outcome, not a
             # setup bug — reports/dev_oof_predictions.parquet and
             # dev_oof_diagnostics.json are written before that raise, so
-            # evaluate.py's later reads are unaffected either way.
+            # this fixture's own setup completes either way. Since PR B0,
+            # though, evaluate.py's later subprocess CLI calls independently
+            # re-check screen_passed and will themselves exit 1 if the screen
+            # failed here — no longer truly "unaffected" downstream, just no
+            # longer a setup-time failure. The same seeded synthetic fixture
+            # passes the screen deterministically in test_error_analysis.py's
+            # in-process equivalent, so this is not expected to fire.
             pass
     finally:
         reset_active_config()
@@ -399,7 +411,12 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
     assert decision["eval_run_id"] != metrics["run_id"]
 
     test_predictions = pd.read_parquet(reports_dir / "test_predictions.parquet")
-    assert set(test_predictions.columns) == {"customerid", "y_true", "p_hat"}
+    assert set(test_predictions.columns) == {
+        "customerid",
+        "y_true",
+        "p_hat",
+        "logged_model_id",
+    }
     assert len(test_predictions) > 0
 
     # Written by threshold.py's folded-in dev-OOF screen (customerid, y_true,

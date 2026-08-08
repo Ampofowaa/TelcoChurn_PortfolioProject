@@ -801,8 +801,25 @@ def registered_model_version(
         mp.undo()
 
 
+@pytest.fixture(scope="module")
+def registered_model_run_id(full_cfg: OmegaConf, registered_model_version: str) -> str:
+    """The tuning_study run_id registered_model_version was minted from.
+
+    A cheap MLflow lookup on the already-built module-scoped fixture above —
+    not a second train->calibrate cycle — the same pattern two tests in this
+    file already used ad hoc before run_threshold_step took run_id as an
+    explicit argument.
+    """
+    client = mlflow.tracking.MlflowClient()
+    registered_name = str(full_cfg.mlflow.registered_model_name)
+    return str(
+        client.get_model_version(registered_name, registered_model_version).run_id
+    )
+
+
 def test_run_threshold_step_ships_all_three_scenarios(
     full_cfg: OmegaConf,
+    registered_model_run_id: str,
     registered_model_version: str,
     costs_cfg: OmegaConf,
     monkeypatch: pytest.MonkeyPatch,
@@ -813,7 +830,9 @@ def test_run_threshold_step_ships_all_three_scenarios(
     """
     monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
 
-    result = threshold.run_threshold_step(registered_model_version, full_cfg)
+    result = threshold.run_threshold_step(
+        registered_model_run_id, registered_model_version, full_cfg
+    )
     payload = result["threshold_payload"]
 
     assert set(payload["scenarios"]) == {"conservative", "base", "optimistic"}
@@ -830,11 +849,13 @@ def test_run_threshold_step_ships_all_three_scenarios(
         }
     assert payload["scenario"] == "base"
     assert payload["threshold"] == payload["scenarios"]["base"]["threshold"]
-    assert payload["model_version"] == registered_model_version
+    assert payload["model_run_id"] == registered_model_run_id
+    assert payload["logged_model_id"]
 
 
 def test_run_threshold_step_logs_three_figures(
     full_cfg: OmegaConf,
+    registered_model_run_id: str,
     registered_model_version: str,
     costs_cfg: OmegaConf,
     monkeypatch: pytest.MonkeyPatch,
@@ -845,7 +866,9 @@ def test_run_threshold_step_logs_three_figures(
     """
     monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
 
-    result = threshold.run_threshold_step(registered_model_version, full_cfg)
+    result = threshold.run_threshold_step(
+        registered_model_run_id, registered_model_version, full_cfg
+    )
     run_id = result["threshold_payload"]["model_run_id"]
 
     client = mlflow.tracking.MlflowClient()
@@ -864,6 +887,7 @@ def test_run_threshold_step_logs_three_figures(
 
 def test_run_threshold_step_logs_validation_json_and_ev_curve(
     full_cfg: OmegaConf,
+    registered_model_run_id: str,
     registered_model_version: str,
     costs_cfg: OmegaConf,
     monkeypatch: pytest.MonkeyPatch,
@@ -874,7 +898,9 @@ def test_run_threshold_step_logs_validation_json_and_ev_curve(
     """
     monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
 
-    result = threshold.run_threshold_step(registered_model_version, full_cfg)
+    result = threshold.run_threshold_step(
+        registered_model_run_id, registered_model_version, full_cfg
+    )
     run_id = result["threshold_payload"]["model_run_id"]
 
     client = mlflow.tracking.MlflowClient()
@@ -893,7 +919,8 @@ def test_run_threshold_step_logs_validation_json_and_ev_curve(
 
     validation = result["validation_payload"]
     assert validation["model_run_id"] == run_id
-    assert validation["model_version"] == registered_model_version
+    assert validation["logged_model_id"]
+    assert isinstance(validation["screen_passed"], bool)
     assert set(validation["scenarios"]) == {"conservative", "base", "optimistic"}
     for scenario_result in validation["scenarios"].values():
         assert set(scenario_result) == {
@@ -908,6 +935,7 @@ def test_run_threshold_step_logs_validation_json_and_ev_curve(
 
 def test_run_threshold_step_logs_scenario_metrics(
     full_cfg: OmegaConf,
+    registered_model_run_id: str,
     registered_model_version: str,
     costs_cfg: OmegaConf,
     monkeypatch: pytest.MonkeyPatch,
@@ -918,7 +946,9 @@ def test_run_threshold_step_logs_scenario_metrics(
     """
     monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
 
-    result = threshold.run_threshold_step(registered_model_version, full_cfg)
+    result = threshold.run_threshold_step(
+        registered_model_run_id, registered_model_version, full_cfg
+    )
     run_id = result["threshold_payload"]["model_run_id"]
 
     client = mlflow.tracking.MlflowClient()
@@ -935,6 +965,7 @@ def test_run_threshold_step_logs_scenario_metrics(
 
 def test_run_threshold_step_writes_policy_file(
     full_cfg: OmegaConf,
+    registered_model_run_id: str,
     registered_model_version: str,
     costs_cfg: OmegaConf,
     monkeypatch: pytest.MonkeyPatch,
@@ -945,7 +976,9 @@ def test_run_threshold_step_writes_policy_file(
     """
     monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
 
-    result = threshold.run_threshold_step(registered_model_version, full_cfg)
+    result = threshold.run_threshold_step(
+        registered_model_run_id, registered_model_version, full_cfg
+    )
 
     policy_path = Path(str(full_cfg.paths.policy)) / "threshold.yaml"
     assert policy_path.exists()
@@ -955,6 +988,7 @@ def test_run_threshold_step_writes_policy_file(
 
 def test_run_threshold_step_policy_file_has_no_model_dependent_fields(
     full_cfg: OmegaConf,
+    registered_model_run_id: str,
     registered_model_version: str,
     costs_cfg: OmegaConf,
     monkeypatch: pytest.MonkeyPatch,
@@ -966,13 +1000,16 @@ def test_run_threshold_step_policy_file_has_no_model_dependent_fields(
     """
     monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
 
-    threshold.run_threshold_step(registered_model_version, full_cfg)
+    threshold.run_threshold_step(
+        registered_model_run_id, registered_model_version, full_cfg
+    )
 
     policy_path = Path(str(full_cfg.paths.policy)) / "threshold.yaml"
     written = OmegaConf.load(policy_path)
 
     assert "model_run_id" not in written
     assert "model_version" not in written
+    assert "logged_model_id" not in written
     assert "calibration_method" not in written
     assert "argmax_ev_threshold" not in written
     assert "argmax_ev_bootstrap_ci" not in written
@@ -989,6 +1026,7 @@ def test_run_threshold_step_policy_file_has_no_model_dependent_fields(
 
 def test_run_threshold_step_resolves_by_explicit_version_not_alias(
     full_cfg: OmegaConf,
+    registered_model_run_id: str,
     registered_model_version: str,
     costs_cfg: OmegaConf,
     monkeypatch: pytest.MonkeyPatch,
@@ -1022,7 +1060,9 @@ def test_run_threshold_step_resolves_by_explicit_version_not_alias(
         registered_name, "challenger", str(newest_version)
     )
 
-    result = threshold.run_threshold_step(registered_model_version, full_cfg)
+    result = threshold.run_threshold_step(
+        registered_model_run_id, registered_model_version, full_cfg
+    )
 
     assert result["threshold_payload"]["model_run_id"] == expected_run_id
 
@@ -1055,6 +1095,7 @@ def _assert_dev_oof_report_shapes(
 
 def test_run_threshold_step_screens_dev_oof_slope_and_writes_reports(
     full_cfg: OmegaConf,
+    registered_model_run_id: str,
     registered_model_version: str,
     dev_split: tuple[pd.DataFrame, pd.Series],
     costs_cfg: OmegaConf,
@@ -1074,7 +1115,9 @@ def test_run_threshold_step_screens_dev_oof_slope_and_writes_reports(
     run_id = client.get_model_version(registered_name, registered_model_version).run_id
 
     try:
-        result = threshold.run_threshold_step(registered_model_version, full_cfg)
+        result = threshold.run_threshold_step(
+            registered_model_run_id, registered_model_version, full_cfg
+        )
     except RuntimeError:
         # The real sigmoid-calibrated fit on this synthetic fixture may or
         # may not clear the band — either outcome is a valid resting state
@@ -1121,6 +1164,7 @@ def test_run_threshold_step_screens_dev_oof_slope_and_writes_reports(
 
 def test_run_threshold_step_raises_on_bad_slope_read_from_calibration_summary(
     full_cfg: OmegaConf,
+    registered_model_run_id: str,
     registered_model_version: str,
     costs_cfg: OmegaConf,
     monkeypatch: pytest.MonkeyPatch,
@@ -1147,7 +1191,9 @@ def test_run_threshold_step_raises_on_bad_slope_read_from_calibration_summary(
     monkeypatch.setattr(threshold, "load_calibration_summary", _bad_summary)
 
     with pytest.raises(RuntimeError, match="Dev-OOF calibration screen failed"):
-        threshold.run_threshold_step(registered_model_version, full_cfg)
+        threshold.run_threshold_step(
+            registered_model_run_id, registered_model_version, full_cfg
+        )
 
     reports_dir = Path(str(full_cfg.paths.reports))
     assert (reports_dir / "dev_oof_predictions.parquet").exists()
