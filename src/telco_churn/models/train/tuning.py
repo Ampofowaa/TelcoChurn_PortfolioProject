@@ -157,6 +157,7 @@ def _tuning_objective(
     fixed_params: dict[str, Any],
     random_state: int,
     pruning_enabled: bool,
+    study_name: str,
 ) -> float:
     """One Optuna trial: sample params, run early-stopped CV, log a nested MLflow run.
 
@@ -168,6 +169,15 @@ def _tuning_objective(
     exception instead propagates out of the block, closing the run as FAILED;
     run_tuning_step's `study.optimize(..., catch=...)` then catches it so one
     bad trial doesn't kill the study.
+
+    Tagged with `optuna_study_name` (not just implicitly parented via MLflow's
+    own `mlflow.parentRunId`) because the study — not the parent run — is the
+    unit of continuity: `load_if_exists=True` resumes a content-addressed study
+    across separate `run_tuning_step` invocations (a crash-resume, or a rerun
+    that finds the study already complete), so a trial's earlier siblings can
+    live under a different, previous parent run entirely. Querying by this tag
+    finds every trial a study has ever run; querying by parentRunId only finds
+    the ones logged under one specific invocation.
     """
     params = _suggest_lgbm_params(trial, tuning_cfg.search_space)
     es_validation_size = float(tuning_cfg.es_validation_size)
@@ -175,6 +185,7 @@ def _tuning_objective(
     pruned = False
     cv_mean = float("nan")
     with mlflow.start_run(run_name=f"trial_{trial.number:03d}", nested=True):
+        mlflow.set_tag("optuna_study_name", study_name)
         mlflow.log_params(params)
         fold_scores: list[float] = []
         fold_n_estimators: list[int] = []
@@ -433,6 +444,7 @@ def _run_study_trials(
         fixed_params=setup["fixed_params"],
         random_state=setup["random_state"],
         pruning_enabled=setup["pruning_enabled"],
+        study_name=setup["study_name"],
     )
     n_remaining_trials = max(int(tuning_cfg.n_trials) - len(study.trials), 0)
     if n_remaining_trials > 0:
@@ -559,12 +571,57 @@ def _plot_optimization_history(trial_summaries: list[dict[str, Any]]) -> Figure:
     return fig_hist
 
 
-def _log_tuning_artifacts(
-    summary: dict[str, Any], trial_result: dict[str, Any], fig_hist: Figure
-) -> None:
-    """Log the selected trial's params/metrics, the trials table, boundary hits, and the history plot.
+def _compute_hyperparameter_importance(
+    study: optuna.Study, random_state: int
+) -> pd.Series | None:
+    """fANOVA importance per hyperparameter, computed on the live study's completed trials.
 
-    Call from inside the active `tuning_study` MLflow run.
+    Runs directly against the real Optuna study (this step already holds it in
+    memory) rather than a reconstruction from MLflow-logged trial params — the
+    workaround a notebook rendering this after the fact has to fall back to.
+
+    Returns None, after logging a warning, rather than raising if fANOVA can't
+    be computed — e.g. too few completed trials for its internal random-forest
+    surrogate to fit, which legitimately happens on a tiny study (an
+    interrupted run, a fast test fixture) and should not fail a training cycle
+    over a diagnostic.
+    """
+    evaluator = optuna.importance.FanovaImportanceEvaluator(seed=random_state)
+    try:
+        importances = optuna.importance.get_param_importances(
+            study, evaluator=evaluator
+        )
+    except Exception as e:
+        logger.warning(
+            "hyperparameter_importance_unavailable", error=str(e), exc_info=True
+        )
+        return None
+    return pd.Series(importances, name="importance").sort_values(ascending=True)
+
+
+def _plot_hyperparameter_importance(importance: pd.Series, n_completed: int) -> Figure:
+    """Horizontal bar chart of fANOVA importance, sorted ascending."""
+    fig, ax = plt.subplots(figsize=(7, 4))
+    importance.plot.barh(ax=ax, color="steelblue")
+    ax.set_xlabel("fANOVA importance")
+    ax.set_title(f"Hyperparameter importance ({n_completed} completed trials)")
+    plt.tight_layout()
+    return fig
+
+
+def _log_tuning_artifacts(
+    summary: dict[str, Any],
+    trial_result: dict[str, Any],
+    fig_hist: Figure,
+    importance: pd.Series | None,
+    fig_importance: Figure | None,
+) -> None:
+    """Log the selected trial's params/metrics, the trials table, boundary hits, and the history/importance plots.
+
+    Call from inside the active `tuning_study` MLflow run. importance/
+    fig_importance are None together iff fANOVA couldn't be computed
+    (_compute_hyperparameter_importance already logged why) — nothing to log
+    in that case, not an error.
     """
     selected, diagnostics = summary["selected"], summary["diagnostics"]
     boundary_hits = summary["boundary_hits"]
@@ -609,6 +666,10 @@ def _log_tuning_artifacts(
     mlflow.log_dict(boundary_hits, "tuning/boundary_hits.json")
     mlflow.log_figure(fig_hist, "tuning/optimization_history.png")
     plt.close(fig_hist)
+    if importance is not None and fig_importance is not None:
+        mlflow.log_dict(importance.to_dict(), "tuning/hyperparameter_importance.json")
+        mlflow.log_figure(fig_importance, "tuning/hyperparameter_importance.png")
+        plt.close(fig_importance)
 
 
 def run_tuning_step(
@@ -641,6 +702,13 @@ def run_tuning_step(
     Idempotent against a study that already reached n_trials: only the trials
     still needed to reach n_trials are run, so re-running against a completed
     study reuses its existing trials instead of piling n_trials more on top.
+
+    Also logs fANOVA hyperparameter importance — tuning/hyperparameter_importance.png
+    and the underlying per-parameter values (tuning/hyperparameter_importance.json,
+    persisted per CLAUDE.md's "log the array, not only the chart" rule) — computed
+    once here, against the live study, rather than reconstructed later by every
+    notebook that wants to render it. Never gates anything; a study too small for
+    fANOVA to fit logs a warning and skips both artifacts rather than raising.
 
     Returns {"best_params", "best_n_estimators_median", "best_cv_pr_auc_mean",
     "boundary_hits", "n_completed_trials", "parent_run_id", "committed_features",
@@ -689,7 +757,17 @@ def run_tuning_step(
         trial_result = _run_study_trials(setup, X_dev, y_dev)
         summary = _summarize_completed_trials(setup, trial_result)
         fig_hist = _plot_optimization_history(summary["trial_summaries"])
-        _log_tuning_artifacts(summary, trial_result, fig_hist)
+        importance = _compute_hyperparameter_importance(
+            setup["study"], setup["random_state"]
+        )
+        fig_importance = (
+            _plot_hyperparameter_importance(importance, len(summary["trial_summaries"]))
+            if importance is not None
+            else None
+        )
+        _log_tuning_artifacts(
+            summary, trial_result, fig_hist, importance, fig_importance
+        )
 
         parent_run_id = parent_run.info.run_id
 

@@ -258,7 +258,8 @@ def test_build_optuna_storage_isolates_schema_when_postgres_url_is_set(
     """POSTGRES_URL set: schema isolation runs and RDBStorage gets the
     search_path connect_args, both unchanged from the pre-fallback behavior."""
     monkeypatch.setenv(
-        "POSTGRES_URL", "postgresql://user:pass@host/db"  # pragma: allowlist secret
+        "POSTGRES_URL",
+        "postgresql://user:pass@host/db",  # pragma: allowlist secret
     )
     conn = MagicMock()
     engine = MagicMock()
@@ -522,6 +523,40 @@ def test_run_tuning_step_logs_trial_history_as_mlflow_table(
     data, artifact_file = log_table_mock.call_args[0]
     assert artifact_file == "tuning/trials.json"
     assert "fold_scores" not in data.columns
+
+
+def test_run_tuning_step_tags_trial_runs_with_optuna_study_name(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """Every nested trial run carries `optuna_study_name` — not just an implicit
+    `mlflow.parentRunId` link — so a later notebook/query can find every trial a
+    content-addressed study has ever run, even one resumed under a different
+    parent run (a crash-resume, or a rerun once the study is already complete).
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    result = tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        storage=optuna.storages.InMemoryStorage(),
+    )
+
+    client = mlflow.tracking.MlflowClient()
+    parent_run = client.get_run(result["parent_run_id"])
+    study_name = parent_run.data.params["optuna_study_name"]
+
+    trial_runs = client.search_runs(
+        [parent_run.info.experiment_id],
+        filter_string=f"tags.mlflow.parentRunId = '{result['parent_run_id']}'",
+    )
+    assert trial_runs
+    assert all(r.data.tags.get("optuna_study_name") == study_name for r in trial_runs)
 
 
 def test_run_tuning_step_skips_enqueue_without_warm_start_params(
@@ -870,3 +905,102 @@ def test_run_tuning_step_logs_dev_input_once_on_parent_run(
     )
 
     log_dev_input_mock.assert_called_once_with(X_dev, y_dev, context="training")
+
+
+# ---------------------------------------------------------------------------
+# fANOVA hyperparameter importance — logged once in the pipeline, not
+# reconstructed later by every notebook that wants to render it
+# ---------------------------------------------------------------------------
+
+
+def test_run_tuning_step_logs_hyperparameter_importance(
+    monkeypatch: pytest.MonkeyPatch,
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """fANOVA importance is logged as both the rendered chart and the
+    underlying per-parameter values (CLAUDE.md: log the array, not only the
+    chart), computed directly against the live study rather than a
+    reconstruction from MLflow-logged trial params.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    log_dict_mock = Mock()
+    log_figure_mock = Mock()
+    monkeypatch.setattr(mlflow, "log_dict", log_dict_mock)
+    monkeypatch.setattr(mlflow, "log_figure", log_figure_mock)
+
+    tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        storage=optuna.storages.InMemoryStorage(),
+    )
+
+    importance_dict_calls = [
+        c
+        for c in log_dict_mock.call_args_list
+        if c.args[1] == "tuning/hyperparameter_importance.json"
+    ]
+    assert len(importance_dict_calls) == 1
+    importance_payload = importance_dict_calls[0].args[0]
+    assert set(importance_payload) == set(tuning_cfg.tuning.search_space)
+
+    importance_figure_calls = [
+        c
+        for c in log_figure_mock.call_args_list
+        if c.args[1] == "tuning/hyperparameter_importance.png"
+    ]
+    assert len(importance_figure_calls) == 1
+
+
+def test_run_tuning_step_skips_importance_artifacts_when_fanova_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """A study fANOVA can't fit (too few completed trials, a degenerate
+    search) logs a warning and skips both importance artifacts rather than
+    failing the whole training cycle over a diagnostic.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("not enough trials")
+
+    monkeypatch.setattr(optuna.importance, "get_param_importances", _raise)
+    warning_mock = Mock()
+    monkeypatch.setattr(tuning.logger, "warning", warning_mock)
+    log_dict_mock = Mock()
+    log_figure_mock = Mock()
+    monkeypatch.setattr(mlflow, "log_dict", log_dict_mock)
+    monkeypatch.setattr(mlflow, "log_figure", log_figure_mock)
+
+    result = tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        storage=optuna.storages.InMemoryStorage(),
+    )
+
+    assert result["best_params"]  # the step still completes normally
+    assert any(
+        c.args[0] == "hyperparameter_importance_unavailable"
+        for c in warning_mock.call_args_list
+    )
+    assert not any(
+        c.args[1] == "tuning/hyperparameter_importance.json"
+        for c in log_dict_mock.call_args_list
+    )
+    assert not any(
+        c.args[1] == "tuning/hyperparameter_importance.png"
+        for c in log_figure_mock.call_args_list
+    )
