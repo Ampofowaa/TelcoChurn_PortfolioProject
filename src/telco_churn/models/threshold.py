@@ -11,13 +11,20 @@ estimator import. `run_threshold_step` only reads models.calibrate's
 already-computed OOF arrays and telco_churn.data.split's segment/protected
 columns — never the test partition.
 
-Also runs Phase 7's pre-seal dev-OOF screen as its last step: re-screens
-calibrate.py's logged aggregate calibration slope against ANALYSIS.md §0's
-band, and computes V1 (segment collapse), V2 (fairness disparity), and V2b
-(per-group calibration collapse) on that same dev-OOF surface — writing
+Also runs Phase 7's pre-seal dev-OOF screen as its last step. Two *binding*
+checks, both computed here, before the sealed test set is ever touched:
+re-screens calibrate.py's logged aggregate calibration slope against
+ANALYSIS.md §0's band, and V3 — ranks calibrate.py's logged dev-SHAP summary
+(dev_shap_summary.json), cuts at `v3_top_k_features`, and checks each
+surviving feature's direction against explain.EXPECTED_EDA_DIRECTIONS (no
+shap import here; calibrate.py already computed the SHAP values). Also
+computes V1 (segment collapse), V2 (fairness disparity), and V2b (per-group
+calibration collapse) on the same dev-OOF surface — reported-only, never
+gating (CLAUDE.md's three-guardrail rule) — writing
 reports/dev_oof_predictions.parquet and reports/dev_oof_diagnostics.json for
-evaluate.py, error_analysis.py, and drift_reference.py to read back. Raises
-RuntimeError, after logging, if the slope's CI lies entirely outside the band.
+evaluate.py, error_analysis.py, register.py, and drift_reference.py to read
+back. Raises RuntimeError, after logging, if the calibration slope or V3
+fails.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ import json
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import matplotlib.pyplot as plt
 import mlflow
@@ -36,6 +43,7 @@ import mlflow.tracking
 import numpy as np
 import pandas as pd
 from mlflow.data.pandas_dataset import from_pandas as mlflow_dataset_from_pandas
+from mlflow.exceptions import MlflowException
 from numpy.typing import NDArray
 from omegaconf import DictConfig, OmegaConf
 
@@ -58,6 +66,11 @@ from telco_churn.models.diagnostics import (
     sliced_calibration,
     sliced_decision_rates,
     sliced_ranking_metrics,
+)
+from telco_churn.models.explain import (
+    EXPECTED_EDA_DIRECTIONS,
+    check_top_k_elbow,
+    direction_sanity_check,
 )
 from telco_churn.models.gate import slope_passes
 from telco_churn.utils.logging import get_logger
@@ -88,6 +101,7 @@ __all__ = [
     "derive_threshold",
     "load_calibration_summary",
     "load_dev_oof_predictions",
+    "load_dev_shap_summary",
     "load_policy_thresholds",
     "resolve_policy_scenarios",
     "resolve_policy_thresholds_by_scenario",
@@ -411,6 +425,30 @@ def load_dev_oof_predictions(run_id: str, cfg: DictConfig) -> pd.DataFrame:
     return pd.read_parquet(local_path)
 
 
+def load_dev_shap_summary(run_id: str, cfg: DictConfig) -> list[dict[str, Any]]:
+    """Load calibrate.py's dev_shap_summary.json — the ranking the V3 pre-seal veto binds on.
+
+    Sorted mean_abs_shap descending (calibrate.py's own explain.global_importance
+    sort), each row {feature, mean_abs_shap, direction}. Raises loudly, naming
+    the run, if absent — e.g. a hand-run older model version calibrated before
+    this project added dev-SHAP logging — rather than silently skipping V3,
+    which would let an unvetted model reach the sealed test set.
+    """
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    try:
+        summary = mlflow.artifacts.load_dict(
+            f"runs:/{run_id}/calibration/dev_shap_summary.json"
+        )
+    except MlflowException as exc:
+        raise RuntimeError(
+            f"Run {run_id!r} has no calibration/dev_shap_summary.json — this "
+            "looks like a hand-run older model version calibrated before "
+            "dev-SHAP logging existed. V3 cannot be silently skipped; "
+            "re-run models.calibrate for this cycle first."
+        ) from exc
+    return cast("list[dict[str, Any]]", summary)
+
+
 def load_policy_thresholds(cfg: DictConfig) -> DictConfig:
     """Load configs/policy/threshold.yaml — the model-independent scenario thresholds.
 
@@ -527,15 +565,15 @@ def compute_dev_oof_diagnostics(
     v2b_flagged = flag_calibration_collapse(calibration_slices, calibration_slope_band)
 
     return {
-        "ranking": ranking_slices,
-        "v1_flagged": v1_flagged,
-        "decision_rates": decision_slices,
-        "equal_opportunity_difference_by_axis": equal_opportunity_by_axis,
-        "demographic_parity_difference_by_axis": demographic_parity_by_axis,
-        "v2_equal_opportunity_flagged": v2_equal_opportunity_flagged,
-        "v2_demographic_parity_flagged": v2_demographic_parity_flagged,
-        "calibration": calibration_slices,
-        "v2b_flagged": v2b_flagged,
+        "segment_pr_auc": ranking_slices,
+        "segment_collapse_flagged": v1_flagged,
+        "segment_decision_rates": decision_slices,
+        "equal_opportunity_gap_by_axis": equal_opportunity_by_axis,
+        "demographic_parity_gap_by_axis": demographic_parity_by_axis,
+        "equal_opportunity_gap_flagged": v2_equal_opportunity_flagged,
+        "demographic_parity_gap_flagged": v2_demographic_parity_flagged,
+        "segment_calibration": calibration_slices,
+        "calibration_collapse_flagged": v2b_flagged,
     }
 
 
@@ -787,28 +825,128 @@ def _render_threshold_figures(
     }
 
 
+def _run_v3_direction_sanity(run_id: str, cfg: DictConfig) -> dict[str, Any]:
+    """V3 pre-seal veto: rank calibrate.py's dev-SHAP summary, cut at
+    `v3_top_k_features`, and check each surviving feature's direction
+    against `explain.EXPECTED_EDA_DIRECTIONS`.
+
+    No shap import here — calibrate.py already computed the SHAP values and
+    logged the ranking (`dev_shap_summary.json`); this module only ranks,
+    cuts, and checks the already-persisted summary. A top-k feature whose
+    `|direction|` falls below `v3_min_direction_magnitude` is excluded from
+    the checked set (`weak_count`) rather than risking a veto on a sign too
+    unstable/noise-prone to trust.
+    """
+    summary = load_dev_shap_summary(run_id, cfg)
+    v3_top_k = int(cfg.threshold.v3_top_k_features)
+    min_direction_magnitude = float(cfg.threshold.v3_min_direction_magnitude)
+
+    elbow = check_top_k_elbow(
+        [float(row["mean_abs_shap"]) for row in summary], v3_top_k
+    )
+    if not elbow["valid"]:
+        logger.warning("v3_top_k_features_elbow_drifted", **elbow)
+
+    top_rows = summary[:v3_top_k]
+    directions = {str(row["feature"]): float(row["direction"]) for row in top_rows}
+    strong_features = [
+        str(row["feature"])
+        for row in top_rows
+        if abs(float(row["direction"])) >= min_direction_magnitude
+    ]
+    weak_count = len(top_rows) - len(strong_features)
+
+    v3_result = direction_sanity_check(
+        strong_features, directions, EXPECTED_EDA_DIRECTIONS
+    )
+    checked_count = sum(1 for row in v3_result["checked_features"] if row["checked"])
+
+    return {
+        "v3_result": v3_result,
+        "v3_top_k_features": v3_top_k,
+        "top_k_feature_names": [str(row["feature"]) for row in top_rows],
+        "checked_count": checked_count,
+        "weak_count": weak_count,
+        "elbow": elbow,
+    }
+
+
 def _run_dev_oof_screen(
     loaded: dict[str, Any],
     base_threshold: float,
     cfg: DictConfig,
     random_state: int,
 ) -> dict[str, Any]:
-    """Screen calibrate.py's logged calibration slope against ANALYSIS.md §0's band.
+    """Screen calibrate.py's logged calibration slope and this module's own
+    V3 direction-sanity veto against ANALYSIS.md §0's bars.
 
     Reuses the aligned dev-OOF vector `_load_and_align_dev_oof` already
-    built, never re-fetching dev_oof_predictions.parquet. Returns
-    `screen_passed` rather than raising: the caller logs and mirrors the
+    built, never re-fetching dev_oof_predictions.parquet. Returns `failures`
+    (a list of `{criterion, detail, remediation}` dicts, empty iff the
+    screen passes) rather than raising: the caller logs and mirrors the
     audit trail first, and raises only afterward, so a failing screen is
-    recorded rather than silently vanishing.
+    recorded rather than silently vanishing. Exactly two possible entries —
+    `calibration_slope` and `v3_direction_sanity` — never V1/V2/V2b, which
+    stay reported-only per CLAUDE.md's three-guardrail rule. A V3 veto with
+    zero checked features (nothing in the top-k both matched an EDA key and
+    cleared the magnitude floor) is itself a failure: a veto that never fired
+    validated nothing.
     """
     dev_oof_screen_frame = build_dev_oof_screen_frame(
         loaded["customerid"], loaded["y_dev_arr"], loaded["oof_proba"]
     )
     slope = loaded["calibration_summary"]["calibration_slope"]
     calibration_slope_band = load_model_promotion_bars(cfg).calibration_slope_band
-    screen_passed = slope_passes(
+    slope_ok = slope_passes(
         slope["slope_ci_lower"], slope["slope_ci_upper"], calibration_slope_band
     )
+
+    v3 = _run_v3_direction_sanity(loaded["run_id"], cfg)
+
+    failures: list[dict[str, Any]] = []
+    if not slope_ok:
+        failures.append(
+            {
+                "criterion": "calibration_slope",
+                "detail": (
+                    f"dev-OOF slope 95% CI [{slope['slope_ci_lower']:.4f}, "
+                    f"{slope['slope_ci_upper']:.4f}] lies entirely outside "
+                    f"band [{calibration_slope_band[0]}, "
+                    f"{calibration_slope_band[1]}]"
+                ),
+                "remediation": (
+                    "Re-calibrate before evaluating on the sealed test set."
+                ),
+            }
+        )
+    v3_ok = v3["v3_result"]["passed"] and v3["checked_count"] > 0
+    if not v3_ok:
+        if v3["checked_count"] == 0:
+            detail = (
+                f"zero of the dev-SHAP top-{v3['v3_top_k_features']} "
+                "features could be checked against an established EDA "
+                "direction — the veto cannot validate anything this cycle."
+            )
+        else:
+            violation_names = [row["feature"] for row in v3["v3_result"]["violations"]]
+            detail = (
+                f"{len(v3['v3_result']['violations'])} of "
+                f"{v3['checked_count']} checked dev-SHAP top-"
+                f"{v3['v3_top_k_features']} features contradict their "
+                f"established EDA direction: {violation_names}"
+            )
+        failures.append(
+            {
+                "criterion": "v3_direction_sanity",
+                "detail": detail,
+                "remediation": (
+                    "Investigate whether the model is fitting a "
+                    "training-data artifact before evaluating on the "
+                    "sealed test set."
+                ),
+            }
+        )
+
     dev_oof_diagnostics = compute_dev_oof_diagnostics(
         dev_oof_screen_frame,
         base_threshold,
@@ -817,11 +955,16 @@ def _run_dev_oof_screen(
         int(cfg.threshold.n_bootstrap),
         random_state,
     )
+    dev_oof_diagnostics["direction_sanity_result"] = v3["v3_result"]
+    dev_oof_diagnostics["direction_check_feature_names"] = v3["top_k_feature_names"]
+    dev_oof_diagnostics["direction_checked_count"] = v3["checked_count"]
+    dev_oof_diagnostics["direction_weak_signal_count"] = v3["weak_count"]
+
     return {
         "dev_oof_screen_frame": dev_oof_screen_frame,
         "slope": slope,
         "calibration_slope_band": calibration_slope_band,
-        "screen_passed": screen_passed,
+        "failures": failures,
         "dev_oof_diagnostics": dev_oof_diagnostics,
     }
 
@@ -830,7 +973,7 @@ def _assemble_threshold_payloads(
     loaded: dict[str, Any],
     derived: dict[str, Any],
     model_version: str,
-    screen_passed: bool,
+    failures: list[dict[str, Any]],
     cfg: DictConfig,
 ) -> dict[str, Any]:
     """Assemble threshold.json, threshold.yaml (policy), and threshold_validation.json.
@@ -842,7 +985,7 @@ def _assemble_threshold_payloads(
     model-independent file must not carry a model stamp, or a rollback to a
     different champion leaves it describing the wrong model.
     threshold_validation.json carries the model-dependent half (argmax-EV
-    threshold, its bootstrap CI, calibration_method, screen_passed, ...) as
+    threshold, its bootstrap CI, calibration_method, failures, ...) as
     an artifact on this model's own run, so it travels with that version
     rather than sitting at a fixed path a rollback could leave stale.
 
@@ -899,11 +1042,12 @@ def _assemble_threshold_payloads(
         "argmax_ev_bootstrap_ci": base["argmax_ev_bootstrap_ci"],
         "within_ci": base["within_ci"],
         "implied_contact_rate": base["implied_contact_rate"],
-        # The model-dependent half of the dev-OOF calibration screen —
-        # evaluate.py/error_analysis.py re-check this independently via
+        # The model-dependent half of the dev-OOF pre-seal screen (calibration
+        # slope + V3 direction sanity) — evaluate.py/error_analysis.py/
+        # register.py re-check this independently via
         # check_threshold_screen_passed, on top of the RuntimeError
-        # run_threshold_step itself already raises when it's False.
-        "screen_passed": screen_passed,
+        # run_threshold_step itself already raises when this is non-empty.
+        "failures": failures,
         "scenarios": {
             name: {
                 "scenario": name,
@@ -999,7 +1143,7 @@ def _log_threshold_run(
             screen["dev_oof_diagnostics"], "threshold/dev_oof_diagnostics.json"
         )
         mlflow.set_tag(
-            "dev_oof_screen_result", "pass" if screen["screen_passed"] else "fail"
+            "dev_oof_screen_result", "pass" if not screen["failures"] else "fail"
         )
 
 
@@ -1053,7 +1197,8 @@ def run_threshold_step(
     the same aligned dev-OOF vector already built for the threshold
     derivation above (no second fetch), writing
     reports/dev_oof_predictions.parquet and reports/dev_oof_diagnostics.json.
-    Raises RuntimeError, after logging, if the slope fails the band.
+    Raises RuntimeError, after logging, if the calibration slope or the V3
+    direction-sanity veto fails.
     """
     loaded = _load_and_align_dev_oof(run_id, cfg)
     derived = _derive_scenario_thresholds(
@@ -1067,7 +1212,7 @@ def run_threshold_step(
         loaded, float(derived["base"]["threshold"]), cfg, random_state
     )
     payloads = _assemble_threshold_payloads(
-        loaded, derived, model_version, screen["screen_passed"], cfg
+        loaded, derived, model_version, screen["failures"], cfg
     )
     _log_threshold_run(loaded, derived, figures, payloads, screen, model_version, cfg)
     _write_threshold_reports(
@@ -1076,7 +1221,7 @@ def run_threshold_step(
 
     base = derived["base"]
     slope = screen["slope"]
-    screen_passed = screen["screen_passed"]
+    failures = screen["failures"]
     logger.info(
         "threshold_derived",
         run_id=loaded["run_id"],
@@ -1086,7 +1231,7 @@ def run_threshold_step(
         within_ci=base["within_ci"],
         implied_contact_rate=base["implied_contact_rate"],
         dev_oof_calibration_slope=slope["slope"],
-        dev_oof_screen_passed=screen_passed,
+        dev_oof_screen_passed=not failures,
     )
 
     result = {
@@ -1094,17 +1239,15 @@ def run_threshold_step(
         "policy_payload": payloads["policy_payload"],
         "validation_payload": payloads["validation_payload"],
         "dev_oof_diagnostics": screen["dev_oof_diagnostics"],
-        "dev_oof_screen_passed": screen_passed,
+        "dev_oof_screen_passed": not failures,
     }
 
-    if not screen_passed:
-        calibration_slope_band = screen["calibration_slope_band"]
+    if failures:
+        clauses = "; ".join(f"{f['criterion']}: {f['detail']}" for f in failures)
         raise RuntimeError(
-            "Dev-OOF calibration screen failed: calibrate.py's logged slope "
-            f"95% CI [{slope['slope_ci_lower']:.4f}, "
-            f"{slope['slope_ci_upper']:.4f}] lies entirely outside the "
-            f"[{calibration_slope_band[0]}, {calibration_slope_band[1]}] band "
-            "— re-calibrate before evaluating on the sealed test set."
+            f"Dev-OOF pre-seal screen failed ({len(failures)} criterion/"
+            f"criteria): {clauses} — do not evaluate on the sealed test set "
+            "until resolved."
         )
 
     return result

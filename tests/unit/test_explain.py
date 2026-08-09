@@ -7,8 +7,11 @@ import pytest
 
 from telco_churn.models.explain import (
     binary_feature_effects,
+    check_top_k_elbow,
     cohort_shap,
     dependence_points,
+    direction_sanity_check,
+    feature_directions,
     global_importance,
     local_explanations,
 )
@@ -342,3 +345,129 @@ def test_local_explanations_omits_feature_value_when_not_provided() -> None:
     rows = local_explanations(shap_values, 0.3, ["a", "b"], [0], top_k=2)
     for entry in rows[0]["top_features"]:
         assert "feature_value" not in entry
+
+
+# ---------------------------------------------------------------------------
+# feature_directions
+# ---------------------------------------------------------------------------
+
+
+def test_feature_directions_one_entry_per_feature() -> None:
+    """Returns a direction for every column, not just a top-k slice."""
+    rng = np.random.default_rng(9)
+    Xt = rng.normal(size=(30, 3))
+    shap_values = rng.normal(size=(30, 3))
+    result = feature_directions(Xt, shap_values, ["a", "b", "c"])
+    assert set(result) == {"a", "b", "c"}
+
+
+def test_feature_directions_matches_dependence_points_direction() -> None:
+    """feature_directions agrees with dependence_points' own per-feature
+    direction — both wrap the same _signed_direction computation."""
+    rng = np.random.default_rng(10)
+    Xt = rng.normal(size=(40, 2))
+    shap_values = rng.normal(size=(40, 2))
+    result = feature_directions(Xt, shap_values, ["a", "b"])
+    expected_a = dependence_points(Xt[:, 0], shap_values[:, 0])["direction"]
+    assert result["a"] == pytest.approx(expected_a)
+
+
+# ---------------------------------------------------------------------------
+# direction_sanity_check
+# ---------------------------------------------------------------------------
+
+
+def test_direction_sanity_check_no_violation_when_direction_matches() -> None:
+    """A feature whose observed direction matches its expected sign passes."""
+    result = direction_sanity_check(["tenure"], {"tenure": -0.8}, {"tenure": -1})
+    assert result["passed"] is True
+    assert result["violations"] == []
+
+
+def test_direction_sanity_check_flags_contradicting_direction() -> None:
+    """A feature whose observed direction contradicts the established EDA
+    relationship is flagged as a violation, and the gate fails."""
+    result = direction_sanity_check(["tenure"], {"tenure": 0.7}, {"tenure": -1})
+    assert result["passed"] is False
+    assert len(result["violations"]) == 1
+    assert result["violations"][0]["feature"] == "tenure"
+
+
+def test_direction_sanity_check_unmatched_feature_is_not_checked_and_does_not_fail() -> (
+    None
+):
+    """A checked feature with no established relationship is recorded as
+    unchecked rather than silently treated as a pass on a claim never made."""
+    result = direction_sanity_check(
+        ["some_engineered_ratio"], {"some_engineered_ratio": 0.5}, {"tenure": -1}
+    )
+    assert result["passed"] is True
+    row = result["checked_features"][0]
+    assert row["checked"] is False
+    assert row["matched_eda_relationship"] is None
+
+
+def test_direction_sanity_check_longest_key_wins_on_ambiguous_substring() -> None:
+    """A feature name matching multiple expected-direction keys resolves to
+    the longest (most specific) match."""
+    result = direction_sanity_check(
+        ["contract_type_Two year"],
+        {"contract_type_Two year": -0.9},
+        {"year": 1, "two year": -1},
+    )
+    row = result["checked_features"][0]
+    assert row["matched_eda_relationship"] == "two year"
+    assert row["contradicts"] is False
+
+
+# ---------------------------------------------------------------------------
+# check_top_k_elbow
+# ---------------------------------------------------------------------------
+
+
+def test_check_top_k_elbow_valid_when_configured_k_sits_on_a_real_elbow() -> None:
+    """A tight plateau (small consecutive deltas) followed by a real jump at
+    the configured k reports valid=True."""
+    values = [0.90, 0.60, 0.30, 0.29, 0.28, 0.27, 0.10, 0.09, 0.08]
+    result = check_top_k_elbow(values, configured_k=6)
+    assert result["valid"] is True
+    assert result["ratio"] > 1.5
+
+
+def test_check_top_k_elbow_invalid_when_configured_k_is_mid_plateau() -> None:
+    """A configured k landing inside a smooth, gap-free decay (no real
+    elbow anywhere) reports valid=False."""
+    values = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+    result = check_top_k_elbow(values, configured_k=3)
+    assert result["valid"] is False
+
+
+def test_check_top_k_elbow_matches_current_project_config() -> None:
+    """Regression guard pinned to the real global-importance ranking
+    top_k_dependence_features=8 was derived from: its own elbow at rank 8
+    still validates, and a badly-wrong k=3 (mid-plateau) still fails."""
+    global_importance = [
+        0.6469,
+        0.4313,
+        0.2247,
+        0.1949,
+        0.1924,
+        0.1918,
+        0.1831,
+        0.1747,
+        0.1286,
+        0.1157,
+        0.0945,
+    ]
+    assert check_top_k_elbow(global_importance, configured_k=8)["valid"] is True
+    assert check_top_k_elbow(global_importance, configured_k=3)["valid"] is False
+
+
+def test_check_top_k_elbow_empty_plateau_reports_valid_with_no_baseline() -> None:
+    """configured_k too close to 1 to have a plateau baseline reports
+    valid=True with no ratio computed, rather than raising or dividing by
+    zero."""
+    values = [1.0, 0.5, 0.1]
+    result = check_top_k_elbow(values, configured_k=1)
+    assert result["valid"] is True
+    assert result["plateau_median_delta"] is None

@@ -49,7 +49,13 @@ from telco_churn.models.calibrate import (
 )
 from telco_churn.models.diagnostics import FAIRNESS_AXES, ROBUSTNESS_AXES
 from telco_churn.models.drift_reference import build_reference
-from telco_churn.models.evaluate import content_hash, resolve_champion_version
+from telco_churn.models.evaluate import (
+    check_threshold_screen_passed,
+    content_hash,
+    load_dev_oof_diagnostics,
+    load_threshold_validation,
+    resolve_champion_version,
+)
 from telco_churn.models.threshold import load_dev_oof_predictions
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (
@@ -1043,14 +1049,24 @@ def _build_governance_section(
 
 
 def _build_technical_appendix_section(
-    manifest: dict[str, Any], metrics: dict[str, Any], error_analysis: dict[str, Any]
+    manifest: dict[str, Any],
+    metrics: dict[str, Any],
+    error_analysis: dict[str, Any],
+    run_id: str,
+    cfg: DictConfig,
 ) -> dict[str, Any]:
     """Build model_card.json's technical_appendix section.
 
     n_test/evaluation_data_description/n_dev/training_data_description are
     computed here, their only consumer, rather than in the parent assembler.
+
+    Fetches threshold.py's dev_oof_diagnostics.json directly, by this cycle's
+    own run_id — register.py is the sole reader of this data across the whole
+    cycle, so it resolves it once, off the canonical MLflow artifact, rather
+    than through a copy evaluate.py/error_analysis.py used to re-embed in
+    metrics.json/error_analysis.json for no other reader's benefit.
     """
-    dev_oof_flags = error_analysis.get("dev_oof_diagnostics_carried_through", {})
+    dev_oof_diagnostics = load_dev_oof_diagnostics(run_id, cfg)
     calibration = metrics.get("calibration", {})
     sliced = metrics.get("sliced", {})
 
@@ -1122,20 +1138,29 @@ def _build_technical_appendix_section(
         },
         "fairness_robustness": {
             "flags": {
-                "v1_segment_collapse_flagged": dev_oof_flags.get("v1_flagged", []),
-                "v2_equal_opportunity_flagged": dev_oof_flags.get(
-                    "v2_equal_opportunity_flagged", {}
-                ),
-                "v2_demographic_parity_flagged": dev_oof_flags.get(
-                    "v2_demographic_parity_flagged", {}
-                ),
-                "v2b_calibration_flagged": dev_oof_flags.get("v2b_flagged", []),
-                "v3_direction_sanity_violations": error_analysis.get(
-                    "direction_sanity_check", {}
-                ).get("violations", []),
+                "v1_segment_collapse_flagged": dev_oof_diagnostics[
+                    "segment_collapse_flagged"
+                ],
+                "v2_equal_opportunity_flagged": dev_oof_diagnostics[
+                    "equal_opportunity_gap_flagged"
+                ],
+                "v2_demographic_parity_flagged": dev_oof_diagnostics[
+                    "demographic_parity_gap_flagged"
+                ],
+                "v2b_calibration_flagged": dev_oof_diagnostics[
+                    "calibration_collapse_flagged"
+                ],
+                # The binding pre-seal verdict (threshold.py's dev-SHAP V3
+                # veto that actually gated this cycle's promotion) — not
+                # error_analysis.json's own direction_sanity_check_test,
+                # which is a reported-only sealed-test re-audit of that same
+                # dev-derived feature set, never a second gate.
+                "v3_direction_sanity_violations": dev_oof_diagnostics[
+                    "direction_sanity_result"
+                ]["violations"],
             },
             "disaggregated_results": {
-                "dev_oof": sliced.get("dev_oof_diagnostics", {}),
+                "dev_oof": dev_oof_diagnostics,
                 "sealed_test": sliced.get("test", {}),
             },
         },
@@ -1158,6 +1183,7 @@ def _assemble_model_card(
     registered_model_name: str,
     alias: str,
     promoted_at: str,
+    cfg: DictConfig,
 ) -> dict[str, Any]:
     """Assemble model_card.json strictly from already-computed artifacts.
 
@@ -1200,7 +1226,7 @@ def _assemble_model_card(
             promoted_at,
         ),
         "technical_appendix": _build_technical_appendix_section(
-            manifest, metrics, error_analysis
+            manifest, metrics, error_analysis, run_id, cfg
         ),
     }
 
@@ -1647,6 +1673,7 @@ def _build_and_log_model_card(
         registered_model_name,
         alias,
         datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        cfg,
     )
     client.log_dict(run_id, model_card, "registration/model_card.json")
     with open(reports_dir / "model_card.json", "w", encoding="utf-8") as f:
@@ -1785,18 +1812,24 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
            "rejected" tags rejected (human_rejected) and returns; anything
            other than "approved"/"rejected" raises; no entry at all raises.
         4. Stop and tag rejected if the gate itself failed.
-        5. Assert the four per-cycle manifest artifacts are present.
-        6. Resolve error_analysis_run_id (same tag-or-receipt pattern as
+        5. Independent re-check of threshold.py's dev-OOF pre-seal screen
+           (calibration_slope + v3_direction_sanity) via
+           check_threshold_screen_passed — the out-of-band manual
+           `evaluate` -> `register` path's backstop: evaluate.py already
+           enforces this before promotion_decision.json can exist, but this
+           re-check means register.py never trusts that indirectly.
+        6. Assert the four per-cycle manifest artifacts are present.
+        7. Resolve error_analysis_run_id (same tag-or-receipt pattern as
            step 2) and load+verify error_analysis.json.
-        7. Pre-flip smoke check by explicit version URI: environment parity,
+        8. Pre-flip smoke check by explicit version URI: environment parity,
            then schema/output-range and golden-prediction parity (tag
            rejected on failure), then a non-gating latency/size diagnostic.
-        8. Immediately before flipping, re-resolve champion and assert it
+        9. Immediately before flipping, re-resolve champion and assert it
            still matches the decision's incumbent (closes the race window
            between evaluation and promotion).
-        9. Flip the alias, reload through it, and reconfirm golden parity —
-           rolling back via rollback_champion() on failure.
-        10. Build and log drift_reference.json and model_card.json onto the
+        10. Flip the alias, reload through it, and reconfirm golden parity —
+            rolling back via rollback_champion() on failure.
+        11. Build and log drift_reference.json and model_card.json onto the
             promoted run, then tag promoted, append a promotion_log entry,
             and log model_promoted — all as one unit. A failure anywhere in
             this unit rolls the alias back to the prior promoted champion
@@ -1863,6 +1896,12 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
         return {"model_version": model_version, "promotion_status": "rejected"}
 
     run_id = str(current_version.run_id)
+    # Independent re-check, same as evaluate.py/error_analysis.py — closes
+    # the out-of-band path where evaluate.py ran once (writing a decision
+    # this cycle reads) but register.py is invoked manually against a
+    # threshold_validation.json that never actually cleared the pre-seal
+    # screen this same cycle.
+    check_threshold_screen_passed(load_threshold_validation(run_id, cfg))
     _check_manifest_artifacts(run_id)
 
     ea_artifacts = _load_and_verify_error_analysis(

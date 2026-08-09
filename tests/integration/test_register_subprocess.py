@@ -67,6 +67,13 @@ _FAST_CALIBRATION_OVERRIDES = [
     "calibration.inner_cv_folds=3",
 ]
 _FAST_EVALUATE_OVERRIDES = ["evaluate.n_bootstrap=30"]
+# v3_top_k_features=3 (not the production 8): _make_synthetic_processed_frame's
+# docstring plants exactly three real signal columns (contract_type, tenure,
+# monthlycharges) — the only ones with a real, learnable relationship to
+# churn — so cutting the V3 pre-seal veto's top-k at 3 keeps it checking real
+# signal instead of noise from one of this fixture's many uninformative
+# columns. Mirrors tests/unit/test_error_analysis.py's identical override.
+_FAST_THRESHOLD_OVERRIDES = ["threshold.v3_top_k_features=3"]
 
 
 def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame:
@@ -216,6 +223,7 @@ def reviewed_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object
             f"paths.processed_data={data_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
             *_FAST_EVALUATE_OVERRIDES,
+            *_FAST_THRESHOLD_OVERRIDES,
         ]
     )
 

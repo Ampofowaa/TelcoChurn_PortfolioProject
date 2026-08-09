@@ -61,6 +61,14 @@ _FAST_CALIBRATION_OVERRIDES = [
 # bootstrap knob of its own.
 _FAST_EVALUATE_OVERRIDES = ["evaluate.n_bootstrap=30"]
 
+# v3_top_k_features=3 (not the production 8): _make_synthetic_processed_frame's
+# docstring plants exactly three real signal columns (contract_type, tenure,
+# monthlycharges) — the only ones with a real, learnable relationship to
+# churn — so cutting the V3 pre-seal veto's top-k at 3 keeps it checking real
+# signal instead of noise from one of this fixture's many uninformative
+# columns. Mirrors tests/unit/test_error_analysis.py's identical override.
+_FAST_THRESHOLD_OVERRIDES = ["threshold.v3_top_k_features=3"]
+
 
 def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame:
     """A FeatureOutputSchema-conformant frame with every segment-axis column
@@ -216,6 +224,7 @@ def evaluated_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, objec
             f"paths.processed_data={data_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
             *_FAST_EVALUATE_OVERRIDES,
+            *_FAST_THRESHOLD_OVERRIDES,
         ]
     )
 
@@ -368,15 +377,16 @@ def test_error_analysis_main_cli_exits_zero_and_writes_report(
         "shap",
         "top_k_elbow_checks",
         "subgroup_findings",
-        "direction_sanity_check",
-        "dev_oof_diagnostics_carried_through",
+        "direction_sanity_check_test",
     ):
         assert key in payload, f"error_analysis.json missing field: {key}"
+    assert "dev_oof_diagnostics_carried_through" not in payload
 
-    assert "passed" in payload["direction_sanity_check"]
+    assert "passed" in payload["direction_sanity_check_test"]
     assert set(payload["shap"]) >= {
         "global_importance",
         "top_features",
+        "dependence_feature_set",
         "dependence",
         "cohort_shap",
         "cohort_top_features_fp_tn",
@@ -384,7 +394,7 @@ def test_error_analysis_main_cli_exits_zero_and_writes_report(
     }
     assert set(payload["shap"]["cohort_shap"]) == {"fn", "tp", "fp", "tn"}
     assert set(payload["top_k_elbow_checks"]) == {
-        "shap_features",
+        "dependence_features",
         "cohort_gap_fn_tp",
         "cohort_gap_fp_tn",
     }
@@ -431,7 +441,7 @@ def test_error_analysis_main_cli_exits_zero_and_writes_report(
         filter_string="tags.mlflow.runName = 'error_analysis'",
     )
     assert len(runs) >= 1
-    assert runs[0].data.tags.get("direction_sanity_check") in {"pass", "fail"}
+    assert runs[0].data.tags.get("direction_sanity_check_test") in {"pass", "fail"}
 
     # B1: error_analysis.py no longer tags the model version itself — it
     # writes reports/error_analysis_receipt.json, register.py's bootstrap

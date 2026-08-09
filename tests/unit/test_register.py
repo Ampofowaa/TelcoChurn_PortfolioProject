@@ -177,6 +177,34 @@ def _register_test_version(
             dev_oof_path = Path(tmp_dir) / "dev_oof_predictions.parquet"
             dev_oof.to_parquet(dev_oof_path, index=False)
             mlflow.log_artifact(str(dev_oof_path), artifact_path="calibration")
+        # run_registration_step's own independent re-check
+        # (check_threshold_screen_passed) fetches this unconditionally,
+        # before the manifest-artifacts assertion — must exist on every
+        # registered run, always passing, so it never interferes with a
+        # test's own intended failure path.
+        mlflow.log_dict({"failures": []}, "threshold/threshold_validation.json")
+        # _build_technical_appendix_section fetches this directly (register.py
+        # is the sole reader of dev_oof_diagnostics.json across the whole
+        # cycle, no longer via error_analysis.json's old carried_through
+        # copy) — must exist on every registered run.
+        mlflow.log_dict(
+            {
+                "segment_pr_auc": [],
+                "segment_collapse_flagged": [],
+                "segment_decision_rates": [],
+                "equal_opportunity_gap_by_axis": {},
+                "demographic_parity_gap_by_axis": {},
+                "equal_opportunity_gap_flagged": {},
+                "demographic_parity_gap_flagged": {},
+                "segment_calibration": [],
+                "calibration_collapse_flagged": [],
+                "direction_sanity_result": {"violations": []},
+                "direction_check_feature_names": [],
+                "direction_checked_count": 0,
+                "direction_weak_signal_count": 0,
+            },
+            "threshold/dev_oof_diagnostics.json",
+        )
         model_info = mlflow.sklearn.log_model(
             sk_model=fitted_model,
             name="calibrated_model",
@@ -291,13 +319,7 @@ def _log_evaluation_and_error_analysis(
     if include_error_analysis:
         error_analysis_payload = {
             "model_version": error_analysis_model_version,
-            "dev_oof_diagnostics_carried_through": {
-                "v1_flagged": [],
-                "v2_equal_opportunity_flagged": {},
-                "v2_demographic_parity_flagged": {},
-                "v2b_flagged": [],
-            },
-            "direction_sanity_check": {"violations": []},
+            "direction_sanity_check_test": {"violations": []},
             "error_concentration": {},
         }
         with mlflow.start_run(run_name="error_analysis") as run:
@@ -648,6 +670,11 @@ def test_register_manifest_gate_blocks_on_any_missing_artifact(
         for name in all_artifacts:
             if name != missing_artifact:
                 mlflow.log_text("dummy", name)
+        # run_registration_step's own independent re-check
+        # (check_threshold_screen_passed) runs before the manifest gate this
+        # test targets — must exist and pass, or that unrelated check fails
+        # first instead.
+        mlflow.log_dict({"failures": []}, "threshold/threshold_validation.json")
         model_info = mlflow.sklearn.log_model(
             sk_model=fitted_model,
             name="calibrated_model",

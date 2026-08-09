@@ -282,21 +282,25 @@ def check_threshold_provenance(
 
 
 def check_threshold_screen_passed(validation_payload: dict[str, Any]) -> None:
-    """Raise RuntimeError if threshold.py's dev-OOF calibration screen failed.
+    """Raise RuntimeError if threshold.py's dev-OOF pre-seal screen failed.
 
-    validation_payload["screen_passed"] is the model-dependent half of
-    threshold.py's dev-OOF screen (slope-band check) — this is an
-    independent re-check at every downstream reader (evaluate.py,
-    error_analysis.py), not a replacement for the RuntimeError
-    run_threshold_step itself already raises when the screen fails. No
-    override flag: a failed screen means the calibration is not trustworthy,
-    and nothing downstream may proceed against it regardless.
+    validation_payload["failures"] is the model-dependent half of
+    threshold.py's dev-OOF pre-seal screen (calibration_slope +
+    v3_direction_sanity; V1/V2/V2b are reported-only and never appear here)
+    — this is an independent re-check at every downstream reader
+    (evaluate.py, error_analysis.py, register.py), not a replacement for the
+    RuntimeError run_threshold_step itself already raises when the screen
+    fails. No override flag: a failed screen means the artifact is not
+    trustworthy, and nothing downstream may proceed against it regardless.
     """
-    if not bool(validation_payload["screen_passed"]):
+    failures = validation_payload["failures"]
+    if failures:
+        clauses = "; ".join(f"{f['criterion']}: {f['detail']}" for f in failures)
         raise RuntimeError(
-            "threshold_validation.json's screen_passed is False — "
-            "threshold.py's dev-OOF calibration screen failed for this "
-            "model. Re-calibrate before evaluating or running error analysis."
+            "threshold_validation.json's dev-OOF pre-seal screen failed "
+            f"({len(failures)} criterion/criteria): {clauses}. Re-run "
+            "models.threshold (and models.calibrate first, if needed) "
+            "before evaluating or running error analysis."
         )
 
 
@@ -1430,13 +1434,15 @@ def _compute_promotion_decision(
     policy_ctx: dict[str, Any],
     cfg: DictConfig,
 ) -> dict[str, Any]:
-    """Load the gate bars and dev-OOF diagnostics, resolve the incumbent, and call decide_promotion."""
-    bars = load_model_promotion_bars(cfg)
+    """Load the gate bars, resolve the incumbent, and call decide_promotion.
 
-    # V1/V2/V2b are computed by threshold.py's dev-OOF screen, Phase 6's last
-    # step — fetched here by run_id from its logged MLflow artifact, unchanged,
-    # never recomputed, so the dev-OOF surface has exactly one owner.
-    dev_oof_diagnostics = load_dev_oof_diagnostics(run_id, cfg)
+    Does not fetch threshold.py's dev-OOF diagnostics (V1/V2/V2b) — nothing
+    here consumes them, and metrics.json no longer embeds a copy. Its sole
+    reader, register.py's model card, fetches load_dev_oof_diagnostics(run_id,
+    cfg) directly, off the same canonical MLflow artifact this run_id already
+    points at — one owner, one read, not a chain of copies.
+    """
+    bars = load_model_promotion_bars(cfg)
 
     champion_version = resolve_champion_version(cfg)
     incumbent_proba = (
@@ -1463,7 +1469,6 @@ def _compute_promotion_decision(
     )
 
     return {
-        "dev_oof_diagnostics": dev_oof_diagnostics,
         "champion_version": champion_version,
         "incumbent_summary": incumbent_summary,
         "decision": decision,
@@ -1511,7 +1516,6 @@ def _assemble_metrics_and_economics_payloads(
                 "equal_opportunity_diff": sliced["test_equal_opportunity_diff"],
                 "demographic_parity_diff": sliced["test_demographic_parity_diff"],
             },
-            "dev_oof_diagnostics": decision_result["dev_oof_diagnostics"],
         },
     }
     y_test_int = y_test.to_numpy(dtype=np.int64)
@@ -1801,8 +1805,10 @@ def _write_reports_mirror(
 
     reports/dev_oof_predictions.parquet and dev_oof_diagnostics.json are not
     written here — threshold.py's dev-OOF screen (Phase 6's last step)
-    already wrote both; this module only ever fetches the latter (by run_id,
-    via load_dev_oof_diagnostics), never produces either.
+    already wrote both, and this module produces neither. This module also no
+    longer fetches dev_oof_diagnostics.json itself (load_dev_oof_diagnostics
+    stays exported for error_analysis.py/register.py, which resolve it
+    directly rather than through a copy embedded in metrics.json).
     """
     reports_dir = get_project_root() / str(cfg.paths.reports)
     reports_dir.mkdir(parents=True, exist_ok=True)

@@ -1415,6 +1415,56 @@ def test_run_calibration_step_logs_dev_oof_predictions(
     assert oof["p_hat"].between(0, 1).all()
 
 
+def test_run_calibration_step_logs_dev_shap_values(
+    calibrated_run: dict[str, Any],
+) -> None:
+    """dev_shap_values.parquet — the evidence threshold.py's V3 pre-seal
+    screen binds on — carries one row per dev customer, one column per
+    transformed feature, plus customerid and base_value (CLAUDE.md § Persist
+    the evidence, not just the conclusion).
+    """
+    run_id = calibrated_run["run_id"]
+    y_dev = calibrated_run["y_dev"]
+    registration_cfg = calibrated_run["cfg"]
+    mlflow.set_tracking_uri(str(registration_cfg.mlflow.tracking_uri))
+
+    local_path = mlflow.artifacts.download_artifacts(
+        run_id=run_id, artifact_path="calibration/dev_shap_values.parquet"
+    )
+    shap_df = pd.read_parquet(local_path)
+
+    assert len(shap_df) == len(y_dev)
+    assert {"customerid", "base_value"} <= set(shap_df.columns)
+    feature_cols = [c for c in shap_df.columns if c not in ("customerid", "base_value")]
+    assert len(feature_cols) > 0
+    assert shap_df[feature_cols].to_numpy().dtype.kind == "f"
+
+
+def test_run_calibration_step_logs_dev_shap_summary(
+    calibrated_run: dict[str, Any],
+) -> None:
+    """dev_shap_summary.json ranks every transformed feature by mean_abs_shap
+    (descending, matching explain.global_importance's sort) and carries a
+    signed direction alongside it — the ranking threshold.py's V3 pre-seal
+    veto is derived from and binds on.
+    """
+    run_id = calibrated_run["run_id"]
+    registration_cfg = calibrated_run["cfg"]
+    mlflow.set_tracking_uri(str(registration_cfg.mlflow.tracking_uri))
+
+    summary = mlflow.artifacts.load_dict(
+        f"runs:/{run_id}/calibration/dev_shap_summary.json"
+    )
+
+    assert len(summary) > 0
+    for row in summary:
+        assert {"feature", "mean_abs_shap", "direction"} <= set(row)
+        assert row["mean_abs_shap"] >= 0.0
+        assert -1.0 <= row["direction"] <= 1.0
+    mean_abs_shap_values = [row["mean_abs_shap"] for row in summary]
+    assert mean_abs_shap_values == sorted(mean_abs_shap_values, reverse=True)
+
+
 def test_run_calibration_step_calibration_summary_has_calibration_spec(
     registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],

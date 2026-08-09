@@ -1,7 +1,8 @@
 """Error-diagnosis step, run after evaluate.py. Owns reports/error_analysis.json.
 
 Answers what aggregate metrics can't: *where* the errors are, *how wrong*
-they were, and *what they cost*. Delegates SHAP mechanics to explain.py.
+they were, and *what they cost*. Delegates SHAP computation to
+models/shap_values.py and SHAP summary statistics/verdicts to explain.py.
 
 Data provenance:
 - Test/dev-OOF predictions come from evaluate.py's test_predictions.parquet
@@ -27,13 +28,16 @@ headline numbers on.
 SHAP values are computed against the champion's base LightGBM decision
 function, not the final calibrated probability — TreeExplainer cannot see
 through CalibratedClassifierCV's post-hoc sigmoid/isotonic map (the same
-constraint features.select.compute_shap_audit works under). That map is
-monotone, so a feature's *direction* of effect is provably identical
-pre- and post-calibration — V3 relies on exactly this, and only this. Its
-*magnitude* is not similarly protected: a non-linear monotone map can
-stretch or compress SHAP magnitudes unevenly, so global_importance's
-mean-|SHAP| ranking (and therefore which features make the V3 top-8) is a
-pre-calibration ranking, not guaranteed to match a post-calibration one.
+constraint features.select.compute_shap_audit and calibrate.py's dev-SHAP
+logging work under). That map is monotone, so a feature's *direction* of
+effect is provably identical pre- and post-calibration — threshold.py's V3
+pre-seal veto relies on exactly this, and only this. Its *magnitude* is not
+similarly protected: a non-linear monotone map can stretch or compress SHAP
+magnitudes unevenly, so global_importance's mean-|SHAP| ranking (and
+therefore which features make a top-k cut) is a pre-calibration ranking, not
+guaranteed to match a post-calibration one.
+
+This module's own SHAP pass runs on the *sealed test set*, after evaluate.py.
 """
 
 from __future__ import annotations
@@ -72,11 +76,18 @@ from telco_churn.models.evaluate import (
     load_threshold_validation,
 )
 from telco_churn.models.explain import (
+    EXPECTED_EDA_DIRECTIONS,
     binary_feature_effects,
+    check_top_k_elbow,
     cohort_shap,
     dependence_points,
+    direction_sanity_check,
     global_importance,
     local_explanations,
+)
+from telco_churn.models.shap_values import (
+    compute_shap_values,
+    unwrap_calibrated_pipeline,
 )
 from telco_churn.models.threshold import (
     load_dev_oof_predictions,
@@ -95,7 +106,6 @@ from telco_churn.utils.mlflow import (
 from telco_churn.utils.paths import get_project_root
 
 __all__ = [
-    "direction_sanity_check",
     "display_feature_name",
     "error_concentration_scan",
     "error_confidence_profile",
@@ -130,36 +140,6 @@ _NOT_ASSESSED = "not_assessed"
 # with an underscore before a feature name becomes part of a metric key.
 _METRIC_NAME_DISALLOWED_CHARS_RE = re.compile(r"[^a-zA-Z0-9_\-. /]")
 
-# EDA's established bivariate relationships, keyed by a lowercase substring
-# of the transformed (post-ColumnTransformer) feature name — the longest
-# matching key wins, mirroring features.select's column-map resolution. +1
-# means "higher/present pushes toward churn"; -1 the reverse.
-# A top-8 SHAP feature with no key here has no established relationship to
-# contradict and is simply not checked (V3 is silent, not passing-by-default
-# on a claim it never evaluated).
-_EXPECTED_EDA_DIRECTIONS: dict[str, int] = {
-    "tenure": -1,  # longer tenure -> lower churn
-    "totalcharges": -1,  # higher lifetime spend -> lower churn (only long-tenure customers accumulate it)
-    "monthlycharges": 1,  # higher monthly spend (fiber concentration) -> higher churn
-    "month-to-month": 1,  # contract_type dummy: r ~= +0.40
-    "two year": -1,  # contract_type dummy: r ~= -0.30
-    "onlinesecurity_no": 1,  # no security add-on -> higher churn, Cramer's V 0.35
-    "techsupport_no": 1,  # no support add-on -> higher churn, Cramer's V 0.34
-    "onlinebackup_no": 1,  # no backup add-on -> higher churn, Cramer's V 0.29
-    "deviceprotection_no": 1,  # no device protection -> higher churn, Cramer's V 0.28
-    # The matching "..._no internet service" level (all six add-on columns)
-    # is deliberately unkeyed: those columns are identical-by-construction for
-    # every no-internet customer and score exactly 0.0 mean |SHAP| (see
-    # global_importance), so they can never enter the top-k and a key here
-    # would never be exercised.
-    "fiber optic": 1,  # internetservice dummy: disproportionately high churn, Cramer's V 0.32
-    "internetservice_no": -1,  # no internet service -> lowest churn rate of the three tiers, every contract length
-    "electronic check": 1,  # paymentmethod dummy: highest-churn payment method, Cramer's V 0.30
-    "paperlessbilling": 1,  # paperless billing -> higher churn, Cramer's V 0.19
-    "seniorcitizen": 1,  # senior citizen -> higher churn, Cramer's V 0.15
-    "has_partner": -1,  # has a partner -> lower churn, Cramer's V 0.15
-    "dependents": -1,  # has dependents -> lower churn, Cramer's V 0.16
-}
 
 # Human-readable label for every FEATURE_SCHEMA column — a fixed lookup rather
 # than a `.replace("_", " ").title()` heuristic, since most raw columns
@@ -198,7 +178,7 @@ def display_feature_name(raw_name: str) -> str:
     "numeric__monthlycharges" -> "Monthly Charges"; "multi_cat__contract_type_
     Month-to-month" -> "Contract Type: Month-to-month". Matches the known
     column against FEATURE_SCHEMA's binary/multi_cat lists (longest match
-    wins, mirroring _EXPECTED_EDA_DIRECTIONS' convention) rather than
+    wins, mirroring explain.EXPECTED_EDA_DIRECTIONS' convention) rather than
     splitting on the first underscore, since several raw columns
     (contract_type, charge_per_service) already contain underscores that
     would make a naive split land in the wrong place. Falls back to the raw
@@ -429,72 +409,6 @@ def error_concentration_scan(
     return rows[:top_k]
 
 
-def _match_expected_direction_key(
-    feature_name: str, expected_directions: dict[str, int]
-) -> str | None:
-    """Longest-matching key in `expected_directions` that is a substring of
-    `feature_name` (case-insensitive), or None if nothing matches."""
-    name_lower = feature_name.lower()
-    candidates = [key for key in expected_directions if key in name_lower]
-    if not candidates:
-        return None
-    return max(candidates, key=len)
-
-
-def direction_sanity_check(
-    top_feature_names: Sequence[str],
-    directions: dict[str, float],
-    expected_directions: dict[str, int],
-) -> dict[str, Any]:
-    """V3: does any top-8 SHAP feature's effect direction contradict the
-    established EDA relationship?
-
-    `directions` is {feature_name: signed correlation} — explain.py::
-    dependence_points' `direction` output for each of `top_feature_names`, the
-    champion's own top-8 by mean |SHAP|. `expected_directions` maps a
-    substring of a feature name to its established sign (+1/-1); a top-8
-    feature matching no key has no established relationship to contradict and
-    is recorded as checked=False rather than silently counted as a pass.
-    Automatic veto surface: a sign flip on a feature this influential means
-    the model is fitting an artifact, and no aggregate metric would reveal it.
-    """
-    rows: list[dict[str, Any]] = []
-    violations: list[dict[str, Any]] = []
-    for name in top_feature_names:
-        key = _match_expected_direction_key(name, expected_directions)
-        if key is None:
-            rows.append(
-                {
-                    "feature": name,
-                    "checked": False,
-                    "matched_eda_relationship": None,
-                    "expected_sign": None,
-                    "observed_direction": directions[name],
-                    "contradicts": False,
-                }
-            )
-            continue
-        expected_sign = expected_directions[key]
-        observed = directions[name]
-        contradicts = observed != 0.0 and np.sign(observed) != np.sign(expected_sign)
-        row = {
-            "feature": name,
-            "checked": True,
-            "matched_eda_relationship": key,
-            "expected_sign": expected_sign,
-            "observed_direction": observed,
-            "contradicts": bool(contradicts),
-        }
-        rows.append(row)
-        if contradicts:
-            violations.append(row)
-    return {
-        "checked_features": rows,
-        "violations": violations,
-        "passed": len(violations) == 0,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -529,52 +443,6 @@ def _features_by_customer_id(customer_ids: pd.Series) -> pd.DataFrame:
         "customer id set came from."
     )
     return df.reindex(customer_ids).reset_index()
-
-
-def _shap_values_for_test_rows(
-    model: Any, X_test: pd.DataFrame
-) -> tuple[NDArray[np.float64], list[str], float, NDArray[np.float64]]:
-    """TreeExplainer SHAP values against the champion's base LightGBM step.
-
-    ensemble=False (calibrate.py::build_calibrated_pipeline) collapses
-    calibrated_classifiers_ to length 1, whose .estimator is the
-    [preprocessor -> model] Pipeline refit on all of development — the same
-    access path features.select.compute_shap_audit uses. Returns
-    (shap_values, feature_names, base_value, Xt); Xt (the transformed model
-    input matrix) is returned too because dependence_points/local_explanations
-    both need feature values in the same space shap_values was computed in.
-
-    Uses the explainer's `__call__` API rather than the legacy
-    `.shap_values(Xt)`, which warns unconditionally for a binary LightGBM
-    classifier (shap/explainers/_tree.py). `Explanation.values` comes back
-    shape (n_rows, n_features, 2) for a binary classifier — index `[..., 1]`
-    selects the positive (churn) class, mirroring the old `list[1]` indexing
-    on the legacy API's two-array return.
-    """
-    base_pipeline = model.calibrated_classifiers_[0].estimator
-    preprocessor = base_pipeline.named_steps["preprocessor"]
-    booster = base_pipeline.named_steps["model"]
-
-    Xt = preprocessor.transform(X_test)
-    feature_names = list(preprocessor.get_feature_names_out())
-
-    explainer = shap.TreeExplainer(booster)
-    shap_values = explainer(Xt).values
-    if shap_values.ndim == 3:
-        shap_values = shap_values[..., 1]
-
-    base_value_raw = explainer.expected_value
-    base_value = (
-        float(np.atleast_1d(base_value_raw)[-1])
-        if isinstance(base_value_raw, list | np.ndarray)
-        else float(base_value_raw)
-    )
-    return (
-        np.asarray(shap_values, dtype=float),
-        feature_names,
-        base_value,
-        np.asarray(Xt),
-    )
 
 
 def _illustrative_indices(
@@ -614,10 +482,10 @@ def _illustrative_indices(
 def _save_shap_global_importance_plot(rows: list[dict[str, Any]], path: Path) -> None:
     """Horizontal bar chart of mean |SHAP| for every feature in the model
     input space — model documentation, not error analysis
-    (explain.py::global_importance). Unlike the dependence/V3 subset
-    (top_k_shap_features), this renders the full ranking: a feature ranked
-    9th or lower is invisible to V3 but is exactly what a stakeholder skimming
-    the model card asks about next."""
+    (explain.py::global_importance). Unlike the dependence subset
+    (top_k_dependence_features), this renders the full ranking: a feature
+    ranked 9th or lower is outside that audit set but is exactly what a
+    stakeholder skimming the model card asks about next."""
     fig, ax = plt.subplots(figsize=(10, 0.3 * len(rows) + 1.5))
     names = [display_feature_name(cast(str, r["feature"])) for r in rows][::-1]
     values = [cast(float, r["mean_abs_shap"]) for r in rows][::-1]
@@ -670,10 +538,23 @@ def _save_shap_beeswarm_plot(
 
 
 def _save_dependence_plots(
-    dependence_by_feature: dict[str, dict[str, Any]], path: Path
+    dependence_by_feature: dict[str, dict[str, Any]],
+    dev_v3_audit_set: set[str],
+    contradicting_features: set[str],
+    path: Path,
 ) -> None:
-    """One scatter subplot per top-8 feature — SHAP value vs. raw (transformed)
-    feature value, the instrument V3 reads direction from."""
+    """One scatter subplot per dependence-grid feature — SHAP value vs. raw
+    (transformed) feature value.
+
+    Renders top_k_dependence_features' test-side ranking unioned with
+    threshold.py's own dev-side V3 audit set (dev_v3_audit_set) — panel
+    titles mark which features are inherited from that dev audit set
+    (audit-set) and which of those contradict their established EDA
+    direction on the sealed test set (direction_sanity_check_test's
+    violations) — CONTRADICTS is only ever set alongside audit-set, since
+    only audit-set features are actually re-checked (no independent
+    test-side k).
+    """
     features = list(dependence_by_feature)
     fig, axes = plt.subplots(1, len(features), figsize=(5.0 * len(features), 4.5))
     axes_list = [axes] if len(features) == 1 else list(axes)
@@ -685,7 +566,12 @@ def _save_dependence_plots(
         ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8)
         ax.set_xlabel(display_feature_name(feature))
         ax.set_ylabel("SHAP value")
-        ax.set_title(f"direction = {dep['direction']:.2f}", fontsize=9)
+        title = f"direction = {dep['direction']:.2f}"
+        if feature in dev_v3_audit_set:
+            title += " [audit-set]"
+        if feature in contradicting_features:
+            title += " [CONTRADICTS]"
+        ax.set_title(title, fontsize=9)
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path)
@@ -702,9 +588,9 @@ def _sorted_gap_pairs(
     global_importance's overall-population rank, which can and does pick a
     different top-n (a feature both cohorts agree on contributes nothing to
     distinguishing one from the other). Returns every feature, not a top-n
-    slice — the full ranking is what `_check_top_k_elbow` verifies a cutoff
-    against, and what error_analysis.json persists so a drifted cutoff can
-    be re-derived by hand straight from the file.
+    slice — the full ranking is what `explain.check_top_k_elbow` verifies a
+    cutoff against, and what error_analysis.json persists so a drifted
+    cutoff can be re-derived by hand straight from the file.
     """
     b_by_feature = {
         cast(str, r["feature"]): cast(float, r["mean_signed_shap"]) for r in rows_b
@@ -721,61 +607,6 @@ def _sorted_gap_pairs(
     ]
     gaps.sort(key=lambda t: t[1], reverse=True)
     return gaps
-
-
-def _check_top_k_elbow(
-    values: list[float],
-    configured_k: int,
-    plateau_window: int = 3,
-    min_elbow_ratio: float = 1.5,
-) -> dict[str, Any]:
-    """Verify the plateau-then-elbow shape that justified `configured_k` still holds.
-
-    `top_k_shap_features`, `top_k_cohort_gap_features`, and
-    `top_k_cohort_gap_features_fp_tn` were each hand-derived once from the
-    sorted deltas of exactly this kind of ranking (see their config
-    comments), and nothing re-derives them when the champion changes —
-    Phase 10's retrain calls this module with no human in the loop, so a
-    stale cutoff would otherwise drift silently.
-
-    Deliberately not "auto-pick k = argmax(delta)": on this project's own
-    global-importance ranking, the single biggest delta sits at rank 1-2
-    (0.22), not the plateau's real end (rank 8, delta 0.046) — an argmax
-    picker would discard most of the features the human derivation correctly
-    kept. Instead this asks a narrower question: is the drop right after
-    `configured_k` still clearly bigger than the drops right before it?
-    `plateau_window` deltas ending at `configured_k` set the local baseline;
-    `min_elbow_ratio` is how many multiples of it the elbow drop must clear
-    to pass. A ratio well below that threshold means the plateau has shifted
-    and `k` needs re-deriving by hand. This catches gross drift only — it
-    doesn't resolve boundary-adjacent ambiguity (an off-by-one `k` may still
-    pass) and never raises: too few features before `configured_k` to form a
-    baseline reports `valid=True` rather than a spurious failure.
-    """
-    deltas = [values[i] - values[i + 1] for i in range(len(values) - 1)]
-    elbow_delta = deltas[configured_k - 1]
-    window_start = max(0, configured_k - 1 - plateau_window)
-    plateau = sorted(deltas[window_start : configured_k - 1])
-    if not plateau:
-        return {
-            "configured_k": configured_k,
-            "elbow_delta": elbow_delta,
-            "plateau_median_delta": None,
-            "ratio": None,
-            "valid": True,
-        }
-    mid = len(plateau) // 2
-    plateau_median = (
-        plateau[mid] if len(plateau) % 2 else (plateau[mid - 1] + plateau[mid]) / 2
-    )
-    ratio = elbow_delta / plateau_median if plateau_median > 0 else float("inf")
-    return {
-        "configured_k": configured_k,
-        "elbow_delta": elbow_delta,
-        "plateau_median_delta": plateau_median,
-        "ratio": ratio,
-        "valid": ratio >= min_elbow_ratio,
-    }
 
 
 def _save_cohort_shap_plot(
@@ -1243,42 +1074,70 @@ def _compute_shap_diagnostics(
     model: Any,
     test_features_df: pd.DataFrame,
     committed_features: list[str],
+    dev_v3_audit_set: list[str],
     ea_cfg: Any,
 ) -> dict[str, Any]:
-    """Compute SHAP values once, global importance, dependence, direction sanity, and binary effects.
+    """Compute SHAP values once, global importance, dependence, the test-side
+    direction-sanity re-audit, and binary effects.
 
     Everything downstream that needs SHAP reads from this one bundle —
     shap_values/feature_names/base_value/Xt_test/feature_index live across
     nearly the whole error-analysis pass, so they travel together rather
     than being re-threaded individually.
+
+    `dev_v3_audit_set` is threshold.py's own V3 pre-seal top-k feature names
+    (dev_oof_diagnostics.json's direction_check_feature_names) — direction_sanity_
+    check_test re-audits exactly that set on the sealed test set, with no
+    independent test-side k of its own (item 11): this checks whether what
+    threshold.py already vetoed on dev still holds up on test, it does not
+    re-derive its own veto surface. The dependence grid separately renders
+    the broader union of that inherited set and this module's own
+    top_k_dependence_features test-side ranking, for visual completeness.
     """
-    shap_values, feature_names, base_value, Xt_test = _shap_values_for_test_rows(
-        model, test_features_df[committed_features]
+    preprocessor, booster = unwrap_calibrated_pipeline(model)
+    shap_values, feature_names, base_value, Xt_test = compute_shap_values(
+        preprocessor, booster, test_features_df[committed_features]
     )
     feature_index = {name: i for i, name in enumerate(feature_names)}
 
     importance_rows = global_importance(shap_values, feature_names)
-    top_k_shap = int(ea_cfg.top_k_shap_features)
-    top_features = [cast(str, r["feature"]) for r in importance_rows[:top_k_shap]]
-    top_k_shap_elbow = _check_top_k_elbow(
-        [cast(float, r["mean_abs_shap"]) for r in importance_rows], top_k_shap
+    importance_by_feature = {
+        cast(str, row["feature"]): cast(float, row["mean_abs_shap"])
+        for row in importance_rows
+    }
+    top_k_dependence = int(ea_cfg.top_k_dependence_features)
+    test_top_features = [
+        cast(str, r["feature"]) for r in importance_rows[:top_k_dependence]
+    ]
+    top_k_dependence_elbow = check_top_k_elbow(
+        [cast(float, r["mean_abs_shap"]) for r in importance_rows], top_k_dependence
     )
-    if not top_k_shap_elbow["valid"]:
-        logger.warning("top_k_shap_features_elbow_drifted", **top_k_shap_elbow)
+    if not top_k_dependence_elbow["valid"]:
+        logger.warning(
+            "top_k_dependence_features_elbow_drifted", **top_k_dependence_elbow
+        )
 
+    dependence_feature_set = sorted(
+        set(test_top_features) | set(dev_v3_audit_set),
+        key=lambda f: importance_by_feature[f],
+        reverse=True,
+    )
     dependence_by_feature = {
         feat: dependence_points(
             Xt_test[:, feature_index[feat]], shap_values[:, feature_index[feat]]
         )
-        for feat in top_features
+        for feat in dependence_feature_set
     }
     directions = {
         feat: cast(float, dep["direction"])
         for feat, dep in dependence_by_feature.items()
     }
-    v3_result = direction_sanity_check(
-        top_features, directions, _EXPECTED_EDA_DIRECTIONS
+    direction_sanity_check_test = direction_sanity_check(
+        dev_v3_audit_set, directions, EXPECTED_EDA_DIRECTIONS
     )
+    contradicting_features = {
+        cast(str, row["feature"]) for row in direction_sanity_check_test["violations"]
+    }
 
     binary_features = [name for name in feature_names if name.startswith("binary__")]
     binary_dependence = {
@@ -1295,11 +1154,14 @@ def _compute_shap_diagnostics(
         "Xt_test": Xt_test,
         "feature_index": feature_index,
         "importance_rows": importance_rows,
-        "top_features": top_features,
-        "top_k_shap_elbow": top_k_shap_elbow,
+        "test_top_features": test_top_features,
+        "dev_v3_audit_set": dev_v3_audit_set,
+        "dependence_feature_set": dependence_feature_set,
+        "top_k_dependence_elbow": top_k_dependence_elbow,
         "dependence_by_feature": dependence_by_feature,
         "binary_dependence": binary_dependence,
-        "v3_result": v3_result,
+        "direction_sanity_check_test": direction_sanity_check_test,
+        "contradicting_features": contradicting_features,
     }
 
 
@@ -1321,7 +1183,7 @@ def _compute_cohort_gap(
     shap_rows_b = cohort_shap(shap_values, mask_b, feature_names)
     gap_ranking = _sorted_gap_pairs(shap_rows_a, shap_rows_b)
     top_features = [name for name, _ in gap_ranking[:top_k]]
-    elbow = _check_top_k_elbow([gap for _, gap in gap_ranking], top_k)
+    elbow = check_top_k_elbow([gap for _, gap in gap_ranking], top_k)
     if not elbow["valid"]:
         logger.warning(elbow_warning_event, **elbow)
     return {
@@ -1516,9 +1378,16 @@ def _assemble_error_analysis_payload(
     illustrative_bundle: dict[str, Any],
     error_profiles: dict[str, Any],
     concentration: dict[str, Any],
-    dev_oof_diagnostics: dict[str, Any],
 ) -> dict[str, Any]:
-    """Assemble error_analysis.json from every already-computed block."""
+    """Assemble error_analysis.json from every already-computed block.
+
+    Does not carry threshold.py's dev_oof_diagnostics.json (V1/V2/V2b/V3)
+    into this payload — register.py's model card is the sole reader of that
+    data and fetches it directly via evaluate.load_dev_oof_diagnostics(run_id,
+    cfg), off the same canonical artifact this run already resolved for its
+    own direction_sanity_check_test re-audit, rather than through a copy
+    re-keyed here that nothing else consumes.
+    """
     return {
         "model_version": model_version,
         "run_id": run_id,
@@ -1534,7 +1403,8 @@ def _assemble_error_analysis_payload(
         },
         "shap": {
             "global_importance": shap_diag["importance_rows"],
-            "top_features": shap_diag["top_features"],
+            "top_features": shap_diag["test_top_features"],
+            "dependence_feature_set": shap_diag["dependence_feature_set"],
             "dependence": shap_diag["dependence_by_feature"],
             "binary_dependence": shap_diag["binary_dependence"],
             "cohort_shap": {
@@ -1554,31 +1424,19 @@ def _assemble_error_analysis_payload(
             "local_explanations": illustrative_bundle["local_explanation_rows"],
         },
         "top_k_elbow_checks": {
-            "shap_features": shap_diag["top_k_shap_elbow"],
+            "dependence_features": shap_diag["top_k_dependence_elbow"],
             "cohort_gap_fn_tp": fn_tp_gap["elbow"],
             "cohort_gap_fp_tn": fp_tn_gap["elbow"],
         },
         "subgroup_findings": {
             "annual_contract_fn_vs_tn_monthlycharges": subgroup["finding"],
         },
-        "direction_sanity_check": shap_diag["v3_result"],
-        # Direct indexing, not .get(key, [])/.get(key, {}): dev_oof_diagnostics
-        # is now always a live, this-cycle fetch of threshold.py's own
-        # dev_oof_diagnostics.json (via load_dev_oof_diagnostics(run_id, cfg)),
-        # so a missing key is a genuine pipeline defect and must raise
-        # KeyError, never silently render "nothing flagged" — see _NOT_ASSESSED
-        # above for the sentinel a future key that postdates an older artifact
-        # version should use instead.
-        "dev_oof_diagnostics_carried_through": {
-            "v1_flagged": dev_oof_diagnostics["v1_flagged"],
-            "v2_equal_opportunity_flagged": dev_oof_diagnostics[
-                "v2_equal_opportunity_flagged"
-            ],
-            "v2_demographic_parity_flagged": dev_oof_diagnostics[
-                "v2_demographic_parity_flagged"
-            ],
-            "v2b_flagged": dev_oof_diagnostics["v2b_flagged"],
-        },
+        # The reported-only sealed-test re-audit of threshold.py's binding
+        # pre-seal V3 veto (item 11: no independent test-side k). The binding
+        # verdict itself (dev_oof_diagnostics.json's direction_sanity_result)
+        # is not carried through here — register.py's model card fetches it
+        # directly; see _assemble_error_analysis_payload's docstring.
+        "direction_sanity_check_test": shap_diag["direction_sanity_check_test"],
     }
 
 
@@ -1627,7 +1485,12 @@ def _render_error_analysis_figures(
     _save_shap_beeswarm_plot(
         shap_values, Xt_test, feature_names, paths["beeswarm_path"]
     )
-    _save_dependence_plots(shap_diag["dependence_by_feature"], paths["dependence_path"])
+    _save_dependence_plots(
+        shap_diag["dependence_by_feature"],
+        set(shap_diag["dev_v3_audit_set"]),
+        shap_diag["contradicting_features"],
+        paths["dependence_path"],
+    )
     _save_cohort_shap_plot(
         fn_tp_gap["shap_rows_a"],
         fn_tp_gap["shap_rows_b"],
@@ -1735,7 +1598,7 @@ def _log_error_analysis_run(
     test_predictions = loaded["test_predictions"]
     committed_features = loaded["committed_features"]
     test_features_df = loaded["test_features_df"]
-    v3_result = shap_diag["v3_result"]
+    direction_sanity_check_test = shap_diag["direction_sanity_check_test"]
 
     ensure_experiment_metadata(cfg)
     model_id = resolve_logged_model_id(model_version, cfg)
@@ -1766,9 +1629,11 @@ def _log_error_analysis_run(
                     "fn_rate_top_value_decile"
                 ],
             ),
-            "direction_sanity_check_passed": 1.0 if v3_result["passed"] else 0.0,
+            "direction_sanity_check_test_passed": (
+                1.0 if direction_sanity_check_test["passed"] else 0.0
+            ),
         }
-        top_k_shap = int(cfg.error_analysis.top_k_shap_features)
+        top_k_shap = int(cfg.error_analysis.top_k_dependence_features)
         for row in shap_diag["importance_rows"][:top_k_shap]:
             feature_key = _sanitize_metric_name(str(row["feature"]))
             scalar_metrics[f"shap_importance_{feature_key}"] = cast(
@@ -1777,8 +1642,8 @@ def _log_error_analysis_run(
         mlflow.log_metrics(scalar_metrics, model_id=model_id, dataset=test_dataset)
 
         mlflow.set_tag(
-            "direction_sanity_check",
-            "pass" if v3_result["passed"] else "fail",
+            "direction_sanity_check_test",
+            "pass" if direction_sanity_check_test["passed"] else "fail",
         )
 
         mlflow.log_dict(error_analysis_payload, "error_analysis.json")
@@ -1843,11 +1708,12 @@ def run_error_analysis_step(
 
     Computes SHAP once on the sealed-test rows (`_compute_shap_diagnostics`)
     and derives every SHAP-based diagnostic from that single call: global
-    importance, per-feature dependence, binary-feature effects, the V3
-    direction-sanity check, and — via `_compute_cohort_gap` — the FN-vs-TP
-    and FP-vs-TN signed-SHAP cohort gaps (each ranked and sized
-    independently; see that function's docstring for why). The
-    annual-contract Monthly Charges subgroup finding
+    importance, per-feature dependence, binary-feature effects, the reported-
+    only `direction_sanity_check_test` re-audit of threshold.py's own V3
+    pre-seal audit set (never a second gate — see that function's docstring),
+    and — via `_compute_cohort_gap` — the FN-vs-TP and FP-vs-TN signed-SHAP
+    cohort gaps (each ranked and sized independently; see that function's
+    docstring for why). The annual-contract Monthly Charges subgroup finding
     (`_annual_contract_subgroup_finding`) and the illustrative FN/FP/TP/TN
     waterfall cases (`_compute_illustrative_cases`) reuse the same SHAP call.
 
@@ -1857,9 +1723,9 @@ def run_error_analysis_step(
     run (a sibling of evaluate.py's `evaluation` run), and writes
     reports/error_analysis.json — register.py aborts without it.
 
-    Each of the three top-k cutoffs used above (`top_k_shap_features`,
+    Each of the three top-k cutoffs used above (`top_k_dependence_features`,
     `top_k_cohort_gap_features`, `top_k_cohort_gap_features_fp_tn`) is
-    checked against its own ranking via `_check_top_k_elbow`, with a
+    checked against its own ranking via `explain.check_top_k_elbow`, with a
     warning — never a raise — if the plateau-then-elbow shape that justified
     it has drifted: none of these are re-derived when the champion changes,
     so a stale cutoff would otherwise silently narrow or widen a chart's
@@ -1872,10 +1738,17 @@ def run_error_analysis_step(
     y_dev, proba_dev = loaded["y_dev"], loaded["proba_dev"]
     ea_cfg = cfg.error_analysis
 
+    # Loaded before the SHAP pass, not after: direction_sanity_check_test
+    # re-audits exactly the feature set threshold.py's V3 pre-seal screen
+    # derived on dev (direction_check_feature_names), so that set must be in
+    # hand before _compute_shap_diagnostics can build the dependence grid.
+    dev_oof_diagnostics = load_dev_oof_diagnostics(run_id, cfg)
+
     shap_diag = _compute_shap_diagnostics(
         loaded["model"],
         loaded["test_features_df"],
         loaded["committed_features"],
+        list(dev_oof_diagnostics["direction_check_feature_names"]),
         ea_cfg,
     )
     shap_values, feature_names = shap_diag["shap_values"], shap_diag["feature_names"]
@@ -1936,8 +1809,6 @@ def run_error_analysis_step(
         y_dev, proba_dev, base_threshold, loaded["dev_features_df"], ea_cfg
     )
 
-    dev_oof_diagnostics = load_dev_oof_diagnostics(run_id, cfg)
-
     error_analysis_payload = _assemble_error_analysis_payload(
         model_version,
         run_id,
@@ -1949,7 +1820,6 @@ def run_error_analysis_step(
         illustrative_bundle,
         error_profiles,
         concentration,
-        dev_oof_diagnostics,
     )
 
     masks = {
@@ -1987,13 +1857,13 @@ def run_error_analysis_step(
         cfg,
     )
 
-    v3_result = shap_diag["v3_result"]
+    direction_sanity_check_test = shap_diag["direction_sanity_check_test"]
     logger.info(
         "error_analysis_step_done",
         run_id=run_id,
         error_analysis_run_id=error_analysis_run_id,
         model_version=model_version,
-        direction_sanity_check_passed=v3_result["passed"],
+        direction_sanity_check_test_passed=direction_sanity_check_test["passed"],
     )
 
     return {

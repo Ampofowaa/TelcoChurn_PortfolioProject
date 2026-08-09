@@ -182,15 +182,25 @@ def test_check_threshold_provenance_error_message_includes_both_stamps() -> None
 # ---------------------------------------------------------------------------
 
 
-def test_check_threshold_screen_passed_true_does_not_raise() -> None:
-    check_threshold_screen_passed({"screen_passed": True})
+def test_check_threshold_screen_passed_empty_failures_does_not_raise() -> None:
+    check_threshold_screen_passed({"failures": []})
 
 
-def test_check_threshold_screen_passed_false_raises() -> None:
-    """No override flag — a failed dev-OOF calibration screen must always
-    block downstream evaluation/error analysis."""
-    with pytest.raises(RuntimeError, match="screen_passed is False"):
-        check_threshold_screen_passed({"screen_passed": False})
+def test_check_threshold_screen_passed_nonempty_failures_raises() -> None:
+    """No override flag — a failed dev-OOF pre-seal screen must always block
+    downstream evaluation/error analysis."""
+    with pytest.raises(RuntimeError, match="pre-seal screen failed"):
+        check_threshold_screen_passed(
+            {
+                "failures": [
+                    {
+                        "criterion": "calibration_slope",
+                        "detail": "CI outside band",
+                        "remediation": "Re-calibrate.",
+                    }
+                ]
+            }
+        )
 
 
 def test_check_threshold_screen_passed_missing_key_raises_key_error() -> None:

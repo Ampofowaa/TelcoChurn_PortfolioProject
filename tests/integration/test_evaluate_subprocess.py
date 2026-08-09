@@ -67,6 +67,14 @@ _FAST_CALIBRATION_OVERRIDES = [
 # every sliced axis) fast on a CI box; large enough that a CI is still a CI.
 _FAST_EVALUATE_OVERRIDES = ["evaluate.n_bootstrap=30"]
 
+# v3_top_k_features=3 (not the production 8): _make_synthetic_processed_frame's
+# docstring plants exactly three real signal columns (contract_type, tenure,
+# monthlycharges) — the only ones with a real, learnable relationship to
+# churn — so cutting the V3 pre-seal veto's top-k at 3 keeps it checking real
+# signal instead of noise from one of this fixture's many uninformative
+# columns. Mirrors tests/unit/test_error_analysis.py's identical override.
+_FAST_THRESHOLD_OVERRIDES = ["threshold.v3_top_k_features=3"]
+
 
 def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame:
     """A FeatureOutputSchema-conformant frame with every segment-axis column
@@ -229,6 +237,7 @@ def registered_evaluation_model(
             f"paths.reports={reports_dir}",
             f"paths.processed_data={data_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
+            *_FAST_THRESHOLD_OVERRIDES,
         ]
     )
 
@@ -396,7 +405,10 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
         "f1",
     }
     assert "sliced" in metrics
-    assert "dev_oof_diagnostics" in metrics["sliced"]
+    # register.py's model card is the sole reader of dev_oof_diagnostics.json
+    # and now fetches it directly (evaluate.load_dev_oof_diagnostics), so
+    # metrics.json no longer carries a copy under sliced.
+    assert "dev_oof_diagnostics" not in metrics["sliced"]
 
     economics = json.loads((reports_dir / "economics.json").read_text(encoding="utf-8"))
     assert set(economics["ev_by_k"]) == {"conservative", "base", "optimistic"}

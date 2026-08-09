@@ -16,3 +16,26 @@ random_state: 42
 # argmax_ev_bootstrap_n_samples above, since it resamples segment-sliced
 # ranking/calibration metrics, not the argmax-EV curve.
 n_bootstrap: 1000
+
+# V3 pre-seal veto: rank calibrate.py's dev-SHAP summary (dev_shap_summary.json)
+# by mean_abs_shap, take the top v3_top_k_features, and check each one's
+# direction against explain.EXPECTED_EDA_DIRECTIONS. 8, not a round number:
+# derived by hand, once, off a real dev-SHAP ranking — mean-|SHAP| forms a
+# tight plateau across ranks 4-8 (deltas <=0.01) before a real elbow at rank
+# 8->9 (delta ~4.7x the plateau median) — the same k the independently
+# derived test-side ranking (configs/error_analysis/default.yaml's
+# top_k_dependence_features) landed on. Nothing re-derives this if the
+# champion changes (Phase 10's retrain); explain.check_top_k_elbow
+# re-verifies at every run that this cutoff still sits on a real elbow and
+# logs a warning (never raises) if it doesn't.
+v3_top_k_features: 8
+
+# A top-k feature's |direction| (signed correlation, explain.feature_directions)
+# must clear this floor to be checked by the V3 veto — below it, the sign is
+# too unstable/noise-prone to trust asserting a contradiction from. Every one
+# of the derivation run's top-8 features cleared 0.87, so this had no effect
+# at derivation time; it exists to guard a future retrain where a materially
+# weaker feature (that same run's ranking had several well below this floor,
+# e.g. charge_per_service at ~0.08) could enter the cutoff with an unreliable
+# sign.
+v3_min_direction_magnitude: 0.3

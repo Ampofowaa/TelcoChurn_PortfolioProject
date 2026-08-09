@@ -42,7 +42,12 @@ from sklearn.pipeline import Pipeline
 from telco_churn.data.split import partition
 from telco_churn.features.accessor import load_features
 from telco_churn.features.build import TARGET_COL
+from telco_churn.models.explain import feature_directions, global_importance
 from telco_churn.models.plots import reliability_diagram_bins
+from telco_churn.models.shap_values import (
+    compute_shap_values,
+    unwrap_calibrated_pipeline,
+)
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (
     TRAINING_CYCLE_RUN_DESCRIPTION,
@@ -1081,6 +1086,37 @@ def _fit_and_build_golden_fixture(
     }
 
 
+def _compute_dev_shap(
+    fitted: CalibratedClassifierCV, X_dev: pd.DataFrame
+) -> dict[str, Any]:
+    """Compute dev-SHAP values once and rank every transformed feature's (mean_abs_shap, direction).
+
+    This is the evidence threshold.py's V3 pre-seal screen
+    (`v3_direction_sanity`) binds on — computed on the champion's own
+    dev-partition rows, the same ones it trained on, never the sealed test
+    set: V3 is a pre-seal veto and must never require the test partition to
+    evaluate. `configs/threshold/default.yaml`'s `v3_top_k_features`/
+    `v3_min_direction_magnitude` are hand-derived, once, off a real run's
+    `dev_shap_summary.json` output — this function only produces the
+    evidence, it does not itself decide a cutoff.
+    """
+    preprocessor, booster = unwrap_calibrated_pipeline(fitted)
+    shap_values, feature_names, base_value, Xt = compute_shap_values(
+        preprocessor, booster, X_dev
+    )
+    importance_rows = global_importance(shap_values, feature_names)
+    directions = feature_directions(Xt, shap_values, feature_names)
+    summary_rows = [
+        {**row, "direction": directions[row["feature"]]} for row in importance_rows
+    ]
+    return {
+        "shap_values": shap_values,
+        "feature_names": feature_names,
+        "base_value": base_value,
+        "summary_rows": summary_rows,
+    }
+
+
 def _compute_calibration_slopes_and_summary(
     y_dev: pd.Series,
     dev_customer_ids: pd.Series,
@@ -1190,6 +1226,7 @@ def _log_calibration_run(
     figure_path: Path,
     dev_oof_predictions: pd.DataFrame,
     golden: dict[str, Any],
+    dev_shap: dict[str, Any],
 ) -> Any:
     """Log every calibration artifact and metric, and register the calibrated pipeline.
 
@@ -1207,6 +1244,11 @@ def _log_calibration_run(
     dev_mean_p_hat_uncalibrated/dev_observed_churn_rate as MLflow metrics (not
     just JSON fields), so they are plottable as a series across retraining
     cycles.
+
+    Logs dev_shap_values.parquet (the full per-row, per-feature SHAP matrix)
+    and dev_shap_summary.json (per-feature mean_abs_shap + direction, every
+    transformed feature — CLAUDE.md § Persist the evidence, not just the
+    conclusion) — the evidence threshold.py's V3 pre-seal screen binds on.
     """
     method = str(calibration_summary["method"])
     ensure_experiment_metadata(cfg)
@@ -1253,6 +1295,16 @@ def _log_calibration_run(
             dev_oof_predictions.to_parquet(oof_path, index=False)
             mlflow.log_artifact(str(oof_path), artifact_path="calibration")
 
+            shap_path = Path(tmp_dir) / "dev_shap_values.parquet"
+            shap_df = pd.DataFrame(
+                dev_shap["shap_values"], columns=dev_shap["feature_names"]
+            )
+            shap_df.insert(0, "customerid", golden["dev_customer_ids"].to_numpy())
+            shap_df["base_value"] = dev_shap["base_value"]
+            shap_df.to_parquet(shap_path, index=False)
+            mlflow.log_artifact(str(shap_path), artifact_path="calibration")
+
+        mlflow.log_dict(dev_shap["summary_rows"], "calibration/dev_shap_summary.json")
         mlflow.log_dict(golden["golden_fixture"], "calibration/golden_predictions.json")
 
         model_info = mlflow.sklearn.log_model(
@@ -1322,6 +1374,8 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     )
     calibration_summary = slopes_and_summary["calibration_summary"]
 
+    dev_shap = _compute_dev_shap(golden["fitted"], X_dev)
+
     model_info = _log_calibration_run(
         run_id,
         cfg,
@@ -1331,6 +1385,7 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
         selection_result["figure_path"],
         slopes_and_summary["dev_oof_predictions"],
         golden,
+        dev_shap,
     )
 
     # Function-local — see this function's own docstring for why a top-level
