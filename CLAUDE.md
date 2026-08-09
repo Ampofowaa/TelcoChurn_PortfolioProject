@@ -21,7 +21,6 @@ uv sync                          # install / sync dependencies
 uv run pytest                    # run test suite
 uv run pytest -k "test_name"     # run a single test by name
 uv run ruff check src/           # lint
-uv run ruff format src/          # format
 uv run mypy src/                 # type-check (strict on src/ only)
 uv run pre-commit run --all-files  # run all pre-commit hooks
 
@@ -30,6 +29,7 @@ dvc repro --force                # re-run all stages regardless of cache
 
 mlflow ui                        # open experiment tracking UI (localhost:5000)
 
+make format                      # ruff format src/ then black src/ — always in this order
 make lint                        # shortcut: ruff check + mypy
 make test                        # shortcut: pytest --cov=src
 make validate                    # shortcut: uv run python -m telco_churn.data.validate
@@ -148,7 +148,7 @@ Update `CHANGELOG.md` at the end of every phase or significant fix. Follow [Keep
 
 ## Code Style
 
-- **Formatter:** `black` (line length 88). `ruff` for linting (replaces flake8/isort).
+- **Formatter:** `black` (line length 88) has final say — `.pre-commit-config.yaml` only gates `black`, not `ruff format`. `ruff format` and `black` disagree on a handful of edge cases (e.g. chained ternaries) that neither project's config can fully reconcile, so running `ruff format` alone can leave a file that fails the `black` pre-commit hook. Always run `make format` (`ruff format` then `black`, in that order) rather than `ruff format` standalone. `ruff` itself is for linting (replaces flake8/isort).
 - **Type hints:** required on all public functions in `src/`. `mypy --strict` on `src/` only.
 - **`__all__` required in every public module under `src/`.** List every public function, class, and constant. Omit underscore-prefixed internals. Place it after the imports block, before the first definition.
 - **All functions must have docstrings.**

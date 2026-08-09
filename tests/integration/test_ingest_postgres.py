@@ -124,16 +124,12 @@ def test_primary_key_survives_second_ingest(
     ingest(sample_csv, pg_engine)
     ingest(sample_csv, pg_engine)
     with pg_engine.connect() as conn:
-        result = conn.execute(
-            text(
-                """
+        result = conn.execute(text("""
                 SELECT constraint_type
                 FROM information_schema.table_constraints
                 WHERE table_name = 'customers_raw'
                   AND constraint_type = 'PRIMARY KEY'
-            """
-            )
-        ).fetchone()
+            """)).fetchone()
     assert (
         result is not None
     ), "customers_raw must have a PRIMARY KEY constraint after ingest"
