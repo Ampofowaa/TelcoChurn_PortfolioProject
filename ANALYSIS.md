@@ -819,7 +819,7 @@ These gaps track the same real, pre-existing churn-rate differences already note
 
 Every automated criterion above passed; the direction sanity check found no violations; segment and per-group calibration collapse were both clean on the dev-OOF surface (§6). The one flagged item — the fairness-disparity gap on `seniorcitizen`/`has_partner`/`dependents`, also flagged by the dev-OOF V2 check (§6) — was reviewed and judged consistent with genuinely higher churn risk in these groups rather than proxy discrimination, and is tracked for ongoing monitoring rather than treated as a blocker. **Verdict: approved** (Richlove Frimpong, 2026-07-30), clearing the model for registration in §8.
 
-The full sealed-test walkthrough — the classification, calibration, and ranking diagnostics; the disaggregated robustness/fairness slices; the error analysis and SHAP explainability findings; and the direction-sanity check (V3, the one automatic veto) with the stamped promotion verdict, all rendered from the actual run — is in [`notebooks/05-evaluation-and-error-analysis.ipynb`](notebooks/05-evaluation-and-error-analysis.ipynb).
+The full sealed-test walkthrough — the classification, calibration, and ranking diagnostics; the disaggregated robustness/fairness slices; the error analysis and SHAP explainability findings; and the direction-sanity check (V3, the one automatic veto) — all rendered from the actual run — is in [`notebooks/05-evaluation-and-error-analysis.ipynb`](notebooks/05-evaluation-and-error-analysis.ipynb). The promotion verdict itself is stamped separately, outside the notebook, via `models/review.py`.
 
 ---
 

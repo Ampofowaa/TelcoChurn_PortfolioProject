@@ -204,12 +204,13 @@ make evaluate MODEL_VERSION=<version above>        # one-time sealed-test scorin
 make error-analysis MODEL_VERSION=<version above>  # SHAP explainability + error diagnosis
 ```
 
-Opens `notebooks/05-evaluation-and-error-analysis.ipynb` to review the gate result and record the human sign-off.
+Opens `notebooks/05-evaluation-and-error-analysis.ipynb` to review the gate result and error diagnostics.
 
-**8 — Promote the champion**
+**8 — Record human sign-off, then promote the champion**
 
 ```bash
-make register MODEL_VERSION=<version above>  # acts on the gate verdict: flips the champion alias on a pass, tags rejected on a fail
+uv run python -m telco_churn.models.review review.verdict=approved review.approver="Your Name" review.notes="..."  # verdict, approver, and a non-empty reason are all required; prints where to find this cycle's MLflow diagnostics first
+make register MODEL_VERSION=<version above>  # acts on the gate verdict + review: flips the champion alias on a pass, tags rejected on a fail
 ```
 
 **9 — Browse experiment runs**
