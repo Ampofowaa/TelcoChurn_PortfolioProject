@@ -18,6 +18,7 @@ from unittest.mock import Mock, patch
 
 import mlflow
 import mlflow.artifacts
+import mlflow.sklearn
 import numpy as np
 import pandas as pd
 import pytest
@@ -1572,23 +1573,44 @@ def test_run_calibration_step_parity_failure_leaves_tagged_pending_orphan(
     """A reload-parity failure must not leave a permanently untagged orphan.
 
     promotion_status=pending is tagged immediately after log_model returns,
-    before _verify_reload_parity runs — so a parity failure still leaves a
+    before register.register_challenger's reload-parity check runs (B1
+    extracted registration out of calibrate.py — the parity check itself is
+    no longer a standalone patchable function, so this forces the failure
+    the same way a genuine one would occur: the reloaded model disagreeing
+    with the in-memory reference) — so a parity failure still leaves a
     well-formed, reapable `pending` version rather than one with no
     promotion_status tag at all (invisible to both the tag-based rollback
     rule and the Phase 14 pending-reaper). The version must also stay
     unaliased: `challenger` may only ever point at something that has
     actually passed the parity check.
     """
-    monkeypatch.setattr(
-        calibrate,
-        "_verify_reload_parity",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("forced parity failure")
-        ),
-    )
+
     run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
 
-    with pytest.raises(AssertionError, match="forced parity failure"):
+    class _WrongPredictor:
+        def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+            return np.zeros((len(X), 2))
+
+    # run_calibration_step itself also reloads via mlflow.sklearn.load_model
+    # — unfitted_pipeline_from_manifest's single call, loading the
+    # *uncalibrated* pipeline off training_manifest.json's logged_model_uri
+    # — before register.register_challenger's own single reload of the
+    # *calibrated* model at the very end. Both resolve to `models:/m-<id>`
+    # LoggedModel URIs indistinguishable by shape, so disambiguate by call
+    # order instead: first call real, every call after that wrong.
+    real_load_model = mlflow.sklearn.load_model
+    call_count = 0
+
+    def _fake_load_model(model_uri: str) -> Any:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return real_load_model(model_uri)
+        return _WrongPredictor()
+
+    monkeypatch.setattr(mlflow.sklearn, "load_model", _fake_load_model)
+
+    with pytest.raises(AssertionError, match="Reload parity check failed"):
         calibrate.run_calibration_step(run_id, registration_cfg)
 
     client = mlflow.tracking.MlflowClient()

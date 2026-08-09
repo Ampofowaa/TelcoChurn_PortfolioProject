@@ -9,7 +9,7 @@ once per module via direct in-process calls — log_model.run_model_logging_step
 -> calibrate.run_calibration_step -> threshold.run_threshold_step (which now
 folds in the dev-OOF screen as its own last step) -> evaluate.run_evaluation_step
 -> error_analysis.run_error_analysis_step -> a human review stamp via
-gate.record_review (mirroring notebook 05's own closing cell) — one step
+gate.record_review (mirroring what models/review.py's CLI does) — one step
 further down the pipeline than test_error_analysis_subprocess.py's own
 precedent. Only register.py itself crosses the subprocess boundary. A
 dev-OOF screen failure (a real slope outside the band on this synthetic
@@ -280,25 +280,28 @@ def reviewed_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object
 
     decision_path = reports_dir / "promotion_decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
-    # Force a deterministic "pass" — see module docstring.
+    # Force a deterministic "pass" — see module docstring. promotion_decision.json
+    # keeps exactly one author (evaluate.py) post-B1 — this local rewrite is a
+    # human-inspection mirror only and is never read back by register.py, which
+    # always resolves the MLflow copy on the eval run; re-log the forced "pass"
+    # there too so the two copies do not diverge.
     decision["gate"] = "pass"
-    reviewed = gate.record_review(
+    decision_path.write_text(json.dumps(decision), encoding="utf-8")
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+    client.log_dict(decision["eval_run_id"], decision, "promotion_decision.json")
+
+    # The human review verdict is a separate, append-only promotion_review.json
+    # document (B1) — built via gate.record_review and logged onto the eval
+    # run, exactly as models/review.py's CLI does.
+    promotion_review = gate.record_review(
+        None,
         decision,
         verdict="approved",
         notes="Forced pass for register.py subprocess coverage.",
         approver="test-suite",
         reviewed_at=datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        direction_sanity_check_fired=False,
     )
-    decision_path.write_text(json.dumps(reviewed), encoding="utf-8")
-    # register.py resolves promotion_decision.json exclusively via the model
-    # version's eval_run_id tag now (never a local reports/ path) — the local
-    # rewrite above is a human-inspection mirror only, so the reviewed verdict
-    # must also be re-logged onto the eval run itself, exactly as notebook
-    # 05's closing cell does.
-    mlflow.tracking.MlflowClient(tracking_uri=tracking_uri).log_dict(
-        decision["eval_run_id"], reviewed, "promotion_decision.json"
-    )
+    client.log_dict(decision["eval_run_id"], promotion_review, "promotion_review.json")
 
     return {
         "tracking_uri": tracking_uri,
@@ -331,17 +334,26 @@ def _log_and_tag_evaluation_run(
     *,
     decision_model_version: str,
     gate_result: str,
-    review: str,
+    review: str | None,
 ) -> str:
-    """Log a minimal promotion_decision.json + metrics.json onto a fresh
-    'evaluation' MLflow run and tag eval_run_id onto model_version —
-    mirroring evaluate.py's real behavior. register.py resolves both
-    exclusively via that tag now, never a local reports/ path, so a test
-    simulating a specific decision (e.g. gate: fail) logs one directly
-    rather than hand-editing a local JSON file register.py no longer reads.
+    """Log a minimal promotion_decision.json + metrics.json (and, if `review`
+    is not None, a one-entry promotion_review.json) onto a fresh 'evaluation'
+    MLflow run and tag eval_run_id onto model_version — mirroring register.py's
+    own first-pass tagging (B1: evaluate.py itself tags nothing). register.py
+    resolves both exclusively via that tag now, never a local reports/ path,
+    so a test simulating a specific decision (e.g. gate: fail) logs one
+    directly rather than hand-editing a local JSON file register.py no longer
+    reads.
     """
     mlflow.set_tracking_uri(tracking_uri)
-    metrics_payload = {"champion_version": None}
+    metrics_payload = {
+        "champion_version": None,
+        "ranking": {"pr_auc": 0.65},
+        # A "base" row is load-bearing: register.py's _tag_gate_criteria (B1)
+        # reads test_recall off it when tagging every processed version.
+        "classification": [{"scenario": "base", "recall": 0.70}],
+        "calibration": {"brier": 0.13, "calibration_slope": {"slope": 1.0}},
+    }
     with mlflow.start_run(run_name="evaluation") as run:
         eval_run_id = run.info.run_id
         mlflow.log_dict(metrics_payload, "metrics.json")
@@ -349,13 +361,28 @@ def _log_and_tag_evaluation_run(
             {
                 "model_version": decision_model_version,
                 "gate": gate_result,
-                "review": review,
                 "regime": "cold_start",
                 "criteria": {},
                 "metrics_content_hash": evaluate.content_hash(metrics_payload),
             },
             "promotion_decision.json",
         )
+        if review is not None:
+            mlflow.log_dict(
+                {
+                    "eval_run_id": eval_run_id,
+                    "metrics_content_hash": evaluate.content_hash(metrics_payload),
+                    "entries": [
+                        {
+                            "verdict": review,
+                            "notes": "",
+                            "approver": "test-suite",
+                            "reviewed_at": "t",
+                        }
+                    ],
+                },
+                "promotion_review.json",
+            )
     client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
     client.set_model_version_tag(
         registered_model_name, model_version, "eval_run_id", eval_run_id

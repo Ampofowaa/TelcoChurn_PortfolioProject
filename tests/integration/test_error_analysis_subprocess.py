@@ -433,13 +433,16 @@ def test_error_analysis_main_cli_exits_zero_and_writes_report(
     assert len(runs) >= 1
     assert runs[0].data.tags.get("direction_sanity_check") in {"pass", "fail"}
 
-    # register.py's only supported path to this cycle's error_analysis.json —
-    # resolved by run_id, never a local reports/ path.
-    version = client.get_model_version(
-        str(evaluated_model["registered_model_name"]),
-        str(evaluated_model["model_version"]),
+    # B1: error_analysis.py no longer tags the model version itself — it
+    # writes reports/error_analysis_receipt.json, register.py's bootstrap
+    # pointer, and register.py tags error_analysis_run_id onto the version
+    # from that receipt on its own first pass.
+    reports_dir = Path(str(evaluated_model["reports_dir"]))
+    receipt = json.loads(
+        (reports_dir / "error_analysis_receipt.json").read_text(encoding="utf-8")
     )
-    assert version.tags.get("error_analysis_run_id") == runs[0].info.run_id
+    assert receipt["error_analysis_run_id"] == runs[0].info.run_id
+    assert receipt["model_version"] == str(evaluated_model["model_version"])
 
 
 def test_error_analysis_main_cli_resolves_from_receipt_when_model_version_missing(

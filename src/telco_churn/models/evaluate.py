@@ -95,6 +95,7 @@ from telco_churn.utils.mlflow import (
     resolve_model_identifier,
     resolve_tracking_uri,
     set_run_description,
+    write_eval_receipt,
 )
 from telco_churn.utils.paths import get_project_root
 from telco_churn.utils.stats import (
@@ -715,12 +716,14 @@ def resolve_incumbent_summary(
     """Read the champion's own gate-criteria tags and cost-config provenance,
     for side-by-side reporting.
 
-    Every version that has ever gone through evaluate.py carries the four
-    gate-criteria tags and eval_run_id (_tag_evaluated_model_version sets
-    them unconditionally, not only on promotion), so the current champion —
-    itself a prior evaluate.py candidate — always has them. Reading tags off
-    the already-resolved version number, never re-reading the `champion`
-    alias, matches load_incumbent_proba's own rule.
+    register.py tags every version it processes with the four gate-criteria
+    tags and eval_run_id, unconditionally and regardless of the eventual
+    promotion outcome (sourced from reports/eval_receipt.json on its first
+    pass, from the tag itself thereafter — see register.py's own tag-
+    resolution helpers). A champion is by construction a version register.py
+    promoted, so it always carries them. Reading tags off the already-
+    resolved version number, never re-reading the `champion` alias, matches
+    load_incumbent_proba's own rule.
 
     costs_config_hash is a run tag, not a model-version tag (set on the
     evaluation run itself, not the registry entry — see _log_evaluation_run),
@@ -1791,63 +1794,6 @@ def _log_evaluation_run(
     return eval_run_id, test_predictions
 
 
-def _tag_evaluated_model_version(
-    model_version: str,
-    eval_run_id: str,
-    registered_model_name: str,
-    core_metrics: dict[str, Any],
-) -> None:
-    """Tag the evaluated model version with the four gate criteria and eval_run_id.
-
-    register.py's only supported path from "the model version being
-    registered" to this cycle's promotion_decision.json/metrics.json/
-    economics.json/test_predictions.parquet — ModelVersion.model_id doesn't
-    auto-populate in OSS MLflow 3.14, and the same is true of any other
-    run-to-version link, so it must be persisted deliberately (mirrors
-    calibrate.py's logged_model_id tag). A local reports/ path is not a
-    substitute: it only reflects whichever run last executed evaluate.py on
-    this machine, not necessarily this model_version's own cycle.
-    """
-    ranking_metrics = core_metrics["ranking_metrics"]
-    calibration_report = core_metrics["calibration_report"]
-    classification_rows = core_metrics["classification_rows"]
-
-    client = mlflow.tracking.MlflowClient()
-    client.set_model_version_tag(
-        registered_model_name,
-        model_version,
-        "test_pr_auc",
-        str(ranking_metrics["pr_auc"]),
-    )
-    client.set_model_version_tag(
-        registered_model_name,
-        model_version,
-        "test_recall",
-        str(
-            next(
-                row["recall"]
-                for row in classification_rows
-                if row["scenario"] == "base"
-            )
-        ),
-    )
-    client.set_model_version_tag(
-        registered_model_name,
-        model_version,
-        "test_brier",
-        str(calibration_report["brier"]),
-    )
-    client.set_model_version_tag(
-        registered_model_name,
-        model_version,
-        "test_calibration_slope",
-        str(calibration_report["calibration_slope"]["slope"]),
-    )
-    client.set_model_version_tag(
-        registered_model_name, model_version, "eval_run_id", eval_run_id
-    )
-
-
 def _write_reports_mirror(
     payloads: dict[str, Any], test_predictions: pd.DataFrame, cfg: DictConfig
 ) -> None:
@@ -1885,11 +1831,14 @@ def run_evaluation_step(
 
     Logs a dedicated `evaluation` run (never appended to the dev model's own
     run — CLAUDE.md), mirrors metrics.json/economics.json/
-    promotion_decision.json/test_predictions.parquet to reports/, tags the
-    model version with the four gate criteria, and renders all eight
-    evaluation figures — this module builds them directly rather than a
-    notebook, matching this project's convention that notebooks only
-    display pipeline-produced figures, never render their own.
+    promotion_decision.json/test_predictions.parquet to reports/, writes
+    reports/eval_receipt.json (register.py's bootstrap pointer to this
+    cycle's eval run — register.py, not this module, tags the model version
+    with eval_run_id and the four gate criteria, since minting/tagging now
+    happens downstream of review), and renders all eight evaluation figures
+    — this module builds them directly rather than a notebook, matching this
+    project's convention that notebooks only display pipeline-produced
+    figures, never render their own.
     """
     loaded = _load_and_score_candidate(run_id, model_version, model_uri, cfg)
     y_test, proba = loaded["y_test"], loaded["proba"]
@@ -1929,9 +1878,7 @@ def run_evaluation_step(
         cfg,
     )
 
-    _tag_evaluated_model_version(
-        model_version, eval_run_id, loaded["registered_model_name"], core_metrics
-    )
+    write_eval_receipt(model_version, eval_run_id, cfg)
     _write_reports_mirror(payloads, test_predictions, cfg)
 
     decision = decision_result["decision"]

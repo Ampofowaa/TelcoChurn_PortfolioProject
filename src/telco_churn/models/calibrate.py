@@ -8,8 +8,11 @@ pipeline comes from cloning the model at `manifest["logged_model_uri"]`, not
 from `runs:/<run_id>/model` — the latter becomes ambiguous once this module
 logs its own `calibrated_model` onto the same run.
 
-This module performs the training cycle's single MLflow model registration,
-pointing the `challenger` alias at the calibrated pipeline.
+This module fits and logs the calibrated pipeline — a pure, deterministic
+file transform — and stops there. Minting a registry version, tagging it,
+and pointing the `challenger` alias is register.py's job
+(`register_challenger`), called from `run_calibration_step` below via a
+function-local import.
 """
 
 from __future__ import annotations
@@ -47,7 +50,6 @@ from telco_churn.utils.mlflow import (
     read_train_receipt,
     resolve_tracking_uri,
     set_logged_model_description,
-    set_registered_model_description,
     set_run_description,
     write_calibrate_receipt,
 )
@@ -87,18 +89,6 @@ _MODEL_DESCRIPTION = (
     "pipeline logged on this run. This is the artifact registered to the "
     "model registry and pointed at by 'challenger'/'champion'."
 )
-
-_REGISTRY_DESCRIPTION = (
-    "Calibrated LightGBM churn-prediction pipeline for IBM Telco Customer "
-    "Churn. Selected by PR-AUC among Dummy/LogReg/LightGBM candidates, "
-    "calibrated (sigmoid), thresholded at a cost-sensitive cutoff "
-    "t* = c/(r x LTV). 'champion' serves production; 'challenger' holds the "
-    "most recent candidate. Every version carries a promotion_status tag "
-    "(pending/promoted/rejected) - only 'promoted' versions are valid "
-    "rollback targets."
-)
-
-_PENDING_VERSION_DESCRIPTION = "Awaiting sealed-test evaluation and promotion review."
 
 # CalibratedClassifierCV(ensemble=...) — shared by build_calibrated_pipeline and
 # the calibration_spec block logged alongside it, so the two can never drift
@@ -1279,83 +1269,18 @@ def _log_calibration_run(
     return model_info
 
 
-def _verify_reload_parity(
-    model_info: Any, input_example: pd.DataFrame, in_memory_preds: NDArray[np.float64]
-) -> bool:
-    """Assert the reloaded model's predictions match the in-memory pipeline's, before registering."""
-    reloaded = mlflow.sklearn.load_model(model_info.model_uri)
-    reload_preds = reloaded.predict_proba(input_example)
-    parity_ok = bool(np.allclose(in_memory_preds, reload_preds, rtol=0, atol=1e-12))
-    if not parity_ok:
-        raise AssertionError(
-            "Reload parity check failed: predictions from the reloaded "
-            "calibrated model differ from the in-memory pipeline on the same "
-            "input sample — the serialized model is not safe to register."
-        )
-    return parity_ok
-
-
-def _tag_new_version_pending(cfg: DictConfig, model_info: Any) -> str:
-    """Tag a freshly minted registry version promotion_status=pending at mint time.
-
-    Called immediately after log_model returns — before _verify_reload_parity
-    runs — so that even a parity failure leaves a well-formed, reapable
-    `pending` version rather than a permanently untagged orphan. A version
-    with no promotion_status tag at all is invisible to both the tag-based
-    rollback rule and the Phase 14 pending-reaper, so tagging cannot wait on
-    any downstream check succeeding — including this function's own caller's
-    reload-parity check.
-    """
-    registered_model_name = str(cfg.mlflow.registered_model_name)
-    version = str(model_info.registered_model_version)
-    client = mlflow.tracking.MlflowClient()
-    # Idempotent — same self-healing pattern as ensure_experiment_metadata:
-    # cheap to re-set on every registration, so the registry overview page
-    # is never left describing a stale training cycle.
-    set_registered_model_description(registered_model_name, _REGISTRY_DESCRIPTION)
-    client.update_model_version(
-        registered_model_name, version, description=_PENDING_VERSION_DESCRIPTION
-    )
-    client.set_model_version_tag(
-        registered_model_name, version, "training_data_scope", "dev"
-    )
-    # ModelVersion.model_id does not auto-populate in OSS MLflow 3.14 — this tag
-    # is the only supported hop from "the version being evaluated" to the
-    # LoggedModel Phase 7's evaluate.py attaches sealed-test metrics to.
-    client.set_model_version_tag(
-        registered_model_name, version, "logged_model_id", model_info.model_id
-    )
-    # Mint-time default, set before anything downstream can fail: a crash in
-    # _verify_reload_parity, evaluate.py, error_analysis.py, or register.py
-    # leaves this version with no verdict recorded, rather than with a tag
-    # someone forgot to write on an abort path nobody anticipated.
-    # register.py's rollback_champion() query (highest version tagged
-    # promotion_status: promoted) and the Phase 14 pending-orphan reaper both
-    # depend on every version reliably starting here — see CLAUDE.md § MLflow
-    # Model Registry.
-    client.set_model_version_tag(
-        registered_model_name, version, "promotion_status", "pending"
-    )
-    return version
-
-
-def _point_challenger_alias(cfg: DictConfig, version: str) -> None:
-    """Point `challenger` at a version that has already passed reload parity.
-
-    Deliberately the last step of registration: the alias is what makes a
-    version reachable by evaluate.py/register.py/a human, so nothing may be
-    aliased until it has been verified to be the artifact it claims to be.
-    """
-    registered_model_name = str(cfg.mlflow.registered_model_name)
-    client = mlflow.tracking.MlflowClient()
-    client.set_registered_model_alias(registered_model_name, "challenger", version)
-
-
 def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
-    """Calibrate, select a method, and register the fitted pipeline as `challenger`.
+    """Calibrate, select a method, and hand the fitted pipeline to register.py to mint as `challenger`.
 
-    The training cycle's single registration point — run_model_logging_step
-    only logs an uncalibrated pipeline and stops there.
+    Fits and logs a pure, deterministic file transform — the calibrated
+    pipeline, calibration_summary.json, dev_oof_predictions.parquet — and
+    stops there. Minting a registry version, tagging it pending, verifying
+    reload parity, and pointing `challenger` is register.py's job
+    (register_challenger), called below via a function-local import: register.py
+    imports this module's manifest/dev-features loaders at module level, so a
+    top-level import here would be circular. Safe once both modules are
+    fully loaded — the same shape utils/mlflow.py::load_model_promotion_bars
+    already uses to break its own circular import back into models/.
 
     reports/figures/reliability_diagram.png is overwritten on every call —
     it reflects whichever run executed this function most recently on this
@@ -1408,12 +1333,14 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
         golden,
     )
 
-    version = _tag_new_version_pending(cfg, model_info)
+    # Function-local — see this function's own docstring for why a top-level
+    # import here would be circular.
+    from telco_churn.models.register import register_challenger
 
-    parity_ok = _verify_reload_parity(
-        model_info, golden["input_example"], golden["in_memory_preds"]
+    version = register_challenger(
+        cfg, model_info, golden["input_example"], golden["in_memory_preds"]
     )
-    _point_challenger_alias(cfg, version)
+    parity_ok = True
 
     write_calibrate_receipt(
         run_id, version, model_info.model_id, model_info.model_uri, cfg

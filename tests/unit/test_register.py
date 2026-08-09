@@ -38,6 +38,7 @@ from sklearn.linear_model import LogisticRegression
 
 import telco_churn.models.register as register
 from telco_churn.models.evaluate import content_hash
+from telco_churn.utils.mlflow import write_error_analysis_receipt, write_eval_receipt
 
 _COMMITTED_FEATURES = ["tenure", "monthlycharges"]
 
@@ -198,18 +199,22 @@ def _log_evaluation_and_error_analysis(
     *,
     decision_model_version: str | None = None,
     gate: str = "pass",
-    review: str = "approved",
+    review: str | None = "approved",
     regime: str = "cold_start",
     champion_version: str | None = None,
     include_error_analysis: bool = True,
     error_analysis_model_version: str | None = None,
+    tag_version: bool = True,
 ) -> tuple[str, str | None]:
     """Log a real 'evaluation' run (promotion_decision.json/metrics.json/
-    economics.json/test_predictions.parquet) and a real 'error_analysis' run
-    (error_analysis.json), then tag `version` with
-    eval_run_id/error_analysis_run_id — mirroring what
-    evaluate.py/error_analysis.py actually do, since register.py now
-    resolves both exclusively from those tags, never a local reports/ path.
+    economics.json/test_predictions.parquet), a real 'error_analysis' run
+    (error_analysis.json), and — if `review` is not None — a real
+    promotion_review.json (one entry, that verdict) on the eval run. Then,
+    if `tag_version`, tags `version` with eval_run_id/error_analysis_run_id
+    — mirroring what register.py itself does at mint/first-pass (B1:
+    evaluate.py/error_analysis.py write no model-version tags themselves
+    anymore), since register.py resolves both exclusively from tag-or-
+    receipt, never a local reports/ path.
 
     decision_model_version/error_analysis_model_version default to `version`
     but can be overridden to simulate a stale/mismatched artifact (a
@@ -217,7 +222,11 @@ def _log_evaluation_and_error_analysis(
     model_version than the one being registered).
     include_error_analysis=False skips the 'error_analysis' run and its
     error_analysis_run_id tag entirely, simulating error_analysis.py never
-    having run.
+    having run. review=None skips promotion_review.json entirely, simulating
+    "no review recorded yet" (require_review blocks on this). tag_version=False
+    skips both tag writes, for tests exercising register.py's own receipt-
+    bootstrap resolution instead (its first-pass tagging is exactly what
+    this fixture otherwise pre-empts).
 
     Returns (eval_run_id, error_analysis_run_id | None).
     """
@@ -228,7 +237,11 @@ def _log_evaluation_and_error_analysis(
     metrics_payload = {
         "champion_version": champion_version,
         "ranking": {"pr_auc": 0.65, "dummy_pr_auc_floor": 0.265},
-        "classification": [],
+        # A "base" row is load-bearing: register.py's _tag_gate_criteria (B1)
+        # reads test_recall off it when tagging every processed version, not
+        # only promoted ones — matching evaluate.py's old unconditional-tag
+        # behavior.
+        "classification": [{"scenario": "base", "recall": 0.70}],
         "fixed_recall_profile": [],
         "calibration": {"brier": 0.13, "bss": 0.3, "calibration_slope": {"slope": 1.0}},
         "business_impact": {"scenarios": {}},
@@ -236,7 +249,6 @@ def _log_evaluation_and_error_analysis(
     promotion_decision_payload = {
         "model_version": decision_model_version,
         "gate": gate,
-        "review": review,
         "regime": regime,
         "criteria": {},
         "metrics_content_hash": content_hash(metrics_payload),
@@ -254,9 +266,26 @@ def _log_evaluation_and_error_analysis(
             predictions_path = Path(tmp_dir) / "test_predictions.parquet"
             test_predictions.to_parquet(predictions_path, index=False)
             mlflow.log_artifact(str(predictions_path))
-    client.set_model_version_tag(
-        registered_model_name, version, "eval_run_id", eval_run_id
-    )
+        if review is not None:
+            promotion_review_payload = {
+                "eval_run_id": eval_run_id,
+                "metrics_content_hash": promotion_decision_payload[
+                    "metrics_content_hash"
+                ],
+                "entries": [
+                    {
+                        "verdict": review,
+                        "notes": "",
+                        "approver": "test",
+                        "reviewed_at": "t",
+                    }
+                ],
+            }
+            mlflow.log_dict(promotion_review_payload, "promotion_review.json")
+    if tag_version:
+        client.set_model_version_tag(
+            registered_model_name, version, "eval_run_id", eval_run_id
+        )
 
     error_analysis_run_id: str | None = None
     if include_error_analysis:
@@ -274,12 +303,13 @@ def _log_evaluation_and_error_analysis(
         with mlflow.start_run(run_name="error_analysis") as run:
             error_analysis_run_id = run.info.run_id
             mlflow.log_dict(error_analysis_payload, "error_analysis.json")
-        client.set_model_version_tag(
-            registered_model_name,
-            version,
-            "error_analysis_run_id",
-            error_analysis_run_id,
-        )
+        if tag_version:
+            client.set_model_version_tag(
+                registered_model_name,
+                version,
+                "error_analysis_run_id",
+                error_analysis_run_id,
+            )
 
     return eval_run_id, error_analysis_run_id
 
@@ -315,6 +345,76 @@ def X_dev(X_golden: pd.DataFrame) -> pd.DataFrame:
         }
     )
     return pd.concat([X_golden, extra], ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
+# register_challenger — the calibrate.py registration extraction (PR B1)
+# ---------------------------------------------------------------------------
+
+
+def test_register_challenger_mints_pending_and_points_challenger_alias(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """register_challenger — moved out of calibrate.py in B1 — mints the
+    version, tags it pending immediately, and points `challenger` at it only
+    after reload parity passes."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    signature = infer_signature(X_golden, fitted_model.predict_proba(X_golden))
+    with mlflow.start_run(run_name="tuning_study"):
+        model_info = mlflow.sklearn.log_model(
+            sk_model=fitted_model,
+            name="calibrated_model",
+            signature=signature,
+            input_example=X_golden,
+            registered_model_name=registered_name,
+        )
+    in_memory_preds = fitted_model.predict_proba(X_golden)
+
+    version = register.register_challenger(
+        register_cfg, model_info, X_golden, in_memory_preds
+    )
+
+    client = mlflow.tracking.MlflowClient()
+    tags = client.get_model_version(registered_name, version).tags
+    assert tags["promotion_status"] == "pending"
+    assert tags["logged_model_id"] == model_info.model_id
+    assert tags["training_data_scope"] == "dev"
+    challenger = client.get_model_version_by_alias(registered_name, "challenger")
+    assert str(challenger.version) == version
+
+
+def test_register_challenger_leaves_pending_and_no_alias_on_parity_failure(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """A reload-parity mismatch raises, but the mint-time `pending` tag
+    written just before the check must survive — the fail-safe default a
+    crash between mint and verdict is supposed to get for free — and
+    `challenger` must never point at the unverified version."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    signature = infer_signature(X_golden, fitted_model.predict_proba(X_golden))
+    with mlflow.start_run(run_name="tuning_study"):
+        model_info = mlflow.sklearn.log_model(
+            sk_model=fitted_model,
+            name="calibrated_model",
+            signature=signature,
+            input_example=X_golden,
+            registered_model_name=registered_name,
+        )
+    wrong_preds = np.zeros((len(X_golden), 2))
+
+    with pytest.raises(AssertionError, match="Reload parity"):
+        register.register_challenger(register_cfg, model_info, X_golden, wrong_preds)
+
+    client = mlflow.tracking.MlflowClient()
+    version = str(model_info.registered_model_version)
+    tags = client.get_model_version(registered_name, version).tags
+    assert tags["promotion_status"] == "pending"
+    with pytest.raises(MlflowException):
+        client.get_model_version_by_alias(registered_name, "challenger")
 
 
 # ---------------------------------------------------------------------------
@@ -422,9 +522,95 @@ def test_register_requires_approved_review(
     version, _run_id = _register_test_version(
         registered_name, fitted_model, X_golden, promotion_status="pending"
     )
-    _log_evaluation_and_error_analysis(registered_name, version, review="pending")
+    _log_evaluation_and_error_analysis(registered_name, version, review=None)
 
     with pytest.raises(RuntimeError, match="review"):
+        register.run_registration_step(version, register_cfg)
+
+
+def test_register_human_rejected_review_tags_rejected_not_pending(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """A human 'rejected' verdict routes through _tag_rejected like the other
+    three reject sites (gate_fail, smoke_check_failed, post_flip_parity_failed)
+    — the live defect B1 fixes: left at `pending`, a deliberate human
+    rejection would be indistinguishable from a crash artifact."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+    _log_evaluation_and_error_analysis(registered_name, version, review="rejected")
+
+    result = register.run_registration_step(version, register_cfg)
+
+    assert result["promotion_status"] == "rejected"
+    client = mlflow.tracking.MlflowClient()
+    tags = client.get_model_version(registered_name, version).tags
+    assert tags["promotion_status"] == "rejected"
+    assert "human review" in str(
+        client.get_model_version(registered_name, version).description
+    )
+
+
+def test_register_resolves_eval_and_error_analysis_run_id_from_receipts_on_first_pass(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+    X_dev: pd.DataFrame,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no eval_run_id/error_analysis_run_id tags yet — this version's
+    first registration pass — register.py bootstraps both from
+    reports/eval_receipt.json/reports/error_analysis_receipt.json (the
+    pointers evaluate.py/error_analysis.py write in the real pipeline) and
+    tags the version itself, so a full pass still completes and a re-run
+    resolves purely from the now-present tags."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+    eval_run_id, error_analysis_run_id = _log_evaluation_and_error_analysis(
+        registered_name, version, tag_version=False
+    )
+    assert error_analysis_run_id is not None
+    write_eval_receipt(version, eval_run_id, register_cfg)
+    write_error_analysis_receipt(version, error_analysis_run_id, register_cfg)
+    _patch_calibrate_helpers(monkeypatch, X_dev)
+    monkeypatch.setattr(register, "check_environment_parity", lambda *a, **k: {})
+
+    client = mlflow.tracking.MlflowClient()
+    assert "eval_run_id" not in client.get_model_version(registered_name, version).tags
+
+    result = register.run_registration_step(version, register_cfg)
+
+    assert result["promotion_status"] == "promoted"
+    tags = client.get_model_version(registered_name, version).tags
+    assert tags["eval_run_id"] == eval_run_id
+    assert tags["error_analysis_run_id"] == error_analysis_run_id
+    assert tags["test_pr_auc"] == "0.65"
+    assert tags["test_recall"] == "0.7"
+
+
+def test_register_receipt_for_different_model_version_raises(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """A stale reports/eval_receipt.json — written for a different model
+    version, e.g. left over from an earlier cycle on the same machine —
+    must not be silently trusted for this one."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+    eval_run_id, _ea_run_id = _log_evaluation_and_error_analysis(
+        registered_name, version, tag_version=False
+    )
+    write_eval_receipt("999", eval_run_id, register_cfg)
+
+    with pytest.raises(RuntimeError, match="eval_receipt"):
         register.run_registration_step(version, register_cfg)
 
 
@@ -501,7 +687,11 @@ def test_register_aborts_when_error_analysis_missing(
     )
     _patch_calibrate_helpers(monkeypatch, X_dev)
 
-    with pytest.raises(RuntimeError, match="error_analysis.json"):
+    # No error_analysis_run_id tag (error_analysis.py never ran) and no
+    # reports/error_analysis_receipt.json (B1: register.py's only bootstrap
+    # channel) — read_error_analysis_receipt raises naming the producing
+    # command.
+    with pytest.raises(FileNotFoundError, match="models.error_analysis"):
         register.run_registration_step(version, register_cfg)
 
     client = mlflow.tracking.MlflowClient()

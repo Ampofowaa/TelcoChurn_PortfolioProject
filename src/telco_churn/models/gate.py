@@ -17,9 +17,11 @@ of the numbers to go stale against the config.
 Scope: this module implements the automated four-criterion gate (PR-AUC
 selection; recall, Brier, and calibration-slope guardrails) plus V3 (SHAP
 direction sanity), the sole remaining pre-registered human-review veto. V3
-is computed in error_analysis.py via explain.py and stamped by a human via
-`record_review` below, which only writes that stamp onto an already-persisted
-decision.
+is computed in error_analysis.py via explain.py; the human verdict is
+recorded separately, via `record_review` below, as its own append-only
+promotion_review.json document — never fused onto decide_promotion's own
+output, which has exactly one author (evaluate.py) and must stay that way
+for a DVC-tracked out to be valid.
 
 V1 (segment collapse), V2 (fairness disparity), and V2b (per-group
 calibration) are computed in threshold.py's dev-OOF screen via diagnostics.py
@@ -328,10 +330,12 @@ def decide_promotion(
     function applies it without knowing or caring where the numbers came
     from.
 
-    Returns a dict with `regime`, `gate` ("pass"/"fail"), `review` ("pending"
-    until a human stamps it via record_review), and a per-criterion breakdown
-    (`criteria`) recording each one's role, pass/fail, and judged values.
-    `gate` is "pass" iff selection passed *and* every guardrail passed.
+    Returns a dict with `regime`, `gate` ("pass"/"fail"), and a per-criterion
+    breakdown (`criteria`) recording each one's role, pass/fail, and judged
+    values. `gate` is "pass" iff selection passed *and* every guardrail
+    passed. Carries no `review` field — the human verdict is a separate
+    document with a separate author, recorded via `record_review` below, not
+    a field this pure function could ever fill in.
     """
     result = (
         _cold_start_decision(candidate, bars)
@@ -341,39 +345,53 @@ def decide_promotion(
     return {
         "regime": result["regime"],
         "gate": "pass" if result["gate_passed"] else "fail",
-        "review": "pending",
         "criteria": result["criteria"],
     }
 
 
 def record_review(
+    promotion_review: dict[str, Any] | None,
     decision: dict[str, Any],
     verdict: Literal["approved", "rejected"],
     notes: str,
     approver: str,
     reviewed_at: str,
-    direction_sanity_check_fired: bool,
 ) -> dict[str, Any]:
-    """Stamp the human review verdict onto a persisted gate decision.
+    """Append one human-review entry to promotion_review.json's entries list.
 
-    Pure: `decision` is the dict evaluate.py already wrote to
-    reports/promotion_decision.json (with `review: "pending"`) — this
-    function reads/writes nothing itself and returns an updated copy. The
-    notebook's closing cell owns loading and re-saving the file;
-    `register.py` refuses to run without `review: "approved"` here.
+    Pure: `promotion_review` is the dict already logged on the eval run
+    (`runs:/<eval_run_id>/promotion_review.json`), or None if this cycle has
+    no review yet — this function reads/writes nothing itself and returns an
+    updated copy. `decision` is evaluate.py's already-persisted
+    promotion_decision.json, read only for `eval_run_id`/
+    `metrics_content_hash` — the two fields that bind this document to a
+    specific evaluation without ever needing `model_version`, which does not
+    exist yet at review time (register.py mints it afterward). The review CLI
+    (models/review.py) is the sole caller — it owns loading the prior
+    document (if any) and re-logging the result, and never touches the
+    registry itself — register.py reads only `entries[-1]`.
 
-    `direction_sanity_check_fired` is the *outcome* of the V3 direction
-    sanity check (computed in error_analysis.py) — True means a sign flip was
-    found, not that the model failed. Deciding `verdict` from it is the
-    reviewer's judgment call, not this function's. Segment collapse,
-    per-group calibration, and fairness disparity are reported diagnostics
-    (see module docstring), not veto criteria — they are not stamped here.
+    Append-only, never overwritten in place: a reviewer who reconsiders logs
+    a second entry rather than editing the first, so the full review history
+    for a cycle survives (e.g. an initial "rejected" later followed by
+    "approved" once a concern is addressed) — register.py acts on the latest
+    entry only, but every earlier one stays auditable. No
+    `direction_sanity_check_fired` field — that was a machine fact
+    (error_analysis.py's V3 outcome) duplicated into a human document that
+    has no business restating it; a reviewer or auditor traces it through
+    error_analysis_run_id instead. Segment collapse, per-group calibration,
+    and fairness disparity are reported diagnostics (see module docstring),
+    not veto criteria — they are not stamped here either.
     """
-    return {
-        **decision,
-        "review": verdict,
-        "review_notes": notes,
+    existing_entries = list(promotion_review["entries"]) if promotion_review else []
+    entry = {
+        "verdict": verdict,
+        "notes": notes,
         "approver": approver,
         "reviewed_at": reviewed_at,
-        "direction_sanity_check_fired": direction_sanity_check_fired,
+    }
+    return {
+        "eval_run_id": decision["eval_run_id"],
+        "metrics_content_hash": decision["metrics_content_hash"],
+        "entries": [*existing_entries, entry],
     }

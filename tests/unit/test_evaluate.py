@@ -1100,7 +1100,7 @@ def test_promotion_decision_cold_start_gate_passes_on_admissible_candidate(
         _RANDOM_STATE,
     )
     assert result["gate"] == "pass"
-    assert result["review"] == "pending"
+    assert "review" not in result
 
 
 def test_promotion_decision_cold_start_gate_fails_below_pr_auc_bar(
@@ -1360,27 +1360,21 @@ def test_log_evaluation_run_wires_model_id_dataset_and_tags_correctly(
     )
 
 
-def test_tag_evaluated_model_version_failure_leaves_no_partial_tags(
+def test_log_evaluation_run_survives_a_downstream_tagging_failure(
     mlflow_test_experiment: Callable[[str], str],
     y_proba_fixture: tuple[pd.Series, np.ndarray],
     policy_fixture: DictConfig,
     eval_cfg: DictConfig,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A registry failure while tagging the evaluated model version must not
-    leave it half-tagged, and must not corrupt the evaluation run's own
-    already-logged artifacts.
-
-    Mirrors test_calibrate.py's
-    test_run_calibration_step_parity_failure_leaves_tagged_pending_orphan:
-    force the downstream step to fail and assert the resulting state is
-    safe, not merely that nothing crashed. Here, the evaluation run
-    (_log_evaluation_run) is a complete, valid record even though the
-    version-to-run link failed to attach — recovering only requires
-    re-running _tag_evaluated_model_version, not re-evaluating.
+    """_log_evaluation_run's own artifacts are a complete, valid record
+    independent of whatever register.py does with them afterward (B1: model-
+    version tagging moved out of evaluate.py entirely, into register.py's
+    _tag_gate_criteria/_resolve_and_tag_eval_run_id — see test_register.py
+    for that failure mode). Recovering from a downstream tagging failure
+    only requires re-running register.py, not re-evaluating.
     """
-    experiment_name = "test_tag_evaluated_model_version_failure"
+    experiment_name = "test_log_evaluation_run_survives_downstream_failure"
     tracking_uri = mlflow_test_experiment(experiment_name)
     registered_model_name = "test-eval-orchestration-failure"
     version, model_id = _register_trivial_model(registered_model_name)
@@ -1410,29 +1404,12 @@ def test_tag_evaluated_model_version_failure_leaves_no_partial_tags(
         inputs["cfg"],
     )
 
-    def _raise_transient(*args: object, **kwargs: object) -> None:
-        raise MlflowException(
-            "registry temporarily unavailable", error_code=INTERNAL_ERROR
-        )
-
-    monkeypatch.setattr(
-        mlflow.tracking.MlflowClient, "set_model_version_tag", _raise_transient
-    )
-
-    with pytest.raises(MlflowException, match="registry temporarily unavailable"):
-        evaluate._tag_evaluated_model_version(
-            version, eval_run_id, registered_model_name, inputs["core_metrics"]
-        )
-
-    monkeypatch.undo()
-    client = mlflow.tracking.MlflowClient()
-    version_info = client.get_model_version(registered_model_name, version)
-    assert "eval_run_id" not in version_info.tags
-    assert "test_pr_auc" not in version_info.tags
-
-    # The run _log_evaluation_run already produced is untouched by the
-    # tagging failure that happened after it.
     persisted_decision = mlflow.artifacts.load_dict(
         f"runs:/{eval_run_id}/promotion_decision.json"
     )
     assert persisted_decision["eval_run_id"] == eval_run_id
+    version_info = mlflow.tracking.MlflowClient().get_model_version(
+        registered_model_name, version
+    )
+    assert "eval_run_id" not in version_info.tags
+    assert "test_pr_auc" not in version_info.tags

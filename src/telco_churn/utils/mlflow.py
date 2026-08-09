@@ -60,6 +60,10 @@ __all__ = [
     "read_train_receipt",
     "write_calibrate_receipt",
     "read_calibrate_receipt",
+    "write_eval_receipt",
+    "read_eval_receipt",
+    "write_error_analysis_receipt",
+    "read_error_analysis_receipt",
     "TRAINING_CYCLE_RUN_DESCRIPTION",
 ]
 
@@ -352,6 +356,76 @@ def read_calibrate_receipt(cfg: DictConfig) -> dict[str, Any]:
         raise FileNotFoundError(
             f"{path} does not exist — run `python -m telco_churn.models.calibrate` "
             "first, or pass an explicit run_id/model_version override."
+        )
+    with open(path, encoding="utf-8") as f:
+        receipt: dict[str, Any] = json.load(f)
+    return receipt
+
+
+def write_eval_receipt(model_version: str, eval_run_id: str, cfg: DictConfig) -> None:
+    """Write reports/eval_receipt.json — register.py's bootstrap pointer to this cycle's eval run.
+
+    B1 moves model-version tagging (eval_run_id, the four gate criteria) out
+    of evaluate.py and into register.py, which runs after this — so
+    register.py needs a channel to "which evaluation run belongs to this
+    model_version" for its own first invocation, before any tag exists to
+    read it back from. This receipt is that channel, exactly the same
+    first-invocation-bootstrap role calibrate_receipt.json already plays for
+    threshold.py/evaluate.py/error_analysis.py's own input resolution — never
+    trusted again once register.py has tagged eval_run_id onto the version,
+    at which point every later read goes through the tag instead (this
+    module's docstring's distinction between a receipt and cross-cycle
+    evidence).
+    """
+    reports_dir = _reports_dir(cfg)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(reports_dir / "eval_receipt.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {"model_version": model_version, "eval_run_id": eval_run_id}, f, indent=2
+        )
+
+
+def read_eval_receipt(cfg: DictConfig) -> dict[str, Any]:
+    """Read reports/eval_receipt.json, raising a clear error naming the producing command."""
+    path = _reports_dir(cfg) / "eval_receipt.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} does not exist — run `python -m telco_churn.models.evaluate` "
+            "first for this model version."
+        )
+    with open(path, encoding="utf-8") as f:
+        receipt: dict[str, Any] = json.load(f)
+    return receipt
+
+
+def write_error_analysis_receipt(
+    model_version: str, error_analysis_run_id: str, cfg: DictConfig
+) -> None:
+    """Write reports/error_analysis_receipt.json — register.py's bootstrap pointer to this cycle's error_analysis run.
+
+    Same role as write_eval_receipt above, for the sixth of the six
+    model-version tags B1 moves into register.py.
+    """
+    reports_dir = _reports_dir(cfg)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(reports_dir / "error_analysis_receipt.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "model_version": model_version,
+                "error_analysis_run_id": error_analysis_run_id,
+            },
+            f,
+            indent=2,
+        )
+
+
+def read_error_analysis_receipt(cfg: DictConfig) -> dict[str, Any]:
+    """Read reports/error_analysis_receipt.json, raising a clear error naming the producing command."""
+    path = _reports_dir(cfg) / "error_analysis_receipt.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} does not exist — run `python -m telco_churn.models.error_analysis` "
+            "first for this model version."
         )
     with open(path, encoding="utf-8") as f:
         receipt: dict[str, Any] = json.load(f)

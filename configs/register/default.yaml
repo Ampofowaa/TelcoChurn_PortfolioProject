@@ -6,7 +6,7 @@
 model_version: null
 
 # Require an approved human review before acting. True is the attended default:
-# a reviewer stamps the verdict via notebook 05 or the review CLI each cycle.
+# a reviewer stamps the verdict via the review CLI each cycle.
 # What Phase 10's weekly unattended retrain sets this to is NOT yet decided —
 # earlier drafts asserted false here, but that was residue from the review
 # mechanism being Jupyter-bound (an unattended flow cannot open JupyterLab), not

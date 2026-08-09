@@ -406,7 +406,9 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
     )
     assert decision["regime"] == "cold_start"
     assert decision["gate"] in {"pass", "fail"}
-    assert decision["review"] == "pending"
+    # B1: promotion_decision.json carries no "review" field — the human
+    # verdict is a separate, append-only promotion_review.json document.
+    assert "review" not in decision
     assert "metrics_content_hash" in decision
     assert decision["eval_run_id"] != metrics["run_id"]
 
@@ -441,6 +443,10 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
     ):
         assert (figures_dir / filename).exists(), f"missing figure: {filename}"
 
+    # B1: evaluate.py no longer tags the model version itself (the four gate
+    # criteria, eval_run_id) — register.py does, on its own first pass,
+    # sourced from reports/eval_receipt.json below. Assert neither is
+    # tagged yet, and that the receipt is register.py's bootstrap pointer.
     client = mlflow.tracking.MlflowClient(
         tracking_uri=str(registered_evaluation_model["tracking_uri"])
     )
@@ -448,11 +454,19 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
         str(registered_evaluation_model["registered_model_name"]),
         str(registered_evaluation_model["model_version"]),
     )
-    for tag in ("test_pr_auc", "test_recall", "test_brier", "test_calibration_slope"):
-        assert tag in version.tags, f"missing model-version tag: {tag}"
-    # register.py's only supported path to this cycle's promotion_decision.json/
-    # metrics.json — resolved by run_id, never a local reports/ path.
-    assert version.tags.get("eval_run_id") == decision["eval_run_id"]
+    for tag in (
+        "test_pr_auc",
+        "test_recall",
+        "test_brier",
+        "test_calibration_slope",
+        "eval_run_id",
+    ):
+        assert tag not in version.tags, f"unexpected model-version tag: {tag}"
+    receipt = json.loads(
+        (reports_dir / "eval_receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["eval_run_id"] == decision["eval_run_id"]
+    assert receipt["model_version"] == str(registered_evaluation_model["model_version"])
 
 
 def test_evaluate_main_cli_exits_one_when_model_version_missing(

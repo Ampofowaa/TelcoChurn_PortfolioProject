@@ -90,6 +90,7 @@ from telco_churn.utils.mlflow import (
     resolve_model_identifier,
     resolve_tracking_uri,
     set_run_description,
+    write_error_analysis_receipt,
 )
 from telco_churn.utils.paths import get_project_root
 
@@ -1187,7 +1188,6 @@ def _load_error_analysis_inputs(
     through.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    registered_model_name = str(cfg.mlflow.registered_model_name)
 
     validation_payload = load_threshold_validation(run_id, cfg)
     logged_model_id = resolve_logged_model_id(model_version, cfg)
@@ -1223,7 +1223,6 @@ def _load_error_analysis_inputs(
     proba_dev = dev_oof_predictions["p_hat"].to_numpy(dtype=float)
 
     return {
-        "registered_model_name": registered_model_name,
         "run_id": run_id,
         "validation_payload": validation_payload,
         "committed_features": committed_features,
@@ -1807,29 +1806,22 @@ def _log_error_analysis_run(
     return error_analysis_run_id
 
 
-def _tag_and_write_error_analysis_reports(
+def _write_error_analysis_reports(
     model_version: str,
-    registered_model_name: str,
     error_analysis_run_id: str,
     error_analysis_payload: dict[str, Any],
     reports_dir: Path,
+    cfg: DictConfig,
 ) -> None:
-    """Tag the model version with error_analysis_run_id and mirror error_analysis.json to reports/.
+    """Write reports/error_analysis_receipt.json and mirror error_analysis.json to reports/.
 
-    register.py's only supported path from "the model version being
-    registered" to this cycle's error_analysis.json — same tag pattern as
-    calibrate.py's logged_model_id and evaluate.py's eval_run_id, since
-    nothing else auto-populates a run-to-version link. A local reports/
-    path is not a substitute: it only reflects whichever run last executed
-    error_analysis.py on this machine, not necessarily this model_version's
-    own cycle.
+    register.py, not this module, tags the model version with
+    error_analysis_run_id (B1 moves every model-version tag write into
+    register.py, since minting now happens after review) — this receipt is
+    register.py's bootstrap pointer to this cycle's error_analysis run, the
+    same first-invocation role calibrate_receipt.json already plays.
     """
-    mlflow.tracking.MlflowClient().set_model_version_tag(
-        registered_model_name,
-        model_version,
-        "error_analysis_run_id",
-        error_analysis_run_id,
-    )
+    write_error_analysis_receipt(model_version, error_analysis_run_id, cfg)
 
     reports_dir.mkdir(parents=True, exist_ok=True)
     with open(reports_dir / "error_analysis.json", "w", encoding="utf-8") as f:
@@ -1987,12 +1979,12 @@ def run_error_analysis_step(
         cfg,
     )
 
-    _tag_and_write_error_analysis_reports(
+    _write_error_analysis_reports(
         model_version,
-        loaded["registered_model_name"],
         error_analysis_run_id,
         error_analysis_payload,
         loaded["reports_dir"],
+        cfg,
     )
 
     v3_result = shap_diag["v3_result"]

@@ -1,19 +1,24 @@
-"""MLflow registry alias-flip step that closes the training cycle.
+"""The single entry point for every MLflow registry write in a training cycle.
 
-It never recomputes the gate's verdict or mints a new model version: it
-reads the promotion decision evaluate.py already persisted, verifies it
-against the model version being registered, and either flips the
-`champion` alias onto the already-registered `challenger` version or leaves
-it rejected — validating fully (environment, schema, golden-prediction
-parity) before the flip and reconfirming through the alias afterward. Every
-cross-cycle artifact (eval_run_id, error_analysis_run_id) is resolved from
-tags on the model version itself, never a local reports/ path, so
-promotion always acts on this cycle's own evidence rather than whichever
-run last executed on this machine. It opens no MLflow run of its own — it
-acts on the registry and on already-existing runs by explicit run_id — and
-computes no metrics of its own; every promotion/rollback is appended to a
-`promotion_log` tag on the registered model (see champion_history) as an
-ordered, append-only record.
+It never recomputes the gate's verdict: it reads the promotion decision
+evaluate.py already persisted, verifies it against the model version being
+registered, and either flips the `champion` alias onto the `challenger`
+version it minted earlier in this same cycle or leaves it rejected —
+validating fully (environment, schema, golden-prediction parity) before the
+flip and reconfirming through the alias afterward. Five jobs, not four:
+`register_challenger` mints the calibrated pipeline calibrate.py fit and
+logs as a new registry version (calibrate.py performs no registry write of
+its own — see its own docstring), tags it `promotion_status: pending` at
+mint time, and points `challenger` at it; `run_registration_step` then
+tags the model version with eval_run_id/the four gate criteria/
+error_analysis_run_id (resolved from tag if a prior invocation already
+wrote it, else from evaluate.py's/error_analysis.py's reports/*_receipt.json
+bootstrap pointers — see utils/mlflow.py's module docstring), checks the
+human review verdict, and flips or rejects. It opens no MLflow run of its
+own — it acts on the registry and on already-existing runs by explicit
+run_id — and computes no metrics of its own; every promotion/rollback is
+appended to a `promotion_log` tag on the registered model (see
+champion_history) as an ordered, append-only record.
 """
 
 from __future__ import annotations
@@ -47,7 +52,12 @@ from telco_churn.models.drift_reference import build_reference
 from telco_churn.models.evaluate import content_hash, resolve_champion_version
 from telco_churn.models.threshold import load_dev_oof_predictions
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.mlflow import ensure_experiment_metadata
+from telco_churn.utils.mlflow import (
+    ensure_experiment_metadata,
+    read_error_analysis_receipt,
+    read_eval_receipt,
+    set_registered_model_description,
+)
 from telco_churn.utils.paths import get_project_root
 
 __all__ = [
@@ -55,6 +65,7 @@ __all__ = [
     "champion_history",
     "check_environment_parity",
     "promote_to_alias",
+    "register_challenger",
     "rollback_champion",
     "run_registration_step",
 ]
@@ -69,6 +80,18 @@ _MANIFEST_ARTIFACTS = (
     "preprocessing.pkl",
     "training_manifest.json",
 )
+
+_REGISTRY_DESCRIPTION = (
+    "Calibrated LightGBM churn-prediction pipeline for IBM Telco Customer "
+    "Churn. Selected by PR-AUC among Dummy/LogReg/LightGBM candidates, "
+    "calibrated (sigmoid), thresholded at a cost-sensitive cutoff "
+    "t* = c/(r x LTV). 'champion' serves production; 'challenger' holds the "
+    "most recent candidate. Every version carries a promotion_status tag "
+    "(pending/promoted/rejected) - only 'promoted' versions are valid "
+    "rollback targets."
+)
+
+_PENDING_VERSION_DESCRIPTION = "Awaiting sealed-test evaluation and promotion review."
 
 
 class EnvironmentMismatchError(RuntimeError):
@@ -152,6 +175,78 @@ def promote_to_alias(
     client.set_registered_model_alias(registered_model_name, alias, version)
 
 
+def register_challenger(
+    cfg: DictConfig,
+    model_info: Any,
+    input_example: pd.DataFrame,
+    in_memory_preds: NDArray[np.float64],
+) -> str:
+    """Mint calibrate.py's fitted pipeline as a new registry version, tag it pending, and point `challenger` at it.
+
+    Called from calibrate.py's `run_calibration_step` via a function-local
+    import (calibrate.py's own docstring explains why a top-level import
+    would be circular) — the extraction bullet's own point: calibrate.py
+    fits and logs a pure file transform, and this function is the only
+    registry-mutating call in the cycle before evaluation.
+
+    Tags `promotion_status: pending` immediately after mint, before reload
+    parity is even checked — the fail-safe mint-time default (CLAUDE.md §
+    MLflow Model Registry) must be the state a crash between mint and verdict
+    gets for free, not something an abort path has to remember to write.
+    Idempotent registry description writes (`set_registered_model_description`)
+    mirror `ensure_experiment_metadata`'s self-healing pattern: cheap to
+    re-set on every registration, so the registry overview page never
+    describes a stale training cycle.
+
+    Raises AssertionError, leaving the version tagged `pending` (not
+    untagged, not `rejected` — no verdict has been reached), if the reloaded
+    model's predictions disagree with the in-memory pipeline's on the same
+    input sample: the serialized model would not be safe to serve.
+    """
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+    version = str(model_info.registered_model_version)
+    client = mlflow.tracking.MlflowClient()
+
+    set_registered_model_description(registered_model_name, _REGISTRY_DESCRIPTION)
+    client.update_model_version(
+        registered_model_name, version, description=_PENDING_VERSION_DESCRIPTION
+    )
+    client.set_model_version_tag(
+        registered_model_name, version, "training_data_scope", "dev"
+    )
+    # ModelVersion.model_id does not auto-populate in OSS MLflow 3.14 — this tag
+    # is the only supported hop from "the version being evaluated" to the
+    # LoggedModel Phase 7's evaluate.py attaches sealed-test metrics to.
+    client.set_model_version_tag(
+        registered_model_name, version, "logged_model_id", model_info.model_id
+    )
+    # Mint-time default, set before anything downstream can fail: a crash in
+    # the parity check below, evaluate.py, error_analysis.py, or the rest of
+    # this module leaves this version with no verdict recorded, rather than
+    # with a tag someone forgot to write on an abort path nobody anticipated.
+    # rollback_champion()'s query (highest version tagged
+    # promotion_status: promoted) and the Phase 14 pending-orphan reaper both
+    # depend on every version reliably starting here.
+    client.set_model_version_tag(
+        registered_model_name, version, "promotion_status", "pending"
+    )
+
+    reloaded = mlflow.sklearn.load_model(model_info.model_uri)
+    reload_preds = reloaded.predict_proba(input_example)
+    if not np.allclose(in_memory_preds, reload_preds, rtol=0, atol=1e-12):
+        raise AssertionError(
+            "Reload parity check failed: predictions from the reloaded "
+            "calibrated model differ from the in-memory pipeline on the same "
+            "input sample — the serialized model is not safe to register."
+        )
+
+    # Deliberately the last step: the alias is what makes a version
+    # reachable by evaluate.py/register.py/a human, so nothing may be
+    # aliased until it has been verified to be the artifact it claims to be.
+    client.set_registered_model_alias(registered_model_name, "challenger", version)
+    return version
+
+
 _CRITERION_LABELS = {
     "pr_auc": "PR-AUC",
     "recall": "recall",
@@ -190,17 +285,31 @@ def _describe_criterion(key: str, criterion: dict[str, Any]) -> str:
     return f"{label} {criterion['value']:.3f} vs bar {criterion['bar']:.3f} ({status})"
 
 
-def _rejection_description(decision: dict[str, Any], reason: str) -> str:
+def _rejection_description(
+    decision: dict[str, Any],
+    reason: str,
+    review_entry: dict[str, Any] | None = None,
+) -> str:
     """One-line human-readable summary for a rejected model version's description field.
 
-    `reason` distinguishes the three rejection paths in run_registration_step
-    — a gate failure, a post-registration smoke-check failure, or a post-
-    alias-flip parity failure — because they mean operationally different
-    things (a metrics problem vs. a serving-artifact problem vs. a rollback
-    that already happened) and must not collapse into one indistinguishable
-    "rejected" string the way the promotion_status tag alone does.
+    `reason` distinguishes the four rejection paths in run_registration_step
+    — a human veto, a gate failure, a post-registration smoke-check failure,
+    or a post-alias-flip parity failure — because they mean operationally
+    different things (a reviewer's judgment vs. a metrics problem vs. a
+    serving-artifact problem vs. a rollback that already happened) and must
+    not collapse into one indistinguishable "rejected" string the way the
+    promotion_status tag alone does. `review_entry` is required for
+    "human_rejected" only — the promotion_review.json entry naming who
+    rejected it, when, and why.
     """
     today = datetime.now(UTC).strftime("%Y-%m-%d")
+    if reason == "human_rejected":
+        assert review_entry is not None
+        return (
+            f"Rejected {today} ({decision['regime']} regime) — human review "
+            f"rejected by {review_entry['approver']} at "
+            f"{review_entry['reviewed_at']}: {review_entry['notes']}"
+        )
     if reason == "gate_fail":
         clauses = "; ".join(
             _describe_criterion(key, criterion)
@@ -871,6 +980,7 @@ def _build_governance_section(
     manifest: dict[str, Any],
     metrics: dict[str, Any],
     decision: dict[str, Any],
+    review_entry: dict[str, Any] | None,
     calibration_method: str,
     run_id: str,
     eval_run_id: str,
@@ -924,9 +1034,10 @@ def _build_governance_section(
             "criteria": decision.get("criteria"),
         },
         "human_review": {
-            "review": decision.get("review"),
-            "review_notes": decision.get("review_notes"),
-            "reviewed_at": decision.get("reviewed_at"),
+            "review": review_entry.get("verdict") if review_entry else None,
+            "review_notes": review_entry.get("notes") if review_entry else None,
+            "approver": review_entry.get("approver") if review_entry else None,
+            "reviewed_at": review_entry.get("reviewed_at") if review_entry else None,
         },
     }
 
@@ -1038,6 +1149,7 @@ def _assemble_model_card(
     economics: dict[str, Any],
     error_analysis: dict[str, Any],
     decision: dict[str, Any],
+    review_entry: dict[str, Any] | None,
     calibration_method: str,
     run_id: str,
     eval_run_id: str,
@@ -1053,11 +1165,12 @@ def _assemble_model_card(
     sectioning: executive_summary leads, business_case and
     risks_and_limitations follow in the order a stakeholder actually reads
     them, governance carries provenance/ownership plus the promotion-decision
-    audit trail (regime, per-criterion breakdown, human review verdict — all
-    read from decision, never recomputed), and technical_appendix
-    holds everything an ML engineer or auditor would want to verify but a
-    business reader does not need first. No hyperparameters, hashes, or raw
-    statistical detail — those stay in training_manifest.json
+    audit trail (regime and per-criterion breakdown from decision, the human
+    review verdict from review_entry — promotion_review.json's latest entry,
+    a separate document with a separate author — never recomputed), and
+    technical_appendix holds everything an ML engineer or auditor would want
+    to verify but a business reader does not need first. No hyperparameters,
+    hashes, or raw statistical detail — those stay in training_manifest.json
     (governance.model_details.hyperparameters_and_provenance points there
     rather than duplicating any of it). Baselines throughout are
     treat-none/treat-all and the DummyClassifier prevalence floor, never
@@ -1076,6 +1189,7 @@ def _assemble_model_card(
             manifest,
             metrics,
             decision,
+            review_entry,
             calibration_method,
             run_id,
             eval_run_id,
@@ -1113,22 +1227,107 @@ def _check_already_decided(
     return None
 
 
-def _load_and_verify_evaluation_artifacts(
-    current_version: Any, model_version: str
-) -> dict[str, Any]:
-    """Resolve eval_run_id from the version's own tag and load+verify its decision/metrics.
+def _resolve_and_tag_eval_run_id(
+    client: Any,
+    cfg: DictConfig,
+    current_version: Any,
+    registered_model_name: str,
+    model_version: str,
+) -> str:
+    """Resolve this cycle's eval_run_id and tag it onto the model version.
 
-    Never a local reports/ path — a fixed path would reflect whichever run
-    last executed evaluate.py on this machine, not necessarily this
-    model_version's own cycle.
+    From the version's own tag if a prior invocation of this function
+    already wrote it — durable evidence, trusted from here on, the same
+    resolve-by-tag rule this module has always followed. Otherwise from
+    evaluate.py's reports/eval_receipt.json, the first-invocation bootstrap
+    pointer (utils/mlflow.py's module docstring) — verified against
+    model_version before being trusted, then tagged immediately so every
+    later read, including this same version's own next invocation, goes
+    through the tag and never the receipt again.
     """
-    eval_run_id = current_version.tags.get("eval_run_id")
-    if not eval_run_id:
+    tagged = current_version.tags.get("eval_run_id")
+    if tagged:
+        return str(tagged)
+    receipt = read_eval_receipt(cfg)
+    receipt_model_version = str(receipt["model_version"])
+    if receipt_model_version != str(model_version):
         raise RuntimeError(
-            f"Model version {model_version!r} has no eval_run_id tag — "
-            "evaluate.py's registration step sets this; re-run "
-            "models.evaluate before registering."
+            f"reports/eval_receipt.json was written for model_version="
+            f"{receipt_model_version!r}, not {model_version!r} — "
+            "models.evaluate was not the last thing run for this model "
+            "version on this machine. Re-run models.evaluate for this "
+            "version first, or pass an explicit run_id/model_version "
+            "override to it."
         )
+    eval_run_id = str(receipt["eval_run_id"])
+    client.set_model_version_tag(
+        registered_model_name, model_version, "eval_run_id", eval_run_id
+    )
+    return eval_run_id
+
+
+def _tag_gate_criteria(
+    client: Any,
+    registered_model_name: str,
+    model_version: str,
+    metrics: dict[str, Any],
+) -> None:
+    """Tag the four gate-criteria values onto the model version.
+
+    Moved from evaluate.py so register.py is the sole writer of
+    model-version tags — legible to someone scanning a version list under
+    pressure without opening a run, on both a promoted and a rejected
+    version, matching evaluate.py's old unconditional-tag behaviour. Set on
+    every invocation that reaches this point: harmless to re-set the same
+    values on a retry, since `metrics` is already hash-verified against
+    promotion_decision.json's metrics_content_hash by the caller.
+    """
+    ranking_metrics = metrics["ranking"]
+    calibration_report = metrics["calibration"]
+    base_row = next(
+        row for row in metrics["classification"] if row["scenario"] == "base"
+    )
+    client.set_model_version_tag(
+        registered_model_name,
+        model_version,
+        "test_pr_auc",
+        str(ranking_metrics["pr_auc"]),
+    )
+    client.set_model_version_tag(
+        registered_model_name, model_version, "test_recall", str(base_row["recall"])
+    )
+    client.set_model_version_tag(
+        registered_model_name,
+        model_version,
+        "test_brier",
+        str(calibration_report["brier"]),
+    )
+    client.set_model_version_tag(
+        registered_model_name,
+        model_version,
+        "test_calibration_slope",
+        str(calibration_report["calibration_slope"]["slope"]),
+    )
+
+
+def _load_and_verify_evaluation_artifacts(
+    client: Any,
+    cfg: DictConfig,
+    current_version: Any,
+    registered_model_name: str,
+    model_version: str,
+) -> dict[str, Any]:
+    """Resolve eval_run_id (tagging it if this is the first pass), tag the
+    four gate criteria, and load+verify promotion_decision.json/metrics.json.
+
+    Beyond the receipt's one-time bootstrap role, never a local reports/
+    path — a fixed path would reflect whichever run last executed
+    evaluate.py on this machine, not necessarily this model_version's own
+    cycle.
+    """
+    eval_run_id = _resolve_and_tag_eval_run_id(
+        client, cfg, current_version, registered_model_name, model_version
+    )
 
     decision = mlflow.artifacts.load_dict(
         f"runs:/{eval_run_id}/promotion_decision.json"
@@ -1154,17 +1353,27 @@ def _load_and_verify_evaluation_artifacts(
             "its own evidence."
         )
 
+    _tag_gate_criteria(client, registered_model_name, model_version, metrics)
+
     return {"eval_run_id": eval_run_id, "decision": decision, "metrics": metrics}
 
 
-def _check_review_approval(cfg: DictConfig, decision: dict[str, Any]) -> None:
-    """Raise if a stamped human review is required but absent."""
-    if bool(cfg.register.require_review) and decision.get("review") != "approved":
-        raise RuntimeError(
-            f"promotion_decision.json's review is {decision.get('review')!r}, "
-            "not 'approved' — register.require_review is set and refuses to "
-            "act without a stamped human review."
-        )
+def _resolve_review_verdict(eval_run_id: str) -> dict[str, Any] | None:
+    """Fetch promotion_review.json's latest entry from the eval run, if any exist.
+
+    None means no review has been recorded for this cycle — the artifact is
+    absent, or present with an empty entries list — which require_review
+    treats as "review pending" and blocks on.
+    """
+    client = mlflow.tracking.MlflowClient()
+    eval_run_artifacts = {a.path for a in client.list_artifacts(eval_run_id)}
+    if "promotion_review.json" not in eval_run_artifacts:
+        return None
+    promotion_review = mlflow.artifacts.load_dict(
+        f"runs:/{eval_run_id}/promotion_review.json"
+    )
+    entries = promotion_review.get("entries", [])
+    return dict(entries[-1]) if entries else None
 
 
 def _tag_rejected(
@@ -1173,14 +1382,19 @@ def _tag_rejected(
     model_version: str,
     decision: dict[str, Any],
     reason: str,
+    review_entry: dict[str, Any] | None = None,
 ) -> None:
     """Tag, describe, and log a rejection — the caller still decides return vs. raise.
 
-    Shared by all three reject sites (gate_fail, smoke_check_failed,
-    post_flip_parity_failed), which differ in control flow: gate_fail
-    returns normally, the other two raise from inside an except block. This
-    helper only ever tags/logs — unifying the return-vs-raise decision here
-    too would either swallow a traceback or return instead of propagating.
+    Shared by all four reject sites (human_rejected, gate_fail,
+    smoke_check_failed, post_flip_parity_failed), which differ in control
+    flow: human_rejected and gate_fail return normally, the other two raise
+    from inside an except block. This helper only ever tags/logs — unifying
+    the return-vs-raise decision here too would either swallow a traceback
+    or return instead of propagating. A human veto is a rejection like the
+    other three and must land here too — left at `pending`, it would be
+    indistinguishable from a crash artifact (CLAUDE.md § MLflow Model
+    Registry), the exact ambiguity `promotion_status` exists to prevent.
     """
     client.set_model_version_tag(
         registered_model_name, model_version, "promotion_status", "rejected"
@@ -1188,7 +1402,7 @@ def _tag_rejected(
     client.update_model_version(
         registered_model_name,
         model_version,
-        description=_rejection_description(decision, reason),
+        description=_rejection_description(decision, reason, review_entry),
     )
     logger.info(
         "model_rejected",
@@ -1198,23 +1412,58 @@ def _tag_rejected(
     )
 
 
+def _resolve_and_tag_error_analysis_run_id(
+    client: Any,
+    cfg: DictConfig,
+    current_version: Any,
+    registered_model_name: str,
+    model_version: str,
+) -> str:
+    """Resolve this cycle's error_analysis_run_id and tag it onto the model version.
+
+    Same tag-if-present-else-receipt pattern as
+    _resolve_and_tag_eval_run_id, for the sixth of the six model-version
+    tags B1 moves into register.py.
+    """
+    tagged = current_version.tags.get("error_analysis_run_id")
+    if tagged:
+        return str(tagged)
+    receipt = read_error_analysis_receipt(cfg)
+    receipt_model_version = str(receipt["model_version"])
+    if receipt_model_version != str(model_version):
+        raise RuntimeError(
+            f"reports/error_analysis_receipt.json was written for "
+            f"model_version={receipt_model_version!r}, not {model_version!r} "
+            "— models.error_analysis was not the last thing run for this "
+            "model version on this machine. Re-run models.error_analysis "
+            "for this version first, or pass an explicit run_id/model_version "
+            "override to it."
+        )
+    error_analysis_run_id = str(receipt["error_analysis_run_id"])
+    client.set_model_version_tag(
+        registered_model_name,
+        model_version,
+        "error_analysis_run_id",
+        error_analysis_run_id,
+    )
+    return error_analysis_run_id
+
+
 def _load_and_verify_error_analysis(
-    client: Any, current_version: Any, model_version: str
+    client: Any,
+    cfg: DictConfig,
+    current_version: Any,
+    registered_model_name: str,
+    model_version: str,
 ) -> dict[str, Any]:
-    """Resolve error_analysis_run_id from the version's own tag and load+verify error_analysis.json.
+    """Resolve error_analysis_run_id (tagging it if this is the first pass) and load+verify error_analysis.json.
 
     Verified against this model_version too, so a stale error_analysis.json
     from a different cycle can't be silently attributed to this one.
     """
-    error_analysis_run_id = current_version.tags.get("error_analysis_run_id")
-    if not error_analysis_run_id:
-        raise RuntimeError(
-            f"Model version {model_version!r} has no error_analysis_run_id "
-            "tag — error_analysis.py's registration step sets this; the "
-            "model card's fairness/robustness section cannot be assembled "
-            "without its error_analysis.json. Re-run models.error_analysis "
-            "before registering."
-        )
+    error_analysis_run_id = _resolve_and_tag_error_analysis_run_id(
+        client, cfg, current_version, registered_model_name, model_version
+    )
     error_analysis_run_artifacts = {
         a.path for a in client.list_artifacts(error_analysis_run_id)
     }
@@ -1366,6 +1615,7 @@ def _build_and_log_model_card(
     metrics: dict[str, Any],
     error_analysis: dict[str, Any],
     decision: dict[str, Any],
+    review_entry: dict[str, Any] | None,
     calibration_summary: dict[str, Any],
     run_id: str,
     eval_run_id: str,
@@ -1388,6 +1638,7 @@ def _build_and_log_model_card(
         economics,
         error_analysis,
         decision,
+        review_entry,
         str(calibration_summary.get("method", "unknown")),
         run_id,
         eval_run_id,
@@ -1446,6 +1697,7 @@ def _complete_promotion(
     metrics: dict[str, Any],
     error_analysis: dict[str, Any],
     decision: dict[str, Any],
+    review_entry: dict[str, Any] | None,
     calibration_summary: dict[str, Any],
     X_dev: pd.DataFrame,
     recorded_champion_version: Any,
@@ -1485,6 +1737,7 @@ def _complete_promotion(
             metrics,
             error_analysis,
             decision,
+            review_entry,
             calibration_summary,
             run_id,
             eval_run_id,
@@ -1522,12 +1775,19 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
     mutates before it has to:
         1. Short-circuit if this version is already promoted/rejected
            (a re-invocation of an already-decided cycle).
-        2. Resolve eval_run_id from the version's own tag; load and
-           hash-verify promotion_decision.json/metrics.json against it.
-        3. Enforce human review if cfg.register.require_review is set.
+        2. Resolve eval_run_id (from the version's own tag, or from
+           evaluate.py's reports/eval_receipt.json on this cycle's first
+           pass — tagging it immediately either way); load and hash-verify
+           promotion_decision.json/metrics.json against it; tag the four
+           gate criteria.
+        3. Enforce human review if cfg.register.require_review is set —
+           reads promotion_review.json's latest entry off the eval run.
+           "rejected" tags rejected (human_rejected) and returns; anything
+           other than "approved"/"rejected" raises; no entry at all raises.
         4. Stop and tag rejected if the gate itself failed.
         5. Assert the four per-cycle manifest artifacts are present.
-        6. Resolve error_analysis_run_id and load+verify error_analysis.json.
+        6. Resolve error_analysis_run_id (same tag-or-receipt pattern as
+           step 2) and load+verify error_analysis.json.
         7. Pre-flip smoke check by explicit version URI: environment parity,
            then schema/output-range and golden-prediction parity (tag
            rejected on failure), then a non-gating latency/size diagnostic.
@@ -1547,8 +1807,9 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
     Raises on any abort that is not a genuine pass/fail verdict (missing
     manifest artifacts, missing error_analysis.json, an environment
     mismatch, a stale incumbent, a post-flip finalization failure) — those
-    leave promotion_status untouched. A genuine smoke-check failure tags
-    "rejected" and re-raises.
+    leave promotion_status untouched. A genuine smoke-check failure or a
+    human rejection tags "rejected" and returns (the smoke-check failure
+    also re-raises).
     """
     ensure_experiment_metadata(cfg)
     registered_model_name = str(cfg.mlflow.registered_model_name)
@@ -1561,13 +1822,39 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
         return already_decided
 
     eval_artifacts = _load_and_verify_evaluation_artifacts(
-        current_version, model_version
+        client, cfg, current_version, registered_model_name, model_version
     )
     eval_run_id = eval_artifacts["eval_run_id"]
     decision = eval_artifacts["decision"]
     metrics = eval_artifacts["metrics"]
 
-    _check_review_approval(cfg, decision)
+    review_entry: dict[str, Any] | None = None
+    if bool(cfg.register.require_review):
+        review_entry = _resolve_review_verdict(eval_run_id)
+        if review_entry is None:
+            raise RuntimeError(
+                f"No promotion_review.json entries found on eval run "
+                f"{eval_run_id!r} — register.require_review is set and "
+                "refuses to act without a stamped human review. Run "
+                "`python -m telco_churn.models.review` first."
+            )
+        if review_entry["verdict"] == "rejected":
+            _tag_rejected(
+                client,
+                registered_model_name,
+                model_version,
+                decision,
+                "human_rejected",
+                review_entry,
+            )
+            return {"model_version": model_version, "promotion_status": "rejected"}
+        if review_entry["verdict"] != "approved":
+            raise RuntimeError(
+                f"promotion_review.json's latest entry on eval run "
+                f"{eval_run_id!r} has verdict={review_entry['verdict']!r}, "
+                "not 'approved' or 'rejected' — refusing to act on an "
+                "unrecognized verdict."
+            )
 
     if decision["gate"] == "fail":
         _tag_rejected(
@@ -1579,7 +1866,7 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
     _check_manifest_artifacts(run_id)
 
     ea_artifacts = _load_and_verify_error_analysis(
-        client, current_version, model_version
+        client, cfg, current_version, registered_model_name, model_version
     )
     error_analysis_run_id = ea_artifacts["error_analysis_run_id"]
     error_analysis = ea_artifacts["error_analysis"]
@@ -1627,6 +1914,7 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
         metrics,
         error_analysis,
         decision,
+        review_entry,
         pre_flip["calibration_summary"],
         X_dev,
         recorded_champion_version,
