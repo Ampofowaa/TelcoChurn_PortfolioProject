@@ -42,21 +42,19 @@ from mlflow.exceptions import MlflowException
 from numpy.typing import NDArray
 from omegaconf import DictConfig
 
-from telco_churn.models.calibrate import (
+from telco_churn.models.artifacts import (
     committed_features_from_manifest,
-    load_dev_features,
-    load_training_manifest,
-)
-from telco_churn.models.diagnostics import FAIRNESS_AXES, ROBUSTNESS_AXES
-from telco_churn.models.drift_reference import build_reference
-from telco_churn.models.evaluate import (
-    check_threshold_screen_passed,
-    content_hash,
     load_dev_oof_diagnostics,
+    load_dev_oof_predictions,
     load_threshold_validation,
+    load_training_manifest,
     resolve_champion_version,
 )
-from telco_churn.models.threshold import load_dev_oof_predictions
+from telco_churn.models.dev_features import load_dev_features
+from telco_churn.models.diagnostics import FAIRNESS_AXES, ROBUSTNESS_AXES
+from telco_churn.models.drift_reference import build_reference
+from telco_churn.models.gate import check_threshold_screen_passed
+from telco_churn.utils.hashing import content_hash
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,

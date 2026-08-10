@@ -17,7 +17,7 @@ from telco_churn.models.economics import (
     sensitivity_twoway,
     tornado,
 )
-from telco_churn.models.threshold import CostScenario, expected_value_at_threshold
+from telco_churn.models.policy_config import CostScenario, expected_value_at_threshold
 
 SCENARIO = CostScenario(
     name="base", arpu=70.0, ltv=1512.0, cost=50.0, retention_rate=0.30

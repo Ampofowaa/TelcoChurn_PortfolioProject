@@ -37,7 +37,7 @@ from omegaconf import DictConfig, OmegaConf
 from sklearn.linear_model import LogisticRegression
 
 import telco_churn.models.register as register
-from telco_churn.models.evaluate import content_hash
+from telco_churn.utils.hashing import content_hash
 from telco_churn.utils.mlflow import write_error_analysis_receipt, write_eval_receipt
 
 _COMMITTED_FEATURES = ["tenure", "monthlycharges"]

@@ -20,8 +20,8 @@ import mlflow.tracking
 import pytest
 from omegaconf import DictConfig, OmegaConf
 
-from telco_churn.models.evaluate import content_hash
 from telco_churn.models.review import run_review_step
+from telco_churn.utils.hashing import content_hash
 
 
 @pytest.fixture

@@ -9,6 +9,8 @@ import pytest
 from telco_churn.models.gate import (
     GateBars,
     GateInputs,
+    check_threshold_provenance,
+    check_threshold_screen_passed,
     decide_promotion,
     record_review,
 )
@@ -577,3 +579,76 @@ def test_record_review_carries_no_direction_sanity_check_fired_field() -> None:
     )
     assert "direction_sanity_check_fired" not in promotion_review
     assert "direction_sanity_check_fired" not in promotion_review["entries"][0]
+
+
+# ---------------------------------------------------------------------------
+# check_threshold_provenance
+# ---------------------------------------------------------------------------
+
+
+def test_check_threshold_provenance_matching_stamp_does_not_raise() -> None:
+    """A validation payload whose stamp matches the model being evaluated passes silently."""
+    payload = {"model_run_id": "abc123", "logged_model_id": "m-1"}
+    check_threshold_provenance(payload, logged_model_id="m-1")
+
+
+def test_check_threshold_provenance_mismatched_logged_model_id_raises() -> None:
+    """A stamp naming a different logged_model_id raises — the threshold was
+    derived against a different calibration map. model_run_id is a locator
+    only and plays no part in the comparison."""
+    payload = {"model_run_id": "old_run", "logged_model_id": "m-1"}
+    with pytest.raises(ValueError, match="does not match the model being evaluated"):
+        check_threshold_provenance(payload, logged_model_id="m-2")
+
+
+def test_check_threshold_provenance_compares_as_strings() -> None:
+    """An integer logged_model_id in the payload still matches a string
+    logged_model_id argument — the comparison is coerced to strings, not
+    type-sensitive."""
+    payload = {"model_run_id": "abc123", "logged_model_id": 1}
+    check_threshold_provenance(payload, logged_model_id="1")
+
+
+def test_check_threshold_provenance_error_message_includes_both_stamps() -> None:
+    """The raised error names both the stamped and the actual logged_model_id,
+    so the mismatch is diagnosable from the message alone."""
+    payload = {"model_run_id": "old_run", "logged_model_id": "m-1"}
+    with pytest.raises(ValueError, match="does not match") as exc_info:
+        check_threshold_provenance(payload, logged_model_id="m-2")
+    message = str(exc_info.value)
+    assert "m-1" in message
+    assert "m-2" in message
+
+
+# ---------------------------------------------------------------------------
+# check_threshold_screen_passed
+# ---------------------------------------------------------------------------
+
+
+def test_check_threshold_screen_passed_empty_failures_does_not_raise() -> None:
+    check_threshold_screen_passed({"failures": []})
+
+
+def test_check_threshold_screen_passed_nonempty_failures_raises() -> None:
+    """No override flag — a failed dev-OOF pre-seal screen must always block
+    downstream evaluation/error analysis."""
+    with pytest.raises(RuntimeError, match="pre-seal screen failed"):
+        check_threshold_screen_passed(
+            {
+                "failures": [
+                    {
+                        "criterion": "calibration_slope",
+                        "detail": "CI outside band",
+                        "remediation": "Re-calibrate.",
+                    }
+                ]
+            }
+        )
+
+
+def test_check_threshold_screen_passed_missing_key_raises_key_error() -> None:
+    """Direct indexing, not .get(...): an older threshold_validation.json
+    artifact predating this field is a genuine incompatibility, not an
+    implicit pass."""
+    with pytest.raises(KeyError):
+        check_threshold_screen_passed({})

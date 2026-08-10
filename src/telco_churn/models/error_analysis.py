@@ -64,16 +64,13 @@ from scipy.stats import mannwhitneyu
 from telco_churn.features.accessor import load_features
 from telco_churn.features.build import TARGET_COL
 from telco_churn.features.schema import FEATURE_SCHEMA
-from telco_churn.models.calibrate import (
+from telco_churn.models.artifacts import (
     committed_features_from_manifest,
-    load_training_manifest,
-)
-from telco_churn.models.evaluate import (
-    check_threshold_provenance,
-    check_threshold_screen_passed,
     load_dev_oof_diagnostics,
+    load_dev_oof_predictions,
     load_fitted_model,
     load_threshold_validation,
+    load_training_manifest,
 )
 from telco_churn.models.explain import (
     EXPECTED_EDA_DIRECTIONS,
@@ -85,14 +82,17 @@ from telco_churn.models.explain import (
     global_importance,
     local_explanations,
 )
+from telco_churn.models.gate import (
+    check_threshold_provenance,
+    check_threshold_screen_passed,
+)
+from telco_churn.models.policy_config import (
+    load_policy_thresholds,
+    resolve_policy_thresholds_by_scenario,
+)
 from telco_churn.models.shap_values import (
     compute_shap_values,
     unwrap_calibrated_pipeline,
-)
-from telco_churn.models.threshold import (
-    load_dev_oof_predictions,
-    load_policy_thresholds,
-    resolve_policy_thresholds_by_scenario,
 )
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (

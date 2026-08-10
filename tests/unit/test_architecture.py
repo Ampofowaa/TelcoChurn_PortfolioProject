@@ -87,11 +87,11 @@ def _code_strings(tree: ast.Module) -> list[tuple[int, str]]:
 def test_only_evaluate_binds_the_test_partition() -> None:
     """Every `partition()` call outside evaluate.py must discard the test half.
 
-    `partition(df)` returns (dev_df, test_df). Four modules call it — calibrate,
-    threshold, train/common, evaluate — and only evaluate.py may keep the second
-    element. Checking the *binding* rather than the import is what makes this
-    precise: the other three legitimately import data.split for the dev half, so
-    an import-level rule would either fail on them or be too weak to mean anything.
+    `partition(df)` returns (dev_df, test_df). Today artifacts.py, train/common,
+    and evaluate.py call it — and only evaluate.py may keep the second element.
+    Checking the *binding* rather than the import is what makes this precise:
+    the other two legitimately import data.split for the dev half, so an
+    import-level rule would either fail on them or be too weak to mean anything.
     """
     offenders: list[str] = []
     for path in _src_modules():
@@ -381,4 +381,86 @@ def test_every_main_module_has_a_subprocess_test(module_path: Path) -> None:
     assert covering, (
         f"no integration test launches `python -m {dotted}` via subprocess.run; "
         "add one, or add a waiver naming the covering test"
+    )
+
+
+# --------------------------------------------------------------------------
+# No module imports from a __main__-bearing module, except a named allowance
+# --------------------------------------------------------------------------
+
+# Every legitimate cross-import of a __main__-bearing module. Two shapes:
+# (1) data/features stage modules — the sanctioned pattern
+#     data.split.partition()/features.build's constants already represent
+#     (test_only_evaluate_binds_the_test_partition polices the test-partition
+#     half of that pattern separately), plus each other's own __main__ CLI
+#     wiring (data/split.py's CLI validates via data/validate.py first;
+#     features/build.py's CLI builds SQL features via features/sql_features.py
+#     first) — pre-existing and unrelated to PR C. (2) models/register.py:
+#     calibrate.py, which the __main__-bearing register.py never imports back,
+#     calls its register_challenger via a documented function-local import
+#     (see calibrate.py's run_calibration_step and register.py's own module
+#     docstring) — the one direction PR C's own design keeps: calibrate.py ->
+#     register.py, never the reverse. PR C's point is that every *other*
+#     models/ pairing stays empty: calibrate.py, threshold.py, evaluate.py,
+#     error_analysis.py, and register.py otherwise import their shared
+#     helpers from calibration_metrics.py/artifacts.py/policy_config.py/
+#     gate.py/utils, never from one another.
+_MAIN_MODULE_IMPORT_ALLOWANCES: dict[str, set[str]] = {
+    "data/split.py": {
+        "models/dev_features.py",
+        "models/evaluate.py",
+        "models/train/common.py",
+    },
+    "features/build.py": {
+        "models/dev_features.py",
+        "models/error_analysis.py",
+        "models/evaluate.py",
+        "models/train/candidates.py",
+        "models/train/common.py",
+        "models/train/feature_audit.py",
+        "models/train/feature_selection.py",
+        "models/train/log_model.py",
+        "models/train/tuning.py",
+    },
+    "data/validate.py": {"data/ingest.py", "data/split.py"},
+    "features/sql_features.py": {"features/build.py"},
+    "models/register.py": {"models/calibrate.py"},
+}
+
+
+def test_no_module_imports_from_a_dunder_main_bearing_module() -> None:
+    """No module under src/ imports a name from a module with a __main__ block, except a named allowance.
+
+    A __main__ block marks a stage entry point — the module a human or `make`
+    target runs directly, with its own argparse/compose_config/exit-code
+    contract. Importing library code back out of one couples two entry points'
+    internals together and is exactly the shape PR C's calibration_metrics.py/
+    artifacts.py/policy_config.py/gate.py split existed to undo for
+    calibrate.py/threshold.py/evaluate.py/error_analysis.py/register.py. The
+    three data/features rows in _MAIN_MODULE_IMPORT_ALLOWANCES are a
+    pre-existing, separately-sanctioned pattern (the dev/test-partition and
+    raw-data-validation imports) — not a precedent for adding a models/ row.
+    """
+    main_modules = {_rel(p) for p in _modules_with_main()}
+    offenders: list[str] = []
+    for path in _src_modules():
+        importer = _rel(path)
+        tree = _parse(path)
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and node.module.startswith("telco_churn.")
+            ):
+                continue
+            parts = node.module.split(".")[1:]  # drop leading "telco_churn"
+            target = "/".join(parts) + ".py"
+            if target not in main_modules or target == importer:
+                continue
+            if importer not in _MAIN_MODULE_IMPORT_ALLOWANCES.get(target, set()):
+                offenders.append(f"{importer}:{node.lineno} imports from {target}")
+
+    assert offenders == [], (
+        "modules import from a __main__-bearing module outside the named "
+        f"allowance: {offenders}"
     )

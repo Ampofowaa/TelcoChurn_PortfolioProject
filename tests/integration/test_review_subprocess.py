@@ -24,7 +24,7 @@ import mlflow.artifacts
 import mlflow.tracking
 import pytest
 
-from telco_churn.models.evaluate import content_hash
+from telco_churn.utils.hashing import content_hash
 from telco_churn.utils.paths import compose_config, get_project_root
 
 pytestmark = pytest.mark.integration

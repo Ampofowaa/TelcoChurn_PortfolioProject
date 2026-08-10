@@ -37,7 +37,7 @@ import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.features.preprocessing import build_preprocessor
-from telco_churn.models.threshold import CostScenario
+from telco_churn.models.policy_config import CostScenario
 from telco_churn.models.train.common import _FEATURE_COLS
 
 _OUTER_FOLDS = 3
@@ -91,49 +91,6 @@ def base_scenario() -> CostScenario:
 # ---------------------------------------------------------------------------
 # Cost/ARPU resolution
 # ---------------------------------------------------------------------------
-
-
-def test_costs_config_hash_changes_iff_costs_yaml_changes(tmp_path: Path) -> None:
-    """Same resolved content -> same hash; a resolved-value difference -> a
-    different hash.
-
-    Pins configs/policy/threshold.yaml's provenance without a model stamp:
-    same hash means the model changed, a different hash means the cost
-    assumptions did.
-    """
-    path_a = tmp_path / "costs_a.yaml"
-    path_a.write_text("gross_margin: 0.60\n", encoding="utf-8")
-    path_b = tmp_path / "costs_b.yaml"
-    path_b.write_text("gross_margin: 0.60\n", encoding="utf-8")
-    path_c = tmp_path / "costs_c.yaml"
-    path_c.write_text("gross_margin: 0.65\n", encoding="utf-8")
-
-    assert threshold.costs_config_hash(path_a) == threshold.costs_config_hash(path_b)
-    assert threshold.costs_config_hash(path_a) != threshold.costs_config_hash(path_c)
-
-
-def test_costs_config_hash_ignores_cosmetic_formatting(tmp_path: Path) -> None:
-    """A comment, re-indentation, or a CRLF/LF line-ending swap must not change
-    the hash — only a resolved-value change may, or checking the same
-    costs.yaml out on a different OS becomes a false provenance mismatch
-    against the hash already pinned in configs/policy/threshold.yaml.
-    """
-    path_plain = tmp_path / "costs_plain.yaml"
-    path_plain.write_text("gross_margin: 0.60\nhorizon_months: 12\n", encoding="utf-8")
-    path_commented = tmp_path / "costs_commented.yaml"
-    path_commented.write_text(
-        "# gross margin assumption\n"
-        "gross_margin: 0.60\n"
-        "\n"
-        "horizon_months: 12  # months\n",
-        encoding="utf-8",
-    )
-    path_crlf = tmp_path / "costs_crlf.yaml"
-    path_crlf.write_bytes(b"gross_margin: 0.60\r\nhorizon_months: 12\r\n")
-
-    plain_hash = threshold.costs_config_hash(path_plain)
-    assert threshold.costs_config_hash(path_commented) == plain_hash
-    assert threshold.costs_config_hash(path_crlf) == plain_hash
 
 
 def test_arpu_by_scenario_uses_churners_only(costs_cfg: OmegaConf) -> None:
@@ -280,41 +237,6 @@ def test_expected_value_curve_single_class_argmax_is_contact_no_one(
     ) == pytest.approx(1.0)
 
 
-def test_expected_value_at_threshold_agrees_with_curve(
-    base_scenario: CostScenario,
-) -> None:
-    """expected_value_at_threshold must agree with expected_value_curve at
-    each of the curve's own threshold points — the invariant that keeps the
-    scalar (used for dev_ev_at_t_star and by Phase 7's economics.py) from
-    drifting apart from the curve it is a single point on.
-    """
-    proba = np.array([0.9, 0.7, 0.4, 0.2])
-    y = np.array([1, 0, 1, 0])
-
-    thresholds, ev = threshold.expected_value_curve(proba, y, base_scenario)
-
-    for t, expected_ev in zip(thresholds, ev, strict=True):
-        assert threshold.expected_value_at_threshold(
-            proba, y, base_scenario, float(t)
-        ) == pytest.approx(expected_ev)
-
-
-def test_expected_value_at_threshold_hand_computed(
-    base_scenario: CostScenario,
-) -> None:
-    """Same 4-row example as test_expected_value_curve_hand_computed, evaluated
-    directly at t=0.4 rather than read off the curve: contacts rows with
-    proba >= 0.4 (0.9, 0.7, 0.4) -> y = [1, 0, 1], 2 TP + 1 FP ->
-    (2*150 - 1*100) / 4 = 50.0.
-    """
-    proba = np.array([0.9, 0.7, 0.4, 0.2])
-    y = np.array([1, 0, 1, 0])
-
-    assert threshold.expected_value_at_threshold(
-        proba, y, base_scenario, 0.4
-    ) == pytest.approx(50.0)
-
-
 def test_implied_contact_rate(base_scenario: CostScenario) -> None:
     """Fraction of rows at or above t_star."""
     proba = np.array([0.9, 0.7, 0.5, 0.3, 0.1])
@@ -397,7 +319,7 @@ def test_threshold_module_is_leak_free_by_construction() -> None:
     executable here rather than trusted.
 
     This module does import telco_churn.data.split (for the dev-OOF screen's
-    segment columns via _load_dev_partition) — but only ever takes the dev
+    segment columns via load_dev_partition) — but only ever takes the dev
     half; test_threshold_never_touches_test_partition asserts that
     structurally, the same guard calibration_screen.py used to carry before
     this module absorbed it.
@@ -430,7 +352,7 @@ def test_threshold_never_touches_test_partition() -> None:
     """Structural guard: threshold.py must never import the test split — it
     runs before evaluate.py and never spends the seal, even though it now
     imports telco_churn.data.split.partition for the dev-OOF screen's segment
-    columns (_load_dev_partition takes only the dev half)."""
+    columns (load_dev_partition takes only the dev half)."""
     source = inspect.getsource(threshold)
     assert "test_ids" not in source
     assert "load_test_features" not in source
@@ -756,7 +678,7 @@ def registered_model_version(
     persisted dev_oof_predictions.parquet back onto X_dev/y_dev's row order)
     would do the same against the fake X_dev/y_dev built here.
 
-    threshold._load_dev_partition (the dev-OOF screen's segment-column source,
+    threshold.load_dev_partition (the dev-OOF screen's segment-column source,
     folded in from calibration_screen.py) is sandboxed to feature_df directly
     — its customerid column already uses the same "cust-{i:04d}" ordering as
     _fake_load_dev_customer_ids below, so the screen's by-customerid join
@@ -822,7 +744,7 @@ def registered_model_version(
     mp.setattr(threshold, "load_dev_features", _fake_load_dev_features)
     mp.setattr(calibrate, "load_dev_customer_ids", _fake_load_dev_customer_ids)
     mp.setattr(threshold, "load_dev_customer_ids", _fake_load_dev_customer_ids)
-    mp.setattr(threshold, "_load_dev_partition", lambda: _module_feature_df)
+    mp.setattr(threshold, "load_dev_partition", lambda: _module_feature_df)
     mp.setattr(threshold, "load_dev_shap_summary", _fake_load_dev_shap_summary)
 
     with mlflow.start_run(run_name="tuning_study") as run:
@@ -1384,7 +1306,7 @@ def test_run_dev_oof_screen_ignores_v1_v2_v2b_flags_in_failures(
             "dependents": ["No"] * n,
         }
     )
-    monkeypatch.setattr(threshold, "_load_dev_partition", lambda: feature_df)
+    monkeypatch.setattr(threshold, "load_dev_partition", lambda: feature_df)
 
     def _fake_dev_oof_diagnostics(*args: object, **kwargs: object) -> dict:
         return {

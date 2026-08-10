@@ -1,13 +1,13 @@
 """Shared MLflow tracking-URI resolution, model-registry lookups, and receipts.
 
-resolve_model_run_id/resolve_logged_model_id/load_model_promotion_bars live
-here, rather than in evaluate.py (their original, single-caller home),
-because threshold.py's dev-OOF screen needs all three too: evaluate.py
-already imports from threshold.py (CostScenario, costs_config_hash,
-load_costs_config), so threshold.py importing these back from evaluate.py
-would be a circular import. Neither module owns the other's need for a
-plain MLflow-registry lookup or a policy-config loader, so both live in this
-shared, import-safe location instead.
+resolve_model_run_id/resolve_logged_model_id live here, rather than in
+evaluate.py (their original, single-caller home), because threshold.py's
+dev-OOF screen needs them too and neither module owns the other's need for a
+plain MLflow-registry lookup. (load_model_promotion_bars used to live here
+for the same reason — it now lives in models/policy_config.py instead, which
+nothing in the models/__init__.py -> train -> utils.mlflow import chain
+touches, so the circular-import workaround that justified parking it here no
+longer applies.)
 
 A **receipt** (write_train_receipt/write_calibrate_receipt and their read_*
 counterparts) is a small local JSON file a pipeline stage writes describing
@@ -32,18 +32,15 @@ import json
 import re
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import mlflow
 import mlflow.tracking
 from mlflow.entities import Experiment
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from pandas.errors import Pandas4Warning
 
 from telco_churn.utils.paths import get_project_root
-
-if TYPE_CHECKING:
-    from telco_churn.models.gate import GateBars
 
 __all__ = [
     "resolve_tracking_uri",
@@ -51,7 +48,6 @@ __all__ = [
     "resolve_model_version_from_run_id",
     "resolve_logged_model_id",
     "resolve_model_identifier",
-    "load_model_promotion_bars",
     "ensure_experiment_metadata",
     "set_run_description",
     "set_registered_model_description",
@@ -430,42 +426,6 @@ def read_error_analysis_receipt(cfg: DictConfig) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         receipt: dict[str, Any] = json.load(f)
     return receipt
-
-
-def load_model_promotion_bars(cfg: DictConfig) -> GateBars:
-    """Load configs/model_promotion.yaml and build the GateBars it defines.
-
-    Used by decide_promotion and by threshold.py's dev-OOF calibration-slope
-    screen. Loaded by path (OmegaConf.load), never through Hydra's
-    defaults/CLI-override composition: a bar that decides whether a model
-    ships must not be movable by a command-line override with no diff and no
-    review — the same reason threshold.py's load_policy_thresholds bypasses
-    composition for costs.yaml's derivative.
-    """
-    # Imported here, not at module level: telco_churn.models.gate is a
-    # submodule of telco_churn.models, and importing any submodule of a
-    # package runs that package's __init__.py first — which imports
-    # telco_churn.models.train, which imports resolve_tracking_uri back from
-    # this module. A module-level import here would make that import order
-    # circular; this function-local import breaks the cycle the same way
-    # this module's docstring already avoids one between threshold.py and
-    # evaluate.py.
-    from telco_churn.models.gate import GateBars
-
-    path = get_project_root() / str(cfg.paths.model_promotion_config)
-    loaded = OmegaConf.load(path)
-    assert isinstance(loaded, DictConfig)
-    return GateBars(
-        pr_auc_bar=float(loaded.pr_auc_bar),
-        recall_bar=float(loaded.recall_bar),
-        calibration_slope_band=(
-            float(loaded.calibration_slope_band[0]),
-            float(loaded.calibration_slope_band[1]),
-        ),
-        pr_auc_materiality_threshold=float(loaded.pr_auc_materiality_threshold),
-        brier_non_inferiority_margin=float(loaded.brier_non_inferiority_margin),
-        recall_non_inferiority_margin=float(loaded.recall_non_inferiority_margin),
-    )
 
 
 def ensure_experiment_metadata(cfg: DictConfig) -> Experiment:

@@ -13,8 +13,6 @@ import mlflow.tracking
 import numpy as np
 import pandas as pd
 import pytest
-from mlflow.exceptions import MlflowException
-from mlflow.protos.databricks_pb2 import INTERNAL_ERROR
 from omegaconf import DictConfig, OmegaConf
 from sklearn.linear_model import LogisticRegression
 
@@ -22,15 +20,8 @@ import telco_churn.models.evaluate as evaluate
 from telco_churn.models.diagnostics import build_segment_lookup
 from telco_churn.models.evaluate import (
     build_gate_inputs,
-    check_threshold_provenance,
-    check_threshold_screen_passed,
     comparative_deltas,
-    content_hash,
-    load_model_promotion_bars,
-    resolve_champion_version,
     resolve_incumbent_summary,
-    resolve_policy_scenarios,
-    resolve_policy_thresholds_by_scenario,
     sealed_test_business_impact,
     sealed_test_calibration_report,
     sealed_test_classification_report,
@@ -41,8 +32,17 @@ from telco_churn.models.evaluate import (
     sealed_test_sensitivity_analysis,
     sliced_business_impact,
 )
-from telco_churn.models.gate import GateBars, decide_promotion
-from telco_churn.models.threshold import CostScenario
+from telco_churn.models.gate import (
+    GateBars,
+    decide_promotion,
+)
+from telco_churn.models.policy_config import (
+    CostScenario,
+    load_model_promotion_bars,
+    resolve_policy_scenarios,
+    resolve_policy_thresholds_by_scenario,
+)
+from telco_churn.utils.hashing import content_hash
 
 _N_BOOTSTRAP = 200
 _RANDOM_STATE = 42
@@ -136,79 +136,6 @@ def segment_fixture() -> tuple[pd.Series, np.ndarray, dict[str, pd.Series]]:
         }
     )
     return y, proba, build_segment_lookup(df)
-
-
-# ---------------------------------------------------------------------------
-# check_threshold_provenance
-# ---------------------------------------------------------------------------
-
-
-def test_check_threshold_provenance_matching_stamp_does_not_raise() -> None:
-    """A validation payload whose stamp matches the model being evaluated passes silently."""
-    payload = {"model_run_id": "abc123", "logged_model_id": "m-1"}
-    check_threshold_provenance(payload, logged_model_id="m-1")
-
-
-def test_check_threshold_provenance_mismatched_logged_model_id_raises() -> None:
-    """A stamp naming a different logged_model_id raises — the threshold was
-    derived against a different calibration map. model_run_id is a locator
-    only and plays no part in the comparison."""
-    payload = {"model_run_id": "old_run", "logged_model_id": "m-1"}
-    with pytest.raises(ValueError, match="does not match the model being evaluated"):
-        check_threshold_provenance(payload, logged_model_id="m-2")
-
-
-def test_check_threshold_provenance_compares_as_strings() -> None:
-    """An integer logged_model_id in the payload still matches a string
-    logged_model_id argument — the comparison is coerced to strings, not
-    type-sensitive."""
-    payload = {"model_run_id": "abc123", "logged_model_id": 1}
-    check_threshold_provenance(payload, logged_model_id="1")
-
-
-def test_check_threshold_provenance_error_message_includes_both_stamps() -> None:
-    """The raised error names both the stamped and the actual logged_model_id,
-    so the mismatch is diagnosable from the message alone."""
-    payload = {"model_run_id": "old_run", "logged_model_id": "m-1"}
-    with pytest.raises(ValueError, match="does not match") as exc_info:
-        check_threshold_provenance(payload, logged_model_id="m-2")
-    message = str(exc_info.value)
-    assert "m-1" in message
-    assert "m-2" in message
-
-
-# ---------------------------------------------------------------------------
-# check_threshold_screen_passed
-# ---------------------------------------------------------------------------
-
-
-def test_check_threshold_screen_passed_empty_failures_does_not_raise() -> None:
-    check_threshold_screen_passed({"failures": []})
-
-
-def test_check_threshold_screen_passed_nonempty_failures_raises() -> None:
-    """No override flag — a failed dev-OOF pre-seal screen must always block
-    downstream evaluation/error analysis."""
-    with pytest.raises(RuntimeError, match="pre-seal screen failed"):
-        check_threshold_screen_passed(
-            {
-                "failures": [
-                    {
-                        "criterion": "calibration_slope",
-                        "detail": "CI outside band",
-                        "remediation": "Re-calibrate.",
-                    }
-                ]
-            }
-        )
-
-
-def test_check_threshold_screen_passed_missing_key_raises_key_error() -> None:
-    """Direct indexing, not .get(...): an older threshold_validation.json
-    artifact predating this field is a genuine incompatibility, not an
-    implicit pass."""
-    with pytest.raises(KeyError):
-        check_threshold_screen_passed({})
 
 
 # ---------------------------------------------------------------------------
@@ -687,81 +614,6 @@ def test_load_model_promotion_bars_reads_real_config() -> None:
     assert bars.pr_auc_materiality_threshold == pytest.approx(0.005)
     assert bars.brier_non_inferiority_margin == pytest.approx(0.005)
     assert bars.recall_non_inferiority_margin == pytest.approx(0.01)
-
-
-# ---------------------------------------------------------------------------
-# resolve_champion_version
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_champion_version_returns_none_when_model_never_registered(
-    mlflow_test_experiment: Callable[[str], str],
-) -> None:
-    """A genuinely never-registered model raises RESOURCE_DOES_NOT_EXIST — the
-    first of the two real cold-start shapes MLflow's SqlAlchemy-backed
-    registry reports — and must resolve to None.
-    """
-    tracking_uri = mlflow_test_experiment("test_resolve_champion_version")
-    cfg = OmegaConf.create(
-        {
-            "mlflow": {
-                "tracking_uri": tracking_uri,
-                "registered_model_name": "never-registered-model",
-            }
-        }
-    )
-    assert resolve_champion_version(cfg) is None
-
-
-def test_resolve_champion_version_returns_none_when_alias_never_set(
-    mlflow_test_experiment: Callable[[str], str],
-) -> None:
-    """A registered model with no champion alias ever set raises
-    INVALID_PARAMETER_VALUE, not RESOURCE_DOES_NOT_EXIST — the second real
-    cold-start shape — and must also resolve to None.
-    """
-    tracking_uri = mlflow_test_experiment("test_resolve_champion_version")
-    registered_model_name = "registered-no-alias"
-    mlflow.tracking.MlflowClient().create_registered_model(registered_model_name)
-    cfg = OmegaConf.create(
-        {
-            "mlflow": {
-                "tracking_uri": tracking_uri,
-                "registered_model_name": registered_model_name,
-            }
-        }
-    )
-    assert resolve_champion_version(cfg) is None
-
-
-def test_resolve_champion_version_reraises_non_not_found_mlflow_errors(
-    monkeypatch: pytest.MonkeyPatch, mlflow_test_experiment: Callable[[str], str]
-) -> None:
-    """A transient/auth/server MLflow failure must propagate, not be read as
-    'no champion' — silently swallowing it would flip evaluate.py from the
-    comparative gate regime to cold-start against a perfectly healthy
-    incumbent.
-    """
-
-    def _raise_transient(
-        self: mlflow.tracking.MlflowClient, name: str, alias: str
-    ) -> None:
-        raise MlflowException("temporarily unavailable", error_code=INTERNAL_ERROR)
-
-    monkeypatch.setattr(
-        mlflow.tracking.MlflowClient, "get_model_version_by_alias", _raise_transient
-    )
-    tracking_uri = mlflow_test_experiment("test_resolve_champion_version")
-    cfg = OmegaConf.create(
-        {
-            "mlflow": {
-                "tracking_uri": tracking_uri,
-                "registered_model_name": "telco-churn-pipeline",
-            }
-        }
-    )
-    with pytest.raises(MlflowException, match="temporarily unavailable"):
-        resolve_champion_version(cfg)
 
 
 # ---------------------------------------------------------------------------

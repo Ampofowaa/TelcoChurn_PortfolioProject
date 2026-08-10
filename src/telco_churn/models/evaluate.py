@@ -15,7 +15,6 @@ reports/metrics.json so the metrics stay attributable to a specific artifact.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import tempfile
@@ -26,27 +25,29 @@ from typing import Any, Literal, cast
 import matplotlib.pyplot as plt
 import mlflow
 import mlflow.artifacts
-import mlflow.sklearn
 import mlflow.tracking
 import numpy as np
 import pandas as pd
 from mlflow.data.pandas_dataset import from_pandas as mlflow_dataset_from_pandas
-from mlflow.exceptions import MlflowException
 from numpy.typing import NDArray
 from omegaconf import DictConfig
 from sklearn.dummy import DummyClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
-from sklearn.pipeline import Pipeline
 
 from telco_churn.data.split import partition
 from telco_churn.features.accessor import load_features
 from telco_churn.features.build import TARGET_COL
-from telco_churn.models.calibrate import (
+from telco_churn.models.artifacts import (
+    committed_features_from_manifest,
+    load_fitted_model,
+    load_threshold_validation,
+    load_training_manifest,
+    resolve_champion_version,
+)
+from telco_churn.models.calibration_metrics import (
     brier_skill_score,
     calibration_slope,
-    committed_features_from_manifest,
     expected_calibration_error,
-    load_training_manifest,
     murphy_decomposition,
     pooled_brier,
 )
@@ -71,7 +72,13 @@ from telco_churn.models.economics import (
     sensitivity_twoway,
     tornado,
 )
-from telco_churn.models.gate import GateBars, GateInputs, decide_promotion
+from telco_churn.models.gate import (
+    GateBars,
+    GateInputs,
+    check_threshold_provenance,
+    check_threshold_screen_passed,
+    decide_promotion,
+)
 from telco_churn.models.plots import (
     classification_summary_points,
     decile_lift_table,
@@ -79,18 +86,19 @@ from telco_churn.models.plots import (
     reliability_diagram_bins,
     roc_curve_points,
 )
-from telco_churn.models.threshold import (
+from telco_churn.models.policy_config import (
     CostScenario,
     costs_config_hash,
     load_costs_config,
+    load_model_promotion_bars,
     load_policy_thresholds,
     resolve_policy_scenarios,
     resolve_policy_thresholds_by_scenario,
 )
+from telco_churn.utils.hashing import content_hash
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
-    load_model_promotion_bars,
     resolve_logged_model_id,
     resolve_model_identifier,
     resolve_tracking_uri,
@@ -106,26 +114,15 @@ from telco_churn.utils.stats import (
 
 __all__ = [
     "build_gate_inputs",
-    "check_threshold_provenance",
-    "check_threshold_screen_passed",
     "comparative_deltas",
-    "content_hash",
     "demographic_parity_difference_by_axis",
     "equal_opportunity_difference_by_axis",
-    "load_fitted_model",
-    "load_dev_oof_diagnostics",
     "load_incumbent_proba",
-    "load_model_promotion_bars",
-    "load_policy_thresholds",
     "load_test_customer_ids",
     "load_test_features",
     "load_test_segment_lookup",
-    "load_threshold_validation",
-    "resolve_champion_version",
     "resolve_incumbent_summary",
     "resolve_logged_model_id",
-    "resolve_policy_scenarios",
-    "resolve_policy_thresholds_by_scenario",
     "run_evaluation_step",
     "sealed_test_business_impact",
     "sealed_test_calibration_report",
@@ -172,20 +169,6 @@ _CONTACT_ALL_THRESHOLD = 0.0
 _CONTACT_NONE_THRESHOLD = 1.0 + 1e-9
 
 
-def load_fitted_model(model_uri: str, cfg: DictConfig) -> Pipeline:
-    """Load the calibrated pipeline from an explicit model URI — never an alias.
-
-    model_uri is caller-resolved (resolve_model_identifier): the immutable
-    registry URI (models:/<name>/<version>) on an explicit run_id/
-    model_version override, or calibrate.py's receipt's own stored
-    run-scoped URI on the fully-automatic (neither given) path — the latter
-    never touches the registry version pointer at all.
-    """
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    model: Pipeline = mlflow.sklearn.load_model(model_uri)
-    return model
-
-
 def _load_test_partition() -> pd.DataFrame:
     """Return the full sealed-test-partition rows (customerid included), pre feature-subsetting.
 
@@ -224,84 +207,6 @@ def load_test_segment_lookup() -> dict[str, pd.Series]:
     three derive from the same _load_test_partition() call.
     """
     return build_segment_lookup(_load_test_partition())
-
-
-def load_threshold_validation(run_id: str, cfg: DictConfig) -> dict[str, Any]:
-    """Load threshold.py's threshold_validation.json artifact — the model-dependent stamp."""
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    validation: dict[str, Any] = mlflow.artifacts.load_dict(
-        f"runs:/{run_id}/threshold/threshold_validation.json"
-    )
-    return validation
-
-
-def load_dev_oof_diagnostics(run_id: str, cfg: DictConfig) -> dict[str, Any]:
-    """Load threshold.py's dev_oof_diagnostics.json artifact (V1/V2/V2b) — resolved by run_id, not a local path.
-
-    A fixed local path (reports/dev_oof_diagnostics.json) is what
-    reliability_diagram.png warns against elsewhere in this codebase: it
-    reflects whichever run last executed threshold.py on this machine, not
-    necessarily run_id. Fetching by explicit run_id, same as
-    load_threshold_validation, is what makes this correct under CI or a
-    fresh checkout where no prior threshold.py run has touched local disk.
-    """
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    diagnostics: dict[str, Any] = mlflow.artifacts.load_dict(
-        f"runs:/{run_id}/threshold/dev_oof_diagnostics.json"
-    )
-    return diagnostics
-
-
-def check_threshold_provenance(
-    validation_payload: dict[str, Any], logged_model_id: str
-) -> None:
-    """Raise ValueError if the threshold's model stamp doesn't match the model being evaluated.
-
-    threshold.py splits the derived threshold into a model-independent policy
-    file (configs/policy/threshold.yaml — a pure function of costs.yaml,
-    carrying no model stamp) and this model-dependent validation artifact.
-    "A re-calibration invalidates a previously-derived threshold" (threshold.py's
-    own docstring) is aspirational until something checks it — this is that
-    check. Applying a threshold derived against a different calibration map
-    would otherwise produce plausible, wrong numbers with nothing raised.
-
-    Compares on logged_model_id, not (run_id, model_version): a LoggedModel
-    is the actual scored artifact, and model_run_id is kept in
-    validation_payload as a locator only (see threshold.py's payload
-    assembly) — no longer load-bearing here.
-    """
-    stamped_model_id = str(validation_payload["logged_model_id"])
-    if stamped_model_id != logged_model_id:
-        raise ValueError(
-            "threshold_validation.json's model stamp "
-            f"(logged_model_id={stamped_model_id!r}) does not match the model "
-            f"being evaluated (logged_model_id={logged_model_id!r}) — the "
-            "threshold was derived against a different calibration map. "
-            "Re-run models.threshold before evaluating."
-        )
-
-
-def check_threshold_screen_passed(validation_payload: dict[str, Any]) -> None:
-    """Raise RuntimeError if threshold.py's dev-OOF pre-seal screen failed.
-
-    validation_payload["failures"] is the model-dependent half of
-    threshold.py's dev-OOF pre-seal screen (calibration_slope +
-    v3_direction_sanity; V1/V2/V2b are reported-only and never appear here)
-    — this is an independent re-check at every downstream reader
-    (evaluate.py, error_analysis.py, register.py), not a replacement for the
-    RuntimeError run_threshold_step itself already raises when the screen
-    fails. No override flag: a failed screen means the artifact is not
-    trustworthy, and nothing downstream may proceed against it regardless.
-    """
-    failures = validation_payload["failures"]
-    if failures:
-        clauses = "; ".join(f"{f['criterion']}: {f['detail']}" for f in failures)
-        raise RuntimeError(
-            "threshold_validation.json's dev-OOF pre-seal screen failed "
-            f"({len(failures)} criterion/criteria): {clauses}. Re-run "
-            "models.threshold (and models.calibrate first, if needed) "
-            "before evaluating or running error analysis."
-        )
 
 
 def sealed_test_business_impact(
@@ -576,6 +481,8 @@ def sealed_test_calibration_report(
     """
     p = np.asarray(proba, dtype=float)
     candidate_brier = pooled_brier(p, y_test)
+    ece_n_bins = int(cfg.calibration.ece_n_bins)
+    ece_strategy = str(cfg.calibration.ece_strategy)
 
     dummy = DummyClassifier(strategy="prior")
     dummy_x = np.zeros((len(y_test), 1))
@@ -587,14 +494,16 @@ def sealed_test_calibration_report(
         "brier": candidate_brier,
         "dummy_prior_brier": reference_brier,
         "bss": brier_skill_score(candidate_brier, reference_brier),
-        "ece": expected_calibration_error(p, y_test, cfg),
-        "murphy_decomposition": murphy_decomposition(p, y_test, cfg),
+        "ece": expected_calibration_error(p, y_test, ece_n_bins, ece_strategy),
+        "murphy_decomposition": murphy_decomposition(
+            p, y_test, ece_n_bins, ece_strategy
+        ),
         "calibration_slope": calibration_slope(y_test, p, n_bootstrap, random_state),
         "reliability_bins": reliability_diagram_bins(
             p.tolist(),
             y_test.tolist(),
-            n_bins=int(cfg.calibration.ece_n_bins),
-            strategy=str(cfg.calibration.ece_strategy),
+            n_bins=ece_n_bins,
+            strategy=ece_strategy,
         ),
     }
 
@@ -662,33 +571,6 @@ def sliced_business_impact(
                 }
             )
     return rows
-
-
-def resolve_champion_version(cfg: DictConfig) -> str | None:
-    """Resolve the `champion` alias to an explicit version number, once.
-
-    A single read of "does a champion exist, and which version" — never
-    re-read afterward as a moving pointer. Returns None on cold start (no
-    champion alias yet); a not-yet-registered model means the same thing.
-
-    MLflow's SqlAlchemy-backed registry reports these two cold-start shapes
-    with different error codes — RESOURCE_DOES_NOT_EXIST when the model was
-    never registered, INVALID_PARAMETER_VALUE when it exists but no
-    `champion` alias was ever set — so both, and only both, are read as "no
-    champion." Any other MlflowException (a transient/auth/server failure)
-    must propagate rather than be misread as cold start, which would
-    silently switch the gate to the wrong regime.
-    """
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    registered_model_name = str(cfg.mlflow.registered_model_name)
-    client = mlflow.tracking.MlflowClient()
-    try:
-        version = client.get_model_version_by_alias(registered_model_name, "champion")
-    except MlflowException as exc:
-        if exc.error_code not in ("RESOURCE_DOES_NOT_EXIST", "INVALID_PARAMETER_VALUE"):
-            raise
-        return None
-    return str(version.version)
 
 
 def load_incumbent_proba(champion_version: str, cfg: DictConfig) -> NDArray[np.float64]:
@@ -939,20 +821,6 @@ def sealed_test_promotion_decision(
 # ---------------------------------------------------------------------------
 # Step 6: MLflow orchestration
 # ---------------------------------------------------------------------------
-
-
-def content_hash(payload: dict[str, Any]) -> str:
-    """sha256 of `payload`'s JSON-sorted-keys encoding.
-
-    Embedded in promotion_decision.json so register.py can detect a decision
-    belonging to a different metrics.json than the one it was computed from —
-    same idiom as threshold.py's costs_config_hash, applied to a metrics
-    payload instead of a config file. Public: register.py imports this same
-    function to recompute the hash it verifies against, rather than
-    reimplementing the encoding.
-    """
-    encoded = json.dumps(payload, sort_keys=True, default=str).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _save_pr_curve_plot(

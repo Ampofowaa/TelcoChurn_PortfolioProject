@@ -4,9 +4,9 @@ No I/O, no MLflow, no estimator — arrays, a CostScenario, and cost parameters
 in; dollars and dicts out. models/evaluate.py is the only caller: it builds
 reports/economics.json and the EV/sensitivity figures from these.
 
-Reuses models.threshold.CostScenario and expected_value_at_threshold rather
-than redefining p·r·LTV − c a second time — two implementations would agree
-only until one of them changed. That function returns the *per-customer
+Reuses models.policy_config.CostScenario and expected_value_at_threshold
+rather than redefining p·r·LTV − c a second time — two implementations would
+agree only until one of them changed. That function returns the *per-customer
 average* EV; the dollar-figure helpers below (expected_value, campaign_cost,
 ev_by_k) return *totals* instead — the unit stakeholders actually want — kept
 separate so neither call site has to multiply/divide by n itself.
@@ -20,7 +20,7 @@ from typing import Literal
 import numpy as np
 from numpy.typing import NDArray
 
-from telco_churn.models.threshold import CostScenario, expected_value_at_threshold
+from telco_churn.models.policy_config import CostScenario, expected_value_at_threshold
 
 __all__ = [
     "break_even_retention_rate",

@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 from omegaconf import DictConfig, OmegaConf
 
+import telco_churn.models.artifacts as artifacts
 import telco_churn.models.calibrate as calibrate
 import telco_churn.models.error_analysis as error_analysis
 import telco_churn.models.evaluate as evaluate
@@ -947,7 +948,7 @@ def test_run_error_analysis_step_dependence_grid_includes_dev_v3_audit_set(
     payload = cast(dict[str, Any], result["error_analysis"])
     shap_payload = payload["shap"]
 
-    dev_oof_diagnostics = evaluate.load_dev_oof_diagnostics(run_id, cfg)
+    dev_oof_diagnostics = artifacts.load_dev_oof_diagnostics(run_id, cfg)
     dev_audit_set = set(dev_oof_diagnostics["direction_check_feature_names"])
 
     dependence_feature_set = shap_payload["dependence_feature_set"]

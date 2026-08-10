@@ -29,10 +29,8 @@ fails.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -47,13 +45,15 @@ from mlflow.exceptions import MlflowException
 from numpy.typing import NDArray
 from omegaconf import DictConfig, OmegaConf
 
-from telco_churn.data.split import partition
-from telco_churn.features.accessor import load_features
-from telco_churn.models.calibrate import (
+from telco_churn.models.artifacts import (
     committed_features_from_manifest,
+    load_dev_oof_predictions,
+    load_training_manifest,
+)
+from telco_churn.models.dev_features import (
     load_dev_customer_ids,
     load_dev_features,
-    load_training_manifest,
+    load_dev_partition,
 )
 from telco_churn.models.diagnostics import (
     FAIRNESS_AXES,
@@ -73,10 +73,16 @@ from telco_churn.models.explain import (
     direction_sanity_check,
 )
 from telco_churn.models.gate import slope_passes
+from telco_churn.models.policy_config import (
+    CostScenario,
+    costs_config_hash,
+    expected_value_at_threshold,
+    load_costs_config,
+    load_model_promotion_bars,
+)
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (
     TRAINING_CYCLE_RUN_DESCRIPTION,
-    load_model_promotion_bars,
     resolve_logged_model_id,
     resolve_model_identifier,
     resolve_tracking_uri,
@@ -85,26 +91,18 @@ from telco_churn.utils.mlflow import (
 from telco_churn.utils.paths import get_project_root
 
 __all__ = [
-    "CostScenario",
-    "load_costs_config",
-    "costs_config_hash",
     "arpu_by_scenario",
     "resolve_scenario",
     "resolve_all_scenarios",
     "closed_form_threshold",
     "expected_value_curve",
-    "expected_value_at_threshold",
     "empirical_argmax_threshold",
     "argmax_bootstrap_ci",
     "implied_contact_rate",
     "r_sensitivity_sweep",
     "derive_threshold",
     "load_calibration_summary",
-    "load_dev_oof_predictions",
     "load_dev_shap_summary",
-    "load_policy_thresholds",
-    "resolve_policy_scenarios",
-    "resolve_policy_thresholds_by_scenario",
     "build_dev_oof_screen_frame",
     "compute_dev_oof_diagnostics",
     "run_threshold_step",
@@ -113,47 +111,9 @@ __all__ = [
 logger = get_logger(__name__)
 
 
-@dataclass(frozen=True)
-class CostScenario:
-    """One resolved cost scenario — the ARPU/LTV/cost/retention-rate values a threshold is derived from."""
-
-    name: str
-    arpu: float
-    ltv: float
-    cost: float
-    retention_rate: float
-
-
 # ---------------------------------------------------------------------------
 # Cost/ARPU resolution
 # ---------------------------------------------------------------------------
-
-
-def load_costs_config(path: Path | None = None) -> DictConfig:
-    """Load configs/costs.yaml. path defaults to the canonical project location; pass an explicit path in tests."""
-    resolved = (
-        path if path is not None else get_project_root() / "configs" / "costs.yaml"
-    )
-    cfg = OmegaConf.load(resolved)
-    assert isinstance(cfg, DictConfig)
-    return cfg
-
-
-def costs_config_hash(path: Path | None = None) -> str:
-    """Return the sha256 content hash of configs/costs.yaml's resolved values.
-
-    Pins provenance for configs/policy/threshold.yaml, which is model-
-    independent by construction (t* = c/(r × LTV) is a pure function of
-    costs.yaml) and so carries no model stamp: same hash means the model
-    changed, a different hash means the cost assumptions did. Hashes the
-    *resolved* values (OmegaConf, JSON-encoded with sorted keys), not the
-    file's raw bytes, so a cosmetic edit (comment, line-ending change) can't
-    register as a false cost-assumption change. Same idiom as tuning.py's
-    `_study_name` content-addressing.
-    """
-    content = OmegaConf.to_container(load_costs_config(path), resolve=True)
-    encoded = json.dumps(content, sort_keys=True, default=str).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def arpu_by_scenario(
@@ -260,31 +220,6 @@ def expected_value_curve(
     thresholds = np.concatenate([[1.0], thresholds])
     ev = np.concatenate([[0.0], ev])
     return thresholds, ev
-
-
-def expected_value_at_threshold(
-    proba: NDArray[np.float64], y: NDArray[np.int_], scenario: CostScenario, t: float
-) -> float:
-    """Realized per-customer expected value of "contact iff proba >= t", at one threshold t.
-
-    Same ev(t) = [TP(t)·(r·LTV − c) − FP(t)·c] / n formula
-    expected_value_curve sweeps over every distinct threshold — this
-    evaluates it directly at a single t instead of reading it off the curve.
-    The one implementation both call: Phase 7's economics.py imports this
-    function rather than redefining p·r·LTV − c a second time, since two
-    implementations would agree only until one of them changed.
-    """
-    contacted = proba >= t
-    n = len(y)
-    tp = int(np.sum(contacted & (y == 1)))
-    fp = int(np.sum(contacted & (y == 0)))
-    return float(
-        (
-            tp * (scenario.retention_rate * scenario.ltv - scenario.cost)
-            - fp * scenario.cost
-        )
-        / n
-    )
 
 
 def empirical_argmax_threshold(
@@ -408,23 +343,6 @@ def load_calibration_summary(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     return summary
 
 
-def load_dev_oof_predictions(run_id: str, cfg: DictConfig) -> pd.DataFrame:
-    """Load calibrate.py's persisted dev_oof_predictions.parquet artifact.
-
-    Columns: customerid, y_true, p_hat — the winning calibration method's
-    exact leak-free OOF vector, the one calibrate.py's own method selection
-    and t* validation rested on. Read here rather than recomputed: a
-    recomputation is only sound while the dataset is static and CV folds are
-    seeded, and silently diverges from the vector that cycle's decisions
-    actually used once either stops holding (e.g. under Phase 10 retraining).
-    """
-    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    local_path = mlflow.artifacts.download_artifacts(
-        artifact_uri=f"runs:/{run_id}/calibration/dev_oof_predictions.parquet"
-    )
-    return pd.read_parquet(local_path)
-
-
 def load_dev_shap_summary(run_id: str, cfg: DictConfig) -> list[dict[str, Any]]:
     """Load calibrate.py's dev_shap_summary.json — the ranking the V3 pre-seal veto binds on.
 
@@ -449,61 +367,6 @@ def load_dev_shap_summary(run_id: str, cfg: DictConfig) -> list[dict[str, Any]]:
     return cast("list[dict[str, Any]]", summary)
 
 
-def load_policy_thresholds(cfg: DictConfig) -> DictConfig:
-    """Load configs/policy/threshold.yaml — the model-independent scenario thresholds.
-
-    Carries no model stamp by construction (t* = c/(r × LTV) is a pure
-    function of cost parameters, never of the model). Lives here rather than
-    in evaluate.py because this module is the one that writes the file
-    (`run_threshold_step` below) — reading it back stays writer/reader local.
-    """
-    path = get_project_root() / str(cfg.paths.policy) / "threshold.yaml"
-    loaded = OmegaConf.load(path)
-    assert isinstance(loaded, DictConfig)
-    return loaded
-
-
-def resolve_policy_scenarios(policy: DictConfig) -> dict[str, CostScenario]:
-    """Reconstruct each shipped scenario's CostScenario from configs/policy/threshold.yaml.
-
-    Reads the already-resolved cost/LTV/ARPU values `run_threshold_step`
-    persisted at derivation time, rather than recomputing ARPU quantiles from
-    dev-set MonthlyCharges again — the shipped threshold and the sealed-test
-    business-impact figures must rest on identical cost parameters.
-    """
-    return {
-        str(name): CostScenario(
-            name=str(name),
-            arpu=float(entry.costs.arpu),
-            ltv=float(entry.costs.ltv),
-            cost=float(entry.costs.c),
-            retention_rate=float(entry.costs.r),
-        )
-        for name, entry in policy.scenarios.items()
-    }
-
-
-def resolve_policy_thresholds_by_scenario(policy: DictConfig) -> dict[str, float]:
-    """{scenario_name: t*} from configs/policy/threshold.yaml."""
-    return {
-        str(name): float(entry.threshold) for name, entry in policy.scenarios.items()
-    }
-
-
-def _load_dev_partition() -> pd.DataFrame:
-    """Return the full dev-partition rows (customerid included), pre feature-subsetting.
-
-    Needed only for the dev-OOF screen below: the segment columns it joins
-    (contract_type, gender, ...) aren't part of the committed, selection-
-    restricted feature set run_threshold_step otherwise loads via
-    load_dev_features — those are the model's input space, this is the
-    dev partition's full column set.
-    """
-    df = load_features()
-    dev_df, _test_df = partition(df)
-    return dev_df
-
-
 def build_dev_oof_screen_frame(
     customerid: pd.Series, y_true: NDArray[np.int_], p_hat: NDArray[np.float64]
 ) -> pd.DataFrame:
@@ -513,7 +376,7 @@ def build_dev_oof_screen_frame(
     rather than re-fetching dev_oof_predictions.parquet from MLflow a second
     time — this runs in the same process, right after that alignment.
     """
-    dev_df = _load_dev_partition().set_index("customerid").reindex(customerid)
+    dev_df = load_dev_partition().set_index("customerid").reindex(customerid)
     segment_lookup = build_segment_lookup(dev_df)
     frame = pd.DataFrame(
         {"customerid": customerid.to_numpy(), "y_true": y_true, "p_hat": p_hat}

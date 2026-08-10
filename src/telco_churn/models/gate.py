@@ -48,6 +48,8 @@ from typing import Any, Literal
 __all__ = [
     "GateBars",
     "GateInputs",
+    "check_threshold_provenance",
+    "check_threshold_screen_passed",
     "decide_promotion",
     "record_review",
     "slope_passes",
@@ -395,3 +397,56 @@ def record_review(
         "metrics_content_hash": decision["metrics_content_hash"],
         "entries": [*existing_entries, entry],
     }
+
+
+def check_threshold_provenance(
+    validation_payload: dict[str, Any], logged_model_id: str
+) -> None:
+    """Raise ValueError if the threshold's model stamp doesn't match the model being evaluated.
+
+    threshold.py splits the derived threshold into a model-independent policy
+    file (configs/policy/threshold.yaml — a pure function of costs.yaml,
+    carrying no model stamp) and a model-dependent validation artifact
+    (threshold_validation.json). "A re-calibration invalidates a previously-
+    derived threshold" (threshold.py's own docstring) is aspirational until
+    something checks it — this is that check. Applying a threshold derived
+    against a different calibration map would otherwise produce plausible,
+    wrong numbers with nothing raised.
+
+    Compares on logged_model_id, not (run_id, model_version): a LoggedModel
+    is the actual scored artifact, and model_run_id is kept in
+    validation_payload as a locator only (see threshold.py's payload
+    assembly) — no longer load-bearing here.
+    """
+    stamped_model_id = str(validation_payload["logged_model_id"])
+    if stamped_model_id != logged_model_id:
+        raise ValueError(
+            "threshold_validation.json's model stamp "
+            f"(logged_model_id={stamped_model_id!r}) does not match the model "
+            f"being evaluated (logged_model_id={logged_model_id!r}) — the "
+            "threshold was derived against a different calibration map. "
+            "Re-run models.threshold before evaluating."
+        )
+
+
+def check_threshold_screen_passed(validation_payload: dict[str, Any]) -> None:
+    """Raise RuntimeError if threshold.py's dev-OOF pre-seal screen failed.
+
+    validation_payload["failures"] is the model-dependent half of
+    threshold.py's dev-OOF pre-seal screen (calibration_slope +
+    v3_direction_sanity; V1/V2/V2b are reported-only and never appear here)
+    — this is an independent re-check at every downstream reader
+    (evaluate.py, error_analysis.py, register.py), not a replacement for the
+    RuntimeError run_threshold_step itself already raises when the screen
+    fails. No override flag: a failed screen means the artifact is not
+    trustworthy, and nothing downstream may proceed against it regardless.
+    """
+    failures = validation_payload["failures"]
+    if failures:
+        clauses = "; ".join(f"{f['criterion']}: {f['detail']}" for f in failures)
+        raise RuntimeError(
+            "threshold_validation.json's dev-OOF pre-seal screen failed "
+            f"({len(failures)} criterion/criteria): {clauses}. Re-run "
+            "models.threshold (and models.calibrate first, if needed) "
+            "before evaluating or running error analysis."
+        )

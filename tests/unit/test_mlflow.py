@@ -18,7 +18,6 @@ from sklearn.linear_model import LogisticRegression
 import telco_churn.utils.mlflow as tc_mlflow
 from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
-    load_model_promotion_bars,
     read_calibrate_receipt,
     read_train_receipt,
     resolve_logged_model_id,
@@ -362,40 +361,6 @@ def test_write_and_read_calibrate_receipt_round_trips(reports_cfg: DictConfig) -
 def test_read_calibrate_receipt_raises_when_absent(reports_cfg: DictConfig) -> None:
     with pytest.raises(FileNotFoundError, match="run_id/model_version"):
         read_calibrate_receipt(reports_cfg)
-
-
-# ---------------------------------------------------------------------------
-# load_model_promotion_bars
-# ---------------------------------------------------------------------------
-
-
-def test_load_model_promotion_bars_matches_yaml_file() -> None:
-    """Cross-check against the real configs/model_promotion.yaml — the
-    ANALYSIS.md §0 pre-registered gate policy — rather than hardcoding the
-    bar values, so this test doesn't go stale (or silently start asserting
-    the wrong thing) the moment the policy is revised.
-    """
-    cfg = OmegaConf.create(
-        {"paths": {"model_promotion_config": "configs/model_promotion.yaml"}}
-    )
-    raw = OmegaConf.load(get_project_root() / "configs" / "model_promotion.yaml")
-
-    bars = load_model_promotion_bars(cfg)
-
-    assert bars.pr_auc_bar == pytest.approx(float(raw.pr_auc_bar))
-    assert bars.recall_bar == pytest.approx(float(raw.recall_bar))
-    lo, hi = bars.calibration_slope_band
-    assert lo == pytest.approx(float(raw.calibration_slope_band[0]))
-    assert hi == pytest.approx(float(raw.calibration_slope_band[1]))
-    assert bars.pr_auc_materiality_threshold == pytest.approx(
-        float(raw.pr_auc_materiality_threshold)
-    )
-    assert bars.brier_non_inferiority_margin == pytest.approx(
-        float(raw.brier_non_inferiority_margin)
-    )
-    assert bars.recall_non_inferiority_margin == pytest.approx(
-        float(raw.recall_non_inferiority_margin)
-    )
 
 
 # ---------------------------------------------------------------------------
