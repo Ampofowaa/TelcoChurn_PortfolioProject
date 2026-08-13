@@ -20,6 +20,7 @@ from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
     read_calibrate_receipt,
     read_train_receipt,
+    resolve_calibrated_run,
     resolve_logged_model_id,
     resolve_model_identifier,
     resolve_model_run_id,
@@ -296,27 +297,112 @@ def test_resolve_model_identifier_resolves_from_explicit_run_id(
 def test_resolve_model_identifier_resolves_from_receipt_when_neither_given(
     registry_cfg: DictConfig, tmp_path: Path
 ) -> None:
-    """The fully-automatic path — nothing explicit given, resolves from
-    calibrate.py's receipt rather than the registry."""
+    """The fully-automatic path — nothing explicit given — resolves run_id
+    from calibrate.py's receipt, then the same registry lookup the
+    explicit-run_id path uses below: the receipt itself never carries a
+    model_version (calibrate.py performs no registry write of its own), so
+    a version must already be registered for that run_id — e.g. by
+    register.py's mint step, run separately — or this raises."""
     receipt_cfg = OmegaConf.merge(
         registry_cfg, {"paths": {"reports": str(tmp_path / "reports")}}
     )
     assert isinstance(receipt_cfg, DictConfig)
+    run_id, version = _log_and_register_with_run_id(receipt_cfg)
+    registered_name = str(receipt_cfg.mlflow.registered_model_name)
     write_calibrate_receipt(
-        "receipt_run_id",
-        "7",
-        "receipt_model_id",
-        "runs:/receipt_run_id/calibrated_model",
-        receipt_cfg,
+        run_id, "receipt_model_id", f"models:/{registered_name}/{version}", receipt_cfg
     )
 
     resolved_run_id, resolved_version, resolved_uri = resolve_model_identifier(
         None, None, receipt_cfg
     )
 
+    assert resolved_run_id == run_id
+    assert resolved_version == version
+    assert resolved_uri == f"models:/{registered_name}/{version}"
+
+
+def test_resolve_model_identifier_raises_when_receipt_run_id_not_yet_registered(
+    registry_cfg: DictConfig, tmp_path: Path
+) -> None:
+    """A calibrate.py receipt whose run_id has no registered version yet —
+    register.py's mint step hasn't run for it — must raise, not silently
+    resolve to nothing."""
+    receipt_cfg = OmegaConf.merge(
+        registry_cfg, {"paths": {"reports": str(tmp_path / "reports")}}
+    )
+    assert isinstance(receipt_cfg, DictConfig)
+    mlflow.set_tracking_uri(str(receipt_cfg.mlflow.tracking_uri))
+    with mlflow.start_run() as run:
+        unregistered_run_id = run.info.run_id
+    write_calibrate_receipt(
+        unregistered_run_id, "receipt_model_id", "models:/m-unregistered", receipt_cfg
+    )
+
+    with pytest.raises(ValueError, match="No registered version"):
+        resolve_model_identifier(None, None, receipt_cfg)
+
+
+# ---------------------------------------------------------------------------
+# resolve_calibrated_run — register.py's mint-mode resolver, never the registry
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_calibrated_run_resolves_from_explicit_run_id_tags(
+    registry_cfg: DictConfig,
+) -> None:
+    """An explicit register.run_id override reads the calibrated_model_id/
+    calibrated_model_uri tags calibrate.py sets directly on the run — no
+    receipt, no registry — so re-registering an older calibration run works
+    regardless of what reports/calibrate_receipt.json currently points at."""
+    mlflow.set_tracking_uri(str(registry_cfg.mlflow.tracking_uri))
+    with mlflow.start_run() as run:
+        run_id = run.info.run_id
+        mlflow.set_tag("calibrated_model_id", "m-explicit")
+        mlflow.set_tag("calibrated_model_uri", "models:/m-explicit")
+
+    resolved_run_id, resolved_uri, resolved_model_id = resolve_calibrated_run(
+        run_id, registry_cfg
+    )
+
+    assert resolved_run_id == run_id
+    assert resolved_uri == "models:/m-explicit"
+    assert resolved_model_id == "m-explicit"
+
+
+def test_resolve_calibrated_run_raises_when_explicit_run_id_untagged(
+    registry_cfg: DictConfig,
+) -> None:
+    """A run with no calibrated_model_id/calibrated_model_uri tags means
+    models.calibrate never ran for it — a clear signal, not a KeyError."""
+    mlflow.set_tracking_uri(str(registry_cfg.mlflow.tracking_uri))
+    with mlflow.start_run() as run:
+        untagged_run_id = run.info.run_id
+
+    with pytest.raises(ValueError, match="calibrated_model_id"):
+        resolve_calibrated_run(untagged_run_id, registry_cfg)
+
+
+def test_resolve_calibrated_run_resolves_from_receipt_when_none_given(
+    registry_cfg: DictConfig, tmp_path: Path
+) -> None:
+    """Giving no override resolves from calibrate.py's own receipt — the
+    same convenience default every other stage's __main__ uses."""
+    receipt_cfg = OmegaConf.merge(
+        registry_cfg, {"paths": {"reports": str(tmp_path / "reports")}}
+    )
+    assert isinstance(receipt_cfg, DictConfig)
+    write_calibrate_receipt(
+        "receipt_run_id", "receipt_model_id", "models:/m-receipt", receipt_cfg
+    )
+
+    resolved_run_id, resolved_uri, resolved_model_id = resolve_calibrated_run(
+        None, receipt_cfg
+    )
+
     assert resolved_run_id == "receipt_run_id"
-    assert resolved_version == "7"
-    assert resolved_uri == "runs:/receipt_run_id/calibrated_model"
+    assert resolved_uri == "models:/m-receipt"
+    assert resolved_model_id == "receipt_model_id"
 
 
 # ---------------------------------------------------------------------------
@@ -344,17 +430,18 @@ def test_read_train_receipt_raises_when_absent(reports_cfg: DictConfig) -> None:
 
 
 def test_write_and_read_calibrate_receipt_round_trips(reports_cfg: DictConfig) -> None:
+    """Never a model_version — calibrate.py performs no registry write of its
+    own, so nothing is registered yet at the point this receipt is written."""
     write_calibrate_receipt(
-        "a_run_id", "3", "a_model_id", "models:/telco-churn-pipeline/3", reports_cfg
+        "a_run_id", "a_model_id", "models:/m-a_model_id", reports_cfg
     )
 
     receipt = read_calibrate_receipt(reports_cfg)
 
     assert receipt == {
         "run_id": "a_run_id",
-        "model_version": "3",
         "logged_model_id": "a_model_id",
-        "model_uri": "models:/telco-churn-pipeline/3",
+        "model_uri": "models:/m-a_model_id",
     }
 
 

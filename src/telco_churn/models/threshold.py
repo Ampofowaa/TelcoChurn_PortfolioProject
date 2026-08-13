@@ -753,7 +753,11 @@ def _run_dev_oof_screen(
     stay reported-only per CLAUDE.md's three-guardrail rule. A V3 veto with
     zero checked features (nothing in the top-k both matched an EDA key and
     cleared the magnitude floor) is itself a failure: a veto that never fired
-    validated nothing.
+    validated nothing. The V3 top-k elbow-validity check
+    (`explain.check_top_k_elbow`) is recorded into `dev_oof_diagnostics`
+    under `direction_sanity_elbow_check` — reported-only like V1/V2/V2b, not
+    a third failure entry, since it only flags that `v3_top_k_features` may
+    need re-deriving by hand, never that the veto itself is untrustworthy.
     """
     dev_oof_screen_frame = build_dev_oof_screen_frame(
         loaded["customerid"], loaded["y_dev_arr"], loaded["oof_proba"]
@@ -822,6 +826,7 @@ def _run_dev_oof_screen(
     dev_oof_diagnostics["direction_check_feature_names"] = v3["top_k_feature_names"]
     dev_oof_diagnostics["direction_checked_count"] = v3["checked_count"]
     dev_oof_diagnostics["direction_weak_signal_count"] = v3["weak_count"]
+    dev_oof_diagnostics["direction_sanity_elbow_check"] = v3["elbow"]
 
     return {
         "dev_oof_screen_frame": dev_oof_screen_frame,

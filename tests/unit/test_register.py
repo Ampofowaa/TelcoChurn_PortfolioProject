@@ -90,6 +90,7 @@ def register_cfg(
             "paths": {"reports": str(reports_dir)},
             "register": {
                 "model_version": None,
+                "run_id": None,
                 "require_review": True,
                 "alias": "champion",
                 "golden_atol": 1e-9,
@@ -379,23 +380,38 @@ def test_register_challenger_mints_pending_and_points_challenger_alias(
     fitted_model: LogisticRegression,
     X_golden: pd.DataFrame,
 ) -> None:
-    """register_challenger — moved out of calibrate.py in B1 — mints the
-    version, tags it pending immediately, and points `challenger` at it only
-    after reload parity passes."""
+    """register_challenger — run as its own CLI step after calibrate.py in
+    B1, never called from calibrate.py's own process — mints the version,
+    tags it pending immediately, and points `challenger` at it only after
+    reload parity against golden_predictions.json passes."""
     registered_name = str(register_cfg.mlflow.registered_model_name)
     signature = infer_signature(X_golden, fitted_model.predict_proba(X_golden))
-    with mlflow.start_run(run_name="tuning_study"):
+    in_memory_preds = fitted_model.predict_proba(X_golden)
+    with mlflow.start_run(run_name="tuning_study") as run:
+        run_id = run.info.run_id
+        # No registered_model_name= here — mirrors calibrate.py's own
+        # log_model call, which deliberately logs unregistered so
+        # register_challenger is the sole registry-mutating mint.
         model_info = mlflow.sklearn.log_model(
             sk_model=fitted_model,
             name="calibrated_model",
             signature=signature,
             input_example=X_golden,
-            registered_model_name=registered_name,
         )
-    in_memory_preds = fitted_model.predict_proba(X_golden)
+        # register_challenger reloads and compares against this artifact
+        # (never against an in-memory object it could not receive as its
+        # own, separate CLI process) — the same golden-fixture shape
+        # calibrate.py's own _fit_and_build_golden_fixture logs.
+        mlflow.log_dict(
+            {
+                "rows": X_golden.to_dict(orient="records"),
+                "p_hat": in_memory_preds[:, 1].tolist(),
+            },
+            "calibration/golden_predictions.json",
+        )
 
     version = register.register_challenger(
-        register_cfg, model_info, X_golden, in_memory_preds
+        register_cfg, run_id, model_info.model_uri, model_info.model_id
     )
 
     client = mlflow.tracking.MlflowClient()
@@ -418,21 +434,37 @@ def test_register_challenger_leaves_pending_and_no_alias_on_parity_failure(
     `challenger` must never point at the unverified version."""
     registered_name = str(register_cfg.mlflow.registered_model_name)
     signature = infer_signature(X_golden, fitted_model.predict_proba(X_golden))
-    with mlflow.start_run(run_name="tuning_study"):
+    with mlflow.start_run(run_name="tuning_study") as run:
+        run_id = run.info.run_id
+        # No registered_model_name= here — see the sibling test above for why.
         model_info = mlflow.sklearn.log_model(
             sk_model=fitted_model,
             name="calibrated_model",
             signature=signature,
             input_example=X_golden,
-            registered_model_name=registered_name,
         )
-    wrong_preds = np.zeros((len(X_golden), 2))
+        # A golden reference the reloaded model cannot possibly reproduce —
+        # forces the same failure a genuine serialization bug would.
+        mlflow.log_dict(
+            {
+                "rows": X_golden.to_dict(orient="records"),
+                "p_hat": np.zeros(len(X_golden)).tolist(),
+            },
+            "calibration/golden_predictions.json",
+        )
 
-    with pytest.raises(AssertionError, match="Reload parity"):
-        register.register_challenger(register_cfg, model_info, X_golden, wrong_preds)
+    with pytest.raises(AssertionError, match="Golden-parity check failed"):
+        register.register_challenger(
+            register_cfg, run_id, model_info.model_uri, model_info.model_id
+        )
 
     client = mlflow.tracking.MlflowClient()
-    version = str(model_info.registered_model_version)
+    # register_challenger mints before the parity check fails, so the version
+    # only exists via the registry now — not on model_info, which was logged
+    # unregistered.
+    versions = client.search_model_versions(f"name='{registered_name}'")
+    assert len(versions) == 1
+    version = versions[0].version
     tags = client.get_model_version(registered_name, version).tags
     assert tags["promotion_status"] == "pending"
     with pytest.raises(MlflowException):
@@ -529,6 +561,38 @@ def test_register_fail_fast_skips_smoke_check_on_gate_fail(
 
     assert result["promotion_status"] == "rejected"
     assert smoke_check_calls == []
+
+    client = mlflow.tracking.MlflowClient()
+    tags = client.get_model_version(registered_name, version).tags
+    assert tags["promotion_status"] == "rejected"
+
+
+def test_register_gate_fail_does_not_require_review(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """A gate: fail decision tags rejected without ever consulting review.
+
+    Review is only load-bearing when the gate passed and could otherwise
+    lead to a promotion — a candidate the gate has already vetoed must not
+    block on a human stamping a verdict that cannot change the outcome
+    (mirrors CLAUDE.md's "guardrails may veto; they may never promote").
+    Companion to test_register_fail_fast_skips_smoke_check_on_gate_fail,
+    which covers the same "gate fail short-circuits everything after it"
+    property for the manifest/smoke checks further down the function.
+    """
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+    _log_evaluation_and_error_analysis(
+        registered_name, version, gate="fail", review=None
+    )
+
+    result = register.run_registration_step(version, register_cfg)
+
+    assert result["promotion_status"] == "rejected"
 
     client = mlflow.tracking.MlflowClient()
     tags = client.get_model_version(registered_name, version).tags
@@ -1508,3 +1572,151 @@ def test_rollback_champion_rejects_unpromoted_target_version(
 
     with pytest.raises(RuntimeError, match="not tagged promotion_status=promoted"):
         register.rollback_champion(registered_name, target_version=rejected_version)
+
+
+# ---------------------------------------------------------------------------
+# refresh_champion_reference
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_champion_reference_repoints_tags_at_fresh_cold_start_run(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """The prescribed recovery from evaluate.py's data_content_hash guard:
+    re-run models.evaluate cold-start for the champion's own version, then
+    this function re-points its eval_run_id/gate-criteria tags at that run
+    — without touching promotion_status or any alias — and records the
+    refresh in champion_history()."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="promoted"
+    )
+    old_eval_run_id, _ea = _log_evaluation_and_error_analysis(
+        registered_name, version, tag_version=True
+    )
+    new_eval_run_id, _ea2 = _log_evaluation_and_error_analysis(
+        registered_name, version, tag_version=False
+    )
+    write_eval_receipt(version, new_eval_run_id, register_cfg)
+
+    result = register.refresh_champion_reference(version, register_cfg)
+
+    assert result == {
+        "model_version": version,
+        "eval_run_id": new_eval_run_id,
+        "previous_eval_run_id": old_eval_run_id,
+    }
+    client = mlflow.tracking.MlflowClient()
+    tags = client.get_model_version(registered_name, version).tags
+    assert tags["eval_run_id"] == new_eval_run_id
+    assert tags["test_pr_auc"] == "0.65"
+    assert tags["promotion_status"] == "promoted"
+
+    history = register.champion_history(registered_name)
+    assert history[-1] == {
+        "action": "reference_refreshed",
+        "version": version,
+        "previous_eval_run_id": old_eval_run_id,
+        "eval_run_id": new_eval_run_id,
+        "at": history[-1]["at"],
+    }
+
+
+def test_refresh_champion_reference_rejects_non_promoted_version(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """A pending or rejected version was never a comparison reference to
+    begin with, so it has no stale reference tags worth fixing."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+
+    with pytest.raises(RuntimeError, match="not 'promoted'"):
+        register.refresh_champion_reference(version, register_cfg)
+
+
+def test_refresh_champion_reference_receipt_for_different_model_version_raises(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """A stale reports/eval_receipt.json left over from a different cycle on
+    this machine must not be silently trusted."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="promoted"
+    )
+    eval_run_id, _ea = _log_evaluation_and_error_analysis(
+        registered_name, version, tag_version=False
+    )
+    write_eval_receipt("999", eval_run_id, register_cfg)
+
+    with pytest.raises(RuntimeError, match="eval_receipt"):
+        register.refresh_champion_reference(version, register_cfg)
+
+
+def test_refresh_champion_reference_rejects_comparative_regime_run(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """A reference refresh must be the version's own re-evaluation, never a
+    run that compared it against some other incumbent."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="promoted"
+    )
+    eval_run_id, _ea = _log_evaluation_and_error_analysis(
+        registered_name, version, tag_version=False, regime="comparative"
+    )
+    write_eval_receipt(version, eval_run_id, register_cfg)
+
+    with pytest.raises(ValueError, match="cold_start"):
+        register.refresh_champion_reference(version, register_cfg)
+
+
+def test_refresh_champion_reference_rejects_decision_for_different_model_version(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """promotion_decision.json's own embedded model_version must match, even
+    though the receipt and the tag lookup both point at this run."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="promoted"
+    )
+    eval_run_id, _ea = _log_evaluation_and_error_analysis(
+        registered_name, version, tag_version=False, decision_model_version="999"
+    )
+    write_eval_receipt(version, eval_run_id, register_cfg)
+
+    with pytest.raises(ValueError, match="different artifact"):
+        register.refresh_champion_reference(version, register_cfg)
+
+
+def test_refresh_champion_reference_rejects_stale_metrics_content_hash(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """metrics.json regenerated independently onto the same eval run, after
+    promotion_decision.json's hash was stamped, must not be trusted."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="promoted"
+    )
+    eval_run_id, _ea = _log_evaluation_and_error_analysis(
+        registered_name, version, tag_version=False
+    )
+    with mlflow.start_run(run_id=eval_run_id):
+        mlflow.log_dict({"ranking": {"pr_auc": 0.99}}, "metrics.json")
+    write_eval_receipt(version, eval_run_id, register_cfg)
+
+    with pytest.raises(ValueError, match="metrics_content_hash"):
+        register.refresh_champion_reference(version, register_cfg)

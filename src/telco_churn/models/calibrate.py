@@ -9,10 +9,14 @@ from `runs:/<run_id>/model` — the latter becomes ambiguous once this module
 logs its own `calibrated_model` onto the same run.
 
 This module fits and logs the calibrated pipeline — a pure, deterministic
-file transform — and stops there. Minting a registry version, tagging it,
-and pointing the `challenger` alias is register.py's job
-(`register_challenger`), called from `run_calibration_step` below via a
-function-local import.
+file transform — and stops there. It performs no registry write of its own:
+minting a registry version, tagging it, and pointing the `challenger` alias
+is register.py's job (`register_challenger`), run as its own CLI step after
+this one (`python -m telco_churn.models.register`, with `register.run_id`
+defaulting to `reports/calibrate_receipt.json` when not given, mirroring how
+this module's own `calibration.run_id` defaults to `reports/train_receipt.json`) —
+never called from this process, so this module's own exit code reflects only
+whether calibration itself succeeded.
 """
 
 from __future__ import annotations
@@ -397,7 +401,7 @@ def select_calibration_method(
             "per_fold_mean_ap": float(np.mean(dummy_per_fold_ap)),
             "pooled_brier": dummy_brier,
             "ece": expected_calibration_error(
-                dummy_proba, y_dev, ece_n_bins, ece_strategy
+                dummy_proba, y_dev, ece_n_bins, ece_strategy, "dummy_prior"
             ),
             "bss": brier_skill_score(dummy_brier, dummy_brier),
         },
@@ -405,7 +409,7 @@ def select_calibration_method(
             "per_fold_mean_ap": float(np.mean(uncal_per_fold_ap)),
             "pooled_brier": uncal_brier,
             "ece": expected_calibration_error(
-                uncal_proba, y_dev, ece_n_bins, ece_strategy
+                uncal_proba, y_dev, ece_n_bins, ece_strategy, "uncalibrated"
             ),
             "bss": brier_skill_score(uncal_brier, dummy_brier),
         },
@@ -418,7 +422,9 @@ def select_calibration_method(
         diagnostics[configured_method] = {
             "per_fold_mean_ap": float(np.mean(per_fold_ap)),
             "pooled_brier": candidate_brier,
-            "ece": expected_calibration_error(proba, y_dev, ece_n_bins, ece_strategy),
+            "ece": expected_calibration_error(
+                proba, y_dev, ece_n_bins, ece_strategy, configured_method
+            ),
             "bss": brier_skill_score(candidate_brier, dummy_brier),
         }
         if not pr_auc_gate_passes(per_fold_ap, uncal_per_fold_ap, cfg):
@@ -438,7 +444,7 @@ def select_calibration_method(
             "per_fold_mean_ap": float(np.mean(other_per_fold_ap)),
             "pooled_brier": other_brier,
             "ece": expected_calibration_error(
-                other_proba, y_dev, ece_n_bins, ece_strategy
+                other_proba, y_dev, ece_n_bins, ece_strategy, other_method
             ),
             "bss": brier_skill_score(other_brier, dummy_brier),
         }
@@ -472,7 +478,7 @@ def select_calibration_method(
         "per_fold_mean_ap": float(np.mean(sigmoid_per_fold_ap)),
         "pooled_brier": sigmoid_brier,
         "ece": expected_calibration_error(
-            sigmoid_proba, y_dev, ece_n_bins, ece_strategy
+            sigmoid_proba, y_dev, ece_n_bins, ece_strategy, "sigmoid"
         ),
         "bss": brier_skill_score(sigmoid_brier, dummy_brier),
     }
@@ -494,7 +500,7 @@ def select_calibration_method(
         "per_fold_mean_ap": float(np.mean(isotonic_per_fold_ap)),
         "pooled_brier": isotonic_brier,
         "ece": expected_calibration_error(
-            isotonic_proba, y_dev, ece_n_bins, ece_strategy
+            isotonic_proba, y_dev, ece_n_bins, ece_strategy, "isotonic"
         ),
         "bss": brier_skill_score(isotonic_brier, dummy_brier),
     }
@@ -896,13 +902,22 @@ def _log_calibration_run(
     golden: dict[str, Any],
     dev_shap: dict[str, Any],
 ) -> Any:
-    """Log every calibration artifact and metric, and register the calibrated pipeline.
+    """Log every calibration artifact, metric, and the calibrated pipeline itself — as a LoggedModel, not a registry version.
 
     name="calibrated_model" is load-bearing: reusing name="model" would
     rebind runs:/<run_id>/model away from the uncalibrated pipeline, and
     would make a second run of this function wrap a CalibratedClassifierCV
     inside another one. serialization_format=cloudpickle is mandatory —
     mlflow's skops default rejects CalibratedClassifierCV's internals.
+    Deliberately omits registered_model_name= here — that would register a
+    version as a side effect of logging, before any validation has run.
+    register.py::register_challenger is the sole place that mints a registry
+    version, via mlflow.register_model(model_info.model_uri, ...) — invoked
+    as its own CLI step after this one, never from inside this process (see
+    this module's own docstring). The calibrated_model_id/calibrated_model_uri
+    tags set on this run right after logging are what let that separate
+    process, and an explicit register.run_id=<id> override, resolve this
+    LoggedModel without touching the registry.
 
     Also logs dev_brier/dev_bss/dev_ece/dev_per_fold_mean_ap/
     dev_calibration_slope/dev_calibration_slope_ci_lower/
@@ -920,7 +935,6 @@ def _log_calibration_run(
     """
     method = str(calibration_summary["method"])
     ensure_experiment_metadata(cfg)
-    registered_model_name = str(cfg.mlflow.registered_model_name)
 
     with mlflow.start_run(run_id=run_id):
         set_run_description(TRAINING_CYCLE_RUN_DESCRIPTION)
@@ -982,25 +996,29 @@ def _log_calibration_run(
             input_example=golden["input_example"],
             pyfunc_predict_fn="predict_proba",
             serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE,
-            registered_model_name=registered_model_name,
         )
         set_logged_model_description(model_info.model_id, _MODEL_DESCRIPTION)
+
+        # Run tags, not just the local calibrate_receipt.json — so an
+        # explicit register.run_id=<id> override (re-registering an older
+        # calibration run, not necessarily the latest one on this machine)
+        # can resolve this LoggedModel without touching the registry or
+        # trusting a receipt that may belong to a different run entirely.
+        mlflow.set_tag("calibrated_model_id", model_info.model_id)
+        mlflow.set_tag("calibrated_model_uri", model_info.model_uri)
 
     return model_info
 
 
 def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
-    """Calibrate, select a method, and hand the fitted pipeline to register.py to mint as `challenger`.
+    """Calibrate, select a method, and log the fitted pipeline — no registry write.
 
     Fits and logs a pure, deterministic file transform — the calibrated
     pipeline, calibration_summary.json, dev_oof_predictions.parquet — and
     stops there. Minting a registry version, tagging it pending, verifying
     reload parity, and pointing `challenger` is register.py's job
-    (register_challenger), called below via a function-local import: register.py
-    imports this module's manifest/dev-features loaders at module level, so a
-    top-level import here would be circular. Safe once both modules are
-    fully loaded — the same shape utils/mlflow.py::load_model_promotion_bars
-    already uses to break its own circular import back into models/.
+    (register_challenger), run as a separate CLI step after this one — never
+    called from this process (see this module's own docstring for why).
 
     reports/figures/reliability_diagram.png is overwritten on every call —
     it reflects whichever run executed this function most recently on this
@@ -1013,14 +1031,18 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     Also logs golden_predictions.json (customerid-pinned dev rows, at the
     model's committed input schema, plus the in-memory fitted pipeline's
     reference scores on them, captured before log_model/pickling touches
-    anything) — the independent reference register.py's serving-parity
-    smoke check verifies against, and Phase 9's API parity test reuses.
+    anything) — the independent reference register.py's serving-parity smoke
+    check (both at mint time and at promotion time) verifies against, and
+    Phase 9's API parity test reuses.
 
-    Writes reports/calibrate_receipt.json ({"run_id", "model_version",
-    "logged_model_id", "model_uri"}) — the pointer threshold.py/evaluate.py/
+    Writes reports/calibrate_receipt.json ({"run_id", "logged_model_id",
+    "model_uri"}) — never a model_version, since nothing is registered yet
+    at this point. This is the pointer threshold.py/evaluate.py/
     error_analysis.py's __main__ blocks read by default when no explicit
-    run_id/model_version override is given (see utils/mlflow.py's module
-    docstring for why a local receipt is safe here).
+    run_id/model_version override is given, and register.py's mint step
+    reads by default when no explicit register.run_id override is given
+    (see utils/mlflow.py's module docstring for why a local receipt is safe
+    here).
     """
     manifest = load_training_manifest(run_id, cfg)
     _check_trial_count_gate(manifest, run_id, cfg)
@@ -1056,34 +1078,21 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
         dev_shap,
     )
 
-    # Function-local — see this function's own docstring for why a top-level
-    # import here would be circular.
-    from telco_churn.models.register import register_challenger
-
-    version = register_challenger(
-        cfg, model_info, golden["input_example"], golden["in_memory_preds"]
-    )
-    parity_ok = True
-
-    write_calibrate_receipt(
-        run_id, version, model_info.model_id, model_info.model_uri, cfg
-    )
+    write_calibrate_receipt(run_id, model_info.model_id, model_info.model_uri, cfg)
 
     logger.info(
-        "calibration_registered",
+        "calibration_logged",
         run_id=run_id,
         method=method,
-        model_version=version,
+        logged_model_id=model_info.model_id,
         model_uri=model_info.model_uri,
-        parity_ok=parity_ok,
     )
 
     return {
         "run_id": run_id,
         "method": method,
-        "model_version": version,
+        "logged_model_id": model_info.model_id,
         "model_uri": model_info.model_uri,
-        "parity_ok": parity_ok,
         "calibration_summary": calibration_summary,
     }
 
@@ -1121,7 +1130,7 @@ if __name__ == "__main__":
             "calibration_step_done",
             run_id=result["run_id"],
             method=result["method"],
-            model_version=result["model_version"],
+            logged_model_id=result["logged_model_id"],
         )
     except FileNotFoundError as e:
         logger.error("calibration_data_not_found", error=str(e), exc_info=True)
@@ -1134,9 +1143,6 @@ if __name__ == "__main__":
         sys.exit(1)
     except RuntimeError as e:
         logger.error("calibration_blocked", error=str(e), exc_info=True)
-        sys.exit(1)
-    except AssertionError as e:
-        logger.error("calibration_parity_failed", error=str(e), exc_info=True)
         sys.exit(1)
     except Exception as e:
         logger.error("calibration_failed", error=str(e), exc_info=True)

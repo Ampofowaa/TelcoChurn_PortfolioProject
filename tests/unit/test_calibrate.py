@@ -31,6 +31,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 import telco_churn.models.calibrate as calibrate
+import telco_churn.models.register as register
 import telco_churn.models.train.log_model as log_model
 from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.features.preprocessing import build_preprocessor
@@ -687,6 +688,12 @@ def registration_cfg(calibration_mlflow_uri: str, tmp_path: Path) -> DictConfig:
                 "override_trial_count_gate": False,
                 "golden_n_rows": 5,
             },
+            # register.register_challenger's own config keys — this fixture
+            # feeds both calibrate.run_calibration_step and (in
+            # calibrated_run below) register.register_challenger, mirroring
+            # the real two-step CLI flow (models.calibrate then
+            # models.register) sharing one composed cfg.
+            "register": {"golden_atol": 1.0e-9},
             "mlflow": {
                 "tracking_uri": calibration_mlflow_uri,
                 "experiment_name": "test_run_calibration_step",
@@ -839,6 +846,7 @@ def _shared_registration_cfg(
                 "override_trial_count_gate": False,
                 "golden_n_rows": 5,
             },
+            "register": {"golden_atol": 1.0e-9},
             "mlflow": {
                 "tracking_uri": _shared_calibration_mlflow_uri,
                 "experiment_name": "test_run_calibration_step_shared",
@@ -894,12 +902,16 @@ def calibrated_run(
     _module_dev_split: tuple[pd.DataFrame, pd.Series],
     _shared_tuning_result: dict[str, Any],
 ) -> Iterator[dict[str, Any]]:
-    """The real, unmocked run_calibration_step(sigmoid, default cfg) result —
-    shared across 7 of the 9 test_run_calibration_step_* tests, which only
-    read different artifacts off one real call rather than each re-running
-    the full nested-CV calibration + MLflow registration from scratch
-    (~7-14s each, dominated by setup: a fresh SQLite MLflow store plus the
-    same dummy+uncalibrated+sigmoid+isotonic OOF computation
+    """The real, unmocked run_calibration_step(sigmoid, default cfg) result,
+    plus a real register.register_challenger mint on top of it (B1: calibrate.py
+    itself performs no registry write, so the registry-dependent tests below
+    need this fixture to also mint, mirroring what register.py's own
+    mint-mode CLI would do as a separate step) — shared across 7 of the 9
+    test_run_calibration_step_* tests, which only read different artifacts
+    off one real call rather than each re-running the full nested-CV
+    calibration + MLflow registration from scratch (~7-14s each, dominated
+    by setup: a fresh SQLite MLflow store plus the same
+    dummy+uncalibrated+sigmoid+isotonic OOF computation
     select_calibration_method always performs in pinned mode).
 
     NOT shared with:
@@ -939,10 +951,17 @@ def calibrated_run(
         _shared_registration_cfg,
     )
     result = calibrate.run_calibration_step(run_id, _shared_registration_cfg)
+    model_version = register.register_challenger(
+        _shared_registration_cfg,
+        run_id,
+        result["model_uri"],
+        result["logged_model_id"],
+    )
     try:
         yield {
             "run_id": run_id,
             "result": result,
+            "model_version": model_version,
             "cfg": _shared_registration_cfg,
             "X_dev": X_dev,
             "y_dev": y_dev,
@@ -954,11 +973,13 @@ def calibrated_run(
 def test_run_calibration_step_registers_and_tags(
     calibrated_run: dict[str, Any],
 ) -> None:
-    """Registers exactly one version, tags training_data_scope=dev, and points
-    challenger at it — the training cycle's single registration point.
+    """register.register_challenger (run separately, on top of
+    run_calibration_step's output — B1's decoupling) registers exactly one
+    version, tags training_data_scope=dev, and points challenger at it.
     """
     run_id = calibrated_run["run_id"]
     result = calibrated_run["result"]
+    model_version = calibrated_run["model_version"]
     registration_cfg = calibrated_run["cfg"]
     # calibrated_run is module-scoped and cached — an interleaved test using
     # its own separate MLflow store (e.g. the auto-method calibration_spec
@@ -969,11 +990,10 @@ def test_run_calibration_step_registers_and_tags(
 
     assert result["run_id"] == run_id
     assert result["method"] == "sigmoid"
-    assert result["parity_ok"] is True
 
     client = mlflow.tracking.MlflowClient()
     registered_name = str(registration_cfg.mlflow.registered_model_name)
-    version = client.get_model_version(registered_name, result["model_version"])
+    version = client.get_model_version(registered_name, model_version)
     assert version.tags["training_data_scope"] == "dev"
     # ModelVersion.model_id does not auto-populate in OSS MLflow 3.14 — without
     # this tag the registry has no supported path to the LoggedModel Phase 7's
@@ -982,23 +1002,24 @@ def test_run_calibration_step_registers_and_tags(
     assert mlflow.get_logged_model(version.tags["logged_model_id"]) is not None
 
     registered_model = client.get_registered_model(registered_name)
-    assert str(registered_model.aliases["challenger"]) == result["model_version"]
+    assert str(registered_model.aliases["challenger"]) == model_version
 
 
 def test_run_calibration_step_tags_promotion_status_pending(
     calibrated_run: dict[str, Any],
 ) -> None:
     """Mint-time default: a freshly registered version is tagged
-    promotion_status=pending before register.py has ever seen it — the
-    fail-safe state a crash anywhere downstream leaves it in.
+    promotion_status=pending before register.py's own promote/reject path
+    has ever seen it — the fail-safe state a crash anywhere downstream
+    leaves it in.
     """
-    result = calibrated_run["result"]
+    model_version = calibrated_run["model_version"]
     registration_cfg = calibrated_run["cfg"]
     mlflow.set_tracking_uri(str(registration_cfg.mlflow.tracking_uri))
 
     client = mlflow.tracking.MlflowClient()
     registered_name = str(registration_cfg.mlflow.registered_model_name)
-    version = client.get_model_version(registered_name, result["model_version"])
+    version = client.get_model_version(registered_name, model_version)
     assert version.tags["promotion_status"] == "pending"
 
 
@@ -1011,7 +1032,7 @@ def test_run_calibration_step_logs_golden_predictions(
     by customerid, and round-trip through the registered model exactly.
     """
     run_id = calibrated_run["run_id"]
-    result = calibrated_run["result"]
+    model_version = calibrated_run["model_version"]
     registration_cfg = calibrated_run["cfg"]
     mlflow.set_tracking_uri(str(registration_cfg.mlflow.tracking_uri))
     n_rows = int(registration_cfg.calibration.golden_n_rows)
@@ -1031,9 +1052,7 @@ def test_run_calibration_step_logs_golden_predictions(
     assert all(0.0 <= p <= 1.0 for p in golden["p_hat"])
 
     registered_name = str(registration_cfg.mlflow.registered_model_name)
-    reloaded = mlflow.sklearn.load_model(
-        f"models:/{registered_name}/{result['model_version']}"
-    )
+    reloaded = mlflow.sklearn.load_model(f"models:/{registered_name}/{model_version}")
     reloaded_preds = reloaded.predict_proba(pd.DataFrame(golden["rows"]))[:, 1]
     assert np.allclose(reloaded_preds, golden["p_hat"], rtol=0, atol=1e-9)
 
@@ -1266,73 +1285,18 @@ def test_run_calibration_step_override_trial_count_gate(
     tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
-    """override_trial_count_gate=true forces registration despite the low-trial
-    warning — an explicit human override, not a silent bypass."""
+    """override_trial_count_gate=true forces calibration to proceed despite
+    the low-trial warning — an explicit human override, not a silent bypass.
+    Registration is register.py's own separate step (B1) and is not
+    exercised here — this only asserts calibrate.py itself completes."""
     tuning_result["tuning_summary"]["trial_count_below_threshold"] = True
     registration_cfg.calibration.override_trial_count_gate = True
     run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
 
     result = calibrate.run_calibration_step(run_id, registration_cfg)
 
-    assert result["model_version"] == "1"
-
-
-def test_run_calibration_step_parity_failure_leaves_tagged_pending_orphan(
-    registration_cfg: DictConfig,
-    dev_split: tuple[pd.DataFrame, pd.Series],
-    tuning_result: dict[str, Any],
-    sandboxed_dev_features: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A reload-parity failure must not leave a permanently untagged orphan.
-
-    promotion_status=pending is tagged immediately after log_model returns,
-    before register.register_challenger's reload-parity check runs (B1
-    extracted registration out of calibrate.py — the parity check itself is
-    no longer a standalone patchable function, so this forces the failure
-    the same way a genuine one would occur: the reloaded model disagreeing
-    with the in-memory reference) — so a parity failure still leaves a
-    well-formed, reapable `pending` version rather than one with no
-    promotion_status tag at all (invisible to both the tag-based rollback
-    rule and the Phase 14 pending-reaper). The version must also stay
-    unaliased: `challenger` may only ever point at something that has
-    actually passed the parity check.
-    """
-
-    run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
-
-    class _WrongPredictor:
-        def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-            return np.zeros((len(X), 2))
-
-    # run_calibration_step itself also reloads via mlflow.sklearn.load_model
-    # — unfitted_pipeline_from_manifest's single call, loading the
-    # *uncalibrated* pipeline off training_manifest.json's logged_model_uri
-    # — before register.register_challenger's own single reload of the
-    # *calibrated* model at the very end. Both resolve to `models:/m-<id>`
-    # LoggedModel URIs indistinguishable by shape, so disambiguate by call
-    # order instead: first call real, every call after that wrong.
-    real_load_model = mlflow.sklearn.load_model
-    call_count = 0
-
-    def _fake_load_model(model_uri: str) -> Any:
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return real_load_model(model_uri)
-        return _WrongPredictor()
-
-    monkeypatch.setattr(mlflow.sklearn, "load_model", _fake_load_model)
-
-    with pytest.raises(AssertionError, match="Reload parity check failed"):
-        calibrate.run_calibration_step(run_id, registration_cfg)
+    assert result["run_id"] == run_id
+    assert result["logged_model_id"]
 
     client = mlflow.tracking.MlflowClient()
-    registered_name = str(registration_cfg.mlflow.registered_model_name)
-    version = client.get_model_version(registered_name, "1")
-    assert version.tags["promotion_status"] == "pending"
-    assert version.tags["training_data_scope"] == "dev"
-    assert version.tags["logged_model_id"]
-
-    registered_model = client.get_registered_model(registered_name)
-    assert "challenger" not in registered_model.aliases
+    assert client.search_registered_models() == []

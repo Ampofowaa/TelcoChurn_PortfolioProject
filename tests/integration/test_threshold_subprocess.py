@@ -25,6 +25,7 @@ import pytest
 from omegaconf import OmegaConf
 
 import telco_churn.models.calibrate as calibrate
+import telco_churn.models.register as register_module
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
 from telco_churn.features.accessor import FEATURES_FILENAME
@@ -237,13 +238,22 @@ def registered_threshold_model(
             tuning_result["parent_run_id"] = run.info.run_id
         log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
         cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
+        # B1's call-site decoupling: calibrate.py no longer registers
+        # anything itself, so this fixture mints the challenger the same way
+        # register.py's own mint-mode CLI would, in-process.
+        model_version = register_module.register_challenger(
+            cfg,
+            str(cal_result["run_id"]),
+            str(cal_result["model_uri"]),
+            str(cal_result["logged_model_id"]),
+        )
     finally:
         reset_active_config()
 
     return (
         tracking_uri,
         registered_model_name,
-        str(cal_result["model_version"]),
+        model_version,
         data_dir,
     )
 

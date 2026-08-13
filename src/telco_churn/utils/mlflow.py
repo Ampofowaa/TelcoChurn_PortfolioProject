@@ -11,19 +11,26 @@ longer applies.)
 
 A **receipt** (write_train_receipt/write_calibrate_receipt and their read_*
 counterparts) is a small local JSON file a pipeline stage writes describing
-what it just produced (identifiers only — run_id/model_version/model_uri,
-never evidence), which the next stage reads by default when no explicit
-override is given — the DVC outs:/deps: handshake between chained stages.
-This is deliberately unlike this project's other reports/ rule ("never trust
-a local reports/ path as the source of truth for a cross-cycle decision" —
-register.py, drift_reference.json): that rule protects evidence that must
-survive a champion rollback, where a stale local copy would silently pair a
-decision with the wrong model version. A receipt carries no evidence — it's
-a convenience default for local/CI/DVC chaining, and whatever it resolves to
-is still the exact same (run_id, model_version) pair an explicit override
-would supply, so nothing downstream ever treats the receipt itself as
-ground truth. The audit/rollback path (an explicit run_id or model_version
-override) never reads a receipt at all.
+what it just produced (identifiers only, never evidence), which the next
+stage reads by default when no explicit override is given — the DVC
+outs:/deps: handshake between chained stages. This is deliberately unlike
+this project's other reports/ rule ("never trust a local reports/ path as
+the source of truth for a cross-cycle decision" — register.py,
+drift_reference.json): that rule protects evidence that must survive a
+champion rollback, where a stale local copy would silently pair a decision
+with the wrong model version. A receipt carries no evidence — it's a
+convenience default for local/CI/DVC chaining. calibrate_receipt.json is
+identifiers-only in the strictest sense — {run_id, logged_model_id,
+model_uri}, never a model_version, since calibrate.py performs no registry
+write of its own — so resolve_model_identifier's default (neither an
+explicit run_id nor model_version given) path turns the receipt's run_id
+into a model_version via the same registry lookup its explicit-run_id path
+already uses, rather than trusting a stored value; eval_receipt.json/
+error_analysis_receipt.json do carry model_version (register.py's own
+first-invocation bootstrap pointers), and whatever they resolve to is still
+the exact same pair an explicit override would supply. The audit/rollback
+path (an explicit run_id or model_version override) never reads a receipt
+at all.
 """
 
 from __future__ import annotations
@@ -48,6 +55,7 @@ __all__ = [
     "resolve_model_version_from_run_id",
     "resolve_logged_model_id",
     "resolve_model_identifier",
+    "resolve_calibrated_run",
     "ensure_experiment_metadata",
     "set_run_description",
     "set_registered_model_description",
@@ -103,11 +111,14 @@ def _suppress_known_mlflow_warnings() -> None:
 
 
 _EXPERIMENT_DESCRIPTION = (
-    "End-to-end training cycle for the IBM Telco Customer Churn model — candidate "
-    "comparison (Dummy / LogReg / LightGBM) → feature selection → Optuna tuning → "
-    "calibration → sealed-test evaluation → error analysis → model promotion and "
-    "registry. Selection criterion: PR-AUC (average precision); guardrails (recall, "
-    "Brier, calibration slope) may veto but never promote."
+    "End-to-end training cycle for the IBM Telco Customer Churn model.\n\n"
+    "**Pipeline:** candidate comparison (Dummy / LogReg / LightGBM) → "
+    "feature selection → Optuna tuning → calibration → sealed-test "
+    "evaluation → error analysis → model promotion and registry.\n\n"
+    "**Selection policy:** PR-AUC (average precision) is the sole "
+    "criterion that can *promote* a model. Three guardrails — recall, "
+    "Brier, calibration slope — can *veto* a candidate PR-AUC would "
+    "otherwise admit, but none of them can promote one on their own."
 )
 _EXPERIMENT_TAGS = {
     "project": "telco-churn",
@@ -232,7 +243,10 @@ def resolve_model_version_from_run_id(run_id: str, cfg: DictConfig) -> str:
     if len(matches) == 0:
         raise ValueError(
             f"No registered version of {registered_model_name!r} found for "
-            f"run_id={run_id!r} — was models.calibrate ever run for this run_id?"
+            f"run_id={run_id!r} — models.calibrate does not register a "
+            "version itself; run `python -m telco_churn.models.register "
+            f"register.run_id={run_id}` (or the default no-args form, if "
+            "this is the most recent calibration run) first."
         )
     if len(matches) > 1:
         versions = sorted(str(m.version) for m in matches)
@@ -249,21 +263,25 @@ def resolve_model_identifier(
     explicit_model_version: str | None,
     cfg: DictConfig,
 ) -> tuple[str, str, str]:
-    """Resolve (run_id, model_version, model_uri) from an explicit override or calibrate.py's receipt.
+    """Resolve (run_id, model_version, model_uri) from an explicit override or calibrate.py's receipt, by run id.
 
     Exactly one of explicit_run_id/explicit_model_version may be given —
     giving both is ambiguous and is never silently resolved in one direction
     over the other (raises ValueError naming both). Giving neither resolves
-    from reports/calibrate_receipt.json, the challenger calibrate.py minted
-    most recently on this machine — see this module's docstring for why a
-    receipt is safe to trust here despite this project's general rule
-    against local reports/ paths as a decision source.
+    run_id from reports/calibrate_receipt.json — the most recent calibration
+    run on this machine — and then falls through to the same registry lookup
+    as the explicit-run_id path below: the receipt is calibrate.py's own
+    single-writer description of a still-unregistered artifact (see
+    write_calibrate_receipt's docstring) and never carries a model_version
+    itself, so "resolve by run id, not registry version" is not just true of
+    the explicit override, it is what the fully-automatic default path does
+    too — a registered version (minted by register.py's mint step, run
+    separately after calibrate.py) must already exist for the resolved
+    run_id, or resolve_model_version_from_run_id raises naming the CLI that
+    mints it.
 
-    model_uri is the registry URI (models:/<name>/<version>) on either
-    explicit path — an immutable, version-pinned URI, not a moving alias —
-    and the receipt's own stored (run-scoped) URI on the receipt path: the
-    fully-automatic path never has to consult the registry at all, which is
-    what "resolve by run id, not registry version" means concretely.
+    model_uri is the registry URI (models:/<name>/<version>) on every path —
+    an immutable, version-pinned URI, not a moving alias.
     """
     if explicit_run_id is not None and explicit_model_version is not None:
         raise ValueError(
@@ -279,15 +297,50 @@ def resolve_model_identifier(
         run_id = resolve_model_run_id(model_version, cfg)
         model_uri = f"models:/{registered_model_name}/{model_version}"
         return run_id, model_version, model_uri
+    run_id = (
+        str(explicit_run_id)
+        if explicit_run_id is not None
+        else str(read_calibrate_receipt(cfg)["run_id"])
+    )
+    model_version = resolve_model_version_from_run_id(run_id, cfg)
+    model_uri = f"models:/{registered_model_name}/{model_version}"
+    return run_id, model_version, model_uri
+
+
+def resolve_calibrated_run(
+    explicit_run_id: str | None, cfg: DictConfig
+) -> tuple[str, str, str]:
+    """Resolve (run_id, model_uri, logged_model_id) for register.py's mint step — never the registry.
+
+    Unlike resolve_model_identifier above, this never looks up a
+    model_version: register.py's mint step (register_challenger) is what
+    *creates* one, so there is nothing to resolve yet. An explicit
+    register.run_id override reads the calibrated_model_id/
+    calibrated_model_uri tags calibrate.py sets directly on that run (see
+    calibrate.py's _log_calibration_run) — no receipt involved — so
+    re-registering an older calibration run, not necessarily the most recent
+    one on this machine, works without a local file that only ever describes
+    the latest one. Giving no override resolves from
+    reports/calibrate_receipt.json instead, the same convenience default
+    every other stage's __main__ uses.
+    """
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     if explicit_run_id is not None:
-        model_version = resolve_model_version_from_run_id(explicit_run_id, cfg)
-        model_uri = f"models:/{registered_model_name}/{model_version}"
-        return explicit_run_id, model_version, model_uri
+        run_id = str(explicit_run_id)
+        run = mlflow.tracking.MlflowClient().get_run(run_id)
+        model_id = run.data.tags.get("calibrated_model_id")
+        model_uri = run.data.tags.get("calibrated_model_uri")
+        if not model_id or not model_uri:
+            raise ValueError(
+                f"Run {run_id!r} has no calibrated_model_id/calibrated_model_uri "
+                "tags — was models.calibrate ever run for this run_id?"
+            )
+        return run_id, str(model_uri), str(model_id)
     receipt = read_calibrate_receipt(cfg)
     return (
         str(receipt["run_id"]),
-        str(receipt["model_version"]),
         str(receipt["model_uri"]),
+        str(receipt["logged_model_id"]),
     )
 
 
@@ -324,19 +377,28 @@ def read_train_receipt(cfg: DictConfig) -> dict[str, Any]:
 
 def write_calibrate_receipt(
     run_id: str,
-    model_version: str,
     logged_model_id: str,
     model_uri: str,
     cfg: DictConfig,
 ) -> None:
-    """Write reports/calibrate_receipt.json — threshold/evaluate/error_analysis's default pointer."""
+    """Write reports/calibrate_receipt.json — threshold/evaluate/error_analysis's and register.py's default pointer.
+
+    Never carries a model_version: calibrate.py performs no registry write of
+    its own (see that module's docstring), so no version exists yet at the
+    point this is written. model_uri is the run-scoped LoggedModel URI
+    calibrate.py's own log_model call returned, not a registry URI —
+    resolve_model_identifier's "neither given" default path turns this
+    receipt's run_id into a model_version by looking it up in the registry
+    (resolve_model_version_from_run_id), rather than trusting a value stored
+    here, so this file stays calibrate.py's own single-writer description of
+    a still-unregistered artifact.
+    """
     reports_dir = _reports_dir(cfg)
     reports_dir.mkdir(parents=True, exist_ok=True)
     with open(reports_dir / "calibrate_receipt.json", "w", encoding="utf-8") as f:
         json.dump(
             {
                 "run_id": run_id,
-                "model_version": model_version,
                 "logged_model_id": logged_model_id,
                 "model_uri": model_uri,
             },

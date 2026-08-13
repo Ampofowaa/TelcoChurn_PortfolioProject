@@ -6,8 +6,10 @@ env-var-to-engine joints that only surface at the process boundary.
 
 The full production chain up to (but not including) evaluate.py is seeded
 once per module via direct in-process calls — log_model.run_model_logging_step
--> calibrate.run_calibration_step -> threshold.run_threshold_step (which now
-folds in the dev-OOF screen as its own last step) — mirroring
+-> calibrate.run_calibration_step -> register.register_challenger (B1's
+mint step, decoupled from calibrate.py — this fixture calls it directly,
+mirroring what register.py's own mint-mode CLI does) -> threshold.run_threshold_step
+(which now folds in the dev-OOF screen as its own last step) — mirroring
 test_threshold_subprocess.py's own precedent one step further down the
 pipeline. Only evaluate.py itself crosses the subprocess boundary. A dev-OOF
 screen failure (a real slope outside the band on this synthetic fixture) is
@@ -23,6 +25,13 @@ No `champion` alias exists anywhere in this throwaway registry, so every test
 here exercises the cold-start regime (ANALYSIS.md §0) — the comparative
 regime needs a promoted champion. Coverage for the comparative branch belongs
 with register.py's own subprocess test (tests/integration/test_register_subprocess.py).
+
+test_evaluate_main_cli_accepts_explicit_champion_version_override covers the
+other half of resolve_evaluation_champion — an explicit
+`evaluate.champion_version=none` pins the cold-start regime without touching
+the (nonexistent, here) `champion` alias; the reproducibility path a `dvc
+repro` invocation is expected to use, per PROJECT_PLAN.md's Phase 8 note on
+the undeclared champion-alias dependency.
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ import pytest
 from omegaconf import OmegaConf
 
 import telco_churn.models.calibrate as calibrate
+import telco_churn.models.register as register_module
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
@@ -294,7 +304,13 @@ def registered_evaluation_model(
         log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
         cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
         run_id = str(cal_result["run_id"])
-        model_version = str(cal_result["model_version"])
+        model_uri = str(cal_result["model_uri"])
+        # B1's call-site decoupling: calibrate.py no longer registers
+        # anything itself, so this fixture mints the challenger the same way
+        # register.py's own mint-mode CLI would, in-process.
+        model_version = register_module.register_challenger(
+            cfg, run_id, model_uri, str(cal_result["logged_model_id"])
+        )
 
         try:
             threshold.run_threshold_step(run_id, model_version, cfg)
@@ -479,6 +495,35 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
     )
     assert receipt["eval_run_id"] == decision["eval_run_id"]
     assert receipt["model_version"] == str(registered_evaluation_model["model_version"])
+
+
+def test_evaluate_main_cli_accepts_explicit_champion_version_override(
+    registered_evaluation_model: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    """An explicit evaluate.champion_version=none pins the cold-start regime
+    without evaluate.py ever reading the (here, nonexistent) `champion`
+    alias — the reproducible path a DVC `cmd` string is expected to use."""
+    reports_dir = tmp_path / "reports"
+
+    result = _run_evaluate_cli(
+        str(registered_evaluation_model["model_version"]),
+        registered_evaluation_model,
+        reports_dir,
+        extra_overrides=["evaluate.champion_version=none"],
+    )
+
+    assert (
+        result.returncode == 0
+    ), f"evaluate CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+
+    decision = json.loads(
+        (reports_dir / "promotion_decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["regime"] == "cold_start"
+
+    metrics = json.loads((reports_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["champion_version"] is None
 
 
 def test_evaluate_main_cli_exits_one_when_model_version_missing(

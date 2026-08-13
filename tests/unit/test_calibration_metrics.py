@@ -23,7 +23,9 @@ def test_expected_calibration_error_near_zero_when_calibrated() -> None:
     proba = np.full(20, 0.10)
     y = pd.Series([1] * 2 + [0] * 18)  # observed frequency 0.10, matches proba
 
-    ece = calibration_metrics.expected_calibration_error(proba, y, _N_BINS, "uniform")
+    ece = calibration_metrics.expected_calibration_error(
+        proba, y, _N_BINS, "uniform", "test"
+    )
 
     assert ece == pytest.approx(0.0, abs=1e-9)
 
@@ -33,7 +35,9 @@ def test_expected_calibration_error_large_when_miscalibrated() -> None:
     proba = np.full(20, 0.90)
     y = pd.Series([1] * 2 + [0] * 18)  # observed frequency 0.10, predicted 0.90
 
-    ece = calibration_metrics.expected_calibration_error(proba, y, _N_BINS, "uniform")
+    ece = calibration_metrics.expected_calibration_error(
+        proba, y, _N_BINS, "uniform", "test"
+    )
 
     assert ece == pytest.approx(0.8, abs=1e-9)
 
@@ -50,7 +54,9 @@ def test_expected_calibration_error_constant_proba_detects_miscalibration() -> N
     proba = np.full(20, 0.10)
     y = pd.Series([1] * 18 + [0] * 2)  # observed frequency 0.90, predicted 0.10
 
-    ece = calibration_metrics.expected_calibration_error(proba, y, _N_BINS, "quantile")
+    ece = calibration_metrics.expected_calibration_error(
+        proba, y, _N_BINS, "quantile", "test"
+    )
 
     assert ece == pytest.approx(0.8, abs=1e-9)
 
@@ -67,7 +73,9 @@ def test_expected_calibration_error_warns_on_quantile_bin_collapse(
     proba = np.full(20, 0.10)
     y = pd.Series([1] * 2 + [0] * 18)
 
-    calibration_metrics.expected_calibration_error(proba, y, _N_BINS, "quantile")
+    calibration_metrics.expected_calibration_error(
+        proba, y, _N_BINS, "quantile", "dummy_prior"
+    )
 
     collapse_calls = [
         call
@@ -75,6 +83,7 @@ def test_expected_calibration_error_warns_on_quantile_bin_collapse(
         if call.args[0] == "ece_bins_collapsed"
     ]
     assert len(collapse_calls) == 1
+    assert collapse_calls[0].kwargs["label"] == "dummy_prior"
     assert collapse_calls[0].kwargs["configured_n_bins"] == _N_BINS
     assert collapse_calls[0].kwargs["effective_n_bins"] == 1
 
@@ -91,7 +100,9 @@ def test_expected_calibration_error_no_warning_without_collapse(
     proba = rng.uniform(0.01, 0.99, size=500)
     y = pd.Series(rng.integers(0, 2, size=500))
 
-    calibration_metrics.expected_calibration_error(proba, y, _N_BINS, "quantile")
+    calibration_metrics.expected_calibration_error(
+        proba, y, _N_BINS, "quantile", "test"
+    )
 
     collapse_calls = [
         call

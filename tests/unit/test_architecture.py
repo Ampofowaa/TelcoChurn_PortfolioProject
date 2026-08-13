@@ -388,23 +388,21 @@ def test_every_main_module_has_a_subprocess_test(module_path: Path) -> None:
 # No module imports from a __main__-bearing module, except a named allowance
 # --------------------------------------------------------------------------
 
-# Every legitimate cross-import of a __main__-bearing module. Two shapes:
-# (1) data/features stage modules — the sanctioned pattern
-#     data.split.partition()/features.build's constants already represent
-#     (test_only_evaluate_binds_the_test_partition polices the test-partition
-#     half of that pattern separately), plus each other's own __main__ CLI
-#     wiring (data/split.py's CLI validates via data/validate.py first;
-#     features/build.py's CLI builds SQL features via features/sql_features.py
-#     first) — pre-existing and unrelated to PR C. (2) models/register.py:
-#     calibrate.py, which the __main__-bearing register.py never imports back,
-#     calls its register_challenger via a documented function-local import
-#     (see calibrate.py's run_calibration_step and register.py's own module
-#     docstring) — the one direction PR C's own design keeps: calibrate.py ->
-#     register.py, never the reverse. PR C's point is that every *other*
-#     models/ pairing stays empty: calibrate.py, threshold.py, evaluate.py,
-#     error_analysis.py, and register.py otherwise import their shared
-#     helpers from calibration_metrics.py/artifacts.py/policy_config.py/
-#     gate.py/utils, never from one another.
+# Every legitimate cross-import of a __main__-bearing module — the
+# data/features stage modules' pre-existing, sanctioned pattern:
+# data.split.partition()/features.build's constants already represent
+# (test_only_evaluate_binds_the_test_partition polices the test-partition
+# half of that pattern separately), plus each other's own __main__ CLI wiring
+# (data/split.py's CLI validates via data/validate.py first; features/build.py's
+# CLI builds SQL features via features/sql_features.py first) — unrelated to
+# PR C. models/ carries no row: calibrate.py, threshold.py, evaluate.py,
+# error_analysis.py, and register.py import their shared helpers from
+# calibration_metrics.py/artifacts.py/policy_config.py/gate.py/utils, never
+# from one another — including calibrate.py <-> register.py, which no longer
+# cross-import at all now that register.py's mint step (register_challenger)
+# runs as its own CLI, resolving what it needs from an explicit override or
+# calibrate.py's reports/calibrate_receipt.json rather than an in-process
+# import.
 _MAIN_MODULE_IMPORT_ALLOWANCES: dict[str, set[str]] = {
     "data/split.py": {
         "models/dev_features.py",
@@ -424,7 +422,6 @@ _MAIN_MODULE_IMPORT_ALLOWANCES: dict[str, set[str]] = {
     },
     "data/validate.py": {"data/ingest.py", "data/split.py"},
     "features/sql_features.py": {"features/build.py"},
-    "models/register.py": {"models/calibrate.py"},
 }
 
 

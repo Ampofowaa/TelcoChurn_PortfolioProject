@@ -14,6 +14,7 @@ itself crosses the subprocess boundary.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -168,11 +169,14 @@ def _sqlite_experiment(tmp_path: Path, experiment_name: str) -> str:
     return tracking_uri
 
 
-def test_calibrate_main_cli_exits_zero_and_registers(tmp_path: Path) -> None:
-    """calibrate.py __main__ calibrates the seeded pipeline and registers challenger."""
+def test_calibrate_main_cli_exits_zero_and_logs(tmp_path: Path) -> None:
+    """calibrate.py __main__ calibrates and logs the pipeline — and performs
+    no registry write of its own (B1: register.py's mint step, run as its
+    own separate CLI step afterward, is what registers the challenger)."""
     data_dir = tmp_path / "processed"
     data_dir.mkdir()
     df, manifest = _seed_processed_data(data_dir)
+    reports_dir = tmp_path / "reports"
 
     experiment_name = str(compose_config().mlflow.experiment_name)
     tracking_uri = _sqlite_experiment(tmp_path, experiment_name)
@@ -192,6 +196,7 @@ def test_calibrate_main_cli_exits_zero_and_registers(tmp_path: Path) -> None:
             "telco_churn.models.calibrate",
             f"calibration.run_id={run_id}",
             f"paths.processed_data={data_dir}",
+            f"paths.reports={reports_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
         ],
         env=env,
@@ -208,9 +213,19 @@ def test_calibrate_main_cli_exits_zero_and_registers(tmp_path: Path) -> None:
     assert "calibration_step_done" in result.stdout
 
     client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
-    registered_name = str(compose_config().mlflow.registered_model_name)
-    registered_model = client.get_registered_model(registered_name)
-    assert "challenger" in registered_model.aliases
+    assert client.search_registered_models() == []
+
+    run = client.get_run(run_id)
+    assert run.data.tags["calibrated_model_id"]
+    assert run.data.tags["calibrated_model_uri"]
+
+    receipt = json.loads(
+        (reports_dir / "calibrate_receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["run_id"] == run_id
+    assert receipt["logged_model_id"] == run.data.tags["calibrated_model_id"]
+    assert receipt["model_uri"] == run.data.tags["calibrated_model_uri"]
+    assert "model_version" not in receipt
 
 
 def test_calibrate_main_cli_exits_one_when_run_id_missing(tmp_path: Path) -> None:

@@ -9,6 +9,17 @@ model_version: null
 # Alternative to model_version above — see its comment for the both/neither rules.
 run_id: null
 
+# Incumbent champion version to compare the candidate against, e.g.
+# `evaluate.champion_version=3`. The `champion` registry alias is
+# externally-mutable, moving state a DVC `cmd` string cannot declare as a
+# dep (PROJECT_PLAN.md's undeclared-dependency note) — a pipeline invocation
+# that cares about reproducibility resolves the alias once beforehand and
+# passes the version in explicitly. The literal string "none" pins the
+# cold-start regime explicitly (no incumbent, even if a champion is live).
+# Omitting this falls back to a live read of the `champion` alias — the
+# right default for interactive/notebook use, never for `dvc repro`.
+champion_version: null
+
 # Bootstrap resample count for every reported metric's CI (PR-AUC, recall, precision,
 # F1, BSS, calibration slope, EV). Distinct from comparison.py's
 # _FAMILY_REVIEW_N_BOOTSTRAP (Phase 5's notebook-only model-family comparison

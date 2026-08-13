@@ -583,6 +583,7 @@ def sliced_calibration(
                 pd.Series(y_seg),
                 int(cfg.calibration.ece_n_bins),
                 str(cfg.calibration.ece_strategy),
+                f"segment:{axis}={value}",
             )
             rows.append(
                 {

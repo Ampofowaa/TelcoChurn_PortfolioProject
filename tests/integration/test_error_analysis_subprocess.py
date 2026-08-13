@@ -35,6 +35,7 @@ from omegaconf import OmegaConf
 
 import telco_churn.models.calibrate as calibrate
 import telco_churn.models.evaluate as evaluate
+import telco_churn.models.register as register_module
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
@@ -274,8 +275,13 @@ def evaluated_model(tmp_path_factory: pytest.TempPathFactory) -> dict[str, objec
         log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
         cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
         run_id = str(cal_result["run_id"])
-        model_version = str(cal_result["model_version"])
         model_uri = str(cal_result["model_uri"])
+        # B1's call-site decoupling: calibrate.py no longer registers
+        # anything itself, so this fixture mints the challenger the same way
+        # register.py's own mint-mode CLI would, in-process.
+        model_version = register_module.register_challenger(
+            cfg, run_id, model_uri, str(cal_result["logged_model_id"])
+        )
 
         # A dev-OOF screen failure used to be tolerated here (threshold.py's
         # own RuntimeError, swallowed) since it didn't block evaluate.py.

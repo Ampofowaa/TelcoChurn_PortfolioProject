@@ -60,6 +60,7 @@ from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
     read_error_analysis_receipt,
     read_eval_receipt,
+    resolve_calibrated_run,
     set_registered_model_description,
 )
 from telco_churn.utils.paths import get_project_root
@@ -69,6 +70,7 @@ __all__ = [
     "champion_history",
     "check_environment_parity",
     "promote_to_alias",
+    "refresh_champion_reference",
     "register_challenger",
     "rollback_champion",
     "run_registration_step",
@@ -86,13 +88,21 @@ _MANIFEST_ARTIFACTS = (
 )
 
 _REGISTRY_DESCRIPTION = (
-    "Calibrated LightGBM churn-prediction pipeline for IBM Telco Customer "
-    "Churn. Selected by PR-AUC among Dummy/LogReg/LightGBM candidates, "
-    "calibrated (sigmoid), thresholded at a cost-sensitive cutoff "
-    "t* = c/(r x LTV). 'champion' serves production; 'challenger' holds the "
-    "most recent candidate. Every version carries a promotion_status tag "
-    "(pending/promoted/rejected) - only 'promoted' versions are valid "
-    "rollback targets."
+    "Calibrated LightGBM pipeline predicting customer churn for IBM's "
+    "Telco Customer Churn dataset.\n\n"
+    "**How a model gets here:** selected by PR-AUC among Dummy / Logistic "
+    "Regression / LightGBM candidates → calibrated (sigmoid) so its output "
+    "probabilities are trustworthy → assigned a cost-sensitive decision "
+    "threshold `t* = cost / (retention_rate × customer_LTV)`, balancing "
+    "the cost of a retention offer against the value of the customer it "
+    "might save.\n\n"
+    "**Aliases**\n"
+    "- `champion` — currently serving production predictions\n"
+    "- `challenger` — most recently trained candidate, pending "
+    "evaluation\n\n"
+    "**Version tags:** every version carries `promotion_status` "
+    "(`pending` / `promoted` / `rejected`). Only `promoted` versions are "
+    "valid rollback targets — never assume by version number alone."
 )
 
 _PENDING_VERSION_DESCRIPTION = "Awaiting sealed-test evaluation and promotion review."
@@ -181,17 +191,32 @@ def promote_to_alias(
 
 def register_challenger(
     cfg: DictConfig,
-    model_info: Any,
-    input_example: pd.DataFrame,
-    in_memory_preds: NDArray[np.float64],
+    run_id: str,
+    model_uri: str,
+    logged_model_id: str,
 ) -> str:
-    """Mint calibrate.py's fitted pipeline as a new registry version, tag it pending, and point `challenger` at it.
+    """Mint the calibrated pipeline named by (run_id, model_uri) as a new registry version, tag it pending, and point `challenger` at it.
 
-    Called from calibrate.py's `run_calibration_step` via a function-local
-    import (calibrate.py's own docstring explains why a top-level import
-    would be circular) — the extraction bullet's own point: calibrate.py
-    fits and logs a pure file transform, and this function is the only
-    registry-mutating call in the cycle before evaluation.
+    Runs as its own CLI step (this module's __main__), after calibrate.py
+    has already logged the calibrated pipeline and exited — never called
+    from calibrate.py's own process (see that module's docstring: a second
+    process can only be handed identifiers, not the in-memory fitted
+    pipeline). run_id/model_uri/logged_model_id are resolved by __main__ via
+    utils/mlflow.py::resolve_calibrated_run, from an explicit
+    register.run_id override or calibrate.py's own receipt — never from an
+    in-memory object, which is the reason this function no longer takes a
+    log_model ModelInfo. This is still the only registry-mutating call in
+    the cycle before evaluation.
+
+    Mints via `mlflow.register_model(model_uri, ...)` — calibrate.py
+    deliberately logs its model unregistered (no `registered_model_name=`
+    on its own `log_model` call, see that module's docstring), so this is the
+    only registry-mutating create-version call in the cycle. `register_model`
+    auto-creates the registered model itself on a project's first-ever
+    version, which is why the mint happens before
+    `set_registered_model_description` below rather than after: that call is
+    an update, not an upsert, and would fail against a registered model that
+    doesn't exist yet.
 
     Tags `promotion_status: pending` immediately after mint, before reload
     parity is even checked — the fail-safe mint-time default (CLAUDE.md §
@@ -202,14 +227,22 @@ def register_challenger(
     re-set on every registration, so the registry overview page never
     describes a stale training cycle.
 
-    Raises AssertionError, leaving the version tagged `pending` (not
-    untagged, not `rejected` — no verdict has been reached), if the reloaded
-    model's predictions disagree with the in-memory pipeline's on the same
-    input sample: the serialized model would not be safe to serve.
+    The reload-parity check reuses `_check_golden_parity` against
+    `golden_predictions.json` (calibrate.py's own logged reference, captured
+    in-memory before pickling touched anything) at `cfg.register.golden_atol`
+    — the same mechanism `run_registration_step`'s pre-flip check uses later
+    in the cycle, rather than an ad-hoc in-memory comparison a second process
+    could never have received in the first place. Raises AssertionError,
+    leaving the version tagged `pending` (not untagged, not `rejected` — no
+    verdict has been reached), if the reloaded model's predictions disagree
+    with the golden reference beyond tolerance: the serialized model would
+    not be safe to serve.
     """
     registered_model_name = str(cfg.mlflow.registered_model_name)
-    version = str(model_info.registered_model_version)
     client = mlflow.tracking.MlflowClient()
+
+    registered_version = mlflow.register_model(model_uri, registered_model_name)
+    version = str(registered_version.version)
 
     set_registered_model_description(registered_model_name, _REGISTRY_DESCRIPTION)
     client.update_model_version(
@@ -222,7 +255,7 @@ def register_challenger(
     # is the only supported hop from "the version being evaluated" to the
     # LoggedModel Phase 7's evaluate.py attaches sealed-test metrics to.
     client.set_model_version_tag(
-        registered_model_name, version, "logged_model_id", model_info.model_id
+        registered_model_name, version, "logged_model_id", logged_model_id
     )
     # Mint-time default, set before anything downstream can fail: a crash in
     # the parity check below, evaluate.py, error_analysis.py, or the rest of
@@ -235,14 +268,11 @@ def register_challenger(
         registered_model_name, version, "promotion_status", "pending"
     )
 
-    reloaded = mlflow.sklearn.load_model(model_info.model_uri)
-    reload_preds = reloaded.predict_proba(input_example)
-    if not np.allclose(in_memory_preds, reload_preds, rtol=0, atol=1e-12):
-        raise AssertionError(
-            "Reload parity check failed: predictions from the reloaded "
-            "calibrated model differ from the in-memory pipeline on the same "
-            "input sample — the serialized model is not safe to register."
-        )
+    golden = mlflow.artifacts.load_dict(
+        f"runs:/{run_id}/calibration/golden_predictions.json"
+    )
+    reloaded = mlflow.sklearn.load_model(model_uri)
+    _check_golden_parity(reloaded, golden, float(cfg.register.golden_atol))
 
     # Deliberately the last step: the alias is what makes a version
     # reachable by evaluate.py/register.py/a human, so nothing may be
@@ -383,12 +413,19 @@ def _append_promotion_event(registered_model_name: str, event: dict[str, Any]) -
 
 
 def champion_history(registered_model_name: str) -> list[dict[str, Any]]:
-    """Return every champion promotion/rollback, oldest first.
+    """Return every champion promotion/rollback/reference-refresh, oldest first.
 
-    Each entry is {"action": "promoted" | "rolled_back", "version",
-    "previous_champion_version" | "rolled_back_from", "at"}. "What was
-    champion before this one" is history[-2] — a direct index into an
-    append-only log, not a scan over model-version tags. A rolled_back
+    Each entry is one of:
+      - {"action": "promoted", "version", "previous_champion_version", "at"}
+      - {"action": "rolled_back", "version", "rolled_back_from", "at"}
+      - {"action": "reference_refreshed", "version", "previous_eval_run_id",
+        "eval_run_id", "at"} — refresh_champion_reference() re-pointing an
+        already-promoted version's own eval_run_id/gate-criteria tags at a
+        fresh re-evaluation; the alias never moves for this action, unlike
+        the other two.
+    "What was champion before this one" is history[-2] among "promoted"/
+    "rolled_back" entries specifically — a reference_refresh does not move
+    the alias, so it does not participate in that indexing. A rolled_back
     entry with version=None means there was no earlier promoted version to
     restore, so the champion alias was unset entirely rather than
     re-pointed.
@@ -1382,6 +1419,136 @@ def _load_and_verify_evaluation_artifacts(
     return {"eval_run_id": eval_run_id, "decision": decision, "metrics": metrics}
 
 
+def refresh_champion_reference(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+    """Re-point an already-promoted reference version's eval_run_id/gate-criteria
+    tags at a fresh cold-start re-evaluation of that same version.
+
+    Closes a real gap in models.evaluate's load_incumbent_proba guardrail: it
+    refuses to compare a candidate against a champion whose historical
+    test_predictions.parquet was computed against a different processed-
+    features file (a changed data_content_hash — e.g. a new engineered
+    column added since the champion was promoted, even though the champion's
+    own frozen feature_columns.txt never reads it). The prescribed recovery
+    is to re-run `models.evaluate` for the champion's own run_id/model_version
+    with `evaluate.champion_version=none` (cold start — a version can't be
+    its own incumbent) against the current features file. That produces a
+    fresh eval run with a fresh data_content_hash, but nothing wired that run
+    back into the champion's own model-version tags until this function:
+    register.py's ordinary path (run_registration_step /
+    _resolve_and_tag_eval_run_id) trusts an already-tagged eval_run_id
+    forever, by design, so it can never pick the new run up on its own.
+
+    This is not a promotion decision and does not become one: the gate is
+    not run, require_review is not consulted, promotion_status and the
+    champion/challenger alias are untouched. The champion is not retrained
+    and not re-scored on anything it didn't already train on — it is the
+    same fitted pipeline, re-evaluated against a file that now happens to
+    carry columns it doesn't read. Only the provenance tags every future
+    comparison resolves through (eval_run_id, the four gate-criteria tags)
+    are updated in place, so this is scoped to versions that are already a
+    reference for someone: refreshing a pending or rejected version's tags
+    has no meaning, since neither is a comparison baseline to begin with.
+
+    Requires the fresh eval run to be resolvable from
+    reports/eval_receipt.json (the same first-invocation bootstrap pointer
+    every other resolver in this module uses — meaning models.evaluate must
+    have been the last thing run for this model_version on this machine),
+    to have promotion_decision.json's embedded model_version match, and to
+    carry regime == "cold_start" (a comparative run would mean this version
+    was diffed against some *other* incumbent, not re-evaluated on its own
+    terms — never a valid source for its own reference tags). Verifies
+    metrics.json against promotion_decision.json's metrics_content_hash,
+    the same evidence check _load_and_verify_evaluation_artifacts already
+    makes for a fresh promotion.
+    """
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+    client = mlflow.tracking.MlflowClient()
+    current_version = client.get_model_version(registered_model_name, model_version)
+
+    current_status = current_version.tags.get("promotion_status")
+    if current_status != "promoted":
+        raise RuntimeError(
+            f"Model version {model_version!r} carries promotion_status="
+            f"{current_status!r}, not 'promoted' — only an already-promoted "
+            "reference version's tags can be refreshed. A pending or "
+            "rejected version was never a comparison reference to begin "
+            "with, so it has no stale reference tags to fix."
+        )
+
+    receipt = read_eval_receipt(cfg)
+    receipt_model_version = str(receipt["model_version"])
+    if receipt_model_version != str(model_version):
+        raise RuntimeError(
+            f"reports/eval_receipt.json was written for model_version="
+            f"{receipt_model_version!r}, not {model_version!r} — "
+            "models.evaluate was not the last thing run for this model "
+            "version on this machine. Re-run it first: "
+            f"evaluate.model_version={model_version} "
+            "evaluate.champion_version=none."
+        )
+    new_eval_run_id = str(receipt["eval_run_id"])
+
+    decision = mlflow.artifacts.load_dict(
+        f"runs:/{new_eval_run_id}/promotion_decision.json"
+    )
+    decision_model_version = str(decision["model_version"])
+    if decision_model_version != str(model_version):
+        raise ValueError(
+            f"promotion_decision.json (run {new_eval_run_id!r}) was computed "
+            f"for model_version={decision_model_version!r}, not "
+            f"{model_version!r} — refusing to act on a decision for a "
+            "different artifact."
+        )
+    if decision["regime"] != "cold_start":
+        raise ValueError(
+            f"promotion_decision.json (run {new_eval_run_id!r}) has regime="
+            f"{decision['regime']!r}, not 'cold_start' — a reference "
+            "refresh must be this version's own re-evaluation, not a "
+            "comparison against some other incumbent. Re-run it with "
+            f"evaluate.model_version={model_version} "
+            "evaluate.champion_version=none."
+        )
+
+    metrics = mlflow.artifacts.load_dict(f"runs:/{new_eval_run_id}/metrics.json")
+    stamped_metrics_hash = str(decision.get("metrics_content_hash"))
+    if content_hash(metrics) != stamped_metrics_hash:
+        raise ValueError(
+            "promotion_decision.json's metrics_content_hash does not match a "
+            f"fresh hash of metrics.json on run {new_eval_run_id!r} — the "
+            "decision was computed against a different metrics.json than the "
+            "one currently logged. Refusing to act on a decision that "
+            "cannot be verified against its own evidence."
+        )
+
+    previous_eval_run_id = current_version.tags.get("eval_run_id")
+    client.set_model_version_tag(
+        registered_model_name, model_version, "eval_run_id", new_eval_run_id
+    )
+    _tag_gate_criteria(client, registered_model_name, model_version, metrics)
+
+    _append_promotion_event(
+        registered_model_name,
+        {
+            "action": "reference_refreshed",
+            "version": model_version,
+            "previous_eval_run_id": previous_eval_run_id,
+            "eval_run_id": new_eval_run_id,
+            "at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        },
+    )
+    logger.info(
+        "champion_reference_refreshed",
+        model_version=model_version,
+        previous_eval_run_id=previous_eval_run_id,
+        eval_run_id=new_eval_run_id,
+    )
+    return {
+        "model_version": model_version,
+        "eval_run_id": new_eval_run_id,
+        "previous_eval_run_id": previous_eval_run_id,
+    }
+
+
 def _resolve_review_verdict(eval_run_id: str) -> dict[str, Any] | None:
     """Fetch promotion_review.json's latest entry from the eval run, if any exist.
 
@@ -1805,11 +1972,17 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
            pass — tagging it immediately either way); load and hash-verify
            promotion_decision.json/metrics.json against it; tag the four
            gate criteria.
-        3. Enforce human review if cfg.register.require_review is set —
-           reads promotion_review.json's latest entry off the eval run.
+        3. Stop and tag rejected if the gate itself failed — checked before
+           human review, not after: a gate failure vetoes unconditionally
+           (CLAUDE.md's "guardrails may veto; they may never promote"), so
+           no review verdict can change the outcome, and none is required
+           to exist for a candidate the gate has already rejected.
+        4. Enforce human review if cfg.register.require_review is set (the
+           gate already passed at this point, so review is the only
+           remaining thing that can still block promotion) — reads
+           promotion_review.json's latest entry off the eval run.
            "rejected" tags rejected (human_rejected) and returns; anything
            other than "approved"/"rejected" raises; no entry at all raises.
-        4. Stop and tag rejected if the gate itself failed.
         5. Independent re-check of threshold.py's dev-OOF pre-seal screen
            (calibration_slope + v3_direction_sanity) via
            check_threshold_screen_passed — the out-of-band manual
@@ -1859,6 +2032,12 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
     decision = eval_artifacts["decision"]
     metrics = eval_artifacts["metrics"]
 
+    if decision["gate"] == "fail":
+        _tag_rejected(
+            client, registered_model_name, model_version, decision, "gate_fail"
+        )
+        return {"model_version": model_version, "promotion_status": "rejected"}
+
     review_entry: dict[str, Any] | None = None
     if bool(cfg.register.require_review):
         review_entry = _resolve_review_verdict(eval_run_id)
@@ -1886,12 +2065,6 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
                 "not 'approved' or 'rejected' — refusing to act on an "
                 "unrecognized verdict."
             )
-
-    if decision["gate"] == "fail":
-        _tag_rejected(
-            client, registered_model_name, model_version, decision, "gate_fail"
-        )
-        return {"model_version": model_version, "promotion_status": "rejected"}
 
     run_id = str(current_version.run_id)
     # Independent re-check, same as evaluate.py/error_analysis.py — closes
@@ -1984,21 +2157,74 @@ if __name__ == "__main__":
     load_dotenv()
     configure_logging()
 
-    def _require_model_version(cfg: DictConfig) -> str:
-        """Return register.model_version, raising if the CLI override was not supplied."""
-        if cfg.register.model_version is None:
-            raise ValueError(
-                "register.model_version is required, e.g. `python -m "
-                "telco_churn.models.register register.model_version=2`"
+    def _dispatch_mode(cfg: DictConfig) -> str:
+        """Return "refresh", "promote", or "mint" from register.{refresh_reference_version,model_version,run_id}.
+
+        Mutually exclusive, mirroring the run_id/model_version
+        disambiguation rule every other stage CLI already follows.
+        refresh_reference_version identifies an already-promoted version
+        whose eval_run_id/gate-criteria tags need re-pointing at a fresh
+        cold-start re-evaluation (refresh_champion_reference) — see that
+        function's docstring for when this is the right operation, distinct
+        from both promotion paths below since no gate runs and no alias
+        moves. model_version identifies an already-registered version — the
+        promote/reject path (run_registration_step) — and can only ever
+        mean that, since minting a version *creates* one; passing an
+        existing version to register_challenger would not be a valid
+        request. run_id identifies a calibration run to mint as a new
+        challenger version (register_challenger); giving none of the three
+        also mints, defaulting run_id from calibrate.py's own receipt via
+        resolve_calibrated_run — the same convenience-default shape every
+        other stage's __main__ uses.
+        """
+        given = [
+            name
+            for name, value in (
+                ("refresh_reference_version", cfg.register.refresh_reference_version),
+                ("model_version", cfg.register.model_version),
+                ("run_id", cfg.register.run_id),
             )
-        return str(cfg.register.model_version)
+            if value is not None
+        ]
+        if len(given) > 1:
+            raise ValueError(
+                f"More than one of register.{{{', '.join(given)}}} was given "
+                "— ambiguous: refresh_reference_version re-points an "
+                "already-promoted version's own reference tags, model_version "
+                "selects the promote/reject path for an already-registered "
+                "version, run_id selects the mint path for a not-yet-"
+                "registered calibration run. Pass exactly one, or none to "
+                "mint the most recent calibration run."
+            )
+        if cfg.register.refresh_reference_version is not None:
+            return "refresh"
+        return "promote" if cfg.register.model_version is not None else "mint"
 
     try:
         cfg = compose_config(overrides=sys.argv[1:] or None)
         activate_config(cfg)
-        cli_model_version = _require_model_version(cfg)
-        result = run_registration_step(cli_model_version, cfg)
-        logger.info("registration_step_done", **result)
+        mode = _dispatch_mode(cfg)
+        if mode == "refresh":
+            result = refresh_champion_reference(
+                str(cfg.register.refresh_reference_version), cfg
+            )
+            logger.info("reference_refresh_done", **result)
+        elif mode == "promote":
+            result = run_registration_step(str(cfg.register.model_version), cfg)
+            logger.info("registration_step_done", **result)
+        else:
+            cli_run_id, cli_model_uri, cli_logged_model_id = resolve_calibrated_run(
+                cfg.register.run_id, cfg
+            )
+            challenger_version = register_challenger(
+                cfg, cli_run_id, cli_model_uri, cli_logged_model_id
+            )
+            logger.info(
+                "challenger_registered",
+                run_id=cli_run_id,
+                model_version=challenger_version,
+                model_uri=cli_model_uri,
+            )
     except EnvironmentMismatchError as e:
         logger.error("registration_environment_mismatch", error=str(e), exc_info=True)
         sys.exit(1)

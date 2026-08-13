@@ -35,7 +35,7 @@ from sklearn.dummy import DummyClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from telco_churn.data.split import partition
-from telco_churn.features.accessor import load_features
+from telco_churn.features.accessor import features_sha256, load_features
 from telco_churn.features.build import TARGET_COL
 from telco_churn.models.artifacts import (
     committed_features_from_manifest,
@@ -121,6 +121,7 @@ __all__ = [
     "load_test_customer_ids",
     "load_test_features",
     "load_test_segment_lookup",
+    "resolve_evaluation_champion",
     "resolve_incumbent_summary",
     "resolve_logged_model_id",
     "run_evaluation_step",
@@ -494,7 +495,9 @@ def sealed_test_calibration_report(
         "brier": candidate_brier,
         "dummy_prior_brier": reference_brier,
         "bss": brier_skill_score(candidate_brier, reference_brier),
-        "ece": expected_calibration_error(p, y_test, ece_n_bins, ece_strategy),
+        "ece": expected_calibration_error(
+            p, y_test, ece_n_bins, ece_strategy, "test_candidate"
+        ),
         "murphy_decomposition": murphy_decomposition(
             p, y_test, ece_n_bins, ece_strategy
         ),
@@ -573,26 +576,102 @@ def sliced_business_impact(
     return rows
 
 
-def load_incumbent_proba(champion_version: str, cfg: DictConfig) -> NDArray[np.float64]:
-    """Score the champion (by its already-resolved explicit version, never
-    re-reading the alias) on the identical sealed-test rows the candidate is
-    scored on.
+def load_incumbent_proba(
+    champion_version: str,
+    champion_eval_run_id: str,
+    champion_data_content_hash: str,
+    candidate_customer_ids: pd.Series,
+    candidate_y_test: pd.Series,
+    cfg: DictConfig,
+) -> NDArray[np.float64]:
+    """Read the champion's own historical sealed-test predictions rather than
+    re-scoring it live.
 
-    Loads the full test partition rather than a committed-feature-restricted
-    subset: the champion may have been frozen against a different feature
-    spec than the candidate being evaluated this cycle, and a Pipeline's own
-    ColumnTransformer selects the columns it needs by name regardless of
-    which superset of columns it is handed — so passing the same full
-    dataframe to both candidate and incumbent is what makes the comparison
-    robust to that mismatch, rather than assuming the two share one
-    committed_features list.
+    The champion's test_predictions.parquet (customerid, y_true, p_hat) was
+    logged onto its own eval run — champion_eval_run_id, resolved by the
+    caller via resolve_incumbent_summary — at the moment *it* was evaluated
+    and promoted: an immutable, already-materialized artifact, not something
+    this cycle recomputes. Reading it instead of loading the champion's
+    fitted pipeline and re-running inference removes two live-coupling costs
+    at once: no second model deserialization/inference pass every cycle, and
+    no exposure to library/environment drift silently perturbing the
+    champion's historical numbers between cycles — a second-order
+    reproducibility gap resolve_evaluation_champion's explicit version pin
+    doesn't by itself close, since pinning *which* version is champion still
+    leaves *how it's scored* live unless the scoring itself is also frozen.
+
+    Checked against the current processed-features file's own content hash
+    first, before any download: customerid/label agreement alone can't rule
+    out the feature pipeline having changed under an unchanged customer set
+    (e.g. a new engineered column added to every row) — a candidate scored
+    on a different feature space than the champion was is not a fair
+    comparison even though nothing about the test partition's membership
+    moved. Raises loudly, naming both hashes, rather than silently comparing
+    across feature spaces.
+
+    Reindexed onto candidate_customer_ids's exact row order rather than
+    trusted to already match — the two vectors come from different
+    evaluate.py runs (this cycle's and the champion's own), so alignment
+    can't be assumed from row order alone the way it could when both were
+    scored together in one process. Raises loudly, naming the champion
+    version and its eval run, if the champion's recorded test customer set
+    isn't identical to the candidate's (the canonical split moved since the
+    champion was last evaluated — no fair paired comparison is possible
+    without re-evaluating the champion against the current split) or if any
+    shared customerid's recorded label disagrees (a same-customer label
+    change should never happen on this project's static dataset and signals
+    a deeper data-integrity problem, not a stale split).
     """
-    registered_model_name = str(cfg.mlflow.registered_model_name)
-    incumbent_model = load_fitted_model(
-        f"models:/{registered_model_name}/{champion_version}", cfg
+    candidate_data_content_hash = features_sha256()
+    if candidate_data_content_hash != champion_data_content_hash:
+        raise RuntimeError(
+            f"Champion model version {champion_version!r}'s historical "
+            f"sealed-test predictions (eval run {champion_eval_run_id!r}) "
+            f"were computed against a different processed-features file "
+            f"(data_content_hash {champion_data_content_hash!r}) than the "
+            f"one on disk now ({candidate_data_content_hash!r}) — the "
+            "feature pipeline has changed since the champion was last "
+            "evaluated, so its historical predictions aren't a fair "
+            "comparison even if the customer set still matches. Re-run "
+            "models.evaluate for the champion's own run_id/model_version "
+            "against the current features file, or pin "
+            "evaluate.champion_version=none to compare cold-start instead."
+        )
+
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    local_path = mlflow.artifacts.download_artifacts(
+        artifact_uri=f"runs:/{champion_eval_run_id}/test_predictions.parquet"
     )
-    test_df = _load_test_partition()
-    proba: NDArray[np.float64] = incumbent_model.predict_proba(test_df)[:, 1]
+    champion_predictions = pd.read_parquet(local_path)
+
+    champion_ids = set(champion_predictions["customerid"])
+    candidate_ids = set(candidate_customer_ids)
+    if champion_ids != candidate_ids:
+        raise RuntimeError(
+            f"Champion model version {champion_version!r}'s historical "
+            f"sealed-test predictions (eval run {champion_eval_run_id!r}) "
+            "cover a different customer set than the current sealed test "
+            "partition — the canonical split has moved since the champion "
+            "was last evaluated. Re-run models.evaluate for the champion's "
+            "own run_id/model_version against the current split, or pin "
+            "evaluate.champion_version=none to compare cold-start instead."
+        )
+
+    aligned = champion_predictions.set_index("customerid").loc[candidate_customer_ids]
+    if not np.array_equal(
+        aligned["y_true"].to_numpy(dtype=np.int64),
+        candidate_y_test.to_numpy(dtype=np.int64),
+    ):
+        raise RuntimeError(
+            f"Champion model version {champion_version!r}'s historical "
+            f"sealed-test labels (eval run {champion_eval_run_id!r}) "
+            "disagree with the candidate's for at least one shared "
+            "customerid — the same customer carries different churn labels "
+            "between the two evaluation cycles, which should never happen "
+            "on a static dataset."
+        )
+
+    proba: NDArray[np.float64] = aligned["p_hat"].to_numpy(dtype=np.float64)
     return proba
 
 
@@ -619,6 +698,17 @@ def resolve_incumbent_summary(
     this incumbent number was tagged under whatever costs.yaml was live at
     its own promotion — a different hash means it was never actually served
     under today's cost assumptions.
+
+    data_content_hash is likewise a run tag, fetched the same way. It is also
+    load_incumbent_proba's own input — that function refuses to compare
+    against a champion whose historical predictions were computed against a
+    different processed-features file, since a customerid/label match alone
+    can't rule out the feature pipeline having changed under the same
+    customer set.
+
+    The returned eval_run_id is also load_incumbent_proba's own input — the
+    caller resolves it once here rather than each function re-deriving it
+    from a second get_model_version call.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     registered_model_name = str(cfg.mlflow.registered_model_name)
@@ -644,11 +734,16 @@ def resolve_incumbent_summary(
         )
 
     eval_run_tags = client.get_run(tags["eval_run_id"]).data.tags
-    if "costs_config_hash" not in eval_run_tags:
+    missing_run_tags = [
+        key
+        for key in ("costs_config_hash", "data_content_hash")
+        if key not in eval_run_tags
+    ]
+    if missing_run_tags:
         raise RuntimeError(
             f"Champion model version {champion_version!r}'s evaluation run "
-            f"{tags['eval_run_id']!r} is missing the costs_config_hash tag "
-            "— every evaluation run sets it. Re-run models.evaluate for "
+            f"{tags['eval_run_id']!r} is missing tag(s) {missing_run_tags} "
+            "— every evaluation run sets them. Re-run models.evaluate for "
             "that version."
         )
 
@@ -659,7 +754,31 @@ def resolve_incumbent_summary(
         "brier": float(tags["test_brier"]),
         "calibration_slope": float(tags["test_calibration_slope"]),
         "costs_config_hash": eval_run_tags["costs_config_hash"],
+        "data_content_hash": eval_run_tags["data_content_hash"],
+        "eval_run_id": tags["eval_run_id"],
     }
+
+
+def resolve_evaluation_champion(cfg: DictConfig) -> str | None:
+    """Resolve the incumbent champion version to compare the candidate against.
+
+    An explicit `evaluate.champion_version` override is read verbatim and
+    never touches the `champion` alias — the alias is externally-mutable,
+    moving registry state a DVC `cmd` string cannot declare as a dep
+    (PROJECT_PLAN.md's undeclared-dependency note on the Phase 8 DAG), so a
+    reproducible invocation resolves it once beforehand and passes the
+    version in. The literal string "none" pins the cold-start regime
+    explicitly, even if a champion happens to be live. Omitting the override
+    (the config default) falls back to resolve_champion_version's live alias
+    read — the right behaviour for interactive/notebook use, where reading
+    "whichever champion is live right now" is exactly what's wanted.
+    """
+    override = cfg.evaluate.champion_version
+    if override is None:
+        return resolve_champion_version(cfg)
+    if str(override).strip().lower() == "none":
+        return None
+    return str(override)
 
 
 def comparative_deltas(
@@ -782,13 +901,14 @@ def sealed_test_promotion_decision(
     the point ANALYSIS.md §0 and CLAUDE.md fix as where the decision is made.
 
     incumbent_proba is None for a cold start (no champion yet, resolved by
-    resolve_champion_version returning None); otherwise the champion's own
-    probabilities on these exact sealed-test rows (load_incumbent_proba),
-    scored once by the caller and passed in — never re-derived here — so the
-    paired deltas this function computes are over the identical evaluation
-    set the veto-only guardrails were also measured on. The caller persists
-    the returned verdict to reports/promotion_decision.json; this function
-    does not write anything.
+    resolve_evaluation_champion returning None); otherwise the champion's own
+    historical sealed-test probabilities, aligned onto these exact rows
+    (load_incumbent_proba, which reads them off the champion's own eval run
+    rather than re-scoring it), read once by the caller and passed in — never
+    re-derived here — so the paired deltas this function computes are over
+    the identical evaluation set the veto-only guardrails were also measured
+    on. The caller persists the returned verdict to
+    reports/promotion_decision.json; this function does not write anything.
     """
     deltas = None
     if incumbent_proba is not None:
@@ -1298,6 +1418,7 @@ def _compute_promotion_decision(
     run_id: str,
     y_test: pd.Series,
     proba: NDArray[np.float64],
+    customer_ids: pd.Series,
     core_metrics: dict[str, Any],
     policy_ctx: dict[str, Any],
     cfg: DictConfig,
@@ -1309,19 +1430,37 @@ def _compute_promotion_decision(
     reader, register.py's model card, fetches load_dev_oof_diagnostics(run_id,
     cfg) directly, off the same canonical MLflow artifact this run_id already
     points at — one owner, one read, not a chain of copies.
+
+    The incumbent is resolved via resolve_evaluation_champion, not a bare
+    resolve_champion_version(cfg) call — see that function's docstring for
+    why the champion alias must be an explicit, caller-supplied override
+    under `dvc repro` rather than a live read from inside this stage.
+
+    incumbent_summary is resolved before incumbent_proba, not independently
+    of it — both need the champion's eval_run_id and data_content_hash, and
+    resolve_incumbent_summary already looks both up as part of reading the
+    four gate-criteria tags, so load_incumbent_proba takes them as parameters
+    rather than re-resolving either with a second registry round trip.
     """
     bars = load_model_promotion_bars(cfg)
 
-    champion_version = resolve_champion_version(cfg)
-    incumbent_proba = (
-        None
-        if champion_version is None
-        else load_incumbent_proba(champion_version, cfg)
-    )
+    champion_version = resolve_evaluation_champion(cfg)
     incumbent_summary = (
         None
         if champion_version is None
         else resolve_incumbent_summary(champion_version, cfg)
+    )
+    incumbent_proba = (
+        None
+        if champion_version is None or incumbent_summary is None
+        else load_incumbent_proba(
+            champion_version,
+            str(incumbent_summary["eval_run_id"]),
+            str(incumbent_summary["data_content_hash"]),
+            customer_ids,
+            y_test,
+            cfg,
+        )
     )
     decision = sealed_test_promotion_decision(
         y_test,
@@ -1621,6 +1760,11 @@ def _log_evaluation_run(
             "costs_config_hash",
             costs_config_hash(get_project_root() / str(cfg.paths.costs_config)),
         )
+        # Fingerprints the processed-features file this candidate was scored
+        # against, so a later comparative cycle (load_incumbent_proba) can
+        # detect a feature-pipeline change even when the sealed test
+        # partition's customerid membership happens to be unaffected by it.
+        mlflow.set_tag("data_content_hash", features_sha256())
 
         mlflow.set_tag("gate_regime", decision["regime"])
         mlflow.set_tag("gate_result", decision["gate"])
@@ -1699,7 +1843,9 @@ def run_evaluation_step(
     model_version override, never an alias, or calibrate.py's receipt),
     scores the sealed test set exactly once, computes every metrics/
     economics/slice block from that one probability vector, resolves the
-    incumbent champion (if any) to score on the identical rows, and calls
+    incumbent champion (if any) and reads its own historical predictions off
+    its eval run rather than re-scoring it (load_incumbent_proba never
+    touches the sealed test set a second time), and calls
     gate.py::decide_promotion — the single pass CLAUDE.md's "test set
     touched once" invariant permits.
 
@@ -1722,7 +1868,13 @@ def run_evaluation_step(
     sensitivity_block = _compute_sensitivity_block(y_test, proba, policy_ctx, cfg)
     sliced = _compute_sliced_diagnostics(y_test, proba, policy_ctx, cfg)
     decision_result = _compute_promotion_decision(
-        loaded["run_id"], y_test, proba, core_metrics, policy_ctx, cfg
+        loaded["run_id"],
+        y_test,
+        proba,
+        loaded["customer_ids"],
+        core_metrics,
+        policy_ctx,
+        cfg,
     )
 
     payloads = _assemble_metrics_and_economics_payloads(

@@ -617,6 +617,49 @@ def test_load_model_promotion_bars_reads_real_config() -> None:
 
 
 # ---------------------------------------------------------------------------
+# resolve_evaluation_champion
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_evaluation_champion_explicit_override_skips_alias_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit evaluate.champion_version is returned verbatim, and
+    resolve_champion_version (the live alias read) is never called."""
+
+    def _fail_if_called(_cfg: DictConfig) -> str | None:
+        raise AssertionError("resolve_champion_version must not be called")
+
+    monkeypatch.setattr(evaluate, "resolve_champion_version", _fail_if_called)
+    cfg = OmegaConf.create({"evaluate": {"champion_version": "3"}})
+    assert evaluate.resolve_evaluation_champion(cfg) == "3"
+
+
+def test_resolve_evaluation_champion_explicit_none_pins_cold_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The literal "none" override pins the cold-start regime explicitly,
+    without touching the live alias — even if a champion happens to exist."""
+
+    def _fail_if_called(_cfg: DictConfig) -> str | None:
+        raise AssertionError("resolve_champion_version must not be called")
+
+    monkeypatch.setattr(evaluate, "resolve_champion_version", _fail_if_called)
+    cfg = OmegaConf.create({"evaluate": {"champion_version": "none"}})
+    assert evaluate.resolve_evaluation_champion(cfg) is None
+
+
+def test_resolve_evaluation_champion_omitted_falls_back_to_live_alias_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting the override (the config default, null) falls back to a live
+    resolve_champion_version(cfg) read — the interactive/notebook default."""
+    monkeypatch.setattr(evaluate, "resolve_champion_version", lambda _cfg: "7")
+    cfg = OmegaConf.create({"evaluate": {"champion_version": None}})
+    assert evaluate.resolve_evaluation_champion(cfg) == "7"
+
+
+# ---------------------------------------------------------------------------
 # resolve_incumbent_summary
 # ---------------------------------------------------------------------------
 
@@ -627,10 +670,11 @@ def _tag_incumbent_version(
     eval_run_id: str,
     *,
     include_costs_hash: bool = True,
+    include_data_hash: bool = True,
 ) -> None:
     """Mint the tag set _tag_evaluated_model_version + _log_evaluation_run
     would leave on a real champion: the four gate criteria and eval_run_id
-    on the version, costs_config_hash on the run itself.
+    on the version, costs_config_hash/data_content_hash on the run itself.
     """
     client = mlflow.tracking.MlflowClient()
     client.set_model_version_tag(registered_model_name, version, "test_pr_auc", "0.7")
@@ -644,6 +688,8 @@ def _tag_incumbent_version(
     )
     if include_costs_hash:
         client.set_tag(eval_run_id, "costs_config_hash", "deadbeef")
+    if include_data_hash:
+        client.set_tag(eval_run_id, "data_content_hash", "feedface")
 
 
 def test_resolve_incumbent_summary_returns_expected_fields(
@@ -678,6 +724,8 @@ def test_resolve_incumbent_summary_returns_expected_fields(
         "brier": 0.15,
         "calibration_slope": 1.02,
         "costs_config_hash": "deadbeef",
+        "data_content_hash": "feedface",
+        "eval_run_id": eval_run_id,
     }
 
 
@@ -727,8 +775,175 @@ def test_resolve_incumbent_summary_raises_on_missing_costs_config_hash(
             }
         }
     )
-    with pytest.raises(RuntimeError, match="missing the costs_config_hash tag"):
+    with pytest.raises(RuntimeError, match="costs_config_hash"):
         resolve_incumbent_summary(version, cfg)
+
+
+def test_resolve_incumbent_summary_raises_on_missing_data_content_hash(
+    mlflow_test_experiment: Callable[[str], str],
+) -> None:
+    """A pre-existing champion whose eval run predates the data_content_hash
+    tag must fail loudly rather than silently omitting the field.
+    """
+    tracking_uri = mlflow_test_experiment("test_resolve_incumbent_summary")
+    registered_model_name = "incumbent-summary-no-data-hash"
+    version, _model_id = _register_trivial_model(registered_model_name)
+    with mlflow.start_run() as run:
+        eval_run_id = run.info.run_id
+    _tag_incumbent_version(
+        registered_model_name, version, eval_run_id, include_data_hash=False
+    )
+
+    cfg = OmegaConf.create(
+        {
+            "mlflow": {
+                "tracking_uri": tracking_uri,
+                "registered_model_name": registered_model_name,
+            }
+        }
+    )
+    with pytest.raises(RuntimeError, match="data_content_hash"):
+        resolve_incumbent_summary(version, cfg)
+
+
+# ---------------------------------------------------------------------------
+# load_incumbent_proba
+# ---------------------------------------------------------------------------
+
+
+def _log_champion_predictions(tmp_path: Path, df: pd.DataFrame) -> str:
+    """Start a throwaway run and log df as its test_predictions.parquet — the
+    shape _log_evaluation_run leaves on a real champion's own eval run."""
+    predictions_path = tmp_path / "test_predictions.parquet"
+    df.to_parquet(predictions_path, index=False)
+    with mlflow.start_run() as run:
+        mlflow.log_artifact(str(predictions_path))
+        return str(run.info.run_id)
+
+
+def test_load_incumbent_proba_aligns_by_customerid_regardless_of_row_order(
+    mlflow_test_experiment: Callable[[str], str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returned proba follows candidate_customer_ids's order, not whatever
+    order the champion's historical parquet happened to store rows in."""
+    mlflow_test_experiment("test_load_incumbent_proba")
+    monkeypatch.setattr(evaluate, "features_sha256", lambda: "feedface")
+    champion_df = pd.DataFrame(
+        {
+            "customerid": ["c-002", "c-000", "c-001"],
+            "y_true": [1, 0, 0],
+            "p_hat": [0.9, 0.1, 0.2],
+            "logged_model_id": ["m-1", "m-1", "m-1"],
+        }
+    )
+    eval_run_id = _log_champion_predictions(tmp_path, champion_df)
+
+    candidate_customer_ids = pd.Series(["c-000", "c-001", "c-002"])
+    candidate_y_test = pd.Series([0, 0, 1])
+    cfg = OmegaConf.create({"mlflow": {"tracking_uri": mlflow.get_tracking_uri()}})
+
+    proba = evaluate.load_incumbent_proba(
+        "3", eval_run_id, "feedface", candidate_customer_ids, candidate_y_test, cfg
+    )
+    np.testing.assert_allclose(proba, [0.1, 0.2, 0.9])
+
+
+def test_load_incumbent_proba_raises_on_data_content_hash_mismatch(
+    mlflow_test_experiment: Callable[[str], str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A champion whose historical predictions were computed against a
+    different processed-features file must fail loudly, even when the
+    customerid set and labels would otherwise line up — a feature-pipeline
+    change (e.g. a new engineered column) doesn't necessarily change which
+    customers land in the test partition."""
+    mlflow_test_experiment("test_load_incumbent_proba")
+    monkeypatch.setattr(evaluate, "features_sha256", lambda: "current-hash")
+    champion_df = pd.DataFrame(
+        {
+            "customerid": ["c-000", "c-001"],
+            "y_true": [0, 1],
+            "p_hat": [0.1, 0.8],
+            "logged_model_id": ["m-1", "m-1"],
+        }
+    )
+    eval_run_id = _log_champion_predictions(tmp_path, champion_df)
+
+    candidate_customer_ids = pd.Series(["c-000", "c-001"])
+    candidate_y_test = pd.Series([0, 1])
+    cfg = OmegaConf.create({"mlflow": {"tracking_uri": mlflow.get_tracking_uri()}})
+
+    with pytest.raises(RuntimeError, match="different processed-features file"):
+        evaluate.load_incumbent_proba(
+            "3",
+            eval_run_id,
+            "stale-hash",
+            candidate_customer_ids,
+            candidate_y_test,
+            cfg,
+        )
+
+
+def test_load_incumbent_proba_raises_on_customer_set_mismatch(
+    mlflow_test_experiment: Callable[[str], str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A champion whose historical predictions cover a different customer set
+    (the split moved since it was last evaluated) must fail loudly."""
+    mlflow_test_experiment("test_load_incumbent_proba")
+    monkeypatch.setattr(evaluate, "features_sha256", lambda: "feedface")
+    champion_df = pd.DataFrame(
+        {
+            "customerid": ["c-000", "c-999"],
+            "y_true": [0, 1],
+            "p_hat": [0.1, 0.8],
+            "logged_model_id": ["m-1", "m-1"],
+        }
+    )
+    eval_run_id = _log_champion_predictions(tmp_path, champion_df)
+
+    candidate_customer_ids = pd.Series(["c-000", "c-001"])
+    candidate_y_test = pd.Series([0, 0])
+    cfg = OmegaConf.create({"mlflow": {"tracking_uri": mlflow.get_tracking_uri()}})
+
+    with pytest.raises(RuntimeError, match="different customer set"):
+        evaluate.load_incumbent_proba(
+            "3", eval_run_id, "feedface", candidate_customer_ids, candidate_y_test, cfg
+        )
+
+
+def test_load_incumbent_proba_raises_on_label_mismatch(
+    mlflow_test_experiment: Callable[[str], str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same customer set, but a shared customerid's recorded label disagrees
+    between the champion's historical run and the candidate's own — a
+    data-integrity signal, never silently resolved either way."""
+    mlflow_test_experiment("test_load_incumbent_proba")
+    monkeypatch.setattr(evaluate, "features_sha256", lambda: "feedface")
+    champion_df = pd.DataFrame(
+        {
+            "customerid": ["c-000", "c-001"],
+            "y_true": [0, 1],
+            "p_hat": [0.1, 0.8],
+            "logged_model_id": ["m-1", "m-1"],
+        }
+    )
+    eval_run_id = _log_champion_predictions(tmp_path, champion_df)
+
+    candidate_customer_ids = pd.Series(["c-000", "c-001"])
+    candidate_y_test = pd.Series([0, 0])  # c-001 disagrees: 1 vs. 0
+    cfg = OmegaConf.create({"mlflow": {"tracking_uri": mlflow.get_tracking_uri()}})
+
+    with pytest.raises(RuntimeError, match="labels"):
+        evaluate.load_incumbent_proba(
+            "3", eval_run_id, "feedface", candidate_customer_ids, candidate_y_test, cfg
+        )
 
 
 # ---------------------------------------------------------------------------

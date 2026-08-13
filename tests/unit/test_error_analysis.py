@@ -19,6 +19,7 @@ import telco_churn.models.artifacts as artifacts
 import telco_churn.models.calibrate as calibrate
 import telco_churn.models.error_analysis as error_analysis
 import telco_churn.models.evaluate as evaluate
+import telco_churn.models.register as register
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
@@ -804,8 +805,13 @@ def evaluated_model(
     log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
     cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
     run_id = str(cal_result["run_id"])
-    model_version = str(cal_result["model_version"])
     model_uri = str(cal_result["model_uri"])
+    # B1's call-site decoupling: calibrate.py no longer registers anything
+    # itself, so this fixture mints the challenger the same way register.py's
+    # own mint-mode CLI would, in-process.
+    model_version = register.register_challenger(
+        cfg, run_id, model_uri, str(cal_result["logged_model_id"])
+    )
 
     threshold.run_threshold_step(run_id, model_version, cfg)
     evaluate.run_evaluation_step(run_id, model_version, model_uri, cfg)

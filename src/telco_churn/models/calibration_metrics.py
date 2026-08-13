@@ -59,7 +59,7 @@ def brier_skill_score(candidate_brier: float, reference_brier: float) -> float:
 
 
 def expected_calibration_error(
-    proba: NDArray[np.float64], y_dev: pd.Series, n_bins: int, strategy: str
+    proba: NDArray[np.float64], y_dev: pd.Series, n_bins: int, strategy: str, label: str
 ) -> float:
     """Expected Calibration Error: weighted mean |predicted − observed| across bins.
 
@@ -67,6 +67,11 @@ def expected_calibration_error(
     ece_strategy — pinned so the number is comparable across calibration
     runs. ECE gates nothing here, it is logged purely so a loser's numbers
     make a winner's selection legible.
+
+    label identifies the distribution being binned (e.g. "dummy_prior",
+    "sigmoid", "segment:gender=Female") purely for the collapse warning
+    below — every call site passes one so a collapse is attributable
+    without cross-referencing calibration_summary.json by hand.
 
     Under strategy="quantile", tied probabilities can collapse the requested
     bin count (np.unique drops duplicate quantile edges) — logged as a
@@ -93,6 +98,7 @@ def expected_calibration_error(
             # visible, not just absorbed into a smaller ECE.
             logger.warning(
                 "ece_bins_collapsed",
+                label=label,
                 configured_n_bins=n_bins,
                 effective_n_bins=n_bins_effective,
                 hint=(

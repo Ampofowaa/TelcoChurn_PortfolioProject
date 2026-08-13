@@ -33,6 +33,7 @@ from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.pipeline import Pipeline
 
 import telco_churn.models.calibrate as calibrate
+import telco_churn.models.register as register
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
@@ -540,6 +541,7 @@ def full_cfg(
                 "v3_top_k_features": 2,
                 "v3_min_direction_magnitude": 0.3,
             },
+            "register": {"golden_atol": 1.0e-9},
             "mlflow": {
                 "tracking_uri": threshold_mlflow_uri,
                 "experiment_name": "test_run_threshold_step",
@@ -658,8 +660,10 @@ def registered_model_version(
     tuning_result: dict,
 ) -> Iterator[str]:
     """Register a real calibrated model version via the actual production chain
-    (log_model.run_model_logging_step -> calibrate.run_calibration_step), the
-    exact setup run_threshold_step consumes.
+    (log_model.run_model_logging_step -> calibrate.run_calibration_step ->
+    register.register_challenger, B1's mint step, decoupled from
+    calibrate.py — called directly here, mirroring what register.py's own
+    mint-mode CLI does), the exact setup run_threshold_step consumes.
 
     Also redirects load_dev_features() to the synthetic dev_split fixture, on
     both its calibrate.py definition and threshold.py's separate `from ...
@@ -751,8 +755,17 @@ def registered_model_version(
         tuning_result = {**tuning_result, "parent_run_id": run.info.run_id}
     log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, full_cfg)
     cal_result = calibrate.run_calibration_step(log_result["run_id"], full_cfg)
+    # B1's call-site decoupling: calibrate.py no longer registers anything
+    # itself, so this fixture mints the challenger the same way register.py's
+    # own mint-mode CLI would, in-process.
+    model_version = register.register_challenger(
+        full_cfg,
+        str(cal_result["run_id"]),
+        str(cal_result["model_uri"]),
+        str(cal_result["logged_model_id"]),
+    )
     try:
-        yield str(cal_result["model_version"])
+        yield model_version
     finally:
         mp.undo()
 
@@ -1050,6 +1063,7 @@ def _assert_dev_oof_report_shapes(
         "direction_check_feature_names",
         "direction_checked_count",
         "direction_weak_signal_count",
+        "direction_sanity_elbow_check",
     }
 
 
