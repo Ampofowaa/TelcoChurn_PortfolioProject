@@ -54,10 +54,8 @@ paths:
   interim_data: datasets/interim/
   # Plain literal, not ${oc.env:...}: DVC declares this under the split/features
   # stages' `params:`, and an env-resolved key resolves differently on a dev box
-  # than in CI, which thrashes dvc.lock. Tests redirect it via activate_config()
-  # (Phase 8 prerequisite) instead of PROCESSED_DATA_DIR — that helper must land
-  # in the same change as this line, or every test that set the env var silently
-  # falls through to this real path.
+  # than in CI, which thrashes dvc.lock. Overrides go through activate_config()
+  # (Hydra CLI overrides), never an env var.
   processed_data: datasets/processed/
   sql_features: sql/features
   reports: reports
