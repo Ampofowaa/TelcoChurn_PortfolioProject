@@ -31,6 +31,7 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import mlflow
+import mlflow.tracking
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
@@ -67,6 +68,23 @@ __all__ = ["run_feature_selection_step"]
 logger = get_logger(__name__)
 
 _REVIEW_EXPERIMENT_NAME = "telco-churn-feature-selection-review"
+
+# Experiment-level description, distinct from _RUN_DESCRIPTION below (MLflow
+# renders one 'mlflow.note.content' tag per experiment and a separate one per
+# run) — set idempotently on every call via client.set_experiment_tag, the
+# same self-healing pattern utils.mlflow.ensure_experiment_metadata uses for
+# telco-churn-training, so it never depends on being first to run.
+_REVIEW_EXPERIMENT_DESCRIPTION = (
+    "Tests whether the model needs all of its input features, or whether a "
+    "smaller set performs just as well. Compares two versions of the model "
+    "- one using every available feature, one using only the features that "
+    "prove they carry real signal - scored fairly against each other on the "
+    "same data splits, then checks whether the gap between them is big "
+    "enough to matter. This is what actually decides which features the "
+    "production model is allowed to use. It's run occasionally, not on "
+    "every training cycle - only when there's a reason to double check (a "
+    "new feature was added, or it's just been a while)."
+)
 
 _RUN_DESCRIPTION = (
     "Feature-selection review — full-feature vs. permutation-reduced LightGBM "
@@ -296,7 +314,12 @@ def run_feature_selection_step(
     )
 
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    mlflow.set_experiment(_REVIEW_EXPERIMENT_NAME)
+    review_experiment = mlflow.set_experiment(_REVIEW_EXPERIMENT_NAME)
+    mlflow.tracking.MlflowClient().set_experiment_tag(
+        review_experiment.experiment_id,
+        "mlflow.note.content",
+        _REVIEW_EXPERIMENT_DESCRIPTION,
+    )
 
     with mlflow.start_run(
         run_name=f"selection_review_{pd.Timestamp.now():%Y%m%d_%H%M%S}"

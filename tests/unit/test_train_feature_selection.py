@@ -377,6 +377,32 @@ def test_run_feature_selection_step_logs_dataset_source_via_accessor(
     assert source["uri"] == str(features_path())
 
 
+def test_run_feature_selection_step_sets_experiment_description(
+    feature_selection_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    feature_selection_cfg: OmegaConf,
+) -> None:
+    """The review experiment (not just the run) carries an 'mlflow.note.content'
+    description, set idempotently every call — the same self-healing pattern
+    utils.mlflow.ensure_experiment_metadata uses for telco-churn-training, so a
+    human landing on the experiment in the MLflow UI sees what it's for without
+    opening a run."""
+    feature_selection_cfg.mlflow.tracking_uri = feature_selection_mlflow_uri
+    X_dev, y_dev = dev_split
+
+    feature_selection.run_feature_selection_step(
+        X_dev, y_dev, feature_selection_cfg, cv_folds=2, cv_repeats=1, n_bootstrap=200
+    )
+
+    client = mlflow.tracking.MlflowClient()
+    experiment = client.get_experiment_by_name(_TEST_EXPERIMENT_NAME)
+
+    assert (
+        experiment.tags.get("mlflow.note.content")
+        == feature_selection._REVIEW_EXPERIMENT_DESCRIPTION
+    )
+
+
 def test_review_experiment_name_is_dedicated_and_separate_from_training() -> None:
     """The (unpatched) module constant is a fixed name distinct from
     cfg.mlflow.experiment_name's usual value — every review run adds a dated
