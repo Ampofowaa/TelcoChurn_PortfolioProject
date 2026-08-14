@@ -85,7 +85,12 @@ def bootstrap_comparison(
     Δ plus the materiality threshold delta_threshold:
       lgbm_win   — CI excludes 0 in LGBM's favour and delta_obs >= threshold.
       logreg_win — CI excludes 0 in LogReg's favour and |delta_obs| >= threshold.
-      tie        — otherwise; LGBM is still adopted.
+      tie        — otherwise; LGBM is still adopted. LGBM is the pre-committed family
+                   for this build regardless of this comparison (fast exact TreeSHAP
+                   for the explainability work, training speed for Optuna and the
+                   weekly retrain cadence, clean class_weight-based imbalance
+                   handling) — a statistical tie has no grounds to override that
+                   up-front choice, so it does not flip the decision to LogReg.
 
     Returns delta_obs, delta_ci_lower/upper, p_value (informational only — the CI is
     the test), decision ('lgbm'/'logreg'), decision_rule, n_bootstrap, and the raw
@@ -101,6 +106,8 @@ def bootstrap_comparison(
     elif ci_upper < 0 and delta_obs <= -delta_threshold:
         decision, decision_rule = "logreg", "logreg_win"
     else:
+        # Ties keep LGBM, the pre-committed family (see docstring) — a statistical
+        # tie is not evidence for LogReg, so it can't be grounds to switch to it.
         decision, decision_rule = "lgbm", "tie"
 
     return {

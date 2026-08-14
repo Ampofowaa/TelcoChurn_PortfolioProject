@@ -633,11 +633,11 @@ def test_register_main_cli_mints_challenger_via_run_id(
     assert challenger.tags["promotion_status"] == "pending"
 
 
-def test_register_main_cli_exits_one_on_gate_fail(
+def test_register_main_cli_exits_zero_and_rejects_on_gate_fail(
     reviewed_model: dict[str, object],
 ) -> None:
-    """A gate: fail decision must exit 1 and tag the version rejected, never
-    flip champion.
+    """A gate: fail decision must exit 0 (a clean rejection, not a crash) and
+    tag the version rejected, never flip champion.
 
     Mints its own second version via _mint_second_pending_version rather than
     reusing reviewed_model["model_version"] — that version may already be

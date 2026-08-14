@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from testcontainers.postgres import PostgresContainer
 
-from telco_churn.data.ingest import ingest
+from telco_churn.data.ingest import ingest, load_raw_csv
 from telco_churn.features import (
     FEATURE_SCHEMA,
     FEATURES_FILENAME,
@@ -23,6 +23,7 @@ from telco_churn.features import (
     build_feature_df,
     build_sql_features,
 )
+from telco_churn.features.generate import compute_charge_per_service
 from telco_churn.utils.paths import get_project_root
 
 pytestmark = pytest.mark.integration
@@ -168,6 +169,31 @@ def test_charge_per_service_value_correctness(
         ).scalar()
     assert val is not None
     assert float(val) == pytest.approx(expected)
+
+
+def test_charge_per_service_python_formula_matches_sql_view(
+    seeded_engine: Engine,
+) -> None:
+    """generate.compute_charge_per_service — the pandas mirror
+    notebooks/02a-feature-discovery.ipynb uses so it can run with no database
+    connection — agrees with the shipped SQL view row-for-row. This is the parity
+    check the two independent implementations of this one formula rely on (QA #7);
+    a future edit to either without the other fails here first.
+    """
+    df = load_raw_csv(_FIXTURES_DIR / "sample_features.csv")
+    python_by_id = dict(
+        zip(df["customerid"], compute_charge_per_service(df), strict=True)
+    )
+
+    with seeded_engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT customerid, charge_per_service FROM charge_per_service")
+        ).all()
+    sql_by_id = {row.customerid: float(row.charge_per_service) for row in rows}
+
+    assert set(python_by_id) == set(sql_by_id)
+    for customerid, sql_value in sql_by_id.items():
+        assert python_by_id[customerid] == pytest.approx(sql_value), customerid
 
 
 # ---------------------------------------------------------------------------

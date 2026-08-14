@@ -1,8 +1,16 @@
 """Feature discovery machinery for the error-driven feature discovery loop.
 
-Pure, typed, testable functions — no feature engineering logic lives here.
-The discovery loop (notebooks/02a-feature-discovery.ipynb) imports these and
-owns only the improvised candidate features, which migrate to build.py on adoption.
+Pure, typed, testable functions — no feature engineering logic lives here, with
+one exception: compute_service_count/compute_charge_per_service. Every other
+improvised candidate feature is owned directly by the discovery loop
+(notebooks/02a-feature-discovery.ipynb), which migrates it to build.py on
+adoption. charge_per_service is different — it is the one candidate that was
+adopted *and* SQL-engineered (sql/features/charge_per_service.sql), so a second,
+independent pandas implementation exists purely so the notebook can construct
+it without a database connection. Two hand-written copies of the same formula
+with nothing checking they agree is exactly the failure mode this module
+otherwise avoids, so the formula lives here once and
+test_sql_features_postgres.py asserts it against the real SQL view.
 
 Gate thresholds are module-level constants so every lap is self-describing and
 the gate is reproducible from provenance.json alone without a git lookup.
@@ -15,7 +23,7 @@ import functools
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -39,6 +47,7 @@ __all__ = [
     "ImportanceResult",
     "AdoptionDecision",
     "LapRecord",
+    "LapEvaluation",
     "BackwardEliminationResult",
     "backward_elimination",
     "oof_predictions",
@@ -48,8 +57,11 @@ __all__ = [
     "redundancy_screen",
     "candidate_importance",
     "adoption_gate",
+    "run_lap",
     "bootstrap_pr_auc_ci",
     "write_provenance",
+    "compute_service_count",
+    "compute_charge_per_service",
 ]
 
 # ---------------------------------------------------------------------------
@@ -60,6 +72,46 @@ CORR_THRESHOLD: float = 0.85
 CRAMERS_V_THRESHOLD: float = 0.70
 IMPORTANCE_NOISE_FLOOR_MARGIN: float = 0.005
 MIN_PR_AUC_DELTA: float = 0.0015
+
+# ---------------------------------------------------------------------------
+# charge_per_service — the one candidate with a shipped SQL twin (see module
+# docstring). Kept together so the two lines summed below and
+# sql/features/charge_per_service.sql's CASE conditions are edited as one unit.
+# ---------------------------------------------------------------------------
+
+
+def compute_service_count(df: pd.DataFrame) -> pd.Series:
+    """Active service count per customer — nine binary flags summed.
+
+    Mirrors sql/features/charge_per_service.sql's inner CASE-based count exactly:
+    phoneservice and multiplelines are separate line items (both contribute 1),
+    internetservice uses "!= 'No'" so DSL and Fiber optic both count.
+    """
+    return (
+        (df["phoneservice"] == "Yes").astype(int)
+        + (df["multiplelines"] == "Yes").astype(int)
+        + (df["internetservice"] != "No").astype(int)
+        + (df["onlinesecurity"] == "Yes").astype(int)
+        + (df["onlinebackup"] == "Yes").astype(int)
+        + (df["deviceprotection"] == "Yes").astype(int)
+        + (df["techsupport"] == "Yes").astype(int)
+        + (df["streamingtv"] == "Yes").astype(int)
+        + (df["streamingmovies"] == "Yes").astype(int)
+    ).rename("service_count")
+
+
+def compute_charge_per_service(df: pd.DataFrame) -> pd.Series:
+    """monthlycharges divided by active service count, floored at 1.
+
+    Pandas mirror of sql/features/charge_per_service.sql — same GREATEST(service_count, 1)
+    divide-by-zero guard, expressed as .clip(lower=1). Parity with the SQL view is
+    asserted in test_sql_features_postgres.py against a seeded fixture; edit both together.
+    """
+    service_count = compute_service_count(df)
+    return (df["monthlycharges"] / service_count.clip(lower=1)).rename(
+        "charge_per_service"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Serving-time-available base columns (raw IBM set after ingest cleaning)
@@ -131,6 +183,28 @@ class AdoptionDecision:
     adopted: bool
     rejection_screen: int | None
     rejection_reason: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class LapEvaluation:
+    """Bundled four-screen gate outcome for one discovery-loop candidate, from run_lap.
+
+    Replaces the ~10 loose per-lap locals (oof_<suffix>, pr_auc_<suffix>, decision_<suffix>,
+    ...) the notebook used to carry out of each hand-written Evaluate cell. The Record cell
+    reads LapRecord fields off this object; the post-decision state update reads
+    X_with_candidate/oof_proba/pr_auc/ci instead of a per-lap X_<suffix>/oof_<suffix> pair.
+    """
+
+    candidate_col: str
+    X_with_candidate: pd.DataFrame
+    serving_result: tuple[bool, str]
+    redundancy_result: RedundancyResult | None
+    oof_proba: npt.NDArray[np.float64]
+    pr_auc: float
+    ci: tuple[float, float]
+    sub_recall_delta: float | None
+    importance_result: ImportanceResult | None
+    decision: AdoptionDecision
 
 
 @dataclasses.dataclass(frozen=True)
@@ -531,6 +605,187 @@ def adoption_gate(
         )
 
     return AdoptionDecision(adopted=True, rejection_screen=None, rejection_reason=None)
+
+
+def run_lap(
+    candidate: pd.Series,
+    candidate_col: str,
+    required_cols: list[str],
+    feature_group: Literal["binary", "multi_cat", "numeric"],
+    X_current: pd.DataFrame,
+    y: pd.Series,
+    active_binary: list[str],
+    active_multi_cat: list[str],
+    active_numeric: list[str],
+    adopted_df: pd.DataFrame,
+    decoy_col: pd.Series,
+    decoy_col_name: str,
+    current_oof_proba: npt.NDArray[np.float64],
+    current_pr_auc: float,
+    current_ci: tuple[float, float],
+    build_preprocessor_fn: Callable[..., Any],
+    bs_mask: npt.NDArray[np.bool_] | None = None,
+    swap_sub_recall_delta: float | None = None,
+    discovery_threshold: float = 0.5,
+    random_state: int = 42,
+    verbose: bool = True,
+) -> LapEvaluation:
+    """Run one discovery-loop candidate through the four-screen adoption gate.
+
+    Factors notebooks/02a-feature-discovery.ipynb's per-lap Evaluate block (serving
+    check -> redundancy -> OOF fit -> PR-AUC delta -> importance vs. decoy -> decision)
+    into a single call so a gate-logic change applies to every lap at once instead of
+    ~9 hand-edited notebook cells. feature_group selects which of active_binary/
+    active_multi_cat/active_numeric the candidate — and the decoy noise column at
+    Screen 4 — is appended to when building each ColumnTransformer via
+    build_preprocessor_fn.
+
+    bs_mask, when given, drives the Screen 4 blind-spot subgroup-recall diagnostic
+    (sub_recall_delta, printed and returned); when None, a global false-negative-rate
+    diagnostic is printed instead and sub_recall_delta stays None — the domain-wide
+    laps (charge_per_service, num_add_on_services, monthly_to_total_ratio) use this
+    branch, matching their original hand-written cells.
+    """
+    if feature_group not in ("binary", "multi_cat", "numeric"):
+        raise ValueError(
+            "feature_group must be 'binary', 'multi_cat', or 'numeric', "
+            f"got {feature_group!r}"
+        )
+
+    def _groups(extra_numeric: str | None = None) -> dict[str, list[str]]:
+        groups = {
+            "binary": list(active_binary),
+            "multi_cat": list(active_multi_cat),
+            "numeric": list(active_numeric),
+        }
+        groups[feature_group].append(candidate_col)
+        if extra_numeric is not None:
+            groups["numeric"].append(extra_numeric)
+        return groups
+
+    srv = serving_available(required_cols)
+    if verbose:
+        print(f"  Screen 1 (serving)    : {'PASS' if srv[0] else 'FAIL'}  {srv[1]}")
+
+    X_new = X_current.copy()
+    X_new[candidate_col] = candidate.values
+
+    red: RedundancyResult | None = None
+    oof = current_oof_proba
+    pr_auc = current_pr_auc
+    ci = current_ci
+    sub_delta: float | None = None
+    imp: ImportanceResult | None = None
+
+    if not srv[0]:
+        decision = AdoptionDecision(
+            adopted=False, rejection_screen=1, rejection_reason=srv[1]
+        )
+    else:
+        red = redundancy_screen(candidate, adopted_df)
+        if verbose:
+            print(f"  Screen 2 (redundancy) : {red.summary}")
+
+        groups = _groups()
+        prep = build_preprocessor_fn(
+            binary=groups["binary"],
+            multi_cat=groups["multi_cat"],
+            numeric=groups["numeric"],
+        )
+        oof = oof_predictions(X_new, y, prep, random_state=random_state)
+        pr_auc = float(average_precision_score(y, oof))
+        ci = bootstrap_pr_auc_ci(np.asarray(y), oof, random_state=random_state)
+        delta = pr_auc - current_pr_auc
+        if verbose:
+            print(
+                f"  Screen 3 (PR-AUC)     : {'PASS' if delta >= MIN_PR_AUC_DELTA else 'FAIL'}  "
+                f"base={current_pr_auc:.4f}  new={pr_auc:.4f}  delta={delta:+.4f}  "
+                f"min_delta={MIN_PR_AUC_DELTA}  CI=[{ci[0]:.4f}, {ci[1]:.4f}]"
+            )
+
+        if delta < MIN_PR_AUC_DELTA:
+            if verbose:
+                print("  Screen 4 (importance) : SKIPPED  (Screen 3 failed)")
+        else:
+            X_imp = X_new.copy()
+            X_imp[decoy_col_name] = decoy_col.values
+            imp_groups = _groups(extra_numeric=decoy_col_name)
+            prep_imp = build_preprocessor_fn(
+                binary=imp_groups["binary"],
+                multi_cat=imp_groups["multi_cat"],
+                numeric=imp_groups["numeric"],
+            )
+            imp = candidate_importance(
+                X_imp,
+                y,
+                prep_imp,
+                candidate_col,
+                decoy_col_name,
+                random_state=random_state,
+            )
+            if verbose:
+                print(
+                    f"  Screen 4 (importance) : {'PASS' if imp.above_floor else 'FAIL'}  "
+                    f"candidate={imp.candidate_importance:.4f}  "
+                    f"floor={max(imp.noise_floor, 0.0) + IMPORTANCE_NOISE_FLOOR_MARGIN:.4f}  "
+                    f"(noise={imp.noise_floor:.4f}, margin={IMPORTANCE_NOISE_FLOOR_MARGIN})"
+                )
+
+            if bs_mask is not None:
+                recall_base = subgroup_recall(
+                    current_oof_proba, y, bs_mask, threshold=discovery_threshold
+                )
+                recall_new = subgroup_recall(
+                    oof, y, bs_mask, threshold=discovery_threshold
+                )
+                sub_delta = recall_new - recall_base
+                if verbose:
+                    print(
+                        f"  blind-spot FN rate    : {1 - recall_base:.3f} -> {1 - recall_new:.3f}  "
+                        f"(delta={sub_delta:+.4f})  [diagnostic]"
+                    )
+            else:
+                y_arr = np.asarray(y)
+                fn_base = 1.0 - float(
+                    (current_oof_proba[y_arr == 1] >= discovery_threshold).mean()
+                )
+                fn_new = 1.0 - float((oof[y_arr == 1] >= discovery_threshold).mean())
+                if verbose:
+                    print(
+                        f"  global FN rate        : {fn_base:.3f} -> {fn_new:.3f}  "
+                        f"(delta={fn_new - fn_base:+.4f})  [diagnostic]"
+                    )
+
+        decision = adoption_gate(
+            serving_result=srv,
+            redundancy_result=red,
+            prior_pr_auc=current_pr_auc,
+            new_pr_auc=pr_auc,
+            sub_recall_delta=sub_delta,
+            importance_result=imp,
+            swap_sub_recall_delta=swap_sub_recall_delta,
+        )
+
+    if verbose:
+        print(f"  DECISION              : {'ADOPT' if decision.adopted else 'REJECT'}")
+        if decision.rejection_screen:
+            print(
+                f"  Rejected at Screen    : {decision.rejection_screen}  "
+                f"({decision.rejection_reason})"
+            )
+
+    return LapEvaluation(
+        candidate_col=candidate_col,
+        X_with_candidate=X_new,
+        serving_result=srv,
+        redundancy_result=red,
+        oof_proba=oof,
+        pr_auc=pr_auc,
+        ci=ci,
+        sub_recall_delta=sub_delta,
+        importance_result=imp,
+        decision=decision,
+    )
 
 
 def bootstrap_pr_auc_ci(

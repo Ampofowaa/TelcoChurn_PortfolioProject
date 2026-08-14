@@ -904,6 +904,7 @@ def _build_business_case_section(
         "expected_impact": {
             "scenarios": metrics.get("business_impact", {}).get("scenarios"),
             "ev_by_k_logged": "ev_by_k" in economics,
+            "capacity_budget_check": economics.get("capacity_budget_check"),
         },
         "recommended_next_steps": (
             f"See ANALYSIS.md §7 Business takeaways and §10 "

@@ -56,7 +56,13 @@ search_space:
     low: 0.0
     high: 10.0
     type: float
-  # Guard rail: max_depth >= ceil(log2(num_leaves.high)) so leaf-wise growth can't build arbitrarily deep branches on ~5,600 training rows.
+  # No coupling to num_leaves: max_depth and num_leaves are independent
+  # leaf-wise-growth regularizers, and it's valid for either to bind first.
+  # An earlier version floored this low at ceil(log2(num_leaves.high)) to
+  # keep max_depth deep enough for any sampled num_leaves; on this dataset
+  # it excluded the shallow-tree region (max_depth=4, num_leaves=6) the
+  # 1-SE rule actually preferred and lowered both the raw-best and 1-SE CV
+  # PR-AUC on a re-run. Removed rather than re-anchored — see tuning.py::_suggest_lgbm_params.
   max_depth:
     low: 3
     high: 12

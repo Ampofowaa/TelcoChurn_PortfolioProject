@@ -111,10 +111,12 @@ def _suppress_known_mlflow_warnings() -> None:
 
 
 _EXPERIMENT_DESCRIPTION = (
-    "End-to-end training cycle for the IBM Telco Customer Churn model.\n\n"
+    "End-to-end training cycle for the IBM Telco Customer Churn model. "
+    "Expand for pipeline stages and the model-selection policy.\n\n"
     "**Pipeline:** candidate comparison (Dummy / LogReg / LightGBM) → "
-    "feature selection → Optuna tuning → calibration → sealed-test "
-    "evaluation → error analysis → model promotion and registry.\n\n"
+    "feature selection → Optuna hyperparameter tuning → calibration → "
+    "cost-sensitive threshold derivation → sealed-test evaluation → "
+    "error analysis → model promotion and registry.\n\n"
     "**Selection policy:** PR-AUC (average precision) is the sole "
     "criterion that can *promote* a model. Three guardrails — recall, "
     "Brier, calibration slope — can *veto* a candidate PR-AUC would "

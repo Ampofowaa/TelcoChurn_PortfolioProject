@@ -25,6 +25,7 @@ from telco_churn.models.policy_config import CostScenario, expected_value_at_thr
 __all__ = [
     "break_even_retention_rate",
     "campaign_cost",
+    "capacity_budget_check",
     "ev_by_k",
     "expected_value",
     "retained_revenue",
@@ -137,6 +138,39 @@ def break_even_retention_rate(
     if tp == 0:
         return float("inf")
     return float(scenario.cost * n_contacted / (tp * scenario.ltv))
+
+
+def capacity_budget_check(
+    business_impact_scenarios: dict[str, dict[str, float]],
+    contact_capacity: float,
+    campaign_budget: float,
+) -> dict[str, dict[str, float | bool]]:
+    """Flag any scenario whose shipped-threshold contact count/spend exceeds ops limits.
+
+    Not a gate — ANALYSIS.md §0 makes EV and its supporting economics
+    diagnostics, never binding (only PR-AUC/recall/Brier/calibration-slope
+    veto a promotion). configs/costs.yaml's own comment on contact_capacity/
+    campaign_budget is explicit that the correct response to a breach is
+    top-K-by-EV contact selection at deployment time, not a higher threshold
+    or a blocked promotion — this only surfaces that a breach exists.
+
+    capacity_excess/budget_excess are signed (n_contacted - contact_capacity,
+    campaign_cost - campaign_budget) so one number carries both whether a
+    scenario is over and by how much — negative means headroom, not a breach.
+    over_capacity/over_budget are that same sign as a bool, kept alongside for
+    a plain human read of economics.json without doing the sign-check yourself.
+    """
+    result: dict[str, dict[str, float | bool]] = {}
+    for name, row in business_impact_scenarios.items():
+        capacity_excess = row["n_contacted"] - contact_capacity
+        budget_excess = row["campaign_cost"] - campaign_budget
+        result[name] = {
+            "over_capacity": capacity_excess > 0,
+            "over_budget": budget_excess > 0,
+            "capacity_excess": capacity_excess,
+            "budget_excess": budget_excess,
+        }
+    return result
 
 
 def sensitivity_oneway(

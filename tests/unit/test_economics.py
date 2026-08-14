@@ -10,6 +10,7 @@ import pytest
 from telco_churn.models.economics import (
     break_even_retention_rate,
     campaign_cost,
+    capacity_budget_check,
     ev_by_k,
     expected_value,
     retained_revenue,
@@ -216,6 +217,77 @@ def test_break_even_retention_rate_returns_inf_when_no_true_positives() -> None:
     proba = np.array([0.9, 0.8, 0.7, 0.1])  # only negatives scored above threshold
     r_min = break_even_retention_rate(proba, y, SCENARIO, 0.5)
     assert r_min == float("inf")
+
+
+# ---------------------------------------------------------------------------
+# capacity_budget_check
+# ---------------------------------------------------------------------------
+
+
+def test_capacity_budget_check_flags_scenario_over_both_limits() -> None:
+    """A scenario whose n_contacted/campaign_cost exceed both limits flags both,
+    with a positive excess equal to how far over each one is."""
+    scenarios = {
+        "base": {"n_contacted": 600, "campaign_cost": 20_000.0},
+    }
+    flags = capacity_budget_check(
+        scenarios, contact_capacity=500, campaign_budget=15_000
+    )
+    assert flags == {
+        "base": {
+            "over_capacity": True,
+            "over_budget": True,
+            "capacity_excess": 100,
+            "budget_excess": pytest.approx(5_000.0),
+        }
+    }
+
+
+def test_capacity_budget_check_flags_independently() -> None:
+    """over_capacity and over_budget are independent — one can trip without the other."""
+    scenarios = {
+        "over_capacity_only": {"n_contacted": 600, "campaign_cost": 5_000.0},
+        "over_budget_only": {"n_contacted": 100, "campaign_cost": 20_000.0},
+    }
+    flags = capacity_budget_check(
+        scenarios, contact_capacity=500, campaign_budget=15_000
+    )
+    assert flags["over_capacity_only"]["over_capacity"] is True
+    assert flags["over_capacity_only"]["over_budget"] is False
+    assert flags["over_budget_only"]["over_capacity"] is False
+    assert flags["over_budget_only"]["over_budget"] is True
+
+
+def test_capacity_budget_check_within_limits_flags_false_with_negative_excess() -> None:
+    """A scenario within both limits flags neither, and excess is negative (headroom)."""
+    scenarios = {"base": {"n_contacted": 200, "campaign_cost": 4_000.0}}
+    flags = capacity_budget_check(
+        scenarios, contact_capacity=500, campaign_budget=15_000
+    )
+    assert flags == {
+        "base": {
+            "over_capacity": False,
+            "over_budget": False,
+            "capacity_excess": -300,
+            "budget_excess": pytest.approx(-11_000.0),
+        }
+    }
+
+
+def test_capacity_budget_check_boundary_is_not_over() -> None:
+    """A value exactly at the limit is not flagged — only strictly over is — and excess is zero."""
+    scenarios = {"base": {"n_contacted": 500, "campaign_cost": 15_000.0}}
+    flags = capacity_budget_check(
+        scenarios, contact_capacity=500, campaign_budget=15_000
+    )
+    assert flags == {
+        "base": {
+            "over_capacity": False,
+            "over_budget": False,
+            "capacity_excess": 0,
+            "budget_excess": pytest.approx(0.0),
+        }
+    }
 
 
 # ---------------------------------------------------------------------------

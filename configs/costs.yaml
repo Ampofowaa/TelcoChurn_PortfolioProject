@@ -29,10 +29,14 @@ retention_rate_sweep: [0.15, 0.20, 0.30, 0.40, 0.45]
 # Retention-team operational limits, per campaign cycle. Illustrative, not a
 # measured operational number — this dataset has no capacity data, so these
 # share retention_rate's status as a benchmark guess rather than an estimate.
-# When implied_contact_rate * customer_base exceeds contact_capacity (or the
+# Checked per scenario by models/economics.py::capacity_budget_check, called
+# from evaluate.py's payload assembly: a breach logs a warning and is
+# recorded in economics.json, but never gates promotion (diagnostic only,
+# same footing as every other business metric — ANALYSIS.md §0). When
+# implied_contact_rate * customer_base exceeds contact_capacity (or the
 # implied spend exceeds campaign_budget), the correct policy is top-K by
 # expected value, not a higher threshold — see models/threshold.py's
-# docstring and Phase 7's evaluate.py capacity check.
+# docstring.
 contact_capacity: 500       # customers a retention team can contact per cycle
 campaign_budget: 15_000     # dollars available per cycle
 

@@ -231,6 +231,44 @@ def test_boundary_hit_check_interior_values_not_flagged() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _suggest_lgbm_params (C1)
+# ---------------------------------------------------------------------------
+
+
+def test_suggest_lgbm_params_max_depth_independent_of_num_leaves() -> None:
+    """max_depth samples its own configured range regardless of num_leaves's draw.
+
+    Regression test for the removed num_leaves-coupling: max_depth and
+    num_leaves are independent leaf-wise-growth regularizers, and a trial
+    where max_depth binds before num_leaves is exhausted is valid, not an
+    error the sampler needs to prevent.
+    """
+    search_space = OmegaConf.create(
+        {
+            "num_leaves": {"low": 100, "high": 200, "type": "int"},
+            "max_depth": {"low": 3, "high": 12, "type": "int"},
+        }
+    )
+    study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=42))
+    for _ in range(20):
+        trial = study.ask()
+        params = tuning._suggest_lgbm_params(trial, search_space)
+        assert 3 <= params["max_depth"] <= 12
+        study.tell(trial, 0.5)
+
+
+def test_suggest_lgbm_params_max_depth_unaffected_when_num_leaves_absent() -> None:
+    """max_depth samples its configured range untouched when num_leaves isn't tuned."""
+    search_space = OmegaConf.create(
+        {"max_depth": {"low": 3, "high": 12, "type": "int"}}
+    )
+    study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=42))
+    trial = study.ask()
+    params = tuning._suggest_lgbm_params(trial, search_space)
+    assert 3 <= params["max_depth"] <= 12
+
+
+# ---------------------------------------------------------------------------
 # _build_optuna_storage
 # ---------------------------------------------------------------------------
 
@@ -325,6 +363,37 @@ def test_study_name_changes_when_features_content_changes(
 
     assert name_a != name_b
     assert name_a == name_a_again  # unchanged data resumes the same study
+
+
+def test_study_name_changes_when_search_space_changes(
+    tuning_cfg: DictConfig, tmp_path: Path
+) -> None:
+    """A search_space edit (e.g. max_depth.low) mints a new study name.
+
+    config_digest hashes the raw YAML search_space, so any bound change —
+    not just a data change — must start a fresh study rather than mixing
+    trials sampled under different ranges into the same 1-SE pool.
+    """
+    features_dir = tmp_path / "features"
+    features_dir.mkdir()
+    (features_dir / "telco_churn_features.parquet").write_bytes(b"content")
+    committed_features = ["tenure", "monthlycharges"]
+
+    cfg_a = tuning_cfg.copy()
+    cfg_a.tuning.search_space.max_depth.low = 3
+    cfg_b = tuning_cfg.copy()
+    cfg_b.tuning.search_space.max_depth.low = 4
+
+    try:
+        activate_config(
+            OmegaConf.create({"paths": {"processed_data": str(features_dir)}})
+        )
+        name_a = tuning._study_name(cfg_a, committed_features)
+        name_b = tuning._study_name(cfg_b, committed_features)
+    finally:
+        reset_active_config()
+
+    assert name_a != name_b
 
 
 # ---------------------------------------------------------------------------

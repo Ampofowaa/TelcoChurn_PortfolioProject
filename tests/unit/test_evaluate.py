@@ -6,6 +6,7 @@ import math
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import mlflow.artifacts
 import mlflow.sklearn
@@ -18,6 +19,7 @@ from sklearn.linear_model import LogisticRegression
 
 import telco_churn.models.evaluate as evaluate
 from telco_churn.models.diagnostics import build_segment_lookup
+from telco_churn.models.economics import capacity_budget_check
 from telco_churn.models.evaluate import (
     build_gate_inputs,
     comparative_deltas,
@@ -480,6 +482,123 @@ def test_business_impact_parameter_spread_flag_is_boolean(
     )
     expected = result["ev_spread"] > result["widest_within_scenario_ci_width"]
     assert result["parameter_spread_dominates_sampling"] == expected
+
+
+# ---------------------------------------------------------------------------
+# _assemble_metrics_and_economics_payloads — capacity/budget check (QA #4)
+# ---------------------------------------------------------------------------
+
+
+def _minimal_assemble_inputs(
+    business_impact: dict[str, Any],
+    scenarios: dict[str, CostScenario],
+    contact_capacity: float,
+    campaign_budget: float,
+) -> dict[str, Any]:
+    """Stub every _assemble_metrics_and_economics_payloads input this QA
+    check doesn't exercise, so each test only varies costs_cfg's limits."""
+    return {
+        "core_metrics": {
+            "ranking_metrics": {},
+            "classification_rows": [],
+            "fixed_recall_rows": [],
+            "calibration_report": {},
+            "decile_rows": [],
+            "business_impact": business_impact,
+        },
+        "sliced": {
+            "test_ranking_slices": [],
+            "test_decision_slices": [],
+            "test_calibration_slices": [],
+            "test_business_impact_slices": [],
+            "test_equal_opportunity_by_axis": {},
+            "test_demographic_parity_by_axis": {},
+            "test_equal_opportunity_diff": float("nan"),
+            "test_demographic_parity_diff": float("nan"),
+        },
+        "sensitivity_block": {
+            "sensitivity": {},
+            "retention_rate_values": [],
+            "cost_values": [],
+            "costs_cfg": OmegaConf.create(
+                {
+                    "contact_capacity": contact_capacity,
+                    "campaign_budget": campaign_budget,
+                }
+            ),
+        },
+        "decision_result": {
+            "decision": {"gate": "reject", "regime": "cold_start"},
+            "champion_version": None,
+            "incumbent_summary": None,
+        },
+        "policy_ctx": {"scenarios": scenarios},
+    }
+
+
+def test_assemble_payloads_flags_and_warns_when_capacity_and_budget_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+    y_proba_fixture: tuple[pd.Series, np.ndarray],
+    scenarios_fixture: dict[str, CostScenario],
+    thresholds_fixture: dict[str, float],
+) -> None:
+    """economics.json's capacity_budget_check reflects a real breach and logs
+    a warning — diagnostic only (ANALYSIS.md §0: EV/economics never gate)."""
+    y, proba = y_proba_fixture
+    business_impact = sealed_test_business_impact(
+        y, proba, scenarios_fixture, thresholds_fixture, _N_BOOTSTRAP, _RANDOM_STATE
+    )
+    inputs = _minimal_assemble_inputs(
+        business_impact, scenarios_fixture, contact_capacity=1, campaign_budget=1.0
+    )
+    warning_mock = Mock()
+    monkeypatch.setattr(evaluate.logger, "warning", warning_mock)
+
+    payloads = evaluate._assemble_metrics_and_economics_payloads(
+        "1", "run-id", y, proba, **inputs
+    )
+
+    capacity_flags = payloads["economics_payload"]["capacity_budget_check"]
+    assert all(
+        flags["over_capacity"] and flags["over_budget"]
+        for flags in capacity_flags.values()
+    )
+    assert warning_mock.call_count == len(capacity_flags)
+    assert all(
+        c.args[0] == "capacity_or_budget_exceeded" for c in warning_mock.call_args_list
+    )
+
+
+def test_assemble_payloads_no_warning_within_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    y_proba_fixture: tuple[pd.Series, np.ndarray],
+    scenarios_fixture: dict[str, CostScenario],
+    thresholds_fixture: dict[str, float],
+) -> None:
+    """No warning and every flag False when limits comfortably cover the shipped policy."""
+    y, proba = y_proba_fixture
+    business_impact = sealed_test_business_impact(
+        y, proba, scenarios_fixture, thresholds_fixture, _N_BOOTSTRAP, _RANDOM_STATE
+    )
+    inputs = _minimal_assemble_inputs(
+        business_impact,
+        scenarios_fixture,
+        contact_capacity=10_000,
+        campaign_budget=10_000_000.0,
+    )
+    warning_mock = Mock()
+    monkeypatch.setattr(evaluate.logger, "warning", warning_mock)
+
+    payloads = evaluate._assemble_metrics_and_economics_payloads(
+        "1", "run-id", y, proba, **inputs
+    )
+
+    capacity_flags = payloads["economics_payload"]["capacity_budget_check"]
+    assert all(
+        not flags["over_capacity"] and not flags["over_budget"]
+        for flags in capacity_flags.values()
+    )
+    warning_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1294,7 +1413,12 @@ def _build_evaluation_orchestration_inputs(
         "model_version": version,
         "champion_version": None,
     }
-    economics_payload: dict[str, Any] = {"note": "test economics payload"}
+    economics_payload: dict[str, Any] = {
+        "note": "test economics payload",
+        "capacity_budget_check": capacity_budget_check(
+            business_impact["scenarios"], contact_capacity=500, campaign_budget=15_000
+        ),
+    }
     promotion_decision_payload = {
         **decision,
         "model_version": version,
@@ -1315,7 +1439,13 @@ def _build_evaluation_orchestration_inputs(
     }
 
     sensitivity_block = {
-        "costs_cfg": OmegaConf.create({"gross_margin": 0.6, "contact_capacity": 500})
+        "costs_cfg": OmegaConf.create(
+            {
+                "gross_margin": 0.6,
+                "contact_capacity": 500,
+                "campaign_budget": 15_000,
+            }
+        )
     }
 
     figure_keys = (

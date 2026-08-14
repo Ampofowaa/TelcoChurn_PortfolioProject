@@ -65,6 +65,7 @@ from telco_churn.models.diagnostics import (
 from telco_churn.models.economics import (
     break_even_retention_rate,
     campaign_cost,
+    capacity_budget_check,
     ev_by_k,
     expected_value,
     retained_revenue,
@@ -1531,6 +1532,31 @@ def _assemble_metrics_and_economics_payloads(
         for name, scenario in policy_ctx["scenarios"].items()
     }
 
+    costs_cfg = sensitivity_block["costs_cfg"]
+    capacity_flags = capacity_budget_check(
+        business_impact["scenarios"],
+        float(costs_cfg.contact_capacity),
+        float(costs_cfg.campaign_budget),
+    )
+    for name, flags in capacity_flags.items():
+        if flags["over_capacity"] or flags["over_budget"]:
+            logger.warning(
+                "capacity_or_budget_exceeded",
+                scenario=name,
+                n_contacted=business_impact["scenarios"][name]["n_contacted"],
+                contact_capacity=float(costs_cfg.contact_capacity),
+                campaign_cost=business_impact["scenarios"][name]["campaign_cost"],
+                campaign_budget=float(costs_cfg.campaign_budget),
+                over_capacity=flags["over_capacity"],
+                over_budget=flags["over_budget"],
+                hint=(
+                    "Implied contact count or spend at this scenario's shipped "
+                    "threshold exceeds the retention team's operational limits — "
+                    "the correct policy response is top-K-by-EV contact "
+                    "selection (economics.json's ev_by_k), not a higher threshold."
+                ),
+            )
+
     economics_payload: dict[str, Any] = {
         "sensitivity": sensitivity_block["sensitivity"],
         "ev_by_k": ev_curves,
@@ -1540,6 +1566,7 @@ def _assemble_metrics_and_economics_payloads(
         },
         "retention_rate_values_swept": sensitivity_block["retention_rate_values"],
         "cost_values_swept": sensitivity_block["cost_values"],
+        "capacity_budget_check": capacity_flags,
     }
     promotion_decision_payload: dict[str, Any] = {
         **decision,
@@ -1628,12 +1655,18 @@ def _render_evaluation_figures(
 
 
 def _build_scalar_metrics(
-    core_metrics: dict[str, Any], sliced: dict[str, Any]
+    core_metrics: dict[str, Any],
+    sliced: dict[str, Any],
+    capacity_flags: dict[str, dict[str, float | bool]],
 ) -> dict[str, float]:
     """Build the flat test_* MLflow metric dict from the already-computed core/sliced blocks.
 
     Pure dict assembly — no MLflow calls, so it is a no-risk extraction on
-    its own.
+    its own. capacity_flags is economics.capacity_budget_check's output
+    (computed once in _assemble_metrics_and_economics_payloads and threaded
+    through payloads, not recomputed here) — only its numeric excess fields
+    become metrics; over_capacity/over_budget are that same sign as a bool
+    and stay economics.json-only, since MLflow metrics must be numeric.
     """
     ranking_metrics = core_metrics["ranking_metrics"]
     calibration_report = core_metrics["calibration_report"]
@@ -1698,6 +1731,13 @@ def _build_scalar_metrics(
         scalar_metrics[f"test_ev_treat_none_{scenario_name}"] = cast(
             float, row["ev_treat_none"]
         )
+    for scenario_name, flags in capacity_flags.items():
+        scalar_metrics[f"test_capacity_excess_{scenario_name}"] = cast(
+            float, flags["capacity_excess"]
+        )
+        scalar_metrics[f"test_budget_excess_{scenario_name}"] = cast(
+            float, flags["budget_excess"]
+        )
     return scalar_metrics
 
 
@@ -1742,7 +1782,8 @@ def _log_evaluation_run(
         decision["eval_run_id"] = eval_run_id
         mlflow.log_input(test_dataset, context="evaluation")
 
-        scalar_metrics = _build_scalar_metrics(core_metrics, sliced)
+        capacity_flags = economics_payload["capacity_budget_check"]
+        scalar_metrics = _build_scalar_metrics(core_metrics, sliced, capacity_flags)
         mlflow.log_metrics(scalar_metrics, model_id=model_id, dataset=test_dataset)
 
         for scenario_name, scenario in policy_ctx["scenarios"].items():
@@ -1756,6 +1797,7 @@ def _log_evaluation_run(
             )
         mlflow.log_param("gross_margin", float(costs_cfg.gross_margin))
         mlflow.log_param("contact_capacity", int(costs_cfg.contact_capacity))
+        mlflow.log_param("campaign_budget", float(costs_cfg.campaign_budget))
         mlflow.set_tag(
             "costs_config_hash",
             costs_config_hash(get_project_root() / str(cfg.paths.costs_config)),

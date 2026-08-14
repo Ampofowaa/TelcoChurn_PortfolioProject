@@ -42,6 +42,13 @@ __all__ = [
 
 logger = get_logger(__name__)
 
+# Path to the authoritative DDL for Optuna's isolated schema — same
+# sql/schema/*.sql convention customers_raw's table follows (ingest.py's
+# _SQL_SCHEMA), not an inline string here.
+_OPTUNA_SCHEMA_SQL = (
+    get_project_root() / "sql" / "schema" / "002_create_optuna_schema.sql"
+)
+
 
 def _raw_best_diagnostics(trial_summaries: list[dict[str, Any]]) -> dict[str, Any]:
     """Raw-best trial identity and its 1-SE band, independent of selection_rule.
@@ -128,16 +135,26 @@ def boundary_hit_check(
 def _suggest_lgbm_params(
     trial: optuna.Trial, search_space: DictConfig
 ) -> dict[str, Any]:
-    """Sample one LightGBM hyperparameter set from the Hydra-configured search space."""
+    """Sample one LightGBM hyperparameter set from the Hydra-configured search space.
+
+    max_depth and num_leaves are independent leaf-wise-growth regularizers —
+    LightGBM applies whichever binds first, so a trial where max_depth caps
+    the tree before num_leaves is exhausted is a valid shallow-tree config,
+    not an error. An earlier version of this function coupled max_depth's
+    low to ceil(log2(num_leaves.high)) to prevent that case; on this dataset
+    it excluded the shallow-tree region the study actually preferred
+    (max_depth=4 paired with num_leaves=6 in the 1-SE-selected trial,
+    ANALYSIS.md §4b) and measurably lowered both the raw-best and 1-SE CV
+    PR-AUC on a re-run. Removed rather than re-anchored.
+    """
     params: dict[str, Any] = {}
     for name, spec in search_space.items():
+        name = str(name)
         if str(spec.type) == "int":
-            params[str(name)] = trial.suggest_int(
-                str(name), int(spec.low), int(spec.high)
-            )
+            params[name] = trial.suggest_int(name, int(spec.low), int(spec.high))
         else:
-            params[str(name)] = trial.suggest_float(
-                str(name),
+            params[name] = trial.suggest_float(
+                name,
                 float(spec.low),
                 float(spec.high),
                 log=bool(spec.get("log", False)),
@@ -277,11 +294,15 @@ def _build_optuna_storage() -> optuna.storages.RDBStorage:
     crashed process and can be reloaded directly with optuna.load_study — no
     more reconstructing it from MLflow-logged trial params just to run fANOVA
     importance. Isolated in its own 'optuna' schema (not 'public') so Optuna's
-    own tables (studies, trials, ...) can't collide with application tables.
-    Builds its own engine rather than reusing utils.db.get_engine()'s shared
-    singleton: that one stays strict (raises with no POSTGRES_URL) for
-    ingest.py/sql_features.py, whose SQL is Postgres-only and must never
-    silently run against a SQLite fallback.
+    own tables (studies, trials, ...) can't collide with application tables —
+    the schema's DDL lives in sql/schema/002_create_optuna_schema.sql, the
+    same convention customers_raw's table follows, not an inline string here;
+    this executes it explicitly (mirroring ingest.py::setup_schema) since
+    docker-compose.yml's docker-entrypoint-initdb.d mount only fires against a
+    fresh Postgres data volume. Builds its own engine rather than reusing
+    utils.db.get_engine()'s shared singleton: that one stays strict (raises
+    with no POSTGRES_URL) for ingest.py/sql_features.py, whose SQL is
+    Postgres-only and must never silently run against a SQLite fallback.
 
     The SQLite fallback skips schema isolation (SQLite has no schema/
     search_path concept, and nothing else runs against the fallback file to
@@ -297,7 +318,7 @@ def _build_optuna_storage() -> optuna.storages.RDBStorage:
 
     engine = create_engine(url, pool_pre_ping=True)
     with engine.begin() as conn:
-        conn.execute(text("CREATE SCHEMA IF NOT EXISTS optuna"))
+        conn.execute(text(_OPTUNA_SCHEMA_SQL.read_text()))
     return optuna.storages.RDBStorage(
         url=engine.url.render_as_string(hide_password=False),
         engine_kwargs={"connect_args": {"options": "-csearch_path=optuna"}},

@@ -1258,6 +1258,50 @@ def test_summarize_model_drivers_empty_global_importance_renders_fallback() -> N
 
 
 # ---------------------------------------------------------------------------
+# _build_business_case_section — model_card.json's capacity/budget surfacing (QA #4)
+# ---------------------------------------------------------------------------
+
+
+def test_business_case_section_threads_capacity_budget_check_from_economics() -> None:
+    """capacity_budget_check is read straight off economics.json, never
+    recomputed — the same "assembled from artifacts" rule as every other
+    model_card.json field."""
+    capacity_budget_check = {
+        "base": {
+            "over_capacity": True,
+            "over_budget": False,
+            "capacity_excess": 40,
+            "budget_excess": -500.0,
+        }
+    }
+    economics = {
+        "ev_by_k": {},
+        "capacity_budget_check": capacity_budget_check,
+    }
+    section = register._build_business_case_section(
+        {"git_sha": "abc123"},
+        {"business_impact": {}},
+        economics,
+        {"regime": "cold_start", "criteria": {}},
+    )
+    assert section["expected_impact"]["capacity_budget_check"] == capacity_budget_check
+
+
+def test_business_case_section_capacity_budget_check_none_when_economics_missing() -> (
+    None
+):
+    """economics.json absent from the eval run (older cycle, pre-QA#4 code) ->
+    capacity_budget_check reads None rather than raising a KeyError."""
+    section = register._build_business_case_section(
+        {"git_sha": "abc123"},
+        {"business_impact": {}},
+        {},
+        {"regime": "cold_start", "criteria": {}},
+    )
+    assert section["expected_impact"]["capacity_budget_check"] is None
+
+
+# ---------------------------------------------------------------------------
 # Full pass: alias flip, drift_reference.json, model_card.json, promoted tag
 # ---------------------------------------------------------------------------
 

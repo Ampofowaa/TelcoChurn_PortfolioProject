@@ -35,15 +35,19 @@ from telco_churn.features.generate import (
     AdoptionDecision,
     BackwardEliminationResult,
     ImportanceResult,
+    LapEvaluation,
     LapRecord,
     RedundancyResult,
     adoption_gate,
     backward_elimination,
     bootstrap_pr_auc_ci,
     candidate_importance,
+    compute_charge_per_service,
+    compute_service_count,
     oof_predictions,
     profile_false_negatives,
     redundancy_screen,
+    run_lap,
     serving_available,
     write_provenance,
 )
@@ -268,6 +272,66 @@ def test_profile_fn_sorted_by_fn_rate_descending() -> None:
     result = profile_false_negatives(X, y, proba, threshold=0.5)
     fn_rates = result["fn_rate"].tolist()
     assert fn_rates == sorted(fn_rates, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# compute_service_count / compute_charge_per_service (QA #7)
+# ---------------------------------------------------------------------------
+
+
+def _cps_row(**overrides: str | float) -> pd.DataFrame:
+    """One-row frame with every compute_service_count input, Yes/No defaults."""
+    base: dict[str, str | float] = {
+        "phoneservice": "No",
+        "multiplelines": "No phone service",
+        "internetservice": "No",
+        "onlinesecurity": "No",
+        "onlinebackup": "No",
+        "deviceprotection": "No",
+        "techsupport": "No",
+        "streamingtv": "No",
+        "streamingmovies": "No",
+        "monthlycharges": 20.0,
+    }
+    base.update(overrides)
+    return pd.DataFrame([base])
+
+
+def test_compute_service_count_sums_active_flags() -> None:
+    """phoneservice + multiplelines are separate line items; both contribute 1."""
+    df = _cps_row(phoneservice="Yes", multiplelines="Yes", internetservice="DSL")
+    assert compute_service_count(df).iloc[0] == 3
+
+
+def test_compute_service_count_fiber_and_dsl_both_count_as_internet() -> None:
+    """internetservice contributes 1 whenever it isn't 'No' — DSL or Fiber optic alike."""
+    df_dsl = _cps_row(internetservice="DSL")
+    df_fiber = _cps_row(internetservice="Fiber optic")
+    assert compute_service_count(df_dsl).iloc[0] == 1
+    assert compute_service_count(df_fiber).iloc[0] == 1
+
+
+def test_compute_service_count_all_no_is_zero() -> None:
+    """A customer with every service flag 'No' has service_count 0 (clipped by the caller)."""
+    assert compute_service_count(_cps_row()).iloc[0] == 0
+
+
+def test_compute_charge_per_service_divides_by_active_services() -> None:
+    """monthlycharges / service_count for a customer with more than one active service."""
+    df = _cps_row(
+        phoneservice="Yes",
+        internetservice="DSL",
+        onlinebackup="Yes",
+        monthlycharges=29.85,
+    )
+    # phone(1) + internet(1) + onlinebackup(1) = 3
+    assert compute_charge_per_service(df).iloc[0] == pytest.approx(29.85 / 3)
+
+
+def test_compute_charge_per_service_clips_zero_service_count_to_one() -> None:
+    """A customer with no active services divides by 1, not 0 — no divide-by-zero."""
+    df = _cps_row(monthlycharges=19.90)
+    assert compute_charge_per_service(df).iloc[0] == pytest.approx(19.90)
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +672,210 @@ def test_adoption_gate_returns_adoption_decision_type() -> None:
     )
     assert isinstance(accepted, AdoptionDecision)
     assert isinstance(rejected, AdoptionDecision)
+
+
+# ---------------------------------------------------------------------------
+# run_lap
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def base_lap_state(
+    discovery_data: tuple[pd.DataFrame, pd.Series],
+) -> tuple[pd.DataFrame, pd.Series, np.ndarray, float, tuple[float, float]]:
+    """Base (candidate-free) OOF state that run_lap's ``current_*`` args represent.
+
+    Mirrors the notebook's cell 9 base-model wiring: OOF fit on monthlycharges alone,
+    using the same LGBMClassifier default run_lap itself uses internally, so the
+    PR-AUC delta computed inside run_lap is comparable to this baseline.
+    """
+    X, y = discovery_data
+    X_base = X[["monthlycharges"]].copy()
+    prep_base = build_preprocessor(binary=[], multi_cat=[], numeric=["monthlycharges"])
+    oof_base = oof_predictions(X_base, y, prep_base, random_state=42)
+    pr_auc_base = float(average_precision_score(y, oof_base))
+    ci_base = bootstrap_pr_auc_ci(np.asarray(y), oof_base, random_state=42)
+    return X_base, y, oof_base, pr_auc_base, ci_base
+
+
+def _run_lap_kwargs(
+    base_lap_state: tuple[
+        pd.DataFrame, pd.Series, np.ndarray, float, tuple[float, float]
+    ],
+    discovery_data: tuple[pd.DataFrame, pd.Series],
+    **overrides: object,
+) -> dict[str, object]:
+    X, _ = discovery_data
+    X_base, y, oof_base, pr_auc_base, ci_base = base_lap_state
+    kwargs: dict[str, object] = dict(
+        candidate=X["candidate_good"],
+        candidate_col="candidate_good",
+        required_cols=["monthlycharges"],
+        feature_group="numeric",
+        X_current=X_base,
+        y=y,
+        active_binary=[],
+        active_multi_cat=[],
+        active_numeric=["monthlycharges"],
+        adopted_df=X_base,
+        decoy_col=X["decoy"],
+        decoy_col_name="decoy_noise",
+        current_oof_proba=oof_base,
+        current_pr_auc=pr_auc_base,
+        current_ci=ci_base,
+        build_preprocessor_fn=build_preprocessor,
+        random_state=42,
+        verbose=False,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_run_lap_invalid_feature_group_raises() -> None:
+    """run_lap rejects a feature_group outside {binary, multi_cat, numeric} immediately."""
+    with pytest.raises(ValueError, match="feature_group"):
+        run_lap(
+            candidate=pd.Series([1, 0]),
+            candidate_col="x",
+            required_cols=[],
+            feature_group="bogus",  # type: ignore[arg-type]
+            X_current=pd.DataFrame({"a": [1, 2]}),
+            y=pd.Series([0, 1]),
+            active_binary=[],
+            active_multi_cat=[],
+            active_numeric=[],
+            adopted_df=pd.DataFrame(),
+            decoy_col=pd.Series([0.1, 0.2]),
+            decoy_col_name="decoy",
+            current_oof_proba=np.array([0.1, 0.2]),
+            current_pr_auc=0.5,
+            current_ci=(0.4, 0.6),
+            build_preprocessor_fn=build_preprocessor,
+        )
+
+
+def test_run_lap_serving_unavailable_rejects_at_screen1(
+    base_lap_state: tuple[
+        pd.DataFrame, pd.Series, np.ndarray, float, tuple[float, float]
+    ],
+    discovery_data: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """A candidate whose source column isn't serving-available is rejected at Screen 1 without a re-fit."""
+    kwargs = _run_lap_kwargs(
+        base_lap_state, discovery_data, required_cols=["not_a_real_raw_column"]
+    )
+    result = run_lap(**kwargs)  # type: ignore[arg-type]
+    assert result.decision.adopted is False
+    assert result.decision.rejection_screen == 1
+    assert result.redundancy_result is None
+    assert result.importance_result is None
+    _, y, oof_base, pr_auc_base, ci_base = base_lap_state
+    np.testing.assert_array_equal(result.oof_proba, oof_base)
+    assert result.pr_auc == pr_auc_base
+    assert result.ci == ci_base
+
+
+def test_run_lap_x_with_candidate_always_populated(
+    base_lap_state: tuple[
+        pd.DataFrame, pd.Series, np.ndarray, float, tuple[float, float]
+    ],
+    discovery_data: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """X_with_candidate carries the candidate column even on a Screen 1 rejection."""
+    kwargs = _run_lap_kwargs(
+        base_lap_state, discovery_data, required_cols=["not_a_real_raw_column"]
+    )
+    result = run_lap(**kwargs)  # type: ignore[arg-type]
+    assert "candidate_good" in result.X_with_candidate.columns
+
+
+def test_run_lap_strong_signal_adopts_with_blind_spot_mask(
+    base_lap_state: tuple[
+        pd.DataFrame, pd.Series, np.ndarray, float, tuple[float, float]
+    ],
+    discovery_data: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """A strongly separating candidate clears all four screens when a bs_mask is supplied."""
+    _, y = discovery_data
+    bs_mask = (y == 1).to_numpy()
+    kwargs = _run_lap_kwargs(base_lap_state, discovery_data, bs_mask=bs_mask)
+    result = run_lap(**kwargs)  # type: ignore[arg-type]
+    assert isinstance(result, LapEvaluation)
+    assert result.decision.adopted is True
+    assert result.redundancy_result is not None
+    assert result.redundancy_result.flagged is False
+    assert result.importance_result is not None
+    assert result.importance_result.above_floor is True
+    assert result.sub_recall_delta is not None
+
+
+def test_run_lap_no_bs_mask_leaves_sub_recall_delta_none_even_when_adopted(
+    base_lap_state: tuple[
+        pd.DataFrame, pd.Series, np.ndarray, float, tuple[float, float]
+    ],
+    discovery_data: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """Domain-wide laps (bs_mask=None) print a global FN diagnostic but never populate sub_recall_delta."""
+    kwargs = _run_lap_kwargs(base_lap_state, discovery_data, bs_mask=None)
+    result = run_lap(**kwargs)  # type: ignore[arg-type]
+    assert result.decision.adopted is True
+    assert result.sub_recall_delta is None
+
+
+def test_run_lap_flat_candidate_rejects_at_screen3(
+    base_lap_state: tuple[
+        pd.DataFrame, pd.Series, np.ndarray, float, tuple[float, float]
+    ],
+    discovery_data: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """A pure-noise candidate fails the PR-AUC delta gate and Screen 4 is skipped."""
+    X, _ = discovery_data
+    kwargs = _run_lap_kwargs(
+        base_lap_state,
+        discovery_data,
+        candidate=X["decoy"],
+        candidate_col="decoy_as_candidate",
+    )
+    result = run_lap(**kwargs)  # type: ignore[arg-type]
+    assert result.decision.adopted is False
+    assert result.decision.rejection_screen == 3
+    assert result.importance_result is None
+
+
+def test_run_lap_verbose_false_prints_nothing(
+    base_lap_state: tuple[
+        pd.DataFrame, pd.Series, np.ndarray, float, tuple[float, float]
+    ],
+    discovery_data: tuple[pd.DataFrame, pd.Series],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """verbose=False suppresses every Screen print, keeping run_lap usable outside notebooks."""
+    kwargs = _run_lap_kwargs(base_lap_state, discovery_data)
+    run_lap(**kwargs)  # type: ignore[arg-type]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
+def test_run_lap_verbose_true_prints_all_four_screens(
+    base_lap_state: tuple[
+        pd.DataFrame, pd.Series, np.ndarray, float, tuple[float, float]
+    ],
+    discovery_data: tuple[pd.DataFrame, pd.Series],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """verbose=True (the notebook default) prints all four screen lines plus the decision."""
+    _, y = discovery_data
+    bs_mask = (y == 1).to_numpy()
+    kwargs = _run_lap_kwargs(
+        base_lap_state, discovery_data, bs_mask=bs_mask, verbose=True
+    )
+    run_lap(**kwargs)  # type: ignore[arg-type]
+    out = capsys.readouterr().out
+    assert "Screen 1 (serving)" in out
+    assert "Screen 2 (redundancy)" in out
+    assert "Screen 3 (PR-AUC)" in out
+    assert "Screen 4 (importance)" in out
+    assert "DECISION" in out
 
 
 # ---------------------------------------------------------------------------

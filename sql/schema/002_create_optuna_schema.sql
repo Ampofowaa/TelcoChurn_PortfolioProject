@@ -1,0 +1,11 @@
+-- Isolates Optuna's own tables (studies, trials, trial_params, ...) from
+-- application tables in the same database — models/train/tuning.py's
+-- RDBStorage connects with search_path=optuna, never 'public'.
+-- Applied twice, deliberately: once here via docker-compose.yml's
+-- docker-entrypoint-initdb.d mount (fresh containers only — that mount never
+-- fires against an already-initialized data volume), and again explicitly by
+-- tuning.py::_build_optuna_storage at call time, the same belt-and-braces
+-- pattern 001_create_raw.sql's setup_schema() uses for customers_raw, so a
+-- pre-existing Postgres instance (CI's testcontainers, Phase 12's RDS, a
+-- developer's already-initialized local container) still gets the schema.
+CREATE SCHEMA IF NOT EXISTS optuna;

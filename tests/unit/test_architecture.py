@@ -394,8 +394,9 @@ def test_every_main_module_has_a_subprocess_test(module_path: Path) -> None:
 # (test_only_evaluate_binds_the_test_partition polices the test-partition
 # half of that pattern separately), plus each other's own __main__ CLI wiring
 # (data/split.py's CLI validates via data/validate.py first; features/build.py's
-# CLI builds SQL features via features/sql_features.py first) — unrelated to
-# PR C. models/ carries no row: calibrate.py, threshold.py, evaluate.py,
+# CLI builds SQL features via features/sql_features.py first, and validates the
+# materialized DataFrame via data/validate.py::validate_clean before persisting
+# it) — unrelated to PR C. models/ carries no row: calibrate.py, threshold.py, evaluate.py,
 # error_analysis.py, and register.py import their shared helpers from
 # calibration_metrics.py/artifacts.py/policy_config.py/gate.py/utils, never
 # from one another — including calibrate.py <-> register.py, which no longer
@@ -420,7 +421,7 @@ _MAIN_MODULE_IMPORT_ALLOWANCES: dict[str, set[str]] = {
         "models/train/log_model.py",
         "models/train/tuning.py",
     },
-    "data/validate.py": {"data/ingest.py", "data/split.py"},
+    "data/validate.py": {"data/ingest.py", "data/split.py", "features/build.py"},
     "features/sql_features.py": {"features/build.py"},
 }
 
