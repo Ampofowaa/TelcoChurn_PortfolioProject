@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock
@@ -12,8 +13,26 @@ import pandas as pd
 import pytest
 from omegaconf import DictConfig, OmegaConf
 
+import telco_churn.features.accessor as accessor
 import telco_churn.models.train.tuning as tuning
 from telco_churn.utils.paths import activate_config, reset_active_config
+
+_FAKE_DATA_CONTENT_HASH = "deadbeef" * 8
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stub_data_content_hash() -> Iterator[None]:
+    """run_tuning_step stamps data_content_hash via features_sha256() with no
+    path override on every trial run and the tuning_summary run alike,
+    resolving to the real, gitignored datasets/processed/telco_churn_features.parquet
+    — absent on a fresh checkout. Every test below trains on the synthetic
+    dev_split fixture, never real processed data, so stub the hash.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(tuning, "features_sha256", lambda path=None: _FAKE_DATA_CONTENT_HASH)
+    yield
+    mp.undo()
+
 
 # ---------------------------------------------------------------------------
 # select_best_trial
@@ -329,7 +348,7 @@ def test_build_optuna_storage_isolates_schema_when_postgres_url_is_set(
 
 
 def test_study_name_changes_when_features_content_changes(
-    tuning_cfg: DictConfig, tmp_path: Path
+    tuning_cfg: DictConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Holding cfg.tuning and committed_features fixed, pointing at two
     different-content features files must mint two different study names.
@@ -339,7 +358,14 @@ def test_study_name_changes_when_features_content_changes(
     a genuine data change never changed the study name and _study_name
     would silently resume a study built on stale data (see tuning.py's
     module docstring / PROJECT_PLAN.md's Phase 8 prerequisites section).
+
+    Restores the real features_sha256 for this test only, undoing the
+    module's _stub_data_content_hash autouse fixture — the whole point here
+    is proving the hash actually reflects file content, which a fixed stub
+    value cannot demonstrate. Both dirs below are this test's own tmp_path
+    files, never the real project artifact, so hashing them for real is safe.
     """
+    monkeypatch.setattr(tuning, "features_sha256", accessor.features_sha256)
     committed_features = ["tenure", "monthlycharges"]
 
     dir_a = tmp_path / "content_a"

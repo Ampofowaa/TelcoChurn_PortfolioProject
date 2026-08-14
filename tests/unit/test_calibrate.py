@@ -749,10 +749,14 @@ def sandboxed_dev_features(
     monkeypatch: pytest.MonkeyPatch, dev_split: tuple[pd.DataFrame, pd.Series]
 ) -> None:
     """Redirect run_calibration_step's load_dev_features()/load_dev_customer_ids()
-    to the synthetic dev_split fixture.
+    to the synthetic dev_split fixture, and stub log_model.features_sha256 for
+    the _log_parent_run(...) -> log_model.run_model_logging_step(...) call
+    every consumer of this fixture makes to produce its parent tuning_study run.
 
-    Unpatched, both fall through to load_features() -> partition() ->
-    load_split(), all called with no path override — reading the real,
+    Unpatched, load_dev_features()/load_dev_customer_ids() fall through to
+    load_features() -> partition() -> load_split(), and
+    run_model_logging_step's own data_content_hash stamp falls through to
+    features_sha256() — all called with no path override, reading the real,
     gitignored datasets/processed/ directory. That happens to work today only
     because a real processed CSV + split manifest exist locally; on a fresh
     clone (no pipeline run yet), every Step 3 test would fail with
@@ -772,6 +776,7 @@ def sandboxed_dev_features(
 
     monkeypatch.setattr(calibrate, "load_dev_features", _fake_load_dev_features)
     monkeypatch.setattr(calibrate, "load_dev_customer_ids", _fake_load_dev_customer_ids)
+    monkeypatch.setattr(log_model, "features_sha256", lambda path=None: "deadbeef" * 8)
 
 
 def _log_parent_run(
@@ -928,6 +933,11 @@ def calibrated_run(
     All three keep their own function-scoped registration_cfg/tuning_result/
     sandboxed_dev_features (above), untouched by this
     fixture and its separate "test_run_calibration_step_shared" experiment.
+
+    log_model.features_sha256 is stubbed too: _log_parent_run's
+    run_model_logging_step call stamps data_content_hash unconditionally,
+    with no path override, which would otherwise hit the same real,
+    gitignored processed-features file sandboxed_dev_features exists to avoid.
     """
     mp = pytest.MonkeyPatch()
     X_dev, y_dev = _module_dev_split
@@ -944,6 +954,7 @@ def calibrated_run(
 
     mp.setattr(calibrate, "load_dev_features", _fake_load_dev_features)
     mp.setattr(calibrate, "load_dev_customer_ids", _fake_load_dev_customer_ids)
+    mp.setattr(log_model, "features_sha256", lambda path=None: "deadbeef" * 8)
 
     run_id = _log_parent_run(
         _module_dev_split,

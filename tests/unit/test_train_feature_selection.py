@@ -4,7 +4,7 @@ full-vs-reduced paired-bootstrap ablation behind COMMITTED_FEATURES."""
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 import mlflow
 import pandas as pd
@@ -16,6 +16,23 @@ from telco_churn.features.accessor import features_path
 from telco_churn.features.build import FEATURE_SCHEMA
 
 _TEST_EXPERIMENT_NAME = "test_run_feature_selection_step"
+_FAKE_DATA_CONTENT_HASH = "deadbeef" * 8
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stub_data_content_hash() -> Iterator[None]:
+    """run_feature_selection_step stamps data_content_hash via
+    features_sha256() with no path override, resolving to the real,
+    gitignored datasets/processed/telco_churn_features.parquet — absent on a
+    fresh checkout. Every test below trains on synthetic fixtures, never real
+    processed data, so stub the hash.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        feature_selection, "features_sha256", lambda path=None: _FAKE_DATA_CONTENT_HASH
+    )
+    yield
+    mp.undo()
 
 
 @pytest.fixture

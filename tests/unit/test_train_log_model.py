@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import mlflow
@@ -12,6 +13,23 @@ import pytest
 from omegaconf import OmegaConf
 
 import telco_churn.models.train.log_model as log_model
+
+_FAKE_DATA_CONTENT_HASH = "deadbeef" * 8
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stub_data_content_hash() -> Iterator[None]:
+    """run_model_logging_step stamps data_content_hash via features_sha256()
+    with no path override, resolving to the real, gitignored
+    datasets/processed/telco_churn_features.parquet — absent on a fresh
+    checkout. Every test below trains on the synthetic dev_split fixture,
+    never real processed data, so stub the hash.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(log_model, "features_sha256", lambda path=None: _FAKE_DATA_CONTENT_HASH)
+    yield
+    mp.undo()
+
 
 # ---------------------------------------------------------------------------
 # run_model_logging_step (C2)

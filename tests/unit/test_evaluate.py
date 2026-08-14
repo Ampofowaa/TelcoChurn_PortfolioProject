@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -60,6 +60,23 @@ _BARS = GateBars(
     brier_non_inferiority_margin=0.005,
     recall_non_inferiority_margin=0.03,
 )
+
+
+_FAKE_DATA_CONTENT_HASH = "deadbeef" * 8
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stub_data_content_hash() -> Iterator[None]:
+    """_log_evaluation_run stamps data_content_hash via features_sha256() with
+    no path override, resolving to the real, gitignored
+    datasets/processed/telco_churn_features.parquet — absent on a fresh
+    checkout. Every test below scores synthetic fixtures, never real
+    processed data, so stub the hash.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(evaluate, "features_sha256", lambda path=None: _FAKE_DATA_CONTENT_HASH)
+    yield
+    mp.undo()
 
 
 @pytest.fixture

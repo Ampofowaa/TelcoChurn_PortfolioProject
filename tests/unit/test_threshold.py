@@ -674,6 +674,10 @@ def registered_model_version(
     active for the rest of the module: torn down (mp.undo()) only once every
     test in this file has run.
 
+    log_model.features_sha256 is stubbed for the same reason: run_model_logging_step
+    (called here to mint the parent tuning_study run) stamps data_content_hash
+    unconditionally, with no path override, hitting the same real file.
+
     load_dev_customer_ids() is sandboxed the same way, on both bindings too —
     unpatched, run_calibration_step's dev_oof_predictions.parquet build zips
     this fixture's small y_dev against the real, full-length customerid
@@ -750,6 +754,7 @@ def registered_model_version(
     mp.setattr(threshold, "load_dev_customer_ids", _fake_load_dev_customer_ids)
     mp.setattr(threshold, "load_dev_partition", lambda: _module_feature_df)
     mp.setattr(threshold, "load_dev_shap_summary", _fake_load_dev_shap_summary)
+    mp.setattr(log_model, "features_sha256", lambda path=None: "deadbeef" * 8)
 
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result = {**tuning_result, "parent_run_id": run.info.run_id}
