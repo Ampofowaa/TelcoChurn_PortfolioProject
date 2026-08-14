@@ -88,9 +88,14 @@ def test_split_main_cli_exits_zero(
     -> pd.read_sql_table(customers_raw) -> make_split -> write_split.
     """
     out_dir = tmp_path
-    env = {**os.environ, "POSTGRES_URL": pg_url, "PROCESSED_DATA_DIR": str(out_dir)}
+    env = {**os.environ, "POSTGRES_URL": pg_url}
     result = subprocess.run(
-        [sys.executable, "-m", "telco_churn.data.split"],
+        [
+            sys.executable,
+            "-m",
+            "telco_churn.data.split",
+            f"paths.processed_data={out_dir}",
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -127,10 +132,14 @@ def test_split_main_cli_exits_one_when_customers_raw_missing(tmp_path: Path) -> 
         env = {
             **os.environ,
             "POSTGRES_URL": empty_url,
-            "PROCESSED_DATA_DIR": str(tmp_path),
         }
         result = subprocess.run(
-            [sys.executable, "-m", "telco_churn.data.split"],
+            [
+                sys.executable,
+                "-m",
+                "telco_churn.data.split",
+                f"paths.processed_data={tmp_path}",
+            ],
             env=env,
             capture_output=True,
             text=True,

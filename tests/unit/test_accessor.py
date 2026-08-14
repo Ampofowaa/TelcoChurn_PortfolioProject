@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 
 import pandas as pd
+import pyarrow
 import pytest
 from pandera.errors import SchemaError, SchemaErrors
 
@@ -78,7 +79,7 @@ def test_features_path_default_matches_configured_processed_dir() -> None:
 def test_features_path_explicit_override_returned_unchanged(tmp_path: Path) -> None:
     """An explicit path bypasses the canonical project location entirely — the
     override tests use to avoid touching the real project artifact."""
-    explicit = tmp_path / "custom_features.csv"
+    explicit = tmp_path / "custom_features.parquet"
     assert features_path(explicit) == explicit
 
 
@@ -90,10 +91,10 @@ def test_features_path_explicit_override_returned_unchanged(tmp_path: Path) -> N
 def test_load_features_valid_file_round_trips(
     tmp_path: Path, valid_features_df: pd.DataFrame
 ) -> None:
-    """A schema-conformant CSV loads and validates cleanly, preserving row count
-    and columns."""
-    path = tmp_path / "features.csv"
-    valid_features_df.to_csv(path, index=False)
+    """A schema-conformant Parquet file loads and validates cleanly, preserving
+    row count and columns."""
+    path = tmp_path / "features.parquet"
+    valid_features_df.to_parquet(path, index=False)
 
     loaded = load_features(path)
 
@@ -106,8 +107,8 @@ def test_load_features_missing_column_raises(
 ) -> None:
     """A file missing a required column (e.g. the SQL-engineering step was
     skipped) fails schema validation loudly, not silently."""
-    path = tmp_path / "features.csv"
-    valid_features_df.drop(columns=["charge_per_service"]).to_csv(path, index=False)
+    path = tmp_path / "features.parquet"
+    valid_features_df.drop(columns=["charge_per_service"]).to_parquet(path, index=False)
 
     with pytest.raises((SchemaError, SchemaErrors)):
         load_features(path)
@@ -120,42 +121,46 @@ def test_load_features_wrong_dtype_raises(
     schema validation."""
     bad_df = valid_features_df.copy()
     bad_df["tenure"] = "twelve"
-    path = tmp_path / "features.csv"
-    bad_df.to_csv(path, index=False)
+    path = tmp_path / "features.parquet"
+    bad_df.to_parquet(path, index=False)
 
     with pytest.raises((SchemaError, SchemaErrors)):
         load_features(path)
 
 
 def test_load_features_empty_file_raises(tmp_path: Path) -> None:
-    """A zero-byte CSV fails loudly at the pandas read boundary rather than
-    silently returning an empty frame."""
-    path = tmp_path / "features.csv"
+    """A zero-byte file is not a valid Parquet container (no magic bytes/footer)
+    and fails loudly at the pyarrow read boundary rather than silently
+    returning an empty frame."""
+    path = tmp_path / "features.parquet"
     path.write_text("")
 
-    with pytest.raises(pd.errors.EmptyDataError):
+    with pytest.raises(pyarrow.lib.ArrowInvalid):
         load_features(path)
 
 
-def test_load_features_header_only_raises(
+def test_load_features_zero_row_file_loads_empty_frame(
     tmp_path: Path, valid_features_df: pd.DataFrame
 ) -> None:
-    """A header-only (zero-row) CSV also fails schema validation: with no data
-    rows to infer dtypes from, pandas reads every column back as `object`,
-    which FeatureOutputSchema's strict `coerce=False` rejects outright — a
-    distinct failure mode from the zero-byte-file case above."""
-    path = tmp_path / "features.csv"
-    valid_features_df.iloc[:0].to_csv(path, index=False)
+    """A zero-row Parquet file loads and validates cleanly, unlike the
+    equivalent CSV case: Parquet stores each column's dtype in its schema, so a
+    zero-row file round-trips with the same dtypes as the DataFrame that wrote
+    it — there is no header-only ambiguity for pandera's coerce=False check to
+    reject the way an all-`object`-dtype CSV read would be."""
+    path = tmp_path / "features.parquet"
+    valid_features_df.iloc[:0].to_parquet(path, index=False)
 
-    with pytest.raises((SchemaError, SchemaErrors)):
-        load_features(path)
+    loaded = load_features(path)
+
+    assert loaded.empty
+    assert set(valid_features_df.columns).issubset(set(loaded.columns))
 
 
 def test_load_features_missing_file_raises(tmp_path: Path) -> None:
     """A nonexistent path fails loudly (FileNotFoundError from pandas), not
     with a schema error that would misattribute the cause."""
     with pytest.raises(FileNotFoundError):
-        load_features(tmp_path / "does-not-exist.csv")
+        load_features(tmp_path / "does-not-exist.parquet")
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +173,8 @@ def test_features_sha256_matches_manual_hash(
 ) -> None:
     """features_sha256 is exactly hashlib.sha256 over the file's raw bytes —
     no normalization, no re-serialization."""
-    path = tmp_path / "features.csv"
-    valid_features_df.to_csv(path, index=False)
+    path = tmp_path / "features.parquet"
+    valid_features_df.to_parquet(path, index=False)
 
     expected = hashlib.sha256(path.read_bytes()).hexdigest()
     assert features_sha256(path) == expected
@@ -179,8 +184,8 @@ def test_features_sha256_stable_across_repeated_calls(
     tmp_path: Path, valid_features_df: pd.DataFrame
 ) -> None:
     """Hashing the same unchanged file twice returns the same digest."""
-    path = tmp_path / "features.csv"
-    valid_features_df.to_csv(path, index=False)
+    path = tmp_path / "features.parquet"
+    valid_features_df.to_parquet(path, index=False)
 
     assert features_sha256(path) == features_sha256(path)
 
@@ -191,12 +196,12 @@ def test_features_sha256_changes_when_content_changes(
     """A content edit (e.g. a re-run of the feature pipeline on updated raw
     data) changes the digest — the consistency check evaluate.py relies
     on to catch a stale or mismatched features file."""
-    path = tmp_path / "features.csv"
-    valid_features_df.to_csv(path, index=False)
+    path = tmp_path / "features.parquet"
+    valid_features_df.to_parquet(path, index=False)
     original_hash = features_sha256(path)
 
     changed_df = valid_features_df.copy()
     changed_df.loc[0, "monthlycharges"] = 999.0
-    changed_df.to_csv(path, index=False)
+    changed_df.to_parquet(path, index=False)
 
     assert features_sha256(path) != original_hash

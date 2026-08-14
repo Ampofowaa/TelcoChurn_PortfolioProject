@@ -1,0 +1,22 @@
+# Permutation-importance feature selector — see features/select.py for the
+# selection rule and rescue logic these values feed. Shared by two callers:
+# models/train/feature_audit.py's live per-cycle diagnostic (reported, never
+# gating — features/schema.py::COMMITTED_FEATURES is the actual committed set,
+# a hand-maintained constant these values never override) and
+# notebooks/03b-feature-selection.ipynb's on-demand ablation review (ANALYSIS.md
+# §4b), which is what can actually change COMMITTED_FEATURES, deliberately,
+# never automatically.
+
+n_repeats: 15
+noise_floor_margin: 0.005
+inner_val_size: 0.2          # distinct from training_setup.test_size
+random_state: 42
+
+correlated_groups:
+  - [tenure, totalcharges, monthlycharges]
+  # 7-feature internetservice add-on cluster (VIF = inf, §8b 01-eda.ipynb) — a
+  # genuine correlation-dilution check, same footing as the trio above.
+  - [internetservice, onlinesecurity, onlinebackup, deviceprotection, techsupport, streamingtv, streamingmovies]
+  # All four fail the individual floor (§4b) — the joint rescue prices the
+  # collective importance a fairness-motivated removal of this block would need.
+  - [gender, seniorcitizen, has_partner, dependents]

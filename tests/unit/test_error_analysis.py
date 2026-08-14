@@ -15,27 +15,28 @@ import pandas as pd
 import pytest
 from omegaconf import DictConfig, OmegaConf
 
+import telco_churn.models.artifacts as artifacts
 import telco_churn.models.calibrate as calibrate
 import telco_churn.models.error_analysis as error_analysis
 import telco_churn.models.evaluate as evaluate
+import telco_churn.models.register as register
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
+from telco_churn.features.accessor import FEATURES_FILENAME
 from telco_churn.features.schema import FEATURE_SCHEMA
 from telco_churn.models.error_analysis import (
     _COLUMN_DISPLAY_NAMES,
-    _check_top_k_elbow,
     _illustrative_indices,
     _sanitize_metric_name,
     _sorted_gap_pairs,
-    direction_sanity_check,
     display_feature_name,
     error_concentration_scan,
     error_confidence_profile,
     near_miss_band_from_validation,
     value_weighted_error_profile,
 )
-from telco_churn.utils.paths import compose_config
+from telco_churn.utils.paths import activate_config, compose_config, reset_active_config
 
 # ---------------------------------------------------------------------------
 # error_confidence_profile
@@ -357,54 +358,6 @@ def test_error_concentration_scan_bins_numeric_features() -> None:
 
 
 # ---------------------------------------------------------------------------
-# direction_sanity_check
-# ---------------------------------------------------------------------------
-
-
-def test_direction_sanity_check_no_violation_when_direction_matches() -> None:
-    """A feature whose observed direction matches its expected sign passes."""
-    result = direction_sanity_check(["tenure"], {"tenure": -0.8}, {"tenure": -1})
-    assert result["passed"] is True
-    assert result["violations"] == []
-
-
-def test_direction_sanity_check_flags_contradicting_direction() -> None:
-    """A feature whose observed direction contradicts the established EDA
-    relationship is flagged as a violation, and the gate fails."""
-    result = direction_sanity_check(["tenure"], {"tenure": 0.7}, {"tenure": -1})
-    assert result["passed"] is False
-    assert len(result["violations"]) == 1
-    assert result["violations"][0]["feature"] == "tenure"
-
-
-def test_direction_sanity_check_unmatched_feature_is_not_checked_and_does_not_fail() -> (
-    None
-):
-    """A checked feature with no established relationship is recorded as
-    unchecked rather than silently treated as a pass on a claim never made."""
-    result = direction_sanity_check(
-        ["some_engineered_ratio"], {"some_engineered_ratio": 0.5}, {"tenure": -1}
-    )
-    assert result["passed"] is True
-    row = result["checked_features"][0]
-    assert row["checked"] is False
-    assert row["matched_eda_relationship"] is None
-
-
-def test_direction_sanity_check_longest_key_wins_on_ambiguous_substring() -> None:
-    """A feature name matching multiple expected-direction keys resolves to
-    the longest (most specific) match."""
-    result = direction_sanity_check(
-        ["contract_type_Two year"],
-        {"contract_type_Two year": -0.9},
-        {"year": 1, "two year": -1},
-    )
-    row = result["checked_features"][0]
-    assert row["matched_eda_relationship"] == "two year"
-    assert row["contradicts"] is False
-
-
-# ---------------------------------------------------------------------------
 # _sorted_gap_pairs
 # ---------------------------------------------------------------------------
 
@@ -441,59 +394,6 @@ def test_sorted_gap_pairs_missing_b_feature_treated_as_zero() -> None:
     rows_a = [{"feature": "a_only", "mean_signed_shap": 0.6}]
     result = _sorted_gap_pairs(rows_a, [])
     assert result == [("a_only", 0.6)]
-
-
-# ---------------------------------------------------------------------------
-# _check_top_k_elbow
-# ---------------------------------------------------------------------------
-
-
-def test_check_top_k_elbow_valid_when_configured_k_sits_on_a_real_elbow() -> None:
-    """A tight plateau (small consecutive deltas) followed by a real jump at
-    the configured k reports valid=True."""
-    values = [0.90, 0.60, 0.30, 0.29, 0.28, 0.27, 0.10, 0.09, 0.08]
-    result = _check_top_k_elbow(values, configured_k=6)
-    assert result["valid"] is True
-    assert result["ratio"] > 1.5
-
-
-def test_check_top_k_elbow_invalid_when_configured_k_is_mid_plateau() -> None:
-    """A configured k landing inside a smooth, gap-free decay (no real
-    elbow anywhere) reports valid=False."""
-    values = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
-    result = _check_top_k_elbow(values, configured_k=3)
-    assert result["valid"] is False
-
-
-def test_check_top_k_elbow_matches_current_project_config() -> None:
-    """Regression guard pinned to the real global-importance ranking
-    top_k_shap_features=8 was derived from: its own elbow at rank 8 still
-    validates, and a badly-wrong k=3 (mid-plateau) still fails."""
-    global_importance = [
-        0.6469,
-        0.4313,
-        0.2247,
-        0.1949,
-        0.1924,
-        0.1918,
-        0.1831,
-        0.1747,
-        0.1286,
-        0.1157,
-        0.0945,
-    ]
-    assert _check_top_k_elbow(global_importance, configured_k=8)["valid"] is True
-    assert _check_top_k_elbow(global_importance, configured_k=3)["valid"] is False
-
-
-def test_check_top_k_elbow_empty_plateau_reports_valid_with_no_baseline() -> None:
-    """configured_k too close to 1 to have a plateau baseline reports
-    valid=True with no ratio computed, rather than raising or dividing by
-    zero."""
-    values = [1.0, 0.5, 0.1]
-    result = _check_top_k_elbow(values, configured_k=1)
-    assert result["valid"] is True
-    assert result["plateau_median_delta"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -683,8 +583,16 @@ _FAST_EVALUATE_OVERRIDES = ["evaluate.n_bootstrap=30"]
 # V2b calibration-collapse check (sliced_calibration -> calibration_slope's
 # LogisticRegression bootstrap) -- ~8k unreduced refits. test_threshold.py's
 # own fixture already reduces this to 200; mirrored here since this fixture
-# nests the same call inside a larger chain.
-_FAST_THRESHOLD_OVERRIDES = ["threshold.n_bootstrap=50"]
+# nests the same call inside a larger chain. v3_top_k_features=3 (not the
+# production 8): _make_synthetic_processed_frame's docstring plants exactly
+# three real signal columns (contract_type, tenure, monthlycharges) — the
+# only ones with a real, learnable relationship to churn — so cutting the V3
+# pre-seal veto's top-k at 3 keeps it checking real signal instead of noise
+# from one of this fixture's many uninformative columns.
+_FAST_THRESHOLD_OVERRIDES = [
+    "threshold.n_bootstrap=50",
+    "threshold.v3_top_k_features=3",
+]
 
 
 def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame:
@@ -751,9 +659,9 @@ def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame
 def _seed_processed_data(
     out_dir: Path, n: int = 300, seed: int = 0
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Write a processed CSV + matching canonical split manifest into out_dir."""
+    """Write a processed features file + matching canonical split manifest into out_dir."""
     df = _make_synthetic_processed_frame(n=n, seed=seed)
-    df.to_csv(out_dir / "telco_churn_processed.csv", index=False)
+    df.to_parquet(out_dir / FEATURES_FILENAME, index=False)
     manifest = make_split(
         ids=df["customerid"], labels=df["churn"], test_size=0.2, random_state=42
     )
@@ -800,7 +708,7 @@ def evaluated_model(
 ) -> Iterator[dict[str, object]]:
     """Seed a real registered, calibrated, thresholded, and evaluated model —
     the production chain up to (not including) error_analysis.py — via direct
-    in-process calls, then leave PROCESSED_DATA_DIR set so the test body's own
+    in-process calls, then leave the config installed so the test body's own
     call into run_error_analysis_step resolves the same synthetic features.
 
     Self-contained: a throwaway SQLite MLflow store, no Docker — mirrors
@@ -812,16 +720,14 @@ def evaluated_model(
     (run_error_analysis_step is re-invoked, deterministically, by each test
     body) rather than mutating it, so the full train->calibrate->threshold->
     evaluate chain — ~65s of real model fitting — is built once per module
-    instead of once per test. tmp_path/monkeypatch are function-scoped
-    fixtures and can't be depended on by a module-scoped one, hence
-    tmp_path_factory and a manually-managed MonkeyPatch here.
+    instead of once per test. activate_config's installed config is a
+    process-global, not tied to any fixture scope, so nothing here depends on
+    tmp_path/monkeypatch's function scoping the way the old env-var version did.
     """
-    mp = pytest.MonkeyPatch()
     tmp_path = tmp_path_factory.mktemp("evaluated_model")
     data_dir = tmp_path / "processed"
     data_dir.mkdir()
     df, manifest = _seed_processed_data(data_dir)
-    mp.setenv("PROCESSED_DATA_DIR", str(data_dir))
 
     # Must match cfg.mlflow.experiment_name's own default (not an arbitrary
     # name): log_model.run_model_logging_step calls mlflow.set_experiment(cfg
@@ -851,11 +757,13 @@ def evaluated_model(
             f"paths.figures={figures_dir}",
             f"paths.policy={policy_dir}",
             f"paths.reports={reports_dir}",
+            f"paths.processed_data={data_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
             *_FAST_EVALUATE_OVERRIDES,
             *_FAST_THRESHOLD_OVERRIDES,
         ]
     )
+    activate_config(cfg)
 
     dev_df, _test_df = partition(df, manifest)
     feature_cols = [c for c in df.columns if c not in ("customerid", "churn")]
@@ -892,30 +800,28 @@ def evaluated_model(
             "boundary_hits": {"num_leaves": False},
         },
     }
-    comparison_result = {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result["parent_run_id"] = run.info.run_id
-    log_result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, cfg
-    )
+    log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
     cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
-    model_version = str(cal_result["model_version"])
+    run_id = str(cal_result["run_id"])
+    model_uri = str(cal_result["model_uri"])
+    # B1's call-site decoupling: calibrate.py no longer registers anything
+    # itself, so this fixture mints the challenger the same way register.py's
+    # own mint-mode CLI would, in-process.
+    model_version = register.register_challenger(
+        cfg, run_id, model_uri, str(cal_result["logged_model_id"])
+    )
 
-    threshold.run_threshold_step(model_version, cfg)
-    evaluate.run_evaluation_step(model_version, cfg)
+    threshold.run_threshold_step(run_id, model_version, cfg)
+    evaluate.run_evaluation_step(run_id, model_version, model_uri, cfg)
 
     try:
         yield {
             "cfg": cfg,
+            "run_id": run_id,
             "model_version": model_version,
+            "model_uri": model_uri,
             "data_dir": data_dir,
             "reports_dir": reports_dir,
             "figures_dir": figures_dir,
@@ -925,7 +831,34 @@ def evaluated_model(
             "registered_model_name": registered_model_name,
         }
     finally:
-        mp.undo()
+        reset_active_config()
+
+
+@pytest.fixture(autouse=True)
+def _reactivate_evaluated_model_config(
+    request: pytest.FixtureRequest,
+) -> Iterator[None]:
+    """Re-install evaluated_model's cfg for each test body that uses it.
+
+    evaluated_model is module-scoped, so its own activate_config() call is
+    undone by tests/unit/conftest.py's autouse _reset_active_config (function-
+    scoped, and same-scope conftest fixtures instantiate before same-scope
+    fixtures declared in the test module itself — so it runs after
+    evaluated_model's setup but before every test body). Re-installing here,
+    at the same function scope but declared in this file, runs after that
+    reset and is what makes the config survive for the test body. Guarded on
+    request.fixturenames so tests that don't use evaluated_model — most of
+    this module — never pay for building it.
+    """
+    if "evaluated_model" not in request.fixturenames:
+        yield
+        return
+    cfg = cast(DictConfig, request.getfixturevalue("evaluated_model")["cfg"])
+    activate_config(cfg)
+    try:
+        yield
+    finally:
+        reset_active_config()
 
 
 def test_run_error_analysis_step_returns_expected_keys_and_writes_report(
@@ -935,9 +868,13 @@ def test_run_error_analysis_step_returns_expected_keys_and_writes_report(
     OOF for error concentration, and writes reports/error_analysis.json — the
     artifact register.py aborts without."""
     cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
     model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
 
-    result = error_analysis.run_error_analysis_step(model_version, cfg)
+    result = error_analysis.run_error_analysis_step(
+        run_id, model_version, model_uri, cfg
+    )
 
     assert result["model_version"] == model_version
     assert result["error_analysis_run_id"]
@@ -949,10 +886,10 @@ def test_run_error_analysis_step_returns_expected_keys_and_writes_report(
         "shap",
         "top_k_elbow_checks",
         "subgroup_findings",
-        "direction_sanity_check",
-        "dev_oof_diagnostics_carried_through",
+        "direction_sanity_check_test",
     ):
         assert key in payload, f"error_analysis payload missing field: {key}"
+    assert "dev_oof_diagnostics_carried_through" not in payload
 
     reports_dir = Path(str(evaluated_model["reports_dir"]))
     on_disk = json.loads(
@@ -967,15 +904,20 @@ def test_run_error_analysis_step_shap_payload_has_expected_shape(
     """The shap sub-payload carries every field the notebook and model_card
     assembly (register.py) read, including both cohort-gap rankings."""
     cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
     model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
 
-    result = error_analysis.run_error_analysis_step(model_version, cfg)
+    result = error_analysis.run_error_analysis_step(
+        run_id, model_version, model_uri, cfg
+    )
     payload = cast(dict[str, Any], result["error_analysis"])
     shap_payload = payload["shap"]
 
     assert set(shap_payload) >= {
         "global_importance",
         "top_features",
+        "dependence_feature_set",
         "dependence",
         "binary_dependence",
         "cohort_shap",
@@ -986,12 +928,45 @@ def test_run_error_analysis_step_shap_payload_has_expected_shape(
         "local_explanations",
     }
     assert set(shap_payload["cohort_shap"]) == {"fn", "tp", "fp", "tn"}
-    assert "passed" in payload["direction_sanity_check"]
+    assert "passed" in payload["direction_sanity_check_test"]
     assert set(payload["top_k_elbow_checks"]) == {
-        "shap_features",
+        "dependence_features",
         "cohort_gap_fn_tp",
         "cohort_gap_fp_tn",
     }
+
+
+def test_run_error_analysis_step_dependence_grid_includes_dev_v3_audit_set(
+    evaluated_model: dict[str, object],
+) -> None:
+    """The dependence grid's feature set is top_k_dependence_features' own
+    test-side ranking unioned with threshold.py's dev-side V3 audit set —
+    sorted by test mean-|SHAP| descending, with no independent test-side k
+    for the inherited half (item 11/12)."""
+    cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
+    model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
+
+    result = error_analysis.run_error_analysis_step(
+        run_id, model_version, model_uri, cfg
+    )
+    payload = cast(dict[str, Any], result["error_analysis"])
+    shap_payload = payload["shap"]
+
+    dev_oof_diagnostics = artifacts.load_dev_oof_diagnostics(run_id, cfg)
+    dev_audit_set = set(dev_oof_diagnostics["direction_check_feature_names"])
+
+    dependence_feature_set = shap_payload["dependence_feature_set"]
+    assert dev_audit_set <= set(dependence_feature_set)
+    assert set(shap_payload["top_features"]) <= set(dependence_feature_set)
+
+    importance_by_feature = {
+        row["feature"]: row["mean_abs_shap"]
+        for row in shap_payload["global_importance"]
+    }
+    mean_abs_shap_values = [importance_by_feature[f] for f in dependence_feature_set]
+    assert mean_abs_shap_values == sorted(mean_abs_shap_values, reverse=True)
 
 
 def test_run_error_analysis_step_writes_all_figures(
@@ -1000,9 +975,11 @@ def test_run_error_analysis_step_writes_all_figures(
     """Every figure the notebook embeds is written to paths.figures, not left
     to be regenerated ad hoc."""
     cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
     model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
 
-    error_analysis.run_error_analysis_step(model_version, cfg)
+    error_analysis.run_error_analysis_step(run_id, model_version, model_uri, cfg)
 
     figures_dir = Path(str(evaluated_model["figures_dir"]))
     for filename in (
@@ -1029,19 +1006,23 @@ def test_run_error_analysis_step_logs_mlflow_run_and_direction_tag(
     evaluated_model: dict[str, object],
 ) -> None:
     """Logs its own error_analysis run (a sibling of evaluate.py's evaluation
-    run) tagged with the V3 direction-sanity verdict, with error_analysis.json
-    and the figures/ folder attached as artifacts."""
+    run) tagged with the test-side direction-sanity re-audit verdict, with
+    error_analysis.json and the figures/ folder attached as artifacts."""
     cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
     model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
 
-    result = error_analysis.run_error_analysis_step(model_version, cfg)
+    result = error_analysis.run_error_analysis_step(
+        run_id, model_version, model_uri, cfg
+    )
 
     client = mlflow.tracking.MlflowClient(
         tracking_uri=str(evaluated_model["tracking_uri"])
     )
     run = client.get_run(str(result["error_analysis_run_id"]))
     assert run.info.run_name == "error_analysis"
-    assert run.data.tags.get("direction_sanity_check") in {"pass", "fail"}
+    assert run.data.tags.get("direction_sanity_check_test") in {"pass", "fail"}
 
     artifact_paths = {a.path for a in client.list_artifacts(run.info.run_id)}
     assert "error_analysis.json" in artifact_paths
@@ -1062,7 +1043,9 @@ def test_run_error_analysis_step_raises_when_prediction_artifacts_missing(
     loudly rather than silently reaching for the test split some other way —
     mirrors test_error_analysis_subprocess.py's exit-1 CLI case, one layer
     closer to the code that actually raises."""
+    run_id = str(evaluated_model["run_id"])
     model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
     empty_reports_dir = tmp_path / "empty_reports"
     empty_reports_dir.mkdir()
     cfg_with_empty_reports = compose_config(
@@ -1080,4 +1063,62 @@ def test_run_error_analysis_step_raises_when_prediction_artifacts_missing(
     )
 
     with pytest.raises(FileNotFoundError):
-        error_analysis.run_error_analysis_step(model_version, cfg_with_empty_reports)
+        error_analysis.run_error_analysis_step(
+            run_id, model_version, model_uri, cfg_with_empty_reports
+        )
+
+
+def test_run_error_analysis_step_raises_on_missing_dev_oof_diagnostics_key(
+    evaluated_model: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dev_oof_diagnostics.json missing direction_check_feature_names raises
+    KeyError — a genuine pipeline defect, never silently rendered as an empty
+    V3 audit set. This is now the only key this module reads directly off
+    threshold.py's artifact — the V1/V2/V2b/V3 flags are no longer carried
+    through error_analysis.json; register.py's model card fetches those
+    itself, directly, at promotion time."""
+    cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
+    model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
+
+    def _incomplete_dev_oof_diagnostics(
+        _run_id: str, _cfg: DictConfig
+    ) -> dict[str, Any]:
+        return {}  # direction_check_feature_names deliberately omitted
+
+    monkeypatch.setattr(
+        error_analysis, "load_dev_oof_diagnostics", _incomplete_dev_oof_diagnostics
+    )
+
+    with pytest.raises(KeyError, match="direction_check_feature_names"):
+        error_analysis.run_error_analysis_step(run_id, model_version, model_uri, cfg)
+
+
+def test_run_error_analysis_step_raises_on_stale_test_predictions_stamp(
+    evaluated_model: dict[str, object],
+) -> None:
+    """reports/test_predictions.parquet stamped with a different logged_model_id
+    than the model being analyzed raises — the stale-copy-on-hand-run-rollback
+    hole the stamp exists to close."""
+    cfg = cast(DictConfig, evaluated_model["cfg"])
+    run_id = str(evaluated_model["run_id"])
+    model_version = str(evaluated_model["model_version"])
+    model_uri = str(evaluated_model["model_uri"])
+    reports_dir = Path(str(evaluated_model["reports_dir"]))
+
+    predictions_path = reports_dir / "test_predictions.parquet"
+    original = pd.read_parquet(predictions_path)
+    stale = original.copy()
+    stale["logged_model_id"] = "a-different-logged-model-id"
+    stale.to_parquet(predictions_path, index=False)
+
+    try:
+        with pytest.raises(ValueError, match="a-different-logged-model-id"):
+            error_analysis.run_error_analysis_step(
+                run_id, model_version, model_uri, cfg
+            )
+    finally:
+        # evaluated_model is module-scoped and shared with later tests —
+        # restore the real stamp so this test's mutation doesn't poison them.
+        original.to_parquet(predictions_path, index=False)

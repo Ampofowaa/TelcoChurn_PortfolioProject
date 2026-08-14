@@ -19,7 +19,7 @@ from telco_churn.data.checks import (
     check_totalcharges_nulls,
 )
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.paths import get_project_root, load_config
+from telco_churn.utils.paths import activate_config, compose_config, get_project_root
 
 __all__ = [
     "ValidationResult",
@@ -251,7 +251,8 @@ if __name__ == "__main__":
     load_dotenv()
     configure_logging()
 
-    cfg = load_config()
+    cfg = compose_config(overrides=sys.argv[1:] or None)
+    activate_config(cfg)
     min_rows = int(cfg.validation.min_rows)
     max_null_rate = float(cfg.validation.max_null_rate)
     reports_dir = get_project_root() / cfg.paths.validation_reports

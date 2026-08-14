@@ -18,10 +18,12 @@ from sklearn.metrics import average_precision_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 
+from telco_churn.features.accessor import features_sha256
 from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.models.train.common import (
-    _dvc_hash,
+    COMMITTED_MODEL_FAMILY,
+    COMMITTED_MODEL_FAMILY_DECISION_RUN_ID,
     _git_sha,
     _lgbm_fixed_knobs,
 )
@@ -31,6 +33,7 @@ from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
     set_logged_model_description,
     set_run_description,
+    write_train_receipt,
 )
 
 __all__ = ["run_model_logging_step"]
@@ -209,7 +212,6 @@ def _fit_committed_pipeline(
 
 def _build_training_manifest(
     cfg: DictConfig,
-    comparison: dict[str, Any],
     tuning_result: dict[str, Any],
     committed_features: list[str],
     full_feature_space: list[str],
@@ -221,15 +223,13 @@ def _build_training_manifest(
     """Assemble training_manifest.json — one section per pipeline step, nothing recomputed."""
     return {
         "model_name": str(cfg.mlflow.registered_model_name),
-        "model_family": "lightgbm",
+        "model_family": COMMITTED_MODEL_FAMILY,
         "git_sha": _git_sha(),
-        "dvc_data_hash": _dvc_hash(cfg),
-        "model_comparison": {
-            "delta_obs": comparison["delta_obs"],
-            "delta_ci_lower": comparison["delta_ci_lower"],
-            "delta_ci_upper": comparison["delta_ci_upper"],
-            "decision": comparison["decision"],
-            "decision_rule": comparison["decision_rule"],
+        "data_content_hash": features_sha256(),
+        "model_family_committed": {
+            "model_family": COMMITTED_MODEL_FAMILY,
+            "decision_reference": "ANALYSIS.md §4a",
+            "decision_run_id": COMMITTED_MODEL_FAMILY_DECISION_RUN_ID,
         },
         "feature_selection": {
             "feature_space": full_feature_space,
@@ -315,7 +315,6 @@ def _log_model_run(
 def run_model_logging_step(
     X_dev: pd.DataFrame,
     y_dev: pd.Series,
-    comparison: dict[str, Any],
     tuning_result: dict[str, Any],
     cfg: DictConfig,
 ) -> dict[str, Any]:
@@ -334,9 +333,11 @@ def run_model_logging_step(
     input example, runs a log -> reload -> predict_proba parity check (hard
     assertion), and logs feature_space.txt / feature_columns.txt /
     preprocessing.pkl plus training_manifest.json — the engineering audit trail,
-    one section per pipeline step: model_comparison (Step 2's family decision),
-    feature_selection (Step 3's frozen input space), training_summary (the
-    fixed LightGBM knobs applied to every fit, tuned or not), and tuning_summary
+    one section per pipeline step: model_family_committed (Steps 1-2's frozen
+    family decision, common.py::COMMITTED_MODEL_FAMILY — referenced, not
+    recomputed; see ANALYSIS.md §4a), feature_selection (Step 3's frozen input
+    space), training_summary (the fixed LightGBM knobs applied to every fit,
+    tuned or not), and tuning_summary
     (Step 4's trial counts, 1-SE band diagnostics, and the selected
     hyperparameters, passed through from run_tuning_step plus
     selected_hyperparameters added here — plus the tree-count scaling
@@ -355,6 +356,11 @@ def run_model_logging_step(
     registered. Phase 6's calibrate.py performs the training cycle's single
     registration, on the calibrated artifact, resolved via this manifest's
     logged_model_uri.
+
+    Writes reports/train_receipt.json ({"run_id"}) — the pointer
+    calibrate.py's __main__ reads by default when no explicit
+    calibration.run_id override is given (see utils/mlflow.py's module
+    docstring for why a local receipt is safe here).
 
     Returns {"run_id", "model_uri", "parity_ok", "training_manifest"}.
     """
@@ -386,6 +392,15 @@ def run_model_logging_step(
         "n_estimators": scaling["n_estimators_final"],
         **best_params,
     }
+    _colliding_keys = set(selected_hyperparameters) & set(fixed_hyperparameters)
+    if _colliding_keys:
+        raise ValueError(
+            "selected_hyperparameters and fixed_hyperparameters collide on "
+            f"{sorted(_colliding_keys)} — fixed: knobs must be non-negotiable "
+            "against any search result, so a key present in both means the "
+            "merge below is silently letting the fixed: block override a "
+            "value Optuna also searched, rather than a knob Optuna never saw."
+        )
     model_params = {**selected_hyperparameters, **fixed_hyperparameters}
 
     fitted = _fit_committed_pipeline(
@@ -400,7 +415,6 @@ def run_model_logging_step(
 
     training_manifest = _build_training_manifest(
         cfg,
-        comparison,
         tuning_result,
         committed_features,
         full_feature_space,
@@ -431,6 +445,8 @@ def run_model_logging_step(
         "from the in-memory pipeline on the same input sample — the serialized "
         "model is not safe to log."
     )
+
+    write_train_receipt(run_id, cfg)
 
     logger.info(
         "model_logged",

@@ -1,4 +1,4 @@
-.PHONY: help lint format test test-data test-features test-models test-integration data db-up db-down ingest validate split features train calibrate threshold evaluate error-analysis register pre-commit mlflow-ui clean
+.PHONY: help lint format test test-data test-features test-models test-integration data db-up db-down ingest validate split features train calibrate threshold evaluate error-analysis review register-challenger register pre-commit mlflow-ui clean
 
 .DEFAULT_GOAL := help
 
@@ -32,7 +32,7 @@ test-features: ## Run features package tests with scoped coverage
 		--cov=src/telco_churn/features --cov-report=term-missing
 
 test-models: ## Run models package tests with scoped coverage
-	$(RUN) pytest tests/unit/test_train_common.py tests/unit/test_train_candidates.py tests/unit/test_train_comparison.py tests/unit/test_train_feature_freeze.py tests/unit/test_train_tuning.py tests/unit/test_train_log_model.py tests/unit/test_diagnostics.py tests/unit/test_calibrate.py tests/unit/test_threshold.py tests/unit/test_economics.py tests/unit/test_error_analysis.py tests/unit/test_evaluate.py tests/unit/test_explain.py tests/unit/test_gate.py tests/unit/test_plots.py tests/unit/test_register.py tests/unit/test_drift_reference.py \
+	$(RUN) pytest tests/unit/test_train_common.py tests/unit/test_train_candidates.py tests/unit/test_train_comparison.py tests/unit/test_train_feature_audit.py tests/unit/test_train_feature_selection.py tests/unit/test_train_tuning.py tests/unit/test_train_log_model.py tests/unit/test_diagnostics.py tests/unit/test_calibrate.py tests/unit/test_calibration_metrics.py tests/unit/test_threshold.py tests/unit/test_economics.py tests/unit/test_error_analysis.py tests/unit/test_evaluate.py tests/unit/test_explain.py tests/unit/test_gate.py tests/unit/test_plots.py tests/unit/test_register.py tests/unit/test_review.py tests/unit/test_drift_reference.py tests/unit/test_artifacts.py tests/unit/test_policy_config.py tests/unit/test_shap_values.py \
 		--override-ini="addopts=" \
 		--cov=src/telco_churn/models --cov-report=term-missing
 
@@ -70,23 +70,30 @@ features: ## Build SQL feature views -> write the processed dataset
 train: ## Train LightGBM + Optuna tuning; logs to MLflow
 	$(RUN) python -m telco_churn.models.train
 
-calibrate: ## Calibrate probabilities + register challenger (RUN_ID=<run_id>)
-	@if [ -z "$(RUN_ID)" ]; then echo "Error: RUN_ID is required. Usage: make calibrate RUN_ID=<run_id>"; exit 1; fi
-	$(RUN) python -m telco_churn.models.calibrate calibration.run_id=$(RUN_ID)
+calibrate: ## Calibrate probabilities (fit + log only, no registry write; optional RUN_ID=<run_id>; defaults to train.py's receipt)
+	$(RUN) python -m telco_churn.models.calibrate $(if $(RUN_ID),calibration.run_id=$(RUN_ID),)
 
-threshold: ## Derive the cost-sensitive threshold (MODEL_VERSION=<version>)
-	@if [ -z "$(MODEL_VERSION)" ]; then echo "Error: MODEL_VERSION is required. Usage: make threshold MODEL_VERSION=<version>"; exit 1; fi
-	$(RUN) python -m telco_churn.models.threshold threshold.model_version=$(MODEL_VERSION)
+threshold: ## Derive the cost-sensitive threshold (optional MODEL_VERSION=<version>; defaults to calibrate.py's receipt)
+	$(RUN) python -m telco_churn.models.threshold $(if $(MODEL_VERSION),threshold.model_version=$(MODEL_VERSION),)
 
-evaluate: ## One-time sealed-test evaluation + promotion gate (MODEL_VERSION=<version>)
-	@if [ -z "$(MODEL_VERSION)" ]; then echo "Error: MODEL_VERSION is required. Usage: make evaluate MODEL_VERSION=<version>"; exit 1; fi
-	$(RUN) python -m telco_churn.models.evaluate evaluate.model_version=$(MODEL_VERSION)
+evaluate: ## One-time sealed-test evaluation + promotion gate (optional MODEL_VERSION=<version>; defaults to calibrate.py's receipt)
+	$(RUN) python -m telco_churn.models.evaluate $(if $(MODEL_VERSION),evaluate.model_version=$(MODEL_VERSION),)
 
-error-analysis: ## SHAP explainability + error diagnosis (MODEL_VERSION=<version>)
-	@if [ -z "$(MODEL_VERSION)" ]; then echo "Error: MODEL_VERSION is required. Usage: make error-analysis MODEL_VERSION=<version>"; exit 1; fi
-	$(RUN) python -m telco_churn.models.error_analysis error_analysis.model_version=$(MODEL_VERSION)
+error-analysis: ## SHAP explainability + error diagnosis (optional MODEL_VERSION=<version>; defaults to calibrate.py's receipt)
+	$(RUN) python -m telco_churn.models.error_analysis $(if $(MODEL_VERSION),error_analysis.model_version=$(MODEL_VERSION),)
 
-register: ## Act on the promotion gate verdict: flip champion, or reject (MODEL_VERSION=<version>)
+review: ## Stamp a human promotion-review verdict (VERDICT=approved|rejected APPROVER="..." NOTES="..." required; optional EVAL_RUN_ID=<run_id>, defaults to evaluate.py's receipt)
+	@if [ -z "$(VERDICT)" ] || [ -z "$(APPROVER)" ] || [ -z "$(NOTES)" ]; then \
+		echo 'Error: VERDICT, APPROVER, and NOTES are all required.'; \
+		echo 'Usage: make review VERDICT=approved APPROVER="J. Doe" NOTES="reason for the verdict"'; \
+		exit 1; \
+	fi
+	$(RUN) python -m telco_churn.models.review $(if $(EVAL_RUN_ID),review.eval_run_id=$(EVAL_RUN_ID),) review.verdict=$(VERDICT) review.approver="'$(APPROVER)'" review.notes="'$(NOTES)'"
+
+register-challenger: ## Mint the calibrated pipeline as a new challenger version (optional RUN_ID=<run_id>; defaults to calibrate.py's receipt)
+	$(RUN) python -m telco_churn.models.register $(if $(RUN_ID),register.run_id=$(RUN_ID),)
+
+register: ## Act on the promotion gate verdict: flip champion, or reject (MODEL_VERSION=<version> required — no receipt fallback, deliberately explicit)
 	@if [ -z "$(MODEL_VERSION)" ]; then echo "Error: MODEL_VERSION is required. Usage: make register MODEL_VERSION=<version>"; exit 1; fi
 	$(RUN) python -m telco_churn.models.register register.model_version=$(MODEL_VERSION)
 

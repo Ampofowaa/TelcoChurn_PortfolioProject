@@ -54,8 +54,8 @@ target-version = "py313"
 exclude = ["notebooks/"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "PT"]
-ignore = ["E501"]
+select = ["E", "F", "I", "UP", "B", "PT", "TRY", "LOG", "PTH"]
+ignore = ["E501", "TRY003", "PTH123"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["ANN"]

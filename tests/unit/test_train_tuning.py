@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock
@@ -12,7 +13,26 @@ import pandas as pd
 import pytest
 from omegaconf import DictConfig, OmegaConf
 
+import telco_churn.features.accessor as accessor
 import telco_churn.models.train.tuning as tuning
+from telco_churn.utils.paths import activate_config, reset_active_config
+
+_FAKE_DATA_CONTENT_HASH = "deadbeef" * 8
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stub_data_content_hash() -> Iterator[None]:
+    """run_tuning_step stamps data_content_hash via features_sha256() with no
+    path override on every trial run and the tuning_summary run alike,
+    resolving to the real, gitignored datasets/processed/telco_churn_features.parquet
+    — absent on a fresh checkout. Every test below trains on the synthetic
+    dev_split fixture, never real processed data, so stub the hash.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(tuning, "features_sha256", lambda path=None: _FAKE_DATA_CONTENT_HASH)
+    yield
+    mp.undo()
+
 
 # ---------------------------------------------------------------------------
 # select_best_trial
@@ -230,6 +250,44 @@ def test_boundary_hit_check_interior_values_not_flagged() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _suggest_lgbm_params (C1)
+# ---------------------------------------------------------------------------
+
+
+def test_suggest_lgbm_params_max_depth_independent_of_num_leaves() -> None:
+    """max_depth samples its own configured range regardless of num_leaves's draw.
+
+    Regression test for the removed num_leaves-coupling: max_depth and
+    num_leaves are independent leaf-wise-growth regularizers, and a trial
+    where max_depth binds before num_leaves is exhausted is valid, not an
+    error the sampler needs to prevent.
+    """
+    search_space = OmegaConf.create(
+        {
+            "num_leaves": {"low": 100, "high": 200, "type": "int"},
+            "max_depth": {"low": 3, "high": 12, "type": "int"},
+        }
+    )
+    study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=42))
+    for _ in range(20):
+        trial = study.ask()
+        params = tuning._suggest_lgbm_params(trial, search_space)
+        assert 3 <= params["max_depth"] <= 12
+        study.tell(trial, 0.5)
+
+
+def test_suggest_lgbm_params_max_depth_unaffected_when_num_leaves_absent() -> None:
+    """max_depth samples its configured range untouched when num_leaves isn't tuned."""
+    search_space = OmegaConf.create(
+        {"max_depth": {"low": 3, "high": 12, "type": "int"}}
+    )
+    study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=42))
+    trial = study.ask()
+    params = tuning._suggest_lgbm_params(trial, search_space)
+    assert 3 <= params["max_depth"] <= 12
+
+
+# ---------------------------------------------------------------------------
 # _build_optuna_storage
 # ---------------------------------------------------------------------------
 
@@ -257,7 +315,8 @@ def test_build_optuna_storage_isolates_schema_when_postgres_url_is_set(
     """POSTGRES_URL set: schema isolation runs and RDBStorage gets the
     search_path connect_args, both unchanged from the pre-fallback behavior."""
     monkeypatch.setenv(
-        "POSTGRES_URL", "postgresql://user:pass@host/db"  # pragma: allowlist secret
+        "POSTGRES_URL",
+        "postgresql://user:pass@host/db",  # pragma: allowlist secret
     )
     conn = MagicMock()
     engine = MagicMock()
@@ -281,6 +340,86 @@ def test_build_optuna_storage_isolates_schema_when_postgres_url_is_set(
         url="postgresql://user:pass@host/db",  # pragma: allowlist secret
         engine_kwargs={"connect_args": {"options": "-csearch_path=optuna"}},
     )
+
+
+# ---------------------------------------------------------------------------
+# _study_name — data_content_hash regression coverage
+# ---------------------------------------------------------------------------
+
+
+def test_study_name_changes_when_features_content_changes(
+    tuning_cfg: DictConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Holding cfg.tuning and committed_features fixed, pointing at two
+    different-content features files must mint two different study names.
+
+    Regression test for the data_content_hash fix: the retired _dvc_hash
+    read a .dvc sidecar that never existed and was permanently 'unknown', so
+    a genuine data change never changed the study name and _study_name
+    would silently resume a study built on stale data (see tuning.py's
+    module docstring / PROJECT_PLAN.md's Phase 8 prerequisites section).
+
+    Restores the real features_sha256 for this test only, undoing the
+    module's _stub_data_content_hash autouse fixture — the whole point here
+    is proving the hash actually reflects file content, which a fixed stub
+    value cannot demonstrate. Both dirs below are this test's own tmp_path
+    files, never the real project artifact, so hashing them for real is safe.
+    """
+    monkeypatch.setattr(tuning, "features_sha256", accessor.features_sha256)
+    committed_features = ["tenure", "monthlycharges"]
+
+    dir_a = tmp_path / "content_a"
+    dir_a.mkdir()
+    (dir_a / "telco_churn_features.parquet").write_bytes(b"content-a")
+    dir_b = tmp_path / "content_b"
+    dir_b.mkdir()
+    (dir_b / "telco_churn_features.parquet").write_bytes(b"content-b")
+
+    try:
+        activate_config(OmegaConf.create({"paths": {"processed_data": str(dir_a)}}))
+        name_a = tuning._study_name(tuning_cfg, committed_features)
+
+        activate_config(OmegaConf.create({"paths": {"processed_data": str(dir_b)}}))
+        name_b = tuning._study_name(tuning_cfg, committed_features)
+
+        activate_config(OmegaConf.create({"paths": {"processed_data": str(dir_a)}}))
+        name_a_again = tuning._study_name(tuning_cfg, committed_features)
+    finally:
+        reset_active_config()
+
+    assert name_a != name_b
+    assert name_a == name_a_again  # unchanged data resumes the same study
+
+
+def test_study_name_changes_when_search_space_changes(
+    tuning_cfg: DictConfig, tmp_path: Path
+) -> None:
+    """A search_space edit (e.g. max_depth.low) mints a new study name.
+
+    config_digest hashes the raw YAML search_space, so any bound change —
+    not just a data change — must start a fresh study rather than mixing
+    trials sampled under different ranges into the same 1-SE pool.
+    """
+    features_dir = tmp_path / "features"
+    features_dir.mkdir()
+    (features_dir / "telco_churn_features.parquet").write_bytes(b"content")
+    committed_features = ["tenure", "monthlycharges"]
+
+    cfg_a = tuning_cfg.copy()
+    cfg_a.tuning.search_space.max_depth.low = 3
+    cfg_b = tuning_cfg.copy()
+    cfg_b.tuning.search_space.max_depth.low = 4
+
+    try:
+        activate_config(
+            OmegaConf.create({"paths": {"processed_data": str(features_dir)}})
+        )
+        name_a = tuning._study_name(cfg_a, committed_features)
+        name_b = tuning._study_name(cfg_b, committed_features)
+    finally:
+        reset_active_config()
+
+    assert name_a != name_b
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +618,40 @@ def test_run_tuning_step_logs_trial_history_as_mlflow_table(
     data, artifact_file = log_table_mock.call_args[0]
     assert artifact_file == "tuning/trials.json"
     assert "fold_scores" not in data.columns
+
+
+def test_run_tuning_step_tags_trial_runs_with_optuna_study_name(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """Every nested trial run carries `optuna_study_name` — not just an implicit
+    `mlflow.parentRunId` link — so a later notebook/query can find every trial a
+    content-addressed study has ever run, even one resumed under a different
+    parent run (a crash-resume, or a rerun once the study is already complete).
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    result = tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        storage=optuna.storages.InMemoryStorage(),
+    )
+
+    client = mlflow.tracking.MlflowClient()
+    parent_run = client.get_run(result["parent_run_id"])
+    study_name = parent_run.data.params["optuna_study_name"]
+
+    trial_runs = client.search_runs(
+        [parent_run.info.experiment_id],
+        filter_string=f"tags.mlflow.parentRunId = '{result['parent_run_id']}'",
+    )
+    assert trial_runs
+    assert all(r.data.tags.get("optuna_study_name") == study_name for r in trial_runs)
 
 
 def test_run_tuning_step_skips_enqueue_without_warm_start_params(
@@ -827,3 +1000,102 @@ def test_run_tuning_step_logs_dev_input_once_on_parent_run(
     )
 
     log_dev_input_mock.assert_called_once_with(X_dev, y_dev, context="training")
+
+
+# ---------------------------------------------------------------------------
+# fANOVA hyperparameter importance — logged once in the pipeline, not
+# reconstructed later by every notebook that wants to render it
+# ---------------------------------------------------------------------------
+
+
+def test_run_tuning_step_logs_hyperparameter_importance(
+    monkeypatch: pytest.MonkeyPatch,
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """fANOVA importance is logged as both the rendered chart and the
+    underlying per-parameter values (CLAUDE.md: log the array, not only the
+    chart), computed directly against the live study rather than a
+    reconstruction from MLflow-logged trial params.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    log_dict_mock = Mock()
+    log_figure_mock = Mock()
+    monkeypatch.setattr(mlflow, "log_dict", log_dict_mock)
+    monkeypatch.setattr(mlflow, "log_figure", log_figure_mock)
+
+    tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        storage=optuna.storages.InMemoryStorage(),
+    )
+
+    importance_dict_calls = [
+        c
+        for c in log_dict_mock.call_args_list
+        if c.args[1] == "tuning/hyperparameter_importance.json"
+    ]
+    assert len(importance_dict_calls) == 1
+    importance_payload = importance_dict_calls[0].args[0]
+    assert set(importance_payload) == set(tuning_cfg.tuning.search_space)
+
+    importance_figure_calls = [
+        c
+        for c in log_figure_mock.call_args_list
+        if c.args[1] == "tuning/hyperparameter_importance.png"
+    ]
+    assert len(importance_figure_calls) == 1
+
+
+def test_run_tuning_step_skips_importance_artifacts_when_fanova_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """A study fANOVA can't fit (too few completed trials, a degenerate
+    search) logs a warning and skips both importance artifacts rather than
+    failing the whole training cycle over a diagnostic.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("not enough trials")
+
+    monkeypatch.setattr(optuna.importance, "get_param_importances", _raise)
+    warning_mock = Mock()
+    monkeypatch.setattr(tuning.logger, "warning", warning_mock)
+    log_dict_mock = Mock()
+    log_figure_mock = Mock()
+    monkeypatch.setattr(mlflow, "log_dict", log_dict_mock)
+    monkeypatch.setattr(mlflow, "log_figure", log_figure_mock)
+
+    result = tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        storage=optuna.storages.InMemoryStorage(),
+    )
+
+    assert result["best_params"]  # the step still completes normally
+    assert any(
+        c.args[0] == "hyperparameter_importance_unavailable"
+        for c in warning_mock.call_args_list
+    )
+    assert not any(
+        c.args[1] == "tuning/hyperparameter_importance.json"
+        for c in log_dict_mock.call_args_list
+    )
+    assert not any(
+        c.args[1] == "tuning/hyperparameter_importance.png"
+        for c in log_figure_mock.call_args_list
+    )

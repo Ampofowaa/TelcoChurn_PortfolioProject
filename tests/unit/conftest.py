@@ -13,6 +13,18 @@ from helpers import make_row
 
 from telco_churn.features.build import TARGET_COL
 from telco_churn.models.train.common import _FEATURE_COLS
+from telco_churn.utils.paths import reset_active_config
+
+
+@pytest.fixture(autouse=True)
+def _reset_active_config() -> None:
+    """Clear any installed config between tests.
+
+    activate_config() sets a process-global — without this, a test that calls
+    it (directly, or via an in-process step invocation) would leak its config
+    into every test that runs after it in the same session.
+    """
+    reset_active_config()
 
 
 @pytest.fixture

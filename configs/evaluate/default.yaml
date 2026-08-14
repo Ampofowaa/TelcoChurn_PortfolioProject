@@ -1,11 +1,29 @@
 # Sealed-test evaluation configuration — see models/evaluate.py.
 
-# telco-churn-pipeline version to evaluate on the sealed test set — required, e.g. `evaluate.model_version=1`.
+# telco-churn-pipeline version to evaluate on the sealed test set, e.g. `evaluate.model_version=1`.
+# Giving both this and run_id is an error (ambiguous, never silently resolved
+# in one direction). Giving neither falls back to reports/calibrate_receipt.json.
 model_version: null
 
+# telco-churn-pipeline run_id to evaluate on the sealed test set, e.g. `evaluate.run_id=<id>`.
+# Alternative to model_version above — see its comment for the both/neither rules.
+run_id: null
+
+# Incumbent champion version to compare the candidate against, e.g.
+# `evaluate.champion_version=3`. The `champion` registry alias is
+# externally-mutable, moving state a DVC `cmd` string cannot declare as a
+# dep (PROJECT_PLAN.md's undeclared-dependency note) — a pipeline invocation
+# that cares about reproducibility resolves the alias once beforehand and
+# passes the version in explicitly. The literal string "none" pins the
+# cold-start regime explicitly (no incumbent, even if a champion is live).
+# Omitting this falls back to a live read of the `champion` alias — the
+# right default for interactive/notebook use, never for `dvc repro`.
+champion_version: null
+
 # Bootstrap resample count for every reported metric's CI (PR-AUC, recall, precision,
-# F1, BSS, calibration slope, EV). Distinct from training_setup.bootstrap_n_samples
-# (Phase 5's model-family comparison uses a different count for a different decision).
+# F1, BSS, calibration slope, EV). Distinct from comparison.py's
+# _FAMILY_REVIEW_N_BOOTSTRAP (Phase 5's notebook-only model-family comparison
+# uses a different count for a different decision).
 n_bootstrap: 1000
 
 # Bootstrap resampling seed.

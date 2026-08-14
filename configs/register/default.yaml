@@ -1,23 +1,58 @@
 # Registry promotion configuration — see models/register.py.
 
-# telco-churn-pipeline version to register — required, e.g. `register.model_version=2`.
-# Never inferred from the challenger alias: register.py must act on the exact
-# version evaluate.py's promotion_decision.json was computed against.
+# telco-churn-pipeline version whose eval_run_id/gate-criteria tags should be
+# re-pointed at a fresh cold-start re-evaluation, e.g.
+# `register.refresh_reference_version=3`. The one legitimate use: evaluate.py
+# refused a later cycle's comparative gate because this (already-promoted)
+# version's historical test_predictions.parquet was computed against a
+# processed-features file that no longer matches (data_content_hash drift —
+# e.g. a new engineered column, even though this version's own frozen
+# feature_columns.txt never reads it). Fix by re-running
+# `evaluate.model_version=<this version> evaluate.champion_version=none`
+# against the current features file, then pointing this key at the same
+# version so refresh_champion_reference can pick up that fresh eval run — see
+# its docstring. Does not run the gate and does not move champion/challenger;
+# mutually exclusive with model_version/run_id below (an error to give more
+# than one).
+refresh_reference_version: null
+
+# telco-churn-pipeline version to promote/reject, e.g. `register.model_version=2`
+# — the already-registered challenger evaluate.py's promotion_decision.json
+# was computed against. Never inferred from the challenger alias.
+# Mutually exclusive with run_id below and refresh_reference_version above
+# (an error to give more than one): model_version selects the promote/reject
+# path (run_registration_step); run_id selects the mint path
+# (register_challenger). Giving none of the three also mints, defaulting
+# run_id to calibrate.py's own receipt.
 model_version: null
 
-# Require promotion_decision.json's review field to be "approved" before acting.
-# Phase 7 default: true (a human stamps the review in notebook 05). Phase 10's
-# weekly automated retrain sets this false — no human in the loop every cycle.
+# calibrate.py run_id to mint as a new challenger version, e.g.
+# `register.run_id=<id>`. Falls back to reports/calibrate_receipt.json (the
+# most recent calibrate.py run on this machine) when null and model_version
+# is also null. See model_version's comment above for the both/neither rules.
+run_id: null
+
+# Require an approved human review before acting. True is the attended default:
+# a reviewer stamps the verdict via the review CLI each cycle.
+# What Phase 10's weekly unattended retrain sets this to is NOT yet decided —
+# earlier drafts asserted false here, but that was residue from the review
+# mechanism being Jupyter-bound (an unattended flow cannot open JupyterLab), not
+# a judgment that a weekly cycle needs no human. The CLI removes that constraint.
+# Do not set false in an automated flow on the strength of this comment; see the
+# require_review open question in PROJECT_PLAN.md's Phase 10 section. Note also
+# that a cold start — no version tagged promotion_status: promoted — must force
+# true regardless, since there is no rollback target if the gate admits a bad one.
 require_review: true
 
 # Alias the flip targets on a pass. Parameterized rather than hard-coded so
 # Phase 10's shadow/canary staging can reuse promote_to_alias() unchanged.
 alias: champion
 
-# Absolute tolerance for the golden-parity smoke check (reload vs. calibrate.py's
-# in-memory reference scores). One order looser than calibrate.py's own
-# in-process check (1e-12) to allow for the cross-process/alias-resolution hop —
-# only meaningful under a pinned environment (see environment_packages below).
+# Absolute tolerance for the golden-parity smoke check (reload vs.
+# calibrate.py's logged golden_predictions.json reference scores) — used by
+# both register_challenger's mint-time check and run_registration_step's
+# pre-/post-flip checks. Only meaningful under a pinned environment (see
+# environment_packages below).
 golden_atol: 1.0e-9
 
 # Packages compared between the registered model's logged pip requirements and

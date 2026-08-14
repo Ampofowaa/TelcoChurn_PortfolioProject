@@ -37,7 +37,10 @@ from omegaconf import DictConfig
 from sklearn.metrics import average_precision_score, precision_recall_curve
 
 from telco_churn.features.preprocessing import TENURE_COHORT_EDGES, TENURE_COHORT_LABELS
-from telco_churn.models.calibrate import calibration_slope, expected_calibration_error
+from telco_churn.models.calibration_metrics import (
+    calibration_slope,
+    expected_calibration_error,
+)
 
 __all__ = [
     "FAIRNESS_AXES",
@@ -575,7 +578,13 @@ def sliced_calibration(
                 continue
             y_seg, p_seg = y[mask], p[mask]
             slope = calibration_slope(y_seg, p_seg, n_bootstrap, random_state)
-            ece = expected_calibration_error(p_seg, pd.Series(y_seg), cfg)
+            ece = expected_calibration_error(
+                p_seg,
+                pd.Series(y_seg),
+                int(cfg.calibration.ece_n_bins),
+                str(cfg.calibration.ece_strategy),
+                f"segment:{axis}={value}",
+            )
             rows.append(
                 {
                     "axis": axis,

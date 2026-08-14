@@ -21,14 +21,16 @@ brier_bootstrap_n_samples: 10_000
 
 # Row-resample bootstrap for the dev-OOF calibration slope's CI — a diagnostic,
 # not the family-decision bootstrap, hence the smaller count (matches
-# training_setup.segment_bootstrap_n_samples' cost/precision tradeoff).
+# comparison.py's _FAMILY_REVIEW_SEGMENT_N_BOOTSTRAP cost/precision tradeoff).
 slope_bootstrap_n_samples: 1_000
 
 # Expected Calibration Error (ECE) binning — gates nothing, just needs to be comparable across runs.
 ece_n_bins: 10
 ece_strategy: quantile
 
-# tuning_study run_id to calibrate — required, e.g. `run_id=<id>` on the CLI. Never inferred from "latest".
+# tuning_study run_id to calibrate — e.g. `calibration.run_id=<id>` on the CLI.
+# Falls back to reports/train_receipt.json (written by models.train) when null.
+# Never inferred from mlflow "latest" — only an explicit override or the receipt.
 run_id: null
 
 # Rows in the golden-parity fixture (golden_predictions.json) — the lowest

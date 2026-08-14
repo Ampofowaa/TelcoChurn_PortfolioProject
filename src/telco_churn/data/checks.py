@@ -58,6 +58,9 @@ class CheckResult:
 # totalcharges excluded: nullable=True in RawSchema (11 zero-tenure NULLs expected).
 # customerid excluded: Gate 1 (schema) and Gate 2 (duplicate IDs) already cover it;
 # including it here would triple-report the same problem in the validation report.
+# churn is NOT excluded: a null churn label double-reports (Gate 3 ERROR + Gate 5
+# WARNING null_rate_churn), but Gate 3 alone already drives can_proceed, so the
+# extra WARNING is redundant rather than harmful — left in rather than special-cased.
 _NULL_CHECKED_COLS: Final[frozenset[str]] = frozenset(
     col_name
     for col_name, col_schema in RawSchema.to_schema().columns.items()

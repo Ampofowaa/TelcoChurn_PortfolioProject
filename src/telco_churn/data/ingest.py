@@ -168,41 +168,39 @@ def ingest(
     _load_staging(df, engine)
     n = _merge_from_staging(update_cols, engine)
     if n != csv_rows:
+        # A CHECK/NOT NULL violation would raise IntegrityError out of _merge_from_staging's
+        # engine.begin() before this line is ever reached — Postgres fails the whole
+        # INSERT...SELECT atomically, it does not skip individual rows. validate_raw already
+        # rejects the same violations upstream (Gate 1 mirrors the DDL's CHECK constraints;
+        # Gate 2 rejects duplicate customerid). So a mismatch here, with no exception raised,
+        # points at a staging/merge invariant break instead — e.g. a bug in _load_staging.
         raise RuntimeError(
             f"Merge row count mismatch: DB reported {n} rows processed "
-            f"but CSV contained {csv_rows} — check Postgres logs for constraint violations."
+            f"but CSV contained {csv_rows} — investigate _load_staging/_merge_from_staging, "
+            "not per-row constraint violations."
         )
     logger.info("merge_complete", db_rows=n, csv_rows=csv_rows, table="customers_raw")
     return n
 
 
 if __name__ == "__main__":
-    import argparse
     import sys
 
     from dotenv import load_dotenv
 
     from telco_churn.utils.logging import configure_logging
-    from telco_churn.utils.paths import load_config
+    from telco_churn.utils.paths import activate_config, compose_config
 
     load_dotenv()
     configure_logging()
 
-    cfg = load_config()
-    default_csv = get_project_root() / cfg.paths.raw_data
-
-    parser = argparse.ArgumentParser(description="Ingest raw Telco CSV into Postgres.")
-    parser.add_argument(
-        "--csv-path",
-        type=Path,
-        default=default_csv,
-        help=f"Path to the raw CSV file (default: {default_csv})",
-    )
-    args = parser.parse_args()
+    cfg = compose_config(overrides=sys.argv[1:] or None)
+    activate_config(cfg)
+    csv_path = get_project_root() / cfg.paths.raw_data
 
     try:
         ingest(
-            path=args.csv_path,
+            path=csv_path,
             min_rows=int(cfg.validation.min_rows),
             max_null_rate=float(cfg.validation.max_null_rate),
         )

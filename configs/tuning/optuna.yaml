@@ -10,7 +10,7 @@ timeout_seconds: 5400   # 90 min; generous multiple of expected 50-trial runtime
 # Floor on completed trials before trusting the selection_rule pick — below it, a warning flags the pick as unreliable instead of blocking it. null disables the check.
 min_completed_trials: 10   # 20% of n_trials
 
-# Decoupled from training_setup.cv_folds — this cost compounds across n_trials, so it stays cheap. No cv_repeats for the same reason.
+# Decoupled from candidates.py's _FAMILY_REVIEW_CV_FOLDS (notebook-only, Phase 5's model-family comparison) — this cost compounds across n_trials, so it stays cheap. No cv_repeats for the same reason.
 cv_folds: 5
 random_state: 42
 
@@ -56,7 +56,13 @@ search_space:
     low: 0.0
     high: 10.0
     type: float
-  # Guard rail: max_depth >= ceil(log2(num_leaves.high)) so leaf-wise growth can't build arbitrarily deep branches on ~5,600 training rows.
+  # No coupling to num_leaves: max_depth and num_leaves are independent
+  # leaf-wise-growth regularizers, and it's valid for either to bind first.
+  # An earlier version floored this low at ceil(log2(num_leaves.high)) to
+  # keep max_depth deep enough for any sampled num_leaves; on this dataset
+  # it excluded the shallow-tree region (max_depth=4, num_leaves=6) the
+  # 1-SE rule actually preferred and lowered both the raw-best and 1-SE CV
+  # PR-AUC on a re-run. Removed rather than re-anchored — see tuning.py::_suggest_lgbm_params.
   max_depth:
     low: 3
     high: 12

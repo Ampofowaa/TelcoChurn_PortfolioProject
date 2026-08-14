@@ -5,7 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-__all__ = ["get_project_root", "load_config", "compose_config"]
+__all__ = [
+    "get_project_root",
+    "load_config",
+    "compose_config",
+    "activate_config",
+    "reset_active_config",
+]
+
+_active_config: Any | None = None
 
 
 def get_project_root() -> Path:
@@ -28,10 +36,38 @@ def get_project_root() -> Path:
 
 
 def load_config() -> Any:
-    """Load and return the root Hydra config from configs/config.yaml."""
+    """Return the active installed config if one is set, else load config.yaml fresh.
+
+    An installed config (see activate_config()) always takes precedence — this is
+    what lets a process-global override (e.g. a test's paths.processed_data=<tmp>)
+    reach accessor modules that call load_config() internally without threading a
+    cfg parameter through every call site.
+    """
+    if _active_config is not None:
+        return _active_config
+
     from omegaconf import OmegaConf
 
     return OmegaConf.load(get_project_root() / "configs" / "config.yaml")
+
+
+def activate_config(cfg: Any) -> None:
+    """Install cfg as the process-global config returned by load_config().
+
+    Call once per entry point, immediately after compose_config(), so every
+    module that resolves its own defaults via load_config() (rather than
+    taking cfg as a parameter) sees the same composed, override-applied tree.
+    Must be paired with reset_active_config() between in-process test runs —
+    see the autouse conftest.py fixture.
+    """
+    global _active_config
+    _active_config = cfg
+
+
+def reset_active_config() -> None:
+    """Clear the installed config, reverting load_config() to a fresh on-disk read."""
+    global _active_config
+    _active_config = None
 
 
 def compose_config(overrides: list[str] | None = None) -> Any:

@@ -1,0 +1,22 @@
+# Human promotion-review CLI configuration — see models/review.py.
+
+# Eval run to stamp a review verdict onto — e.g. `review.eval_run_id=<id>`.
+# Falls back to reports/eval_receipt.json (written by models.evaluate) when
+# null. Never inferred from a model version — no version exists yet at
+# review time; register.py mints one only after review, on a pass.
+eval_run_id: null
+
+# "approved" | "rejected" — required, e.g. `review.verdict=approved`.
+verdict: null
+
+# Reviewer's reasoning — required, e.g. `review.notes="PR-AUC and recall
+# both clear the bar; no fairness or calibration concerns."` Becomes part
+# of the permanent audit trail, so an empty note is refused rather than
+# silently accepted.
+notes: null
+
+# Reviewer identity — required, e.g. `review.approver="J. Doe"`. An
+# unauthenticated self-assertion on this tracking server, not a verified
+# identity — see PROJECT_PLAN.md's registration/review resolution for why a
+# git-committed alternative was considered and rejected.
+approver: null

@@ -1,29 +1,44 @@
 defaults:
   - training: lightgbm        # LightGBM fixed knobs → cfg.training
   - training@logreg: logreg   # LogReg comparison params → cfg.logreg
-  - training@selection: selection  # selector hyperparams → cfg.selection
+  - training@selection: feature_selection  # selector hyperparams → cfg.selection
   - tuning: optuna         # Optuna study + search space → cfg.tuning
   - calibration: default  # calibration method/CV/ECE knobs → cfg.calibration
   - threshold: default    # threshold derivation knobs, incl. the pre-seal dev-OOF screen → cfg.threshold
   - evaluate: default     # sealed-test evaluation knobs → cfg.evaluate
   - error_analysis: default  # error-diagnosis step knobs → cfg.error_analysis
+  - review: default       # human promotion-review CLI knobs → cfg.review
   - register: default     # registry promotion knobs → cfg.register
   # - data: telco          # pending
   # - serving: api         # pending
   - _self_
 
+# The dev/test split seed (data/split.py) and the CV-fold seed for models/train/.
+# Deliberately NOT the seed the later steps use: calibration/threshold/evaluate/tuning
+# each carry their own random_state in configs/<step>/default.yaml, all also 42. Two
+# reasons they stay separate despite the shared value. (1) Changing this one redraws
+# which customers are sealed into the test set — a one-key change must not be reachable
+# from a routine "re-run that bootstrap under a different draw" check, per the
+# test-set-touched-once invariant. (2) DVC declares seeds under each stage's `params:`,
+# so a single shared key would have to appear in all nine stages and would rerun the
+# whole DAG (including a cold Optuna study) on any seed edit. Do not "unify" these by
+# writing `random_state: ${random_seed}` in the step configs either — DVC parses those
+# files with its own YAML reader and would hash the literal `${random_seed}` string,
+# silently un-tracking the param (same defect as the ${oc.env:...} wrapper below).
 random_seed: 42
 
 training_setup:
   test_size: 0.2                        # stratified dev/test split fraction
-  cv_folds: 10                           # outer RSKF splits (shared with Optuna inner CV)
-  cv_repeats: 10                         # RSKF repeats — tightens mean PR-AUC on ~5,600 dev rows
-  bootstrap_n_samples: 10000            # paired-bootstrap resamples for Δ CI
-  segment_bootstrap_n_samples: 1000     # per-segment paired-bootstrap resamples (flag-only diagnostic, not the family decision — smaller for cost)
-  delta_threshold: 0.005                 # Δ*: pre-registered materiality threshold
-  fixed_recall_thresholds: [0.70, 0.80, 0.90]  # recall targets for the fixed-recall profile
+  # cv_folds/cv_repeats/bootstrap_n_samples/segment_bootstrap_n_samples retired:
+  # they drove Steps 1-2 (candidates.py/comparison.py), which are notebook-only
+  # (notebooks/03a-model-selection.ipynb) as of the model-family freeze —
+  # nothing automated calls them, so there is no CLI-override use case. Values
+  # now live as module constants (_FAMILY_REVIEW_*) in candidates.py/comparison.py,
+  # same pattern configs/training/feature_selection.yaml's bootstrap_n_samples retirement
+  # used for features/select.py::ABLATION_N_BOOTSTRAP.
+  delta_threshold: 0.005                 # Δ*: pre-registered materiality threshold — also reused by calibrate.py's PR-AUC-preservation gate
+  fixed_recall_thresholds: [0.70, 0.80, 0.90]  # recall targets for the fixed-recall profile — also reused by evaluate.py's sealed-test profile
   class_weight: balanced                # class imbalance handling: up-weights the minority (churn) class; shared by all model families
-  cv_n_jobs: -1                          # outer CV-fold parallelism (joblib, -1 = all cores); distinct from training.fixed.n_jobs (LightGBM's own internal threads, pinned to 1 for determinism) — each fold is an independent fit, so running folds concurrently changes wall-clock time only, never the result. Wired into run_selection_cv (feature_freeze.py) only — its ~850 predict_proba calls/fold comfortably amortize joblib's per-call worker-pool overhead. NOT wired into candidates.py's cv_score_candidate calls: each fold there is a single cheap fit (~0.25s), too light for process-based parallelism to pay off on Windows (spawn-based worker startup + per-task dispatch overhead measured ~2x slower than sequential for this workload).
 
 mlflow:
   # Fallback (no .env, infra profile down — fresh clone or CI) must stay a database
@@ -37,7 +52,11 @@ mlflow:
 paths:
   raw_data: datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv
   interim_data: datasets/interim/
-  processed_data: ${oc.env:PROCESSED_DATA_DIR,datasets/processed/}
+  # Plain literal, not ${oc.env:...}: DVC declares this under the split/features
+  # stages' `params:`, and an env-resolved key resolves differently on a dev box
+  # than in CI, which thrashes dvc.lock. Overrides go through activate_config()
+  # (Hydra CLI overrides), never an env var.
+  processed_data: datasets/processed/
   sql_features: sql/features
   reports: reports
   feature_discovery_reports: ${paths.reports}/feature_discovery

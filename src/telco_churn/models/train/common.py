@@ -1,7 +1,7 @@
 """Shared helpers for the model training pipeline.
 
 Data loading, DVC/git metadata resolution, and the LightGBM knob builders
-reused across every step (candidates.py, feature_freeze.py, tuning.py,
+reused across every step (candidates.py, feature_audit.py, tuning.py,
 log_model.py) so each step's fit is representative of the one that ships.
 MLflow tracking-URI resolution lives in telco_churn.utils.mlflow — shared
 outside the training package (models/calibrate.py is the second consumer).
@@ -17,47 +17,56 @@ import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import pandas as pd
-import yaml
 from joblib import Parallel, delayed
 from matplotlib.figure import Figure
+from matplotlib.patches import Patch
 from mlflow.data.pandas_dataset import PandasDataset
 from mlflow.data.pandas_dataset import from_pandas as mlflow_from_pandas
 from numpy.typing import NDArray
 from omegaconf import DictConfig
 from sklearn.base import clone
-from sklearn.metrics import average_precision_score
+from sklearn.metrics import PrecisionRecallDisplay, average_precision_score
 from sklearn.model_selection import RepeatedStratifiedKFold
 
 from telco_churn.data.split import partition
-from telco_churn.features.accessor import features_path
+from telco_churn.features.accessor import features_path, load_features
 from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
-from telco_churn.features.schema import FeatureOutputSchema
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.paths import get_project_root
 
-__all__ = ["cv_score_candidate", "lgbm_default_params", "logreg_default_params"]
+__all__ = [
+    "COMMITTED_MODEL_FAMILY",
+    "COMMITTED_MODEL_FAMILY_DECISION_RUN_ID",
+    "cv_score_candidate",
+    "lgbm_default_params",
+    "logreg_default_params",
+]
 
 logger = get_logger(__name__)
+
+# The model family Steps 3-5 build against. Frozen by the Step 1/2 comparison
+# (notebooks/03a-model-selection.ipynb, candidates.py::run_candidate_step +
+# comparison.py::run_comparison_step), not recomputed per training cycle — see
+# ANALYSIS.md §4a. LightGBM wins on the evidence (paired-bootstrap Δ = 0.007,
+# CI [0.002, 0.012], p = 0.0020, run `c405f6fe31454c3a9899423680644411`) and on
+# build-specific rationale (SHAP speed, calibration continuity, training
+# speed for Optuna/weekly retrain). Edit this constant — never hand-fit a
+# LogReg pipeline into Steps 3-5 — if a re-run of 03a's on-demand review
+# concludes a different family should ship; same "explicit code changes,
+# never accidental side-effects" discipline features/schema.py's
+# COMMITTED_FEATURES documents.
+COMMITTED_MODEL_FAMILY: str = "lightgbm"
+
+# The model_comparison MLflow run (telco-churn-training experiment) whose
+# logged Δ/CI back the decision above — log_model.py stamps this into
+# training_manifest.json's model_family_committed section so the frozen
+# decision is a resolvable reference, not a number retyped from ANALYSIS.md.
+COMMITTED_MODEL_FAMILY_DECISION_RUN_ID: str = "c405f6fe31454c3a9899423680644411"
 
 _FEATURE_COLS: list[str] = (
     list(FEATURE_SCHEMA.binary)
     + list(FEATURE_SCHEMA.multi_cat)
     + list(FEATURE_SCHEMA.numeric)
 )
-
-
-def _load_processed(cfg: DictConfig) -> pd.DataFrame:
-    """Load the processed feature CSV produced by features/build.py.
-
-    Validated against FeatureOutputSchema before use: the DVC
-    validate->features->train DAG doesn't exist yet, so a standalone
-    `python -m telco_churn.models.train` run must not silently fit on a
-    stale or schema-drifted processed file.
-    """
-    path = get_project_root() / cfg.paths.processed_data / "telco_churn_processed.csv"
-    df = pd.read_csv(path)
-    FeatureOutputSchema.validate(df)
-    return df
 
 
 def _git_sha() -> str:
@@ -77,37 +86,9 @@ def _git_sha() -> str:
         return "unknown"
 
 
-def _dvc_hash(cfg: DictConfig) -> str:
-    """Return the DVC content hash of the processed CSV, or 'unknown' if not tracked.
-
-    A missing .dvc file is the expected, common case before Phase 8 wires up DVC
-    tracking — logged at debug only, not a warning. Any other failure (corrupted
-    YAML, unexpected file structure, a cfg missing paths.processed_data) is
-    logged as a warning so it doesn't masquerade as the same routine
-    'not tracked yet' fallback. The path construction stays inside the try along
-    with the file read — cfg.paths.processed_data can itself raise (e.g. a
-    minimal test cfg with no paths key), and that failure must be caught here
-    too, not just the file-open step.
-    """
-    try:
-        dvc_file = (
-            get_project_root()
-            / cfg.paths.processed_data
-            / "telco_churn_processed.csv.dvc"
-        )
-        with open(dvc_file) as f:
-            return str(yaml.safe_load(f)["outs"][0]["md5"])
-    except FileNotFoundError as e:
-        logger.debug("dvc_hash_not_tracked", error=str(e))
-        return "unknown"
-    except Exception as e:
-        logger.warning("dvc_hash_unexpected_error", error=str(e), exc_info=True)
-        return "unknown"
-
-
-def _load_dev_features(cfg: DictConfig) -> tuple[pd.DataFrame, pd.Series]:
+def _load_dev_features() -> tuple[pd.DataFrame, pd.Series]:
     """Load the processed feature frame and return only its dev-partition rows."""
-    df = _load_processed(cfg)
+    df = load_features()
     dev_df, _test_df = partition(df)
     return dev_df[_FEATURE_COLS], dev_df[TARGET_COL]
 
@@ -134,7 +115,7 @@ def _build_dev_dataset(X_dev: pd.DataFrame, y_dev: pd.Series) -> PandasDataset:
 def _log_dev_input(X_dev: pd.DataFrame, y_dev: pd.Series, context: str) -> None:
     """Log the dev-partition dataset as an MLflow run input — call from inside an active run.
 
-    Shared by comparison.py, feature_freeze.py, and tuning.py (candidates.py
+    Shared by comparison.py, feature_audit.py, and tuning.py (candidates.py
     calls _build_dev_dataset directly instead, since each of its three
     candidate runs needs its own log_input call against one shared dataset
     object, not a fresh build-and-log per run).
@@ -151,7 +132,7 @@ def _plot_bootstrap_delta(
 ) -> Figure:
     """Histogram of the paired-bootstrap Δ distribution against the null and the decision threshold.
 
-    Shared by comparison.py's model-family decision and feature_freeze.py's
+    Shared by comparison.py's model-family decision and feature_selection.py's
     full-vs-reduced feature-set decision — both plot the identical shape
     (bootstrap_deltas histogram, Δ_obs/0/Δ* reference lines) against a
     different Δ definition and title.
@@ -170,6 +151,131 @@ def _plot_bootstrap_delta(
     ax.set_ylabel("Bootstrap resamples")
     ax.set_title(title)
     ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def _plot_pr_curves(
+    candidates: dict[str, dict[str, Any]],
+    title: str,
+) -> Figure:
+    """Pooled OOF precision-recall curve per candidate — one line per label.
+
+    Shared by comparison.py's model-family decision and feature_selection.py's
+    full-vs-reduced feature-set decision — both score candidates via
+    cv_score_candidate/run_selection_cv, which return the identical
+    {"oof_true": [...], "oof_proba": [...]} shape, so this plots any number of
+    candidates without knowing which produced them.
+    """
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for label, result in candidates.items():
+        PrecisionRecallDisplay.from_predictions(
+            result["oof_true"], result["oof_proba"], name=label, ax=ax
+        )
+    ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
+def _plot_shap_audit(
+    shap_audit: pd.DataFrame,
+    high_shap_dropouts: list[str],
+    title: str,
+    flag_column: str = "committed",
+    legend_labels: tuple[str, str] = ("Committed", "Not committed"),
+) -> Figure:
+    """Horizontal bar chart of mean(|SHAP|) per feature — colour = flag_column, dropouts flagged.
+
+    Shared by feature_audit.py's per-cycle diagnostic and feature_selection.py's
+    ablation review (twice, for the latter — once coloured by committed, once by
+    §3's permutation-importance survived, via flag_column) — all call
+    features.select.compute_shap_audit / flag_high_shap_dropouts against their
+    own committed_features and plot the identical shape. shap_audit is
+    compute_shap_audit's output (feature, mean_abs_shap, committed), optionally
+    with another boolean column merged in for flag_column to read instead;
+    high_shap_dropouts is flag_high_shap_dropouts' output — a dropped feature
+    that outranks a committed one gets its own colour rather than blending into
+    the "not [flag_labels[0]]" red, so the exact check flag_high_shap_dropouts
+    computes is visible on the chart, not just inferable by counting bar
+    positions against the top-N cutoff.
+    """
+    ordered = shap_audit.sort_values("mean_abs_shap", ascending=False)
+    dropout_set = set(high_shap_dropouts)
+    colors = [
+        "goldenrod" if feature in dropout_set else ("seagreen" if flag else "indianred")
+        for feature, flag in zip(ordered["feature"], ordered[flag_column], strict=True)
+    ]
+
+    fig, ax = plt.subplots(figsize=(8, max(4.0, 0.3 * len(ordered))))
+    ax.barh(ordered["feature"], ordered["mean_abs_shap"], color=colors)
+    ax.set_xlabel("Mean |SHAP|")
+    ax.set_title(title)
+    ax.invert_yaxis()
+    ax.legend(
+        handles=[
+            Patch(color="seagreen", label=legend_labels[0]),
+            Patch(color="indianred", label=legend_labels[1]),
+            Patch(color="goldenrod", label="High-SHAP dropout"),
+        ],
+        loc="lower right",
+    )
+    fig.tight_layout()
+    return fig
+
+
+def _plot_permutation_importance(
+    importance_table: pd.DataFrame,
+    title: str,
+) -> Figure:
+    """Horizontal bar chart of real permutation importance vs. the decoy floor — colour = survived.
+
+    Shared by feature_audit.py's per-cycle diagnostic (features.select.mint_committed_list's
+    single all-dev fit) and feature_selection.py's ablation review
+    (features.select.run_selection_cv's cross-fold-averaged fit) — both produce a table
+    shaped feature/real_importance/importance_floor/survived and plot the identical shape;
+    only the underlying computation (and hence what "survived" means — one fit's floor
+    check vs. stability >= threshold across folds) differs between callers.
+    """
+    ordered = importance_table.sort_values("real_importance", ascending=False)
+    colors = ordered["survived"].map({True: "seagreen", False: "indianred"})
+
+    fig, ax = plt.subplots(figsize=(8, max(4.0, 0.3 * len(ordered))))
+    ax.barh(ordered["feature"], ordered["real_importance"], color=colors)
+    ax.axvline(
+        ordered["importance_floor"].iloc[0],
+        color="black",
+        linestyle="--",
+        label="decoy floor",
+    )
+    ax.set_xlabel("Real permutation importance (mean PR-AUC drop)")
+    ax.set_title(title)
+    ax.legend(loc="lower right")
+    ax.invert_yaxis()
+    fig.tight_layout()
+    return fig
+
+
+def _plot_stability(
+    importance_table: pd.DataFrame,
+    title: str,
+) -> Figure:
+    """Horizontal bar chart of per-fold selection stability — colour = survived (stability >= threshold).
+
+    feature_selection.py-only: per-fold survival only exists for the cross-fold ablation
+    (features.select.run_selection_cv); feature_audit.py's single all-dev fit
+    (mint_committed_list) has no fold dimension to plot here. Answers a different question
+    from the permutation-importance chart above: not "how big is this feature's importance
+    on one fit," but "does the selector keep choosing this feature fold to fold, or does the
+    survivor list bounce around."
+    """
+    ordered = importance_table.sort_values("stability")
+    colors = ordered["survived"].map({True: "seagreen", False: "indianred"})
+
+    fig, ax = plt.subplots(figsize=(8, max(4.0, 0.3 * len(ordered))))
+    ax.barh(ordered["feature"], ordered["stability"], color=colors)
+    ax.set_xlabel("Fraction of folds survived")
+    ax.set_title(title)
+    ax.set_xlim(0, 1)
     fig.tight_layout()
     return fig
 

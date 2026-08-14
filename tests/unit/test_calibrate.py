@@ -14,10 +14,11 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import mlflow
 import mlflow.artifacts
+import mlflow.sklearn
 import numpy as np
 import pandas as pd
 import pytest
@@ -30,6 +31,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 import telco_churn.models.calibrate as calibrate
+import telco_churn.models.register as register
 import telco_churn.models.train.log_model as log_model
 from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.features.preprocessing import build_preprocessor
@@ -432,342 +434,6 @@ def test_brier_switch_decision(
     assert result["decision_rule"] == expected_rule
 
 
-def test_expected_calibration_error_near_zero_when_calibrated(
-    calibration_cfg: DictConfig,
-) -> None:
-    """A probability vector whose predicted mean matches the observed frequency
-    in its single bin has ~zero ECE."""
-    proba = np.full(20, 0.10)
-    y = pd.Series([1] * 2 + [0] * 18)  # observed frequency 0.10, matches proba
-
-    ece = calibrate.expected_calibration_error(proba, y, calibration_cfg)
-
-    assert ece == pytest.approx(0.0, abs=1e-9)
-
-
-def test_expected_calibration_error_large_when_miscalibrated(
-    calibration_cfg: DictConfig,
-) -> None:
-    """A confidently wrong vector (predicted 0.9, observed 0.1) has ECE ~= 0.8."""
-    proba = np.full(20, 0.90)
-    y = pd.Series([1] * 2 + [0] * 18)  # observed frequency 0.10, predicted 0.90
-
-    ece = calibrate.expected_calibration_error(proba, y, calibration_cfg)
-
-    assert ece == pytest.approx(0.8, abs=1e-9)
-
-
-def test_expected_calibration_error_constant_proba_detects_miscalibration(
-    calibration_cfg: DictConfig,
-) -> None:
-    """A fully-constant, badly wrong probability vector must not report ~0 ECE.
-
-    Regression guard: quantile binning of an all-identical p collapses
-    np.unique's edges to a single point, and edges[0], edges[-1] = 0.0, 1.0
-    on a 1-element array silently drops it to zero valid bins — skipping the
-    summation loop entirely and returning 0.0 regardless of y. Flooring at
-    one bin spanning [0, 1] is what makes this actually measure the gap.
-    """
-    calibration_cfg.calibration.ece_strategy = "quantile"
-    proba = np.full(20, 0.10)
-    y = pd.Series([1] * 18 + [0] * 2)  # observed frequency 0.90, predicted 0.10
-
-    ece = calibrate.expected_calibration_error(proba, y, calibration_cfg)
-
-    assert ece == pytest.approx(0.8, abs=1e-9)
-
-
-def test_expected_calibration_error_warns_on_quantile_bin_collapse(
-    calibration_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Tied probabilities that collapse the quantile bin count below
-    cfg.calibration.ece_n_bins must be flagged, not silently absorbed into a
-    smaller-than-configured ECE.
-    """
-    calibration_cfg.calibration.ece_strategy = "quantile"
-    warning_mock = Mock()
-    monkeypatch.setattr(calibrate.logger, "warning", warning_mock)
-
-    proba = np.full(20, 0.10)
-    y = pd.Series([1] * 2 + [0] * 18)
-
-    calibrate.expected_calibration_error(proba, y, calibration_cfg)
-
-    collapse_calls = [
-        call
-        for call in warning_mock.call_args_list
-        if call.args[0] == "ece_bins_collapsed"
-    ]
-    assert len(collapse_calls) == 1
-    assert collapse_calls[0].kwargs["configured_n_bins"] == int(
-        calibration_cfg.calibration.ece_n_bins
-    )
-    assert collapse_calls[0].kwargs["effective_n_bins"] == 1
-
-
-def test_expected_calibration_error_no_warning_without_collapse(
-    calibration_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Distinct, evenly-spread probabilities reach the configured bin count —
-    no collapse warning should fire."""
-    calibration_cfg.calibration.ece_strategy = "quantile"
-    warning_mock = Mock()
-    monkeypatch.setattr(calibrate.logger, "warning", warning_mock)
-
-    rng = np.random.default_rng(42)
-    proba = rng.uniform(0.01, 0.99, size=500)
-    y = pd.Series(rng.integers(0, 2, size=500))
-
-    calibrate.expected_calibration_error(proba, y, calibration_cfg)
-
-    collapse_calls = [
-        call
-        for call in warning_mock.call_args_list
-        if call.args[0] == "ece_bins_collapsed"
-    ]
-    assert collapse_calls == []
-
-
-# ---------------------------------------------------------------------------
-# murphy_decomposition
-# ---------------------------------------------------------------------------
-
-
-def test_murphy_decomposition_return_keys(calibration_cfg: DictConfig) -> None:
-    """Result carries exactly the four documented keys."""
-    rng = np.random.default_rng(10)
-    n = 200
-    proba = rng.uniform(0.05, 0.95, size=n)
-    y = pd.Series(rng.integers(0, 2, size=n))
-    result = calibrate.murphy_decomposition(proba, y, calibration_cfg)
-    assert set(result) == {
-        "reliability",
-        "resolution",
-        "uncertainty",
-        "brier_reconstructed",
-    }
-
-
-def test_murphy_decomposition_reconstructs_brier_to_tolerance(
-    calibration_cfg: DictConfig,
-) -> None:
-    """The load-bearing test: reliability - resolution + uncertainty must
-    reconstruct the directly-computed Brier score, to tolerance — the
-    identity that proves the decomposition is implemented correctly rather
-    than plausibly."""
-    from sklearn.metrics import brier_score_loss
-
-    rng = np.random.default_rng(11)
-    n = 5000
-    proba = rng.uniform(0.02, 0.98, size=n)
-    y = pd.Series((rng.uniform(size=n) < proba).astype(int))
-
-    result = calibrate.murphy_decomposition(proba, y, calibration_cfg)
-    direct_brier = float(brier_score_loss(y, proba))
-
-    assert result["brier_reconstructed"] == pytest.approx(direct_brier, abs=0.01)
-
-
-def test_murphy_decomposition_uncertainty_matches_base_rate_variance(
-    calibration_cfg: DictConfig,
-) -> None:
-    """uncertainty equals o-bar(1 - o-bar) for the observed base rate — the
-    term that depends only on y, never on the forecast."""
-    proba = np.full(20, 0.5)
-    y = pd.Series([1] * 8 + [0] * 12)  # base rate 0.4
-    result = calibrate.murphy_decomposition(proba, y, calibration_cfg)
-    assert result["uncertainty"] == pytest.approx(0.4 * 0.6)
-
-
-def test_murphy_decomposition_perfect_calibration_gives_near_zero_reliability(
-    calibration_cfg: DictConfig,
-) -> None:
-    """A forecast whose bin means match their bins' observed frequencies has
-    ~zero reliability (calibration error), regardless of resolution."""
-    proba = np.array([0.1] * 100 + [0.9] * 100)
-    y = pd.Series([1] * 10 + [0] * 90 + [1] * 90 + [0] * 10)  # matches proba exactly
-    result = calibrate.murphy_decomposition(proba, y, calibration_cfg)
-    assert result["reliability"] == pytest.approx(0.0, abs=1e-9)
-
-
-def test_murphy_decomposition_no_resolution_when_all_bins_match_base_rate(
-    calibration_cfg: DictConfig,
-) -> None:
-    """A forecast that discriminates nothing (every bin's observed frequency
-    equals the overall base rate) has zero resolution."""
-    proba = np.array([0.2] * 50 + [0.8] * 50)
-    # Both bins have the same 0.3 observed churn rate as the overall base rate.
-    y = pd.Series(([1] * 15 + [0] * 35) + ([1] * 15 + [0] * 35))
-    result = calibrate.murphy_decomposition(proba, y, calibration_cfg)
-    assert result["resolution"] == pytest.approx(0.0, abs=1e-9)
-
-
-def test_calibration_slope_perfectly_calibrated_returns_near_one() -> None:
-    """y generated as Bernoulli(p) from the exact predicted probabilities —
-    the Cox slope of a truly calibrated forecaster is 1.0, and its bootstrap
-    CI should straddle it.
-    """
-    rng = np.random.default_rng(42)
-    n = 4000
-    p_true = rng.uniform(0.05, 0.95, size=n)
-    y = rng.binomial(1, p_true)
-
-    result = calibrate.calibration_slope(
-        pd.Series(y), p_true, n_bootstrap=200, random_state=42
-    )
-
-    assert result["slope"] == pytest.approx(1.0, abs=0.15)
-    assert result["slope_ci_lower"] < result["slope"] < result["slope_ci_upper"]
-
-
-def test_calibration_slope_overconfident_returns_less_than_one() -> None:
-    """Predicted probabilities pushed toward 0/1 relative to the true
-    generating probability are systematically overconfident — the defect the
-    slope exists to catch — and must score below 1.0.
-    """
-    rng = np.random.default_rng(42)
-    n = 4000
-    p_true = rng.uniform(0.05, 0.95, size=n)
-    y = rng.binomial(1, p_true)
-    logit_true = np.log(p_true / (1 - p_true))
-    overconfident_proba = 1.0 / (1.0 + np.exp(-2.0 * logit_true))
-
-    result = calibrate.calibration_slope(
-        pd.Series(y), overconfident_proba, n_bootstrap=200, random_state=42
-    )
-
-    assert result["slope"] < 1.0
-
-
-def test_calibration_slope_redraws_degenerate_bootstrap_resample() -> None:
-    """A small, heavily-imbalanced sample makes a single-class bootstrap
-    resample likely — sklearn's LogisticRegression can't fit one, and
-    np.fromiter's eager consumption means one unlucky draw among many would
-    otherwise crash the whole bootstrap. Must complete and return a full
-    n_bootstrap-length CI instead.
-
-    n=10 with one positive is chosen because it reliably provokes at least
-    one degenerate draw across 200 bootstrap resamples at random_state=42
-    (a resample missing the sole positive has ~35% probability per draw) —
-    this is a regression guard for that redraw path, not merely a small-N
-    smoke test.
-    """
-    y = np.array([1.0] + [0.0] * 9)
-    p = np.array([0.6] + [0.2] * 9)
-
-    result = calibrate.calibration_slope(y, p, n_bootstrap=200, random_state=42)
-
-    assert result["slope_ci_lower"] <= result["slope_ci_upper"]
-    assert np.isfinite(result["slope_ci_lower"])
-    assert np.isfinite(result["slope_ci_upper"])
-
-
-def test_calibration_slope_raises_on_genuinely_single_class_input() -> None:
-    """y_true with only one class can't fit even the point estimate — this
-    must still fail fast (not hang retrying an unwinnable redraw), since no
-    bootstrap resample of single-class data can ever be two-class either.
-    """
-    y = np.zeros(10)
-    p = np.full(10, 0.2)
-
-    with pytest.raises(ValueError, match="at least 2 classes"):
-        calibrate.calibration_slope(y, p, n_bootstrap=200, random_state=42)
-
-
-def test_calibration_slope_analytic_ci_well_ordered() -> None:
-    """The analytic (Wald) CI is centered on the point estimate with a
-    strictly positive standard error, regardless of the bootstrap draw —
-    a basic sanity check that holds before comparing it to anything else.
-    """
-    rng = np.random.default_rng(0)
-    n = 1000
-    p_true = rng.uniform(0.05, 0.95, size=n)
-    y = rng.binomial(1, p_true)
-
-    result = calibrate.calibration_slope(
-        pd.Series(y), p_true, n_bootstrap=50, random_state=42
-    )
-
-    assert result["slope_se_analytic"] > 0.0
-    assert (
-        result["slope_ci_lower_analytic"]
-        < result["slope"]
-        < result["slope_ci_upper_analytic"]
-    )
-
-
-def test_calibration_slope_analytic_matches_finite_difference_hessian() -> None:
-    """Independent proof the Fisher-information formula is implemented
-    correctly: the analytic standard error must match a numerical
-    finite-difference Hessian of the same logistic log-likelihood, computed
-    with no shared code path — this is what makes the analytic CI trustworthy
-    as a cross-check on the bootstrap, rather than a second thing to doubt.
-    """
-    rng = np.random.default_rng(0)
-    n = 4000
-    p_true = rng.uniform(0.05, 0.95, size=n)
-    y = rng.binomial(1, p_true)
-
-    result = calibrate.calibration_slope(y, p_true, n_bootstrap=10, random_state=42)
-    slope, intercept = result["slope"], result["intercept"]
-
-    p = np.clip(p_true, 1e-6, 1 - 1e-6)
-    logit_p = np.log(p / (1 - p))
-
-    def _neg_loglik(beta: np.ndarray) -> float:
-        b0, b1 = beta
-        eta = b0 + b1 * logit_p
-        return float(-np.sum(y * eta - np.log1p(np.exp(eta))))
-
-    eps = 1e-4
-    beta0 = np.array([intercept, slope])
-    hess = np.zeros((2, 2))
-    for i in range(2):
-        for j in range(2):
-            e_i = np.zeros(2)
-            e_i[i] = eps
-            e_j = np.zeros(2)
-            e_j[j] = eps
-            hess[i, j] = (
-                _neg_loglik(beta0 + e_i + e_j)
-                - _neg_loglik(beta0 + e_i - e_j)
-                - _neg_loglik(beta0 - e_i + e_j)
-                + _neg_loglik(beta0 - e_i - e_j)
-            ) / (4 * eps * eps)
-
-    se_finite_diff = float(np.sqrt(np.linalg.inv(hess)[1, 1]))
-
-    assert result["slope_se_analytic"] == pytest.approx(se_finite_diff, rel=1e-4)
-
-
-def test_calibration_slope_analytic_and_bootstrap_ci_agree_on_well_behaved_data() -> (
-    None
-):
-    """On a large, well-behaved sample, the analytic and bootstrap CIs should
-    closely agree — this is the actual cross-check value: close agreement is
-    cheap evidence the percentile bootstrap isn't misbehaving on this kind of
-    data, since nothing had independently verified that before this test.
-    """
-    rng = np.random.default_rng(0)
-    n = 4000
-    p_true = rng.uniform(0.05, 0.95, size=n)
-    y = rng.binomial(1, p_true)
-
-    result = calibrate.calibration_slope(y, p_true, n_bootstrap=1000, random_state=42)
-
-    bootstrap_width = result["slope_ci_upper"] - result["slope_ci_lower"]
-    analytic_width = (
-        result["slope_ci_upper_analytic"] - result["slope_ci_lower_analytic"]
-    )
-    bootstrap_center = (result["slope_ci_upper"] + result["slope_ci_lower"]) / 2
-    analytic_center = (
-        result["slope_ci_upper_analytic"] + result["slope_ci_lower_analytic"]
-    ) / 2
-
-    assert analytic_width == pytest.approx(bootstrap_width, rel=0.25)
-    assert analytic_center == pytest.approx(bootstrap_center, abs=0.02)
-
-
 def test_select_calibration_method_pinned_returns_proba_arrays(
     pinned_sigmoid_result: dict[str, Any],
 ) -> None:
@@ -1022,12 +688,21 @@ def registration_cfg(calibration_mlflow_uri: str, tmp_path: Path) -> DictConfig:
                 "override_trial_count_gate": False,
                 "golden_n_rows": 5,
             },
+            # register.register_challenger's own config keys — this fixture
+            # feeds both calibrate.run_calibration_step and (in
+            # calibrated_run below) register.register_challenger, mirroring
+            # the real two-step CLI flow (models.calibrate then
+            # models.register) sharing one composed cfg.
+            "register": {"golden_atol": 1.0e-9},
             "mlflow": {
                 "tracking_uri": calibration_mlflow_uri,
                 "experiment_name": "test_run_calibration_step",
                 "registered_model_name": "test-telco-churn-pipeline",
             },
-            "paths": {"figures": str(tmp_path / "figures")},
+            "paths": {
+                "figures": str(tmp_path / "figures"),
+                "reports": str(tmp_path / "reports"),
+            },
         }
     )
 
@@ -1070,27 +745,18 @@ def tuning_result(dev_split: tuple[pd.DataFrame, pd.Series]) -> dict[str, Any]:
 
 
 @pytest.fixture
-def comparison_result() -> dict[str, Any]:
-    """A plausible Step 2 output — the fields run_model_logging_step reads."""
-    return {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
-
-@pytest.fixture
 def sandboxed_dev_features(
     monkeypatch: pytest.MonkeyPatch, dev_split: tuple[pd.DataFrame, pd.Series]
 ) -> None:
     """Redirect run_calibration_step's load_dev_features()/load_dev_customer_ids()
-    to the synthetic dev_split fixture.
+    to the synthetic dev_split fixture, and stub log_model.features_sha256 for
+    the _log_parent_run(...) -> log_model.run_model_logging_step(...) call
+    every consumer of this fixture makes to produce its parent tuning_study run.
 
-    Unpatched, both fall through to load_features() -> partition() ->
-    load_split(), all called with no path override — reading the real,
+    Unpatched, load_dev_features()/load_dev_customer_ids() fall through to
+    load_features() -> partition() -> load_split(), and
+    run_model_logging_step's own data_content_hash stamp falls through to
+    features_sha256() — all called with no path override, reading the real,
     gitignored datasets/processed/ directory. That happens to work today only
     because a real processed CSV + split manifest exist locally; on a fresh
     clone (no pipeline run yet), every Step 3 test would fail with
@@ -1110,11 +776,11 @@ def sandboxed_dev_features(
 
     monkeypatch.setattr(calibrate, "load_dev_features", _fake_load_dev_features)
     monkeypatch.setattr(calibrate, "load_dev_customer_ids", _fake_load_dev_customer_ids)
+    monkeypatch.setattr(log_model, "features_sha256", lambda path=None: "deadbeef" * 8)
 
 
 def _log_parent_run(
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict[str, Any],
     tuning_result: dict[str, Any],
     cfg: DictConfig,
 ) -> str:
@@ -1125,9 +791,7 @@ def _log_parent_run(
     X_dev, y_dev = dev_split
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result = {**tuning_result, "parent_run_id": run.info.run_id}
-    result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, cfg
-    )
+    result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
     return str(result["run_id"])
 
 
@@ -1154,6 +818,7 @@ def _shared_registration_cfg(
 ) -> DictConfig:
     """Module-scoped mirror of registration_cfg — see calibrated_run."""
     figures_dir = tmp_path_factory.mktemp("calibrated_run_figures")
+    reports_dir = tmp_path_factory.mktemp("calibrated_run_reports")
     return OmegaConf.create(
         {
             "random_seed": 42,
@@ -1186,12 +851,13 @@ def _shared_registration_cfg(
                 "override_trial_count_gate": False,
                 "golden_n_rows": 5,
             },
+            "register": {"golden_atol": 1.0e-9},
             "mlflow": {
                 "tracking_uri": _shared_calibration_mlflow_uri,
                 "experiment_name": "test_run_calibration_step_shared",
                 "registered_model_name": "test-telco-churn-pipeline",
             },
-            "paths": {"figures": str(figures_dir)},
+            "paths": {"figures": str(figures_dir), "reports": str(reports_dir)},
         }
     )
 
@@ -1236,31 +902,21 @@ def _shared_tuning_result(
 
 
 @pytest.fixture(scope="module")
-def _shared_comparison_result() -> dict[str, Any]:
-    """Module-scoped mirror of comparison_result — see calibrated_run."""
-    return {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
-
-@pytest.fixture(scope="module")
 def calibrated_run(
     _shared_registration_cfg: DictConfig,
     _module_dev_split: tuple[pd.DataFrame, pd.Series],
-    _shared_comparison_result: dict[str, Any],
     _shared_tuning_result: dict[str, Any],
 ) -> Iterator[dict[str, Any]]:
-    """The real, unmocked run_calibration_step(sigmoid, default cfg) result —
-    shared across 7 of the 9 test_run_calibration_step_* tests, which only
-    read different artifacts off one real call rather than each re-running
-    the full nested-CV calibration + MLflow registration from scratch
-    (~7-14s each, dominated by setup: a fresh SQLite MLflow store plus the
-    same dummy+uncalibrated+sigmoid+isotonic OOF computation
+    """The real, unmocked run_calibration_step(sigmoid, default cfg) result,
+    plus a real register.register_challenger mint on top of it (B1: calibrate.py
+    itself performs no registry write, so the registry-dependent tests below
+    need this fixture to also mint, mirroring what register.py's own
+    mint-mode CLI would do as a separate step) — shared across 7 of the 9
+    test_run_calibration_step_* tests, which only read different artifacts
+    off one real call rather than each re-running the full nested-CV
+    calibration + MLflow registration from scratch (~7-14s each, dominated
+    by setup: a fresh SQLite MLflow store plus the same
+    dummy+uncalibrated+sigmoid+isotonic OOF computation
     select_calibration_method always performs in pinned mode).
 
     NOT shared with:
@@ -1275,8 +931,13 @@ def calibrated_run(
       result["model_version"] == "1" — requires being the first-ever
       registration under this registered_model_name.
     All three keep their own function-scoped registration_cfg/tuning_result/
-    comparison_result/sandboxed_dev_features (above), untouched by this
+    sandboxed_dev_features (above), untouched by this
     fixture and its separate "test_run_calibration_step_shared" experiment.
+
+    log_model.features_sha256 is stubbed too: _log_parent_run's
+    run_model_logging_step call stamps data_content_hash unconditionally,
+    with no path override, which would otherwise hit the same real,
+    gitignored processed-features file sandboxed_dev_features exists to avoid.
     """
     mp = pytest.MonkeyPatch()
     X_dev, y_dev = _module_dev_split
@@ -1293,18 +954,25 @@ def calibrated_run(
 
     mp.setattr(calibrate, "load_dev_features", _fake_load_dev_features)
     mp.setattr(calibrate, "load_dev_customer_ids", _fake_load_dev_customer_ids)
+    mp.setattr(log_model, "features_sha256", lambda path=None: "deadbeef" * 8)
 
     run_id = _log_parent_run(
         _module_dev_split,
-        _shared_comparison_result,
         _shared_tuning_result,
         _shared_registration_cfg,
     )
     result = calibrate.run_calibration_step(run_id, _shared_registration_cfg)
+    model_version = register.register_challenger(
+        _shared_registration_cfg,
+        run_id,
+        result["model_uri"],
+        result["logged_model_id"],
+    )
     try:
         yield {
             "run_id": run_id,
             "result": result,
+            "model_version": model_version,
             "cfg": _shared_registration_cfg,
             "X_dev": X_dev,
             "y_dev": y_dev,
@@ -1316,11 +984,13 @@ def calibrated_run(
 def test_run_calibration_step_registers_and_tags(
     calibrated_run: dict[str, Any],
 ) -> None:
-    """Registers exactly one version, tags training_data_scope=dev, and points
-    challenger at it — the training cycle's single registration point.
+    """register.register_challenger (run separately, on top of
+    run_calibration_step's output — B1's decoupling) registers exactly one
+    version, tags training_data_scope=dev, and points challenger at it.
     """
     run_id = calibrated_run["run_id"]
     result = calibrated_run["result"]
+    model_version = calibrated_run["model_version"]
     registration_cfg = calibrated_run["cfg"]
     # calibrated_run is module-scoped and cached — an interleaved test using
     # its own separate MLflow store (e.g. the auto-method calibration_spec
@@ -1331,11 +1001,10 @@ def test_run_calibration_step_registers_and_tags(
 
     assert result["run_id"] == run_id
     assert result["method"] == "sigmoid"
-    assert result["parity_ok"] is True
 
     client = mlflow.tracking.MlflowClient()
     registered_name = str(registration_cfg.mlflow.registered_model_name)
-    version = client.get_model_version(registered_name, result["model_version"])
+    version = client.get_model_version(registered_name, model_version)
     assert version.tags["training_data_scope"] == "dev"
     # ModelVersion.model_id does not auto-populate in OSS MLflow 3.14 — without
     # this tag the registry has no supported path to the LoggedModel Phase 7's
@@ -1344,23 +1013,24 @@ def test_run_calibration_step_registers_and_tags(
     assert mlflow.get_logged_model(version.tags["logged_model_id"]) is not None
 
     registered_model = client.get_registered_model(registered_name)
-    assert str(registered_model.aliases["challenger"]) == result["model_version"]
+    assert str(registered_model.aliases["challenger"]) == model_version
 
 
 def test_run_calibration_step_tags_promotion_status_pending(
     calibrated_run: dict[str, Any],
 ) -> None:
     """Mint-time default: a freshly registered version is tagged
-    promotion_status=pending before register.py has ever seen it — the
-    fail-safe state a crash anywhere downstream leaves it in.
+    promotion_status=pending before register.py's own promote/reject path
+    has ever seen it — the fail-safe state a crash anywhere downstream
+    leaves it in.
     """
-    result = calibrated_run["result"]
+    model_version = calibrated_run["model_version"]
     registration_cfg = calibrated_run["cfg"]
     mlflow.set_tracking_uri(str(registration_cfg.mlflow.tracking_uri))
 
     client = mlflow.tracking.MlflowClient()
     registered_name = str(registration_cfg.mlflow.registered_model_name)
-    version = client.get_model_version(registered_name, result["model_version"])
+    version = client.get_model_version(registered_name, model_version)
     assert version.tags["promotion_status"] == "pending"
 
 
@@ -1373,7 +1043,7 @@ def test_run_calibration_step_logs_golden_predictions(
     by customerid, and round-trip through the registered model exactly.
     """
     run_id = calibrated_run["run_id"]
-    result = calibrated_run["result"]
+    model_version = calibrated_run["model_version"]
     registration_cfg = calibrated_run["cfg"]
     mlflow.set_tracking_uri(str(registration_cfg.mlflow.tracking_uri))
     n_rows = int(registration_cfg.calibration.golden_n_rows)
@@ -1393,9 +1063,7 @@ def test_run_calibration_step_logs_golden_predictions(
     assert all(0.0 <= p <= 1.0 for p in golden["p_hat"])
 
     registered_name = str(registration_cfg.mlflow.registered_model_name)
-    reloaded = mlflow.sklearn.load_model(
-        f"models:/{registered_name}/{result['model_version']}"
-    )
+    reloaded = mlflow.sklearn.load_model(f"models:/{registered_name}/{model_version}")
     reloaded_preds = reloaded.predict_proba(pd.DataFrame(golden["rows"]))[:, 1]
     assert np.allclose(reloaded_preds, golden["p_hat"], rtol=0, atol=1e-9)
 
@@ -1441,10 +1109,59 @@ def test_run_calibration_step_logs_dev_oof_predictions(
     assert oof["p_hat"].between(0, 1).all()
 
 
+def test_run_calibration_step_logs_dev_shap_values(
+    calibrated_run: dict[str, Any],
+) -> None:
+    """dev_shap_values.parquet — the evidence threshold.py's V3 pre-seal
+    screen binds on — carries one row per dev customer, one column per
+    transformed feature, plus customerid and base_value (CLAUDE.md § Persist
+    the evidence, not just the conclusion).
+    """
+    run_id = calibrated_run["run_id"]
+    y_dev = calibrated_run["y_dev"]
+    registration_cfg = calibrated_run["cfg"]
+    mlflow.set_tracking_uri(str(registration_cfg.mlflow.tracking_uri))
+
+    local_path = mlflow.artifacts.download_artifacts(
+        run_id=run_id, artifact_path="calibration/dev_shap_values.parquet"
+    )
+    shap_df = pd.read_parquet(local_path)
+
+    assert len(shap_df) == len(y_dev)
+    assert {"customerid", "base_value"} <= set(shap_df.columns)
+    feature_cols = [c for c in shap_df.columns if c not in ("customerid", "base_value")]
+    assert len(feature_cols) > 0
+    assert shap_df[feature_cols].to_numpy().dtype.kind == "f"
+
+
+def test_run_calibration_step_logs_dev_shap_summary(
+    calibrated_run: dict[str, Any],
+) -> None:
+    """dev_shap_summary.json ranks every transformed feature by mean_abs_shap
+    (descending, matching explain.global_importance's sort) and carries a
+    signed direction alongside it — the ranking threshold.py's V3 pre-seal
+    veto is derived from and binds on.
+    """
+    run_id = calibrated_run["run_id"]
+    registration_cfg = calibrated_run["cfg"]
+    mlflow.set_tracking_uri(str(registration_cfg.mlflow.tracking_uri))
+
+    summary = mlflow.artifacts.load_dict(
+        f"runs:/{run_id}/calibration/dev_shap_summary.json"
+    )
+
+    assert len(summary) > 0
+    for row in summary:
+        assert {"feature", "mean_abs_shap", "direction"} <= set(row)
+        assert row["mean_abs_shap"] >= 0.0
+        assert -1.0 <= row["direction"] <= 1.0
+    mean_abs_shap_values = [row["mean_abs_shap"] for row in summary]
+    assert mean_abs_shap_values == sorted(mean_abs_shap_values, reverse=True)
+
+
 def test_run_calibration_step_calibration_summary_has_calibration_spec(
     registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict[str, Any],
     tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
@@ -1455,9 +1172,7 @@ def test_run_calibration_step_calibration_summary_has_calibration_spec(
     pinned fixture, since a pinned fixture would pass vacuously.
     """
     registration_cfg.calibration.method = "auto"
-    run_id = _log_parent_run(
-        dev_split, comparison_result, tuning_result, registration_cfg
-    )
+    run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
 
     result = calibrate.run_calibration_step(run_id, registration_cfg)
 
@@ -1558,7 +1273,6 @@ def test_run_calibration_step_calibration_summary_has_mean_p_hat_fields(
 def test_run_calibration_step_blocks_on_low_trial_count(
     registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict[str, Any],
     tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
@@ -1567,9 +1281,7 @@ def test_run_calibration_step_blocks_on_low_trial_count(
     registration outright.
     """
     tuning_result["tuning_summary"]["trial_count_below_threshold"] = True
-    run_id = _log_parent_run(
-        dev_split, comparison_result, tuning_result, registration_cfg
-    )
+    run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
 
     with pytest.raises(RuntimeError, match="trial_count_below_threshold"):
         calibrate.run_calibration_step(run_id, registration_cfg)
@@ -1581,61 +1293,21 @@ def test_run_calibration_step_blocks_on_low_trial_count(
 def test_run_calibration_step_override_trial_count_gate(
     registration_cfg: DictConfig,
     dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict[str, Any],
     tuning_result: dict[str, Any],
     sandboxed_dev_features: None,
 ) -> None:
-    """override_trial_count_gate=true forces registration despite the low-trial
-    warning — an explicit human override, not a silent bypass."""
+    """override_trial_count_gate=true forces calibration to proceed despite
+    the low-trial warning — an explicit human override, not a silent bypass.
+    Registration is register.py's own separate step (B1) and is not
+    exercised here — this only asserts calibrate.py itself completes."""
     tuning_result["tuning_summary"]["trial_count_below_threshold"] = True
     registration_cfg.calibration.override_trial_count_gate = True
-    run_id = _log_parent_run(
-        dev_split, comparison_result, tuning_result, registration_cfg
-    )
+    run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
 
     result = calibrate.run_calibration_step(run_id, registration_cfg)
 
-    assert result["model_version"] == "1"
-
-
-def test_run_calibration_step_parity_failure_leaves_tagged_pending_orphan(
-    registration_cfg: DictConfig,
-    dev_split: tuple[pd.DataFrame, pd.Series],
-    comparison_result: dict[str, Any],
-    tuning_result: dict[str, Any],
-    sandboxed_dev_features: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A reload-parity failure must not leave a permanently untagged orphan.
-
-    promotion_status=pending is tagged immediately after log_model returns,
-    before _verify_reload_parity runs — so a parity failure still leaves a
-    well-formed, reapable `pending` version rather than one with no
-    promotion_status tag at all (invisible to both the tag-based rollback
-    rule and the Phase 14 pending-reaper). The version must also stay
-    unaliased: `challenger` may only ever point at something that has
-    actually passed the parity check.
-    """
-    monkeypatch.setattr(
-        calibrate,
-        "_verify_reload_parity",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("forced parity failure")
-        ),
-    )
-    run_id = _log_parent_run(
-        dev_split, comparison_result, tuning_result, registration_cfg
-    )
-
-    with pytest.raises(AssertionError, match="forced parity failure"):
-        calibrate.run_calibration_step(run_id, registration_cfg)
+    assert result["run_id"] == run_id
+    assert result["logged_model_id"]
 
     client = mlflow.tracking.MlflowClient()
-    registered_name = str(registration_cfg.mlflow.registered_model_name)
-    version = client.get_model_version(registered_name, "1")
-    assert version.tags["promotion_status"] == "pending"
-    assert version.tags["training_data_scope"] == "dev"
-    assert version.tags["logged_model_id"]
-
-    registered_model = client.get_registered_model(registered_name)
-    assert "challenger" not in registered_model.aliases
+    assert client.search_registered_models() == []

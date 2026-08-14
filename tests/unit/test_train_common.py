@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from pathlib import Path
 from unittest.mock import Mock
 
 import mlflow
 import pandas as pd
-import pandera as pa
 import pytest
 from lightgbm import LGBMClassifier
-from omegaconf import OmegaConf
 from sklearn.dummy import DummyClassifier
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.pipeline import Pipeline
@@ -24,9 +21,11 @@ from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.models.train.common import cv_score_candidate
 
 # ---------------------------------------------------------------------------
-# _git_sha / _dvc_hash — audit-trail metadata resolution (QA finding #4:
-# failures are logged, not silently swallowed into an indistinguishable
-# 'unknown', since these values feed training_manifest.json's audit trail)
+# _git_sha — audit-trail metadata resolution (QA finding #4: failures are
+# logged, not silently swallowed into an indistinguishable 'unknown', since
+# this value feeds training_manifest.json's audit trail). Its former
+# companion, _dvc_hash, is retired — data_content_hash now comes from
+# features/accessor.py::features_sha256(), covered by test_accessor.py.
 # ---------------------------------------------------------------------------
 
 
@@ -60,57 +59,6 @@ def test_git_sha_returns_unknown_and_warns_on_failure(
     assert warning_mock.call_args.kwargs["exc_info"] is True
 
 
-def test_dvc_hash_returns_unknown_and_logs_debug_when_file_missing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A missing .dvc file (DVC not tracked yet — the routine pre-Phase-8 case)
-    returns 'unknown' and logs at debug only, never a warning.
-    """
-    monkeypatch.setattr(common, "get_project_root", lambda: tmp_path)
-    cfg = OmegaConf.create({"paths": {"processed_data": "."}})
-    debug_mock = Mock()
-    warning_mock = Mock()
-    monkeypatch.setattr(common.logger, "debug", debug_mock)
-    monkeypatch.setattr(common.logger, "warning", warning_mock)
-
-    result = common._dvc_hash(cfg)
-
-    assert result == "unknown"
-    debug_mock.assert_called_once()
-    assert debug_mock.call_args.args[0] == "dvc_hash_not_tracked"
-    warning_mock.assert_not_called()
-
-
-def test_dvc_hash_returns_hash_when_file_present(tmp_path: Path) -> None:
-    """A well-formed .dvc file returns its recorded md5 hash."""
-    dvc_file = tmp_path / "telco_churn_processed.csv.dvc"
-    dvc_file.write_text("outs:\n- md5: deadbeef1234\n")
-    cfg = OmegaConf.create({"paths": {"processed_data": str(tmp_path)}})
-
-    assert common._dvc_hash(cfg) == "deadbeef1234"  # pragma: allowlist secret
-
-
-def test_dvc_hash_returns_unknown_and_warns_on_malformed_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A .dvc file that exists but doesn't have the expected structure returns
-    'unknown' and logs a warning — distinct from the missing-file debug case,
-    since this signals a genuine problem worth a human look.
-    """
-    dvc_file = tmp_path / "telco_churn_processed.csv.dvc"
-    dvc_file.write_text("not_outs: []\n")
-    cfg = OmegaConf.create({"paths": {"processed_data": str(tmp_path)}})
-    warning_mock = Mock()
-    monkeypatch.setattr(common.logger, "warning", warning_mock)
-
-    result = common._dvc_hash(cfg)
-
-    assert result == "unknown"
-    warning_mock.assert_called_once()
-    assert warning_mock.call_args.args[0] == "dvc_hash_unexpected_error"
-    assert warning_mock.call_args.kwargs["exc_info"] is True
-
-
 # ---------------------------------------------------------------------------
 # compose_config — Hydra config loading (D1)
 #
@@ -128,8 +76,6 @@ def test_compose_config_loads_expected_structure() -> None:
 
     assert str(cfg.mlflow.registered_model_name) == "telco-churn-pipeline"
     assert str(cfg.mlflow.experiment_name) == "telco-churn-training"
-    assert int(cfg.training_setup.cv_folds) == 10
-    assert int(cfg.training_setup.cv_repeats) == 10
     assert float(cfg.training_setup.delta_threshold) == pytest.approx(0.005)
     assert int(cfg.training.candidate.n_estimators) == 100
     assert int(cfg.logreg.Cs) == 10
@@ -152,39 +98,12 @@ def test_compose_config_accepts_cli_overrides() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _load_processed — schema guard (B3a)
-# ---------------------------------------------------------------------------
-
-
-def test_load_processed_raises_on_schema_violation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, feature_df: pd.DataFrame
-) -> None:
-    """A processed CSV that violates FeatureOutputSchema aborts the load."""
-    bad_df = feature_df.copy()
-    bad_df.loc[0, "contract_type"] = "Not-a-real-contract"
-    bad_df.to_csv(tmp_path / "telco_churn_processed.csv", index=False)
-    monkeypatch.setattr(common, "get_project_root", lambda: tmp_path)
-    cfg = OmegaConf.create({"paths": {"processed_data": "."}})
-
-    with pytest.raises(pa.errors.SchemaError):
-        common._load_processed(cfg)
-
-
-def test_load_processed_passes_on_clean_data(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, feature_df: pd.DataFrame
-) -> None:
-    """A schema-conformant processed CSV loads without error."""
-    feature_df.to_csv(tmp_path / "telco_churn_processed.csv", index=False)
-    monkeypatch.setattr(common, "get_project_root", lambda: tmp_path)
-    cfg = OmegaConf.create({"paths": {"processed_data": "."}})
-
-    df = common._load_processed(cfg)
-
-    assert len(df) == len(feature_df)
-
-
-# ---------------------------------------------------------------------------
 # _load_dev_features
+#
+# Schema-guard behavior (a schema-violating file aborts the load, a clean one
+# loads without error) is owned by test_accessor.py's load_features() tests
+# now that _load_dev_features routes through the shared accessor rather than
+# a train-package-local CSV reader.
 # ---------------------------------------------------------------------------
 #
 # Split reproducibility/integrity (determinism, disjointness, stratification) is
@@ -214,10 +133,10 @@ def test_load_dev_features_returns_only_dev_rows(
     """_load_dev_features returns exactly the dev-partition rows and feature columns."""
     dev_df = feature_df.iloc[:96].reset_index(drop=True)
     test_df = feature_df.iloc[96:].reset_index(drop=True)
-    monkeypatch.setattr(common, "_load_processed", lambda cfg: feature_df)
+    monkeypatch.setattr(common, "load_features", lambda: feature_df)
     monkeypatch.setattr(common, "partition", lambda df: (dev_df, test_df))
 
-    X_dev, y_dev = common._load_dev_features(cfg=None)
+    X_dev, y_dev = common._load_dev_features()
 
     assert len(X_dev) == len(dev_df) == len(y_dev)
     assert set(X_dev.columns) == set(common._FEATURE_COLS)
@@ -229,15 +148,15 @@ def test_load_dev_features_never_touches_test_partition(
 ) -> None:
     """The test-partition frame returned by partition() must never be read."""
     dev_df = feature_df.iloc[:96].reset_index(drop=True)
-    monkeypatch.setattr(common, "_load_processed", lambda cfg: feature_df)
+    monkeypatch.setattr(common, "load_features", lambda: feature_df)
     monkeypatch.setattr(common, "partition", lambda df: (dev_df, _PoisonFrame()))
 
-    common._load_dev_features(cfg=None)  # raises AssertionError if test_df is touched
+    common._load_dev_features()  # raises AssertionError if test_df is touched
 
 
 # ---------------------------------------------------------------------------
 # _log_dev_input (Fix 6: dataset lineage shared by comparison.py,
-# feature_freeze.py, and tuning.py — candidates.py builds its own copy since
+# feature_audit.py, and tuning.py — candidates.py builds its own copy since
 # each of its three candidate runs needs its own log_input call)
 # ---------------------------------------------------------------------------
 
@@ -255,7 +174,7 @@ def test_log_dev_input_source_resolves_to_accessor_canonical_path(
     """The logged dataset's source resolves to features_path() — the
     accessor's single canonical location — not a hand-assembled copy that
     could silently go stale at Phase 8's CSV -> parquet rename. This is the
-    one test of the shared implementation; comparison.py/feature_freeze.py/
+    one test of the shared implementation; comparison.py/feature_audit.py/
     tuning.py's own tests only need to confirm they call this, not re-prove
     the source resolution themselves.
     """

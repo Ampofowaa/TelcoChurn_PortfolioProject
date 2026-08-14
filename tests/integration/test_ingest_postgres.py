@@ -124,16 +124,12 @@ def test_primary_key_survives_second_ingest(
     ingest(sample_csv, pg_engine)
     ingest(sample_csv, pg_engine)
     with pg_engine.connect() as conn:
-        result = conn.execute(
-            text(
-                """
+        result = conn.execute(text("""
                 SELECT constraint_type
                 FROM information_schema.table_constraints
                 WHERE table_name = 'customers_raw'
                   AND constraint_type = 'PRIMARY KEY'
-            """
-            )
-        ).fetchone()
+            """)).fetchone()
     assert (
         result is not None
     ), "customers_raw must have a PRIMARY KEY constraint after ingest"
@@ -164,7 +160,7 @@ def test_ingest_validates_before_writing(pg_engine: Engine, tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
-# __main__ CLI composition: load_dotenv → OmegaConf.load → argparse →
+# __main__ CLI composition: load_dotenv → compose_config → activate_config →
 #   ingest(path, engine=None) → get_engine() → sys.exit
 # ---------------------------------------------------------------------------
 
@@ -185,8 +181,7 @@ def test_ingest_main_cli_exits_zero(
             sys.executable,
             "-m",
             "telco_churn.data.ingest",
-            "--csv-path",
-            str(sample_csv),
+            f"paths.raw_data={sample_csv}",
         ],
         env=env,
         capture_output=True,
@@ -211,7 +206,12 @@ def test_ingest_main_cli_exits_one_on_missing_csv(pg_url: str, tmp_path: Path) -
     missing = tmp_path / "no_such_file.csv"
     env = {**os.environ, "POSTGRES_URL": pg_url}
     result = subprocess.run(
-        [sys.executable, "-m", "telco_churn.data.ingest", "--csv-path", str(missing)],
+        [
+            sys.executable,
+            "-m",
+            "telco_churn.data.ingest",
+            f"paths.raw_data={missing}",
+        ],
         env=env,
         capture_output=True,
         text=True,

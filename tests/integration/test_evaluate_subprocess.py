@@ -6,18 +6,32 @@ env-var-to-engine joints that only surface at the process boundary.
 
 The full production chain up to (but not including) evaluate.py is seeded
 once per module via direct in-process calls — log_model.run_model_logging_step
--> calibrate.run_calibration_step -> threshold.run_threshold_step (which now
-folds in the dev-OOF screen as its own last step) — mirroring
+-> calibrate.run_calibration_step -> register.register_challenger (B1's
+mint step, decoupled from calibrate.py — this fixture calls it directly,
+mirroring what register.py's own mint-mode CLI does) -> threshold.run_threshold_step
+(which now folds in the dev-OOF screen as its own last step) — mirroring
 test_threshold_subprocess.py's own precedent one step further down the
 pipeline. Only evaluate.py itself crosses the subprocess boundary. A dev-OOF
 screen failure (a real slope outside the band on this synthetic fixture) is
 tolerated during seeding — its artifacts are written before it raises, so
-evaluate.py's later reads are unaffected either way.
+fixture setup completes either way. Since PR B0, evaluate.py's own subprocess
+calls independently re-check the screen's verdict (check_threshold_screen_passed)
+and will exit 1 if it failed here — this fixture's synthetic data passes the
+screen deterministically in practice (see test_error_analysis.py's in-process
+equivalent), so this is not expected to matter, but it is no longer a case
+evaluate.py is agnostic to.
 
 No `champion` alias exists anywhere in this throwaway registry, so every test
 here exercises the cold-start regime (ANALYSIS.md §0) — the comparative
 regime needs a promoted champion. Coverage for the comparative branch belongs
 with register.py's own subprocess test (tests/integration/test_register_subprocess.py).
+
+test_evaluate_main_cli_accepts_explicit_champion_version_override covers the
+other half of resolve_evaluation_champion — an explicit
+`evaluate.champion_version=none` pins the cold-start regime without touching
+the (nonexistent, here) `champion` alias; the reproducibility path a `dvc
+repro` invocation is expected to use, per PROJECT_PLAN.md's Phase 8 note on
+the undeclared champion-alias dependency.
 """
 
 from __future__ import annotations
@@ -36,10 +50,17 @@ import pytest
 from omegaconf import OmegaConf
 
 import telco_churn.models.calibrate as calibrate
+import telco_churn.models.register as register_module
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
-from telco_churn.utils.paths import compose_config, get_project_root
+from telco_churn.features.accessor import FEATURES_FILENAME
+from telco_churn.utils.paths import (
+    activate_config,
+    compose_config,
+    get_project_root,
+    reset_active_config,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -55,6 +76,14 @@ _FAST_CALIBRATION_OVERRIDES = [
 # (ranking, per-scenario classification, calibration slope, business impact,
 # every sliced axis) fast on a CI box; large enough that a CI is still a CI.
 _FAST_EVALUATE_OVERRIDES = ["evaluate.n_bootstrap=30"]
+
+# v3_top_k_features=3 (not the production 8): _make_synthetic_processed_frame's
+# docstring plants exactly three real signal columns (contract_type, tenure,
+# monthlycharges) — the only ones with a real, learnable relationship to
+# churn — so cutting the V3 pre-seal veto's top-k at 3 keeps it checking real
+# signal instead of noise from one of this fixture's many uninformative
+# columns. Mirrors tests/unit/test_error_analysis.py's identical override.
+_FAST_THRESHOLD_OVERRIDES = ["threshold.v3_top_k_features=3"]
 
 
 def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame:
@@ -128,9 +157,9 @@ def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame
 def _seed_processed_data(
     out_dir: Path, n: int = 300, seed: int = 0
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Write a processed CSV + matching canonical split manifest into out_dir."""
+    """Write a processed features file + matching canonical split manifest into out_dir."""
     df = _make_synthetic_processed_frame(n=n, seed=seed)
-    df.to_csv(out_dir / "telco_churn_processed.csv", index=False)
+    df.to_parquet(out_dir / FEATURES_FILENAME, index=False)
     manifest = make_split(
         ids=df["customerid"], labels=df["churn"], test_size=0.2, random_state=42
     )
@@ -216,7 +245,9 @@ def registered_evaluation_model(
             f"paths.figures={figures_dir}",
             f"paths.policy={policy_dir}",
             f"paths.reports={reports_dir}",
+            f"paths.processed_data={data_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
+            *_FAST_THRESHOLD_OVERRIDES,
         ]
     )
 
@@ -255,44 +286,49 @@ def registered_evaluation_model(
             "boundary_hits": {"num_leaves": False},
         },
     }
-    comparison_result = {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
     # calibrate.run_calibration_step/threshold.run_threshold_step re-derive the
-    # dev partition themselves (load_features() -> partition()), reading
-    # PROCESSED_DATA_DIR from the *current* environment rather than from
-    # `cfg` — unlike run_model_logging_step, which only ever sees the X_dev/
-    # y_dev this fixture builds explicitly above. Without this, they would
+    # dev partition themselves (load_features() -> partition()), reading their
+    # config via load_config() rather than the `cfg` passed in — unlike
+    # run_model_logging_step, which only ever sees the X_dev/y_dev this
+    # fixture builds explicitly above. activate_config() is what makes that
+    # internal read see paths.processed_data above; without it, they would
     # silently fall back to the real project's own datasets/processed/ (if
     # present on the machine) instead of this seeded synthetic frame, and
     # calibrate's dev_oof_predictions.parquet would carry real customerids
     # that can never match evaluate.py's later, correctly-scoped subprocess
     # read of this same synthetic data.
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("PROCESSED_DATA_DIR", str(data_dir))
+    activate_config(cfg)
+    try:
         with mlflow.start_run(run_name="tuning_study") as run:
             tuning_result["parent_run_id"] = run.info.run_id
-        log_result = log_model.run_model_logging_step(
-            X_dev, y_dev, comparison_result, tuning_result, cfg
-        )
+        log_result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
         cal_result = calibrate.run_calibration_step(log_result["run_id"], cfg)
-        model_version = str(cal_result["model_version"])
+        run_id = str(cal_result["run_id"])
+        model_uri = str(cal_result["model_uri"])
+        # B1's call-site decoupling: calibrate.py no longer registers
+        # anything itself, so this fixture mints the challenger the same way
+        # register.py's own mint-mode CLI would, in-process.
+        model_version = register_module.register_challenger(
+            cfg, run_id, model_uri, str(cal_result["logged_model_id"])
+        )
 
         try:
-            threshold.run_threshold_step(model_version, cfg)
+            threshold.run_threshold_step(run_id, model_version, cfg)
         except RuntimeError:
             # A dev-OOF screen failure (the real slope on this synthetic
             # fixture lying outside the band) is a legitimate outcome, not a
             # setup bug — reports/dev_oof_predictions.parquet and
             # dev_oof_diagnostics.json are written before that raise, so
-            # evaluate.py's later reads are unaffected either way.
+            # this fixture's own setup completes either way. Since PR B0,
+            # though, evaluate.py's later subprocess CLI calls independently
+            # re-check screen_passed and will themselves exit 1 if the screen
+            # failed here — no longer truly "unaffected" downstream, just no
+            # longer a setup-time failure. The same seeded synthetic fixture
+            # passes the screen deterministically in test_error_analysis.py's
+            # in-process equivalent, so this is not expected to fire.
             pass
+    finally:
+        reset_active_config()
 
     return {
         "tracking_uri": tracking_uri,
@@ -335,6 +371,7 @@ def _run_evaluate_cli(
         f"paths.policy={fixture['policy_dir']}",
         f"paths.figures={fixture['figures_dir']}",
         f"paths.reports={reports_dir}",
+        f"paths.processed_data={fixture['data_dir']}",
         *_FAST_EVALUATE_OVERRIDES,
     ]
     if model_version is not None:
@@ -343,7 +380,6 @@ def _run_evaluate_cli(
 
     env = {
         **os.environ,
-        "PROCESSED_DATA_DIR": str(fixture["data_dir"]),
         "MLFLOW_TRACKING_URI": str(fixture["tracking_uri"]),
     }
     return subprocess.run(
@@ -385,7 +421,10 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
         "f1",
     }
     assert "sliced" in metrics
-    assert "dev_oof_diagnostics" in metrics["sliced"]
+    # register.py's model card is the sole reader of dev_oof_diagnostics.json
+    # and now fetches it directly (evaluate.load_dev_oof_diagnostics), so
+    # metrics.json no longer carries a copy under sliced.
+    assert "dev_oof_diagnostics" not in metrics["sliced"]
 
     economics = json.loads((reports_dir / "economics.json").read_text(encoding="utf-8"))
     assert set(economics["ev_by_k"]) == {"conservative", "base", "optimistic"}
@@ -395,12 +434,19 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
     )
     assert decision["regime"] == "cold_start"
     assert decision["gate"] in {"pass", "fail"}
-    assert decision["review"] == "pending"
+    # B1: promotion_decision.json carries no "review" field — the human
+    # verdict is a separate, append-only promotion_review.json document.
+    assert "review" not in decision
     assert "metrics_content_hash" in decision
     assert decision["eval_run_id"] != metrics["run_id"]
 
     test_predictions = pd.read_parquet(reports_dir / "test_predictions.parquet")
-    assert set(test_predictions.columns) == {"customerid", "y_true", "p_hat"}
+    assert set(test_predictions.columns) == {
+        "customerid",
+        "y_true",
+        "p_hat",
+        "logged_model_id",
+    }
     assert len(test_predictions) > 0
 
     # Written by threshold.py's folded-in dev-OOF screen (customerid, y_true,
@@ -425,6 +471,10 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
     ):
         assert (figures_dir / filename).exists(), f"missing figure: {filename}"
 
+    # B1: evaluate.py no longer tags the model version itself (the four gate
+    # criteria, eval_run_id) — register.py does, on its own first pass,
+    # sourced from reports/eval_receipt.json below. Assert neither is
+    # tagged yet, and that the receipt is register.py's bootstrap pointer.
     client = mlflow.tracking.MlflowClient(
         tracking_uri=str(registered_evaluation_model["tracking_uri"])
     )
@@ -432,11 +482,48 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
         str(registered_evaluation_model["registered_model_name"]),
         str(registered_evaluation_model["model_version"]),
     )
-    for tag in ("test_pr_auc", "test_recall", "test_brier", "test_calibration_slope"):
-        assert tag in version.tags, f"missing model-version tag: {tag}"
-    # register.py's only supported path to this cycle's promotion_decision.json/
-    # metrics.json — resolved by run_id, never a local reports/ path.
-    assert version.tags.get("eval_run_id") == decision["eval_run_id"]
+    for tag in (
+        "test_pr_auc",
+        "test_recall",
+        "test_brier",
+        "test_calibration_slope",
+        "eval_run_id",
+    ):
+        assert tag not in version.tags, f"unexpected model-version tag: {tag}"
+    receipt = json.loads(
+        (reports_dir / "eval_receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["eval_run_id"] == decision["eval_run_id"]
+    assert receipt["model_version"] == str(registered_evaluation_model["model_version"])
+
+
+def test_evaluate_main_cli_accepts_explicit_champion_version_override(
+    registered_evaluation_model: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    """An explicit evaluate.champion_version=none pins the cold-start regime
+    without evaluate.py ever reading the (here, nonexistent) `champion`
+    alias — the reproducible path a DVC `cmd` string is expected to use."""
+    reports_dir = tmp_path / "reports"
+
+    result = _run_evaluate_cli(
+        str(registered_evaluation_model["model_version"]),
+        registered_evaluation_model,
+        reports_dir,
+        extra_overrides=["evaluate.champion_version=none"],
+    )
+
+    assert (
+        result.returncode == 0
+    ), f"evaluate CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+
+    decision = json.loads(
+        (reports_dir / "promotion_decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["regime"] == "cold_start"
+
+    metrics = json.loads((reports_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["champion_version"] is None
 
 
 def test_evaluate_main_cli_exits_one_when_model_version_missing(

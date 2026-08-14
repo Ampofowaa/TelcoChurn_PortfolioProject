@@ -5,6 +5,11 @@
 # configs/tuning/optuna.yaml.
 
 fixed:
+  # Non-negotiable against any Optuna result — log_model.py::run_model_logging_step
+  # asserts these keys are disjoint from selected_hyperparameters (best_params plus
+  # the derived, scaled n_estimators) before merging, so a key added here that
+  # collides with configs/tuning/optuna.yaml's search_space raises loudly instead
+  # of silently letting this block's precedence decide a value Optuna also searched.
   subsample_freq: 1            # must be >= 1 to enable subsample; default 0 silently disables it
   deterministic: true          # bit-reproducible histogram build across runs
   force_row_wise: true         # required companion to deterministic

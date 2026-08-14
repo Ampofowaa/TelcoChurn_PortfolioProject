@@ -1,41 +1,73 @@
-"""Shared MLflow tracking-URI resolution and model-registry lookups.
+"""Shared MLflow tracking-URI resolution, model-registry lookups, and receipts.
 
-resolve_model_run_id/resolve_logged_model_id/load_model_promotion_bars live
-here, rather than in evaluate.py (their original, single-caller home),
-because threshold.py's dev-OOF screen needs all three too: evaluate.py
-already imports from threshold.py (CostScenario, costs_config_hash,
-load_costs_config), so threshold.py importing these back from evaluate.py
-would be a circular import. Neither module owns the other's need for a
-plain MLflow-registry lookup or a policy-config loader, so both live in this
-shared, import-safe location instead.
+resolve_model_run_id/resolve_logged_model_id live here, rather than in
+evaluate.py (their original, single-caller home), because threshold.py's
+dev-OOF screen needs them too and neither module owns the other's need for a
+plain MLflow-registry lookup. (load_model_promotion_bars used to live here
+for the same reason — it now lives in models/policy_config.py instead, which
+nothing in the models/__init__.py -> train -> utils.mlflow import chain
+touches, so the circular-import workaround that justified parking it here no
+longer applies.)
+
+A **receipt** (write_train_receipt/write_calibrate_receipt and their read_*
+counterparts) is a small local JSON file a pipeline stage writes describing
+what it just produced (identifiers only, never evidence), which the next
+stage reads by default when no explicit override is given — the DVC
+outs:/deps: handshake between chained stages. This is deliberately unlike
+this project's other reports/ rule ("never trust a local reports/ path as
+the source of truth for a cross-cycle decision" — register.py,
+drift_reference.json): that rule protects evidence that must survive a
+champion rollback, where a stale local copy would silently pair a decision
+with the wrong model version. A receipt carries no evidence — it's a
+convenience default for local/CI/DVC chaining. calibrate_receipt.json is
+identifiers-only in the strictest sense — {run_id, logged_model_id,
+model_uri}, never a model_version, since calibrate.py performs no registry
+write of its own — so resolve_model_identifier's default (neither an
+explicit run_id nor model_version given) path turns the receipt's run_id
+into a model_version via the same registry lookup its explicit-run_id path
+already uses, rather than trusting a stored value; eval_receipt.json/
+error_analysis_receipt.json do carry model_version (register.py's own
+first-invocation bootstrap pointers), and whatever they resolve to is still
+the exact same pair an explicit override would supply. The audit/rollback
+path (an explicit run_id or model_version override) never reads a receipt
+at all.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import warnings
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import Any
 
 import mlflow
 import mlflow.tracking
 from mlflow.entities import Experiment
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from pandas.errors import Pandas4Warning
 
 from telco_churn.utils.paths import get_project_root
 
-if TYPE_CHECKING:
-    from telco_churn.models.gate import GateBars
-
 __all__ = [
     "resolve_tracking_uri",
     "resolve_model_run_id",
+    "resolve_model_version_from_run_id",
     "resolve_logged_model_id",
-    "load_model_promotion_bars",
+    "resolve_model_identifier",
+    "resolve_calibrated_run",
     "ensure_experiment_metadata",
     "set_run_description",
     "set_registered_model_description",
     "set_logged_model_description",
+    "write_train_receipt",
+    "read_train_receipt",
+    "write_calibrate_receipt",
+    "read_calibrate_receipt",
+    "write_eval_receipt",
+    "read_eval_receipt",
+    "write_error_analysis_receipt",
+    "read_error_analysis_receipt",
     "TRAINING_CYCLE_RUN_DESCRIPTION",
 ]
 
@@ -79,11 +111,16 @@ def _suppress_known_mlflow_warnings() -> None:
 
 
 _EXPERIMENT_DESCRIPTION = (
-    "End-to-end training cycle for the IBM Telco Customer Churn model — candidate "
-    "comparison (Dummy / LogReg / LightGBM) → feature selection → Optuna tuning → "
-    "calibration → sealed-test evaluation → error analysis → model promotion and "
-    "registry. Selection criterion: PR-AUC (average precision); guardrails (recall, "
-    "Brier, calibration slope) may veto but never promote."
+    "End-to-end training cycle for the IBM Telco Customer Churn model. "
+    "Expand for pipeline stages and the model-selection policy.\n\n"
+    "**Pipeline:** candidate comparison (Dummy / LogReg / LightGBM) → "
+    "feature selection → Optuna hyperparameter tuning → calibration → "
+    "cost-sensitive threshold derivation → sealed-test evaluation → "
+    "error analysis → model promotion and registry.\n\n"
+    "**Selection policy:** PR-AUC (average precision) is the sole "
+    "criterion that can *promote* a model. Three guardrails — recall, "
+    "Brier, calibration slope — can *veto* a candidate PR-AUC would "
+    "otherwise admit, but none of them can promote one on their own."
 )
 _EXPERIMENT_TAGS = {
     "project": "telco-churn",
@@ -96,13 +133,18 @@ _EXPERIMENT_TAGS = {
 # this is static, idempotent text describing the run as a whole rather than
 # a per-step fragment any one of the three would overwrite the others' with.
 TRAINING_CYCLE_RUN_DESCRIPTION = (
-    "Training-cycle run. Optuna PR-AUC tuning of the frozen LightGBM spec "
-    "and the final tuned pipeline (logged as pyfunc with "
-    "training_manifest.json); calibration method selection and the cycle's "
-    "single registry registration (calibrate.py); cost-sensitive threshold "
-    "derivation and the pre-seal dev-OOF calibration/fairness screen "
-    "(threshold.py). This is the version aliased 'challenger', and - if it "
-    "clears the sealed-test gate - 'champion'."
+    "Training-cycle run. LightGBM's hyperparameters are searched against the "
+    "frozen feature set, scored on PR-AUC (tuning.py), and the winning "
+    "configuration is refit on the full development set and logged as a "
+    "deployable model with its full audit trail in training_manifest.json "
+    "(log_model.py). calibrate.py then turns the model's raw scores into "
+    "honest probabilities and performs the cycle's single registry "
+    "registration. threshold.py turns those probabilities into a decision - "
+    "the cost-sensitive cutoff at which a customer is worth contacting - "
+    "while re-checking that the calibration is still trustworthy and fair "
+    "before anything moves further. All four steps write to this same run. "
+    "The result is registered as 'challenger', and - if it clears the "
+    "sealed-test gate - 'champion'."
 )
 
 
@@ -181,40 +223,273 @@ def resolve_logged_model_id(model_version: str, cfg: DictConfig) -> str:
     return str(model_id)
 
 
-def load_model_promotion_bars(cfg: DictConfig) -> GateBars:
-    """Load configs/model_promotion.yaml and build the GateBars it defines.
+def resolve_model_version_from_run_id(run_id: str, cfg: DictConfig) -> str:
+    """Resolve a run_id to its registered model version — the reverse of resolve_model_run_id.
 
-    Used by decide_promotion and by threshold.py's dev-OOF calibration-slope
-    screen. Loaded by path (OmegaConf.load), never through Hydra's
-    defaults/CLI-override composition: a bar that decides whether a model
-    ships must not be movable by a command-line override with no diff and no
-    review — the same reason threshold.py's load_policy_thresholds bypasses
-    composition for costs.yaml's derivative.
+    Needed for the explicit-run_id override path: a human pinning to a
+    specific run still needs a concrete model_version for the
+    registry-URI/logged_model_id-tag machinery every downstream check
+    (check_threshold_provenance, resolve_logged_model_id, model-version
+    tagging) already expects. Search is scoped to
+    cfg.mlflow.registered_model_name; raises if zero or more than one
+    registered version was minted from this run — calibrate.py registers
+    exactly one version per run, so either extreme means the run_id is wrong
+    or ambiguous and an explicit model_version should be passed instead.
     """
-    # Imported here, not at module level: telco_churn.models.gate is a
-    # submodule of telco_churn.models, and importing any submodule of a
-    # package runs that package's __init__.py first — which imports
-    # telco_churn.models.train, which imports resolve_tracking_uri back from
-    # this module. A module-level import here would make that import order
-    # circular; this function-local import breaks the cycle the same way
-    # this module's docstring already avoids one between threshold.py and
-    # evaluate.py.
-    from telco_churn.models.gate import GateBars
-
-    path = get_project_root() / str(cfg.paths.model_promotion_config)
-    loaded = OmegaConf.load(path)
-    assert isinstance(loaded, DictConfig)
-    return GateBars(
-        pr_auc_bar=float(loaded.pr_auc_bar),
-        recall_bar=float(loaded.recall_bar),
-        calibration_slope_band=(
-            float(loaded.calibration_slope_band[0]),
-            float(loaded.calibration_slope_band[1]),
-        ),
-        pr_auc_materiality_threshold=float(loaded.pr_auc_materiality_threshold),
-        brier_non_inferiority_margin=float(loaded.brier_non_inferiority_margin),
-        recall_non_inferiority_margin=float(loaded.recall_non_inferiority_margin),
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+    client = mlflow.tracking.MlflowClient()
+    matches = client.search_model_versions(
+        f"name='{registered_model_name}' and run_id='{run_id}'"
     )
+    if len(matches) == 0:
+        raise ValueError(
+            f"No registered version of {registered_model_name!r} found for "
+            f"run_id={run_id!r} — models.calibrate does not register a "
+            "version itself; run `python -m telco_churn.models.register "
+            f"register.run_id={run_id}` (or the default no-args form, if "
+            "this is the most recent calibration run) first."
+        )
+    if len(matches) > 1:
+        versions = sorted(str(m.version) for m in matches)
+        raise ValueError(
+            f"Multiple registered versions of {registered_model_name!r} found "
+            f"for run_id={run_id!r} ({versions}) — pass an explicit "
+            "model_version to disambiguate."
+        )
+    return str(matches[0].version)
+
+
+def resolve_model_identifier(
+    explicit_run_id: str | None,
+    explicit_model_version: str | None,
+    cfg: DictConfig,
+) -> tuple[str, str, str]:
+    """Resolve (run_id, model_version, model_uri) from an explicit override or calibrate.py's receipt, by run id.
+
+    Exactly one of explicit_run_id/explicit_model_version may be given —
+    giving both is ambiguous and is never silently resolved in one direction
+    over the other (raises ValueError naming both). Giving neither resolves
+    run_id from reports/calibrate_receipt.json — the most recent calibration
+    run on this machine — and then falls through to the same registry lookup
+    as the explicit-run_id path below: the receipt is calibrate.py's own
+    single-writer description of a still-unregistered artifact (see
+    write_calibrate_receipt's docstring) and never carries a model_version
+    itself, so "resolve by run id, not registry version" is not just true of
+    the explicit override, it is what the fully-automatic default path does
+    too — a registered version (minted by register.py's mint step, run
+    separately after calibrate.py) must already exist for the resolved
+    run_id, or resolve_model_version_from_run_id raises naming the CLI that
+    mints it.
+
+    model_uri is the registry URI (models:/<name>/<version>) on every path —
+    an immutable, version-pinned URI, not a moving alias.
+    """
+    if explicit_run_id is not None and explicit_model_version is not None:
+        raise ValueError(
+            f"Both an explicit run_id ({explicit_run_id!r}) and an explicit "
+            f"model_version ({explicit_model_version!r}) were given — "
+            "ambiguous, and never silently resolved in one direction over "
+            "the other. Pass exactly one, or neither to resolve from "
+            "calibrate.py's receipt."
+        )
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+    if explicit_model_version is not None:
+        model_version = str(explicit_model_version)
+        run_id = resolve_model_run_id(model_version, cfg)
+        model_uri = f"models:/{registered_model_name}/{model_version}"
+        return run_id, model_version, model_uri
+    run_id = (
+        str(explicit_run_id)
+        if explicit_run_id is not None
+        else str(read_calibrate_receipt(cfg)["run_id"])
+    )
+    model_version = resolve_model_version_from_run_id(run_id, cfg)
+    model_uri = f"models:/{registered_model_name}/{model_version}"
+    return run_id, model_version, model_uri
+
+
+def resolve_calibrated_run(
+    explicit_run_id: str | None, cfg: DictConfig
+) -> tuple[str, str, str]:
+    """Resolve (run_id, model_uri, logged_model_id) for register.py's mint step — never the registry.
+
+    Unlike resolve_model_identifier above, this never looks up a
+    model_version: register.py's mint step (register_challenger) is what
+    *creates* one, so there is nothing to resolve yet. An explicit
+    register.run_id override reads the calibrated_model_id/
+    calibrated_model_uri tags calibrate.py sets directly on that run (see
+    calibrate.py's _log_calibration_run) — no receipt involved — so
+    re-registering an older calibration run, not necessarily the most recent
+    one on this machine, works without a local file that only ever describes
+    the latest one. Giving no override resolves from
+    reports/calibrate_receipt.json instead, the same convenience default
+    every other stage's __main__ uses.
+    """
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    if explicit_run_id is not None:
+        run_id = str(explicit_run_id)
+        run = mlflow.tracking.MlflowClient().get_run(run_id)
+        model_id = run.data.tags.get("calibrated_model_id")
+        model_uri = run.data.tags.get("calibrated_model_uri")
+        if not model_id or not model_uri:
+            raise ValueError(
+                f"Run {run_id!r} has no calibrated_model_id/calibrated_model_uri "
+                "tags — was models.calibrate ever run for this run_id?"
+            )
+        return run_id, str(model_uri), str(model_id)
+    receipt = read_calibrate_receipt(cfg)
+    return (
+        str(receipt["run_id"]),
+        str(receipt["model_uri"]),
+        str(receipt["logged_model_id"]),
+    )
+
+
+def _reports_dir(cfg: DictConfig) -> Path:
+    """Return (without creating) the project's reports/ directory."""
+    return get_project_root() / str(cfg.paths.reports)
+
+
+def write_train_receipt(run_id: str, cfg: DictConfig) -> None:
+    """Write reports/train_receipt.json — the pointer calibrate.py reads by default.
+
+    Identifiers only, never evidence — see this module's docstring. The
+    explicit calibration.run_id override never reads this file.
+    """
+    reports_dir = _reports_dir(cfg)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(reports_dir / "train_receipt.json", "w", encoding="utf-8") as f:
+        json.dump({"run_id": run_id}, f, indent=2)
+
+
+def read_train_receipt(cfg: DictConfig) -> dict[str, Any]:
+    """Read reports/train_receipt.json, raising a clear error naming the CLI override fallback."""
+    path = _reports_dir(cfg) / "train_receipt.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} does not exist — run `python -m telco_churn.models.train` "
+            "first, or pass an explicit "
+            "calibration.run_id=<tuning_study_run_id> override."
+        )
+    with open(path, encoding="utf-8") as f:
+        receipt: dict[str, Any] = json.load(f)
+    return receipt
+
+
+def write_calibrate_receipt(
+    run_id: str,
+    logged_model_id: str,
+    model_uri: str,
+    cfg: DictConfig,
+) -> None:
+    """Write reports/calibrate_receipt.json — threshold/evaluate/error_analysis's and register.py's default pointer.
+
+    Never carries a model_version: calibrate.py performs no registry write of
+    its own (see that module's docstring), so no version exists yet at the
+    point this is written. model_uri is the run-scoped LoggedModel URI
+    calibrate.py's own log_model call returned, not a registry URI —
+    resolve_model_identifier's "neither given" default path turns this
+    receipt's run_id into a model_version by looking it up in the registry
+    (resolve_model_version_from_run_id), rather than trusting a value stored
+    here, so this file stays calibrate.py's own single-writer description of
+    a still-unregistered artifact.
+    """
+    reports_dir = _reports_dir(cfg)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(reports_dir / "calibrate_receipt.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "run_id": run_id,
+                "logged_model_id": logged_model_id,
+                "model_uri": model_uri,
+            },
+            f,
+            indent=2,
+        )
+
+
+def read_calibrate_receipt(cfg: DictConfig) -> dict[str, Any]:
+    """Read reports/calibrate_receipt.json, raising a clear error naming the CLI override fallback."""
+    path = _reports_dir(cfg) / "calibrate_receipt.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} does not exist — run `python -m telco_churn.models.calibrate` "
+            "first, or pass an explicit run_id/model_version override."
+        )
+    with open(path, encoding="utf-8") as f:
+        receipt: dict[str, Any] = json.load(f)
+    return receipt
+
+
+def write_eval_receipt(model_version: str, eval_run_id: str, cfg: DictConfig) -> None:
+    """Write reports/eval_receipt.json — register.py's bootstrap pointer to this cycle's eval run.
+
+    B1 moves model-version tagging (eval_run_id, the four gate criteria) out
+    of evaluate.py and into register.py, which runs after this — so
+    register.py needs a channel to "which evaluation run belongs to this
+    model_version" for its own first invocation, before any tag exists to
+    read it back from. This receipt is that channel, exactly the same
+    first-invocation-bootstrap role calibrate_receipt.json already plays for
+    threshold.py/evaluate.py/error_analysis.py's own input resolution — never
+    trusted again once register.py has tagged eval_run_id onto the version,
+    at which point every later read goes through the tag instead (this
+    module's docstring's distinction between a receipt and cross-cycle
+    evidence).
+    """
+    reports_dir = _reports_dir(cfg)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(reports_dir / "eval_receipt.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {"model_version": model_version, "eval_run_id": eval_run_id}, f, indent=2
+        )
+
+
+def read_eval_receipt(cfg: DictConfig) -> dict[str, Any]:
+    """Read reports/eval_receipt.json, raising a clear error naming the producing command."""
+    path = _reports_dir(cfg) / "eval_receipt.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} does not exist — run `python -m telco_churn.models.evaluate` "
+            "first for this model version."
+        )
+    with open(path, encoding="utf-8") as f:
+        receipt: dict[str, Any] = json.load(f)
+    return receipt
+
+
+def write_error_analysis_receipt(
+    model_version: str, error_analysis_run_id: str, cfg: DictConfig
+) -> None:
+    """Write reports/error_analysis_receipt.json — register.py's bootstrap pointer to this cycle's error_analysis run.
+
+    Same role as write_eval_receipt above, for the sixth of the six
+    model-version tags B1 moves into register.py.
+    """
+    reports_dir = _reports_dir(cfg)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(reports_dir / "error_analysis_receipt.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "model_version": model_version,
+                "error_analysis_run_id": error_analysis_run_id,
+            },
+            f,
+            indent=2,
+        )
+
+
+def read_error_analysis_receipt(cfg: DictConfig) -> dict[str, Any]:
+    """Read reports/error_analysis_receipt.json, raising a clear error naming the producing command."""
+    path = _reports_dir(cfg) / "error_analysis_receipt.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} does not exist — run `python -m telco_churn.models.error_analysis` "
+            "first for this model version."
+        )
+    with open(path, encoding="utf-8") as f:
+        receipt: dict[str, Any] = json.load(f)
+    return receipt
 
 
 def ensure_experiment_metadata(cfg: DictConfig) -> Experiment:

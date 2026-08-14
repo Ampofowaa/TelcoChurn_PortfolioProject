@@ -129,9 +129,17 @@ Raw CSV
 | 6 | Calibration + cost-sensitive threshold | ✅ Done |
 | 7a | Sealed test-set evaluation, error analysis, human review — gate: pass | ✅ Done |
 | 7b | Registry promotion, drift baseline, model card (`register.py`, `drift_reference.py`) | ✅ Done |
-| 8–14 | DVC pipeline → serving → orchestration → cloud → monitoring | Planned |
+| 8 | DVC pipeline wrap | 🔜 Next |
+| 9 | Serving + UI — FastAPI + Streamlit | 🔜 Next |
+| 10 | Orchestration — Prefect retrain/drift flows | ⏸ Scoped, deferred until after 12 |
+| 11 | CI/CD — GitHub Actions | 🔜 Next |
+| 12 | AWS deployment | 🔜 Next |
+| 13 | Monitoring — Prometheus/Grafana/Evidently | ⏸ Scoped, deferred until after 12 |
+| 14 | Documentation polish | Planned |
 
-See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full phase-by-phase roadmap.
+**Current focus:** 8 → 9 → 11 → 12 — DVC, serving, CI/CD, and cloud deployment, in that order, since each is a dependency of the next and together they form one working, deployed system. Orchestration (10) and monitoring (13) are fully scoped but deliberately sequenced *after* deployment — both are more meaningful run against a live system with real traffic than built ahead of one.
+
+See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full phase-by-phase roadmap and the execution-order rationale.
 
 ---
 
@@ -196,12 +204,13 @@ make evaluate MODEL_VERSION=<version above>        # one-time sealed-test scorin
 make error-analysis MODEL_VERSION=<version above>  # SHAP explainability + error diagnosis
 ```
 
-Opens `notebooks/05-evaluation-and-error-analysis.ipynb` to review the gate result and record the human sign-off.
+Opens `notebooks/05-evaluation-and-error-analysis.ipynb` to review the gate result and error diagnostics.
 
-**8 — Promote the champion**
+**8 — Record human sign-off, then promote the champion**
 
 ```bash
-make register MODEL_VERSION=<version above>  # acts on the gate verdict: flips the champion alias on a pass, tags rejected on a fail
+uv run python -m telco_churn.models.review review.verdict=approved review.approver="Your Name" review.notes="..."  # verdict, approver, and a non-empty reason are all required; prints where to find this cycle's MLflow diagnostics first
+make register MODEL_VERSION=<version above>  # acts on the gate verdict + review: flips the champion alias on a pass, tags rejected on a fail
 ```
 
 **9 — Browse experiment runs**

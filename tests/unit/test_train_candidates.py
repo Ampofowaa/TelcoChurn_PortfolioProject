@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -11,6 +12,23 @@ from omegaconf import OmegaConf
 import telco_churn.models.train.candidates as candidates
 import telco_churn.models.train.common as common
 from telco_churn.features.accessor import features_path
+
+_FAKE_DATA_CONTENT_HASH = "deadbeef" * 8
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stub_data_content_hash() -> Iterator[None]:
+    """run_candidate_step stamps data_content_hash via features_sha256() with
+    no path override, resolving to the real, gitignored
+    datasets/processed/telco_churn_features.parquet — absent on a fresh
+    checkout. Every test below trains on synthetic fixtures, never real
+    processed data, so stub the hash.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(candidates, "features_sha256", lambda path=None: _FAKE_DATA_CONTENT_HASH)
+    yield
+    mp.undo()
+
 
 # ---------------------------------------------------------------------------
 # _assert_dummy_canary (B3b)
@@ -147,13 +165,30 @@ def test_run_candidate_step_logs_metric_contract(
     monkeypatch.setattr(candidates.mlflow, "log_metric", lambda *a, **k: None)
     monkeypatch.setattr(common, "mlflow_from_pandas", lambda *a, **k: MagicMock())
     monkeypatch.setattr(candidates, "_git_sha", lambda: "deadbeef")
-    monkeypatch.setattr(candidates, "_dvc_hash", lambda cfg: "unknown")
 
-    results = candidates.run_candidate_step(X_dev, y_dev, cfg)
+    results = candidates.run_candidate_step(
+        X_dev,
+        y_dev,
+        cfg,
+        cv_folds=int(cfg.training_setup.cv_folds),
+        cv_repeats=int(cfg.training_setup.cv_repeats),
+    )
 
     assert set(results) == {"dummy_prior", "logreg_cv", "lgbm_default"}
-    logged_candidates = {p["candidate"] for p in logged_params}
+    logged_candidates = {p["candidate"] for p in logged_params if "candidate" in p}
     assert logged_candidates == {"dummy_prior", "logreg_cv", "lgbm_default"}
+
+    # logreg_cv/lgbm_default each get a second log_params call for their
+    # model-construction kwargs (configs/training/logreg.yaml,lightgbm.yaml) —
+    # class_weight is deliberately excluded there, already logged generically above.
+    model_param_calls = [p for p in logged_params if "candidate" not in p]
+    assert len(model_param_calls) == 2
+    for params in model_param_calls:
+        assert "class_weight" not in params
+    logreg_model_params = next(p for p in model_param_calls if "solver" in p)
+    assert logreg_model_params["Cs"] == 2
+    lgbm_model_params = next(p for p in model_param_calls if "num_leaves" in p)
+    assert lgbm_model_params["n_estimators"] == 10
     for metrics in logged_metrics:
         assert {
             "cv_pr_auc_mean",
@@ -234,8 +269,13 @@ def test_run_candidate_step_dataset_source_uses_accessor_canonical_path(
     monkeypatch.setattr(candidates.mlflow, "log_metric", lambda *a, **k: None)
     monkeypatch.setattr(common, "mlflow_from_pandas", _fake_from_pandas)
     monkeypatch.setattr(candidates, "_git_sha", lambda: "deadbeef")
-    monkeypatch.setattr(candidates, "_dvc_hash", lambda cfg: "unknown")
 
-    candidates.run_candidate_step(X_dev, y_dev, cfg)
+    candidates.run_candidate_step(
+        X_dev,
+        y_dev,
+        cfg,
+        cv_folds=int(cfg.training_setup.cv_folds),
+        cv_repeats=int(cfg.training_setup.cv_repeats),
+    )
 
     assert captured_sources == [str(features_path())]

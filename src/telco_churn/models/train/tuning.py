@@ -22,10 +22,10 @@ from sklearn.metrics import average_precision_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sqlalchemy import create_engine, text
 
+from telco_churn.features.accessor import features_sha256
 from telco_churn.features.build import FEATURE_SCHEMA
 from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.models.train.common import (
-    _dvc_hash,
     _git_sha,
     _lgbm_fixed_knobs,
     _log_dev_input,
@@ -41,6 +41,13 @@ __all__ = [
 ]
 
 logger = get_logger(__name__)
+
+# Path to the authoritative DDL for Optuna's isolated schema — same
+# sql/schema/*.sql convention customers_raw's table follows (ingest.py's
+# _SQL_SCHEMA), not an inline string here.
+_OPTUNA_SCHEMA_SQL = (
+    get_project_root() / "sql" / "schema" / "002_create_optuna_schema.sql"
+)
 
 
 def _raw_best_diagnostics(trial_summaries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -128,16 +135,26 @@ def boundary_hit_check(
 def _suggest_lgbm_params(
     trial: optuna.Trial, search_space: DictConfig
 ) -> dict[str, Any]:
-    """Sample one LightGBM hyperparameter set from the Hydra-configured search space."""
+    """Sample one LightGBM hyperparameter set from the Hydra-configured search space.
+
+    max_depth and num_leaves are independent leaf-wise-growth regularizers —
+    LightGBM applies whichever binds first, so a trial where max_depth caps
+    the tree before num_leaves is exhausted is a valid shallow-tree config,
+    not an error. An earlier version of this function coupled max_depth's
+    low to ceil(log2(num_leaves.high)) to prevent that case; on this dataset
+    it excluded the shallow-tree region the study actually preferred
+    (max_depth=4 paired with num_leaves=6 in the 1-SE-selected trial,
+    ANALYSIS.md §4b) and measurably lowered both the raw-best and 1-SE CV
+    PR-AUC on a re-run. Removed rather than re-anchored.
+    """
     params: dict[str, Any] = {}
     for name, spec in search_space.items():
+        name = str(name)
         if str(spec.type) == "int":
-            params[str(name)] = trial.suggest_int(
-                str(name), int(spec.low), int(spec.high)
-            )
+            params[name] = trial.suggest_int(name, int(spec.low), int(spec.high))
         else:
-            params[str(name)] = trial.suggest_float(
-                str(name),
+            params[name] = trial.suggest_float(
+                name,
                 float(spec.low),
                 float(spec.high),
                 log=bool(spec.get("log", False)),
@@ -157,6 +174,7 @@ def _tuning_objective(
     fixed_params: dict[str, Any],
     random_state: int,
     pruning_enabled: bool,
+    study_name: str,
 ) -> float:
     """One Optuna trial: sample params, run early-stopped CV, log a nested MLflow run.
 
@@ -168,6 +186,15 @@ def _tuning_objective(
     exception instead propagates out of the block, closing the run as FAILED;
     run_tuning_step's `study.optimize(..., catch=...)` then catches it so one
     bad trial doesn't kill the study.
+
+    Tagged with `optuna_study_name` (not just implicitly parented via MLflow's
+    own `mlflow.parentRunId`) because the study — not the parent run — is the
+    unit of continuity: `load_if_exists=True` resumes a content-addressed study
+    across separate `run_tuning_step` invocations (a crash-resume, or a rerun
+    that finds the study already complete), so a trial's earlier siblings can
+    live under a different, previous parent run entirely. Querying by this tag
+    finds every trial a study has ever run; querying by parentRunId only finds
+    the ones logged under one specific invocation.
     """
     params = _suggest_lgbm_params(trial, tuning_cfg.search_space)
     es_validation_size = float(tuning_cfg.es_validation_size)
@@ -175,6 +202,7 @@ def _tuning_objective(
     pruned = False
     cv_mean = float("nan")
     with mlflow.start_run(run_name=f"trial_{trial.number:03d}", nested=True):
+        mlflow.set_tag("optuna_study_name", study_name)
         mlflow.log_params(params)
         fold_scores: list[float] = []
         fold_n_estimators: list[int] = []
@@ -266,11 +294,15 @@ def _build_optuna_storage() -> optuna.storages.RDBStorage:
     crashed process and can be reloaded directly with optuna.load_study — no
     more reconstructing it from MLflow-logged trial params just to run fANOVA
     importance. Isolated in its own 'optuna' schema (not 'public') so Optuna's
-    own tables (studies, trials, ...) can't collide with application tables.
-    Builds its own engine rather than reusing utils.db.get_engine()'s shared
-    singleton: that one stays strict (raises with no POSTGRES_URL) for
-    ingest.py/sql_features.py, whose SQL is Postgres-only and must never
-    silently run against a SQLite fallback.
+    own tables (studies, trials, ...) can't collide with application tables —
+    the schema's DDL lives in sql/schema/002_create_optuna_schema.sql, the
+    same convention customers_raw's table follows, not an inline string here;
+    this executes it explicitly (mirroring ingest.py::setup_schema) since
+    docker-compose.yml's docker-entrypoint-initdb.d mount only fires against a
+    fresh Postgres data volume. Builds its own engine rather than reusing
+    utils.db.get_engine()'s shared singleton: that one stays strict (raises
+    with no POSTGRES_URL) for ingest.py/sql_features.py, whose SQL is
+    Postgres-only and must never silently run against a SQLite fallback.
 
     The SQLite fallback skips schema isolation (SQLite has no schema/
     search_path concept, and nothing else runs against the fallback file to
@@ -286,7 +318,7 @@ def _build_optuna_storage() -> optuna.storages.RDBStorage:
 
     engine = create_engine(url, pool_pre_ping=True)
     with engine.begin() as conn:
-        conn.execute(text("CREATE SCHEMA IF NOT EXISTS optuna"))
+        conn.execute(text(_OPTUNA_SCHEMA_SQL.read_text()))
     return optuna.storages.RDBStorage(
         url=engine.url.render_as_string(hide_password=False),
         engine_kwargs={"connect_args": {"options": "-csearch_path=optuna"}},
@@ -296,18 +328,26 @@ def _build_optuna_storage() -> optuna.storages.RDBStorage:
 def _study_name(cfg: DictConfig, committed_features: list[str]) -> str:
     """Content-addressed study name: same inputs resume the same study.
 
-    Hashes data version, frozen features, and the tuning config (search space,
-    CV scheme, early-stopping settings, pruner) — everything that must stay fixed
-    across a study's trials for Optuna's per-parameter distributions to stay valid,
-    plus pruner (including its n_warmup_steps): a trial pruned under one policy
-    and a trial that ran unpruned under another aren't a fair comparison, so
-    mixing them into one pool would let 1-SE selection silently compare apples
-    to oranges. Any change to these starts a fresh study instead of silently
-    mixing incompatible trials into an old one.
+    Two independent hashes, not one combined digest, so the name itself is
+    legible: a human scanning the `optuna` schema or the MLflow UI can tell
+    at a glance whether a new study came from a data change or a config
+    change without decoding anything. `data_hash` is the processed-features
+    file's own sha256 (features/accessor.py::features_sha256) — real and
+    unconditional, unlike the retired `_dvc_hash`, which read a `.dvc`
+    sidecar that never existed for a pipeline-stage output and was
+    permanently `"unknown"`. `config_digest` hashes frozen features plus the
+    tuning config (search space, CV scheme, early-stopping settings, pruner)
+    — everything that must stay fixed across a study's trials for Optuna's
+    per-parameter distributions to stay valid, plus the pruner's
+    n_warmup_steps: a trial pruned under one policy and a trial that ran
+    unpruned under another aren't a fair comparison, so mixing them into one
+    pool would let 1-SE selection silently compare apples to oranges. A
+    change to either hash starts a fresh study instead of silently mixing
+    incompatible trials into an old one.
     """
+    data_hash = features_sha256()
     tuning_cfg = cfg.tuning
-    key = {
-        "dvc_hash": _dvc_hash(cfg),
+    config_key = {
         "committed_features": sorted(committed_features),
         "search_space": OmegaConf.to_container(tuning_cfg.search_space, resolve=True),
         "cv_folds": int(tuning_cfg.cv_folds),
@@ -318,10 +358,10 @@ def _study_name(cfg: DictConfig, committed_features: list[str]) -> str:
         "pruner": str(tuning_cfg.pruner),
         "pruner_n_warmup_steps": int(tuning_cfg.pruner_n_warmup_steps),
     }
-    digest = hashlib.sha256(
-        json.dumps(key, sort_keys=True, default=str).encode()
-    ).hexdigest()[:16]
-    return f"tuning_{digest}"
+    config_digest = hashlib.sha256(
+        json.dumps(config_key, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    return f"tuning_{data_hash[:8]}_{config_digest[:8]}"
 
 
 def _build_optuna_study(
@@ -425,6 +465,7 @@ def _run_study_trials(
         fixed_params=setup["fixed_params"],
         random_state=setup["random_state"],
         pruning_enabled=setup["pruning_enabled"],
+        study_name=setup["study_name"],
     )
     n_remaining_trials = max(int(tuning_cfg.n_trials) - len(study.trials), 0)
     if n_remaining_trials > 0:
@@ -551,12 +592,57 @@ def _plot_optimization_history(trial_summaries: list[dict[str, Any]]) -> Figure:
     return fig_hist
 
 
-def _log_tuning_artifacts(
-    summary: dict[str, Any], trial_result: dict[str, Any], fig_hist: Figure
-) -> None:
-    """Log the selected trial's params/metrics, the trials table, boundary hits, and the history plot.
+def _compute_hyperparameter_importance(
+    study: optuna.Study, random_state: int
+) -> pd.Series | None:
+    """fANOVA importance per hyperparameter, computed on the live study's completed trials.
 
-    Call from inside the active `tuning_study` MLflow run.
+    Runs directly against the real Optuna study (this step already holds it in
+    memory) rather than a reconstruction from MLflow-logged trial params — the
+    workaround a notebook rendering this after the fact has to fall back to.
+
+    Returns None, after logging a warning, rather than raising if fANOVA can't
+    be computed — e.g. too few completed trials for its internal random-forest
+    surrogate to fit, which legitimately happens on a tiny study (an
+    interrupted run, a fast test fixture) and should not fail a training cycle
+    over a diagnostic.
+    """
+    evaluator = optuna.importance.FanovaImportanceEvaluator(seed=random_state)
+    try:
+        importances = optuna.importance.get_param_importances(
+            study, evaluator=evaluator
+        )
+    except Exception as e:
+        logger.warning(
+            "hyperparameter_importance_unavailable", error=str(e), exc_info=True
+        )
+        return None
+    return pd.Series(importances, name="importance").sort_values(ascending=True)
+
+
+def _plot_hyperparameter_importance(importance: pd.Series, n_completed: int) -> Figure:
+    """Horizontal bar chart of fANOVA importance, sorted ascending."""
+    fig, ax = plt.subplots(figsize=(7, 4))
+    importance.plot.barh(ax=ax, color="steelblue")
+    ax.set_xlabel("fANOVA importance")
+    ax.set_title(f"Hyperparameter importance ({n_completed} completed trials)")
+    plt.tight_layout()
+    return fig
+
+
+def _log_tuning_artifacts(
+    summary: dict[str, Any],
+    trial_result: dict[str, Any],
+    fig_hist: Figure,
+    importance: pd.Series | None,
+    fig_importance: Figure | None,
+) -> None:
+    """Log the selected trial's params/metrics, the trials table, boundary hits, and the history/importance plots.
+
+    Call from inside the active `tuning_study` MLflow run. importance/
+    fig_importance are None together iff fANOVA couldn't be computed
+    (_compute_hyperparameter_importance already logged why) — nothing to log
+    in that case, not an error.
     """
     selected, diagnostics = summary["selected"], summary["diagnostics"]
     boundary_hits = summary["boundary_hits"]
@@ -601,6 +687,10 @@ def _log_tuning_artifacts(
     mlflow.log_dict(boundary_hits, "tuning/boundary_hits.json")
     mlflow.log_figure(fig_hist, "tuning/optimization_history.png")
     plt.close(fig_hist)
+    if importance is not None and fig_importance is not None:
+        mlflow.log_dict(importance.to_dict(), "tuning/hyperparameter_importance.json")
+        mlflow.log_figure(fig_importance, "tuning/hyperparameter_importance.png")
+        plt.close(fig_importance)
 
 
 def run_tuning_step(
@@ -634,6 +724,13 @@ def run_tuning_step(
     still needed to reach n_trials are run, so re-running against a completed
     study reuses its existing trials instead of piling n_trials more on top.
 
+    Also logs fANOVA hyperparameter importance — tuning/hyperparameter_importance.png
+    and the underlying per-parameter values (tuning/hyperparameter_importance.json,
+    persisted per CLAUDE.md's "log the array, not only the chart" rule) — computed
+    once here, against the live study, rather than reconstructed later by every
+    notebook that wants to render it. Never gates anything; a study too small for
+    fANOVA to fit logs a warning and skips both artifacts rather than raising.
+
     Returns {"best_params", "best_n_estimators_median", "best_cv_pr_auc_mean",
     "boundary_hits", "n_completed_trials", "parent_run_id", "committed_features",
     "tuning_summary"}. tuning_summary carries the audit trail behind the
@@ -652,7 +749,7 @@ def run_tuning_step(
             {
                 "stage": "tuning",
                 "git_sha": _git_sha(),
-                "dvc_data_hash": _dvc_hash(cfg),
+                "data_content_hash": features_sha256(),
             }
         )
         # Also covers log_model.py's "model" and calibrate.py's "calibrated_model"
@@ -681,7 +778,17 @@ def run_tuning_step(
         trial_result = _run_study_trials(setup, X_dev, y_dev)
         summary = _summarize_completed_trials(setup, trial_result)
         fig_hist = _plot_optimization_history(summary["trial_summaries"])
-        _log_tuning_artifacts(summary, trial_result, fig_hist)
+        importance = _compute_hyperparameter_importance(
+            setup["study"], setup["random_state"]
+        )
+        fig_importance = (
+            _plot_hyperparameter_importance(importance, len(summary["trial_summaries"]))
+            if importance is not None
+            else None
+        )
+        _log_tuning_artifacts(
+            summary, trial_result, fig_hist, importance, fig_importance
+        )
 
         parent_run_id = parent_run.info.run_id
 

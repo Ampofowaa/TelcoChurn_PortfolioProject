@@ -14,6 +14,7 @@ itself crosses the subprocess boundary.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -26,7 +27,13 @@ import pytest
 
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
-from telco_churn.utils.paths import compose_config, get_project_root
+from telco_churn.features.accessor import FEATURES_FILENAME
+from telco_churn.utils.paths import (
+    activate_config,
+    compose_config,
+    get_project_root,
+    reset_active_config,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -85,14 +92,14 @@ def _make_synthetic_processed_frame(n: int = 150, seed: int = 0) -> pd.DataFrame
 def _seed_processed_data(
     out_dir: Path, n: int = 150, seed: int = 0
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Write a processed CSV + matching canonical split manifest into out_dir.
+    """Write a processed features file + matching canonical split manifest into out_dir.
 
     Returns (df, manifest) — the manifest must be passed explicitly to
     partition() later; partition()'s default reads load_split(), which is the
     real project's split_manifest.parquet, not this seeded one.
     """
     df = _make_synthetic_processed_frame(n=n, seed=seed)
-    df.to_csv(out_dir / "telco_churn_processed.csv", index=False)
+    df.to_parquet(out_dir / FEATURES_FILENAME, index=False)
     manifest = make_split(
         ids=df["customerid"], labels=df["churn"], test_size=0.2, random_state=42
     )
@@ -142,20 +149,18 @@ def _seed_tuning_study_run(
             "boundary_hits": {"num_leaves": False},
         },
     }
-    comparison_result = {
-        "delta_obs": 0.01,
-        "delta_ci_lower": -0.01,
-        "delta_ci_upper": 0.03,
-        "decision": "lgbm",
-        "decision_rule": "tie",
-        "diagnostics": {"fixed_recall": [], "fairness": [], "robustness": []},
-    }
-
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result["parent_run_id"] = run.info.run_id
-    result = log_model.run_model_logging_step(
-        X_dev, y_dev, comparison_result, tuning_result, cfg
-    )
+    # run_model_logging_step's training-manifest step reads the processed-
+    # features path via features_sha256() -> load_config(), not the `cfg`
+    # parameter directly — activate_config() is what makes that internal
+    # read see paths.processed_data below instead of falling back to the
+    # real project's own datasets/processed/, which doesn't exist in CI.
+    activate_config(cfg)
+    try:
+        result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
+    finally:
+        reset_active_config()
     return str(result["run_id"])
 
 
@@ -178,22 +183,28 @@ def _sqlite_experiment(tmp_path: Path, experiment_name: str) -> str:
     return tracking_uri
 
 
-def test_calibrate_main_cli_exits_zero_and_registers(tmp_path: Path) -> None:
-    """calibrate.py __main__ calibrates the seeded pipeline and registers challenger."""
+def test_calibrate_main_cli_exits_zero_and_logs(tmp_path: Path) -> None:
+    """calibrate.py __main__ calibrates and logs the pipeline — and performs
+    no registry write of its own (B1: register.py's mint step, run as its
+    own separate CLI step afterward, is what registers the challenger)."""
     data_dir = tmp_path / "processed"
     data_dir.mkdir()
     df, manifest = _seed_processed_data(data_dir)
+    reports_dir = tmp_path / "reports"
 
     experiment_name = str(compose_config().mlflow.experiment_name)
     tracking_uri = _sqlite_experiment(tmp_path, experiment_name)
     cfg = compose_config(
-        overrides=[f"mlflow.tracking_uri={tracking_uri}", *_FAST_CALIBRATION_OVERRIDES]
+        overrides=[
+            f"mlflow.tracking_uri={tracking_uri}",
+            f"paths.processed_data={data_dir}",
+            *_FAST_CALIBRATION_OVERRIDES,
+        ]
     )
     run_id = _seed_tuning_study_run(df, manifest, cfg)
 
     env = {
         **os.environ,
-        "PROCESSED_DATA_DIR": str(data_dir),
         "MLFLOW_TRACKING_URI": tracking_uri,
     }
     result = subprocess.run(
@@ -202,6 +213,8 @@ def test_calibrate_main_cli_exits_zero_and_registers(tmp_path: Path) -> None:
             "-m",
             "telco_churn.models.calibrate",
             f"calibration.run_id={run_id}",
+            f"paths.processed_data={data_dir}",
+            f"paths.reports={reports_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
         ],
         env=env,
@@ -218,9 +231,19 @@ def test_calibrate_main_cli_exits_zero_and_registers(tmp_path: Path) -> None:
     assert "calibration_step_done" in result.stdout
 
     client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
-    registered_name = str(compose_config().mlflow.registered_model_name)
-    registered_model = client.get_registered_model(registered_name)
-    assert "challenger" in registered_model.aliases
+    assert client.search_registered_models() == []
+
+    run = client.get_run(run_id)
+    assert run.data.tags["calibrated_model_id"]
+    assert run.data.tags["calibrated_model_uri"]
+
+    receipt = json.loads(
+        (reports_dir / "calibrate_receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["run_id"] == run_id
+    assert receipt["logged_model_id"] == run.data.tags["calibrated_model_id"]
+    assert receipt["model_uri"] == run.data.tags["calibrated_model_uri"]
+    assert "model_version" not in receipt
 
 
 def test_calibrate_main_cli_exits_one_when_run_id_missing(tmp_path: Path) -> None:
@@ -258,13 +281,16 @@ def test_calibrate_main_cli_exits_one_on_low_trial_count(tmp_path: Path) -> None
     experiment_name = str(compose_config().mlflow.experiment_name)
     tracking_uri = _sqlite_experiment(tmp_path, experiment_name)
     cfg = compose_config(
-        overrides=[f"mlflow.tracking_uri={tracking_uri}", *_FAST_CALIBRATION_OVERRIDES]
+        overrides=[
+            f"mlflow.tracking_uri={tracking_uri}",
+            f"paths.processed_data={data_dir}",
+            *_FAST_CALIBRATION_OVERRIDES,
+        ]
     )
     run_id = _seed_tuning_study_run(df, manifest, cfg, trial_count_below_threshold=True)
 
     env = {
         **os.environ,
-        "PROCESSED_DATA_DIR": str(data_dir),
         "MLFLOW_TRACKING_URI": tracking_uri,
     }
     result = subprocess.run(
@@ -273,6 +299,7 @@ def test_calibrate_main_cli_exits_one_on_low_trial_count(tmp_path: Path) -> None
             "-m",
             "telco_churn.models.calibrate",
             f"calibration.run_id={run_id}",
+            f"paths.processed_data={data_dir}",
             *_FAST_CALIBRATION_OVERRIDES,
         ],
         env=env,

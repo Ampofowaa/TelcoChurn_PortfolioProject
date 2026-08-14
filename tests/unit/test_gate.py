@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from telco_churn.models.gate import (
     GateBars,
     GateInputs,
+    check_threshold_provenance,
+    check_threshold_screen_passed,
     decide_promotion,
     record_review,
 )
@@ -91,7 +95,7 @@ def test_cold_start_all_criteria_passing_gives_pass() -> None:
     decision = decide_promotion(_passing_cold_start_inputs(), COLD_START, BARS)
     assert decision["regime"] == "cold_start"
     assert decision["gate"] == "pass"
-    assert decision["review"] == "pending"
+    assert "review" not in decision
 
 
 def test_cold_start_failing_pr_auc_fails_selection_and_gate() -> None:
@@ -487,53 +491,164 @@ def test_comparative_no_guardrail_value_alone_flips_a_failed_selection_to_pass(
 # ---------------------------------------------------------------------------
 
 
-def test_record_review_stamps_all_fields() -> None:
-    """The returned dict carries the verdict, notes, approver, timestamp, and
-    the direction sanity check's veto outcome."""
+def _decision_with_eval_metadata(
+    eval_run_id: str = "run123", metrics_content_hash: str = "abc123"
+) -> dict[str, Any]:
+    """A decide_promotion() result plus the eval_run_id/metrics_content_hash
+    fields evaluate.py stamps on afterward — record_review reads both to bind
+    promotion_review.json to this cycle, never model_version (unfillable at
+    review time: register.py mints it only after review, on a pass)."""
     decision = decide_promotion(_passing_cold_start_inputs(), COLD_START, BARS)
-    stamped = record_review(
+    return {
+        **decision,
+        "eval_run_id": eval_run_id,
+        "metrics_content_hash": metrics_content_hash,
+    }
+
+
+def test_record_review_first_entry_builds_document() -> None:
+    """With no prior promotion_review.json (None), record_review builds the
+    document fresh: eval_run_id/metrics_content_hash from decision, one entry
+    carrying the verdict, notes, approver, and timestamp."""
+    decision = _decision_with_eval_metadata()
+    promotion_review = record_review(
+        None,
         decision,
         verdict="approved",
         notes="No segment collapse; fairness gaps within tolerance.",
         approver="r.frimpong",
         reviewed_at="2026-07-19T00:00:00Z",
-        direction_sanity_check_fired=False,
     )
-    assert stamped["review"] == "approved"
-    assert stamped["approver"] == "r.frimpong"
-    assert stamped["reviewed_at"] == "2026-07-19T00:00:00Z"
-    assert stamped["direction_sanity_check_fired"] is False
+    assert promotion_review["eval_run_id"] == "run123"
+    assert promotion_review["metrics_content_hash"] == "abc123"
+    assert len(promotion_review["entries"]) == 1
+    entry = promotion_review["entries"][0]
+    assert entry["verdict"] == "approved"
+    assert entry["approver"] == "r.frimpong"
+    assert entry["reviewed_at"] == "2026-07-19T00:00:00Z"
+    assert entry["notes"] == "No segment collapse; fairness gaps within tolerance."
 
 
-def test_record_review_does_not_mutate_original_decision() -> None:
-    """record_review returns a new dict — the caller's original decision object
-    (and, structurally, whatever pending-review copy is on disk before this
-    call) is left untouched."""
-    decision = decide_promotion(_passing_cold_start_inputs(), COLD_START, BARS)
-    original_review = decision["review"]
-    record_review(
+def test_record_review_appends_to_existing_entries() -> None:
+    """A second call appends a new entry rather than overwriting the first —
+    an initial rejection later followed by an approval both stay on record."""
+    decision = _decision_with_eval_metadata()
+    first = record_review(
+        None,
         decision,
         verdict="rejected",
-        notes="",
+        notes="needs fix",
         approver="a",
-        reviewed_at="t",
-        direction_sanity_check_fired=False,
+        reviewed_at="t1",
     )
-    assert decision["review"] == original_review
-
-
-def test_record_review_preserves_gate_verdict_fields() -> None:
-    """The original gate/regime/criteria fields survive the stamp unchanged —
-    record_review adds fields, it does not overwrite the gate's own verdict."""
-    decision = decide_promotion(_passing_cold_start_inputs(), COLD_START, BARS)
-    stamped = record_review(
+    second = record_review(
+        first,
         decision,
         verdict="approved",
-        notes="",
-        approver="a",
-        reviewed_at="t",
-        direction_sanity_check_fired=False,
+        notes="fixed",
+        approver="b",
+        reviewed_at="t2",
     )
-    assert stamped["gate"] == decision["gate"]
-    assert stamped["regime"] == decision["regime"]
-    assert stamped["criteria"] == decision["criteria"]
+    assert len(second["entries"]) == 2
+    assert second["entries"][0]["verdict"] == "rejected"
+    assert second["entries"][1]["verdict"] == "approved"
+    assert second["eval_run_id"] == first["eval_run_id"]
+
+
+def test_record_review_does_not_mutate_prior_document() -> None:
+    """record_review returns a new dict — a prior promotion_review.json handed
+    in is left untouched, so a caller iterating over it mid-call is safe."""
+    decision = _decision_with_eval_metadata()
+    first = record_review(
+        None, decision, verdict="approved", notes="", approver="a", reviewed_at="t1"
+    )
+    first_entries_before = list(first["entries"])
+    record_review(
+        first, decision, verdict="rejected", notes="", approver="b", reviewed_at="t2"
+    )
+    assert first["entries"] == first_entries_before
+
+
+def test_record_review_carries_no_direction_sanity_check_fired_field() -> None:
+    """Neither the document nor its entries carry direction_sanity_check_fired
+    — that machine fact is traced through error_analysis_run_id instead,
+    never duplicated into the human review document."""
+    decision = _decision_with_eval_metadata()
+    promotion_review = record_review(
+        None, decision, verdict="approved", notes="", approver="a", reviewed_at="t"
+    )
+    assert "direction_sanity_check_fired" not in promotion_review
+    assert "direction_sanity_check_fired" not in promotion_review["entries"][0]
+
+
+# ---------------------------------------------------------------------------
+# check_threshold_provenance
+# ---------------------------------------------------------------------------
+
+
+def test_check_threshold_provenance_matching_stamp_does_not_raise() -> None:
+    """A validation payload whose stamp matches the model being evaluated passes silently."""
+    payload = {"model_run_id": "abc123", "logged_model_id": "m-1"}
+    check_threshold_provenance(payload, logged_model_id="m-1")
+
+
+def test_check_threshold_provenance_mismatched_logged_model_id_raises() -> None:
+    """A stamp naming a different logged_model_id raises — the threshold was
+    derived against a different calibration map. model_run_id is a locator
+    only and plays no part in the comparison."""
+    payload = {"model_run_id": "old_run", "logged_model_id": "m-1"}
+    with pytest.raises(ValueError, match="does not match the model being evaluated"):
+        check_threshold_provenance(payload, logged_model_id="m-2")
+
+
+def test_check_threshold_provenance_compares_as_strings() -> None:
+    """An integer logged_model_id in the payload still matches a string
+    logged_model_id argument — the comparison is coerced to strings, not
+    type-sensitive."""
+    payload = {"model_run_id": "abc123", "logged_model_id": 1}
+    check_threshold_provenance(payload, logged_model_id="1")
+
+
+def test_check_threshold_provenance_error_message_includes_both_stamps() -> None:
+    """The raised error names both the stamped and the actual logged_model_id,
+    so the mismatch is diagnosable from the message alone."""
+    payload = {"model_run_id": "old_run", "logged_model_id": "m-1"}
+    with pytest.raises(ValueError, match="does not match") as exc_info:
+        check_threshold_provenance(payload, logged_model_id="m-2")
+    message = str(exc_info.value)
+    assert "m-1" in message
+    assert "m-2" in message
+
+
+# ---------------------------------------------------------------------------
+# check_threshold_screen_passed
+# ---------------------------------------------------------------------------
+
+
+def test_check_threshold_screen_passed_empty_failures_does_not_raise() -> None:
+    check_threshold_screen_passed({"failures": []})
+
+
+def test_check_threshold_screen_passed_nonempty_failures_raises() -> None:
+    """No override flag — a failed dev-OOF pre-seal screen must always block
+    downstream evaluation/error analysis."""
+    with pytest.raises(RuntimeError, match="pre-seal screen failed"):
+        check_threshold_screen_passed(
+            {
+                "failures": [
+                    {
+                        "criterion": "calibration_slope",
+                        "detail": "CI outside band",
+                        "remediation": "Re-calibrate.",
+                    }
+                ]
+            }
+        )
+
+
+def test_check_threshold_screen_passed_missing_key_raises_key_error() -> None:
+    """Direct indexing, not .get(...): an older threshold_validation.json
+    artifact predating this field is a genuine incompatibility, not an
+    implicit pass."""
+    with pytest.raises(KeyError):
+        check_threshold_screen_passed({})

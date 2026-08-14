@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -13,19 +14,21 @@ import pandas as pd
 import pytest
 
 from telco_churn.data.split import make_split, write_split
+from telco_churn.features.accessor import FEATURES_FILENAME
 from telco_churn.utils.paths import compose_config, get_project_root
 
 pytestmark = pytest.mark.integration
 
 _PROJECT_ROOT = get_project_root()
 
-# Fast-path Hydra CLI overrides — keep the full Steps 1-5 pipeline (candidates,
-# selection, Optuna tuning, model logging) to well under a minute instead of the
-# ~5-minute real-config run, without touching any production config file.
+# Fast-path Hydra CLI overrides — keep the automated Steps 3-5 pipeline
+# (selection, Optuna tuning, model logging) to well under a minute instead of the
+# ~5-minute real-config run, without touching any production config file. Steps
+# 1-2 (candidate comparison, model-family decision) no longer run here — they're
+# notebook-only (notebooks/03a-model-selection.ipynb; see
+# models/train/common.py::COMMITTED_MODEL_FAMILY) — so their former overrides
+# (training_setup.cv_folds/cv_repeats/bootstrap_n_samples, logreg.*) are gone.
 _FAST_OVERRIDES = [
-    "training_setup.cv_folds=2",
-    "training_setup.cv_repeats=1",
-    "training_setup.bootstrap_n_samples=200",
     "training.candidate.n_estimators=10",
     # num_leaves/min_child_samples are sized for ~5,600 real dev rows; on this
     # ~150-row synthetic fold (~75 rows/fold, further carved for early stopping in
@@ -33,11 +36,7 @@ _FAST_OVERRIDES = [
     # stump ("Forced splits file... maximum feature index in dataset is -1").
     "training.candidate.num_leaves=5",
     "training.candidate.min_child_samples=3",
-    "logreg.Cs=2",
-    "logreg.cv_folds=2",
-    "logreg.max_iter=50",
     "selection.n_repeats=3",
-    "selection.bootstrap_n_samples=200",
     "tuning.n_trials=2",
     "tuning.cv_folds=2",
     "tuning.n_estimators_ceiling=20",
@@ -96,9 +95,9 @@ def _make_synthetic_processed_frame(n: int = 150, seed: int = 0) -> pd.DataFrame
 
 
 def _seed_processed_data(out_dir: Path, n: int = 150, seed: int = 0) -> None:
-    """Write a processed CSV + matching canonical split manifest into out_dir."""
+    """Write a processed features file + matching canonical split manifest into out_dir."""
     df = _make_synthetic_processed_frame(n=n, seed=seed)
-    df.to_csv(out_dir / "telco_churn_processed.csv", index=False)
+    df.to_parquet(out_dir / FEATURES_FILENAME, index=False)
     manifest = make_split(
         ids=df["customerid"], labels=df["churn"], test_size=0.2, random_state=42
     )
@@ -106,15 +105,19 @@ def _seed_processed_data(out_dir: Path, n: int = 150, seed: int = 0) -> None:
 
 
 def test_train_main_cli_exits_zero(tmp_path: Path) -> None:
-    """train.py __main__ runs the full Steps 1-5 pipeline end-to-end and exits 0.
+    """train.py __main__ runs the automated Steps 3-5 pipeline end-to-end and exits 0.
+
+    Steps 1-2 (candidate comparison, model-family decision) are notebook-only
+    (notebooks/03a-model-selection.ipynb) as of the model-family freeze — see
+    models/train/common.py::COMMITTED_MODEL_FAMILY — so they are not part of
+    this composition path.
 
     CLAUDE.md: every __main__ entry point requires a subprocess integration test
     covering the full composition path — here that's compose_config() ->
-    _load_dev_features() -> run_candidate_step -> run_comparison_step ->
-    run_selection_step -> run_tuning_step -> run_model_logging_step. Fast-path
-    Hydra CLI overrides (_FAST_OVERRIDES) keep this well under a minute; MLflow
-    points at a throwaway local SQLite store so no Docker server is required and
-    the real experiment history is never touched.
+    _load_dev_features() -> run_feature_audit_step -> run_tuning_step ->
+    run_model_logging_step. Fast-path Hydra CLI overrides (_FAST_OVERRIDES) keep
+    this well under a minute; MLflow points at a throwaway local SQLite store so
+    no Docker server is required and the real experiment history is never touched.
 
     The experiment is pre-created here, in the parent process, with an explicit
     artifact_location under tmp_path — the child subprocess runs with
@@ -127,6 +130,7 @@ def test_train_main_cli_exits_zero(tmp_path: Path) -> None:
     data_dir = tmp_path / "processed"
     data_dir.mkdir()
     _seed_processed_data(data_dir)
+    reports_dir = tmp_path / "reports"
     mlflow_db = tmp_path / "mlflow.db"
     tracking_uri = f"sqlite:///{mlflow_db}"
 
@@ -138,11 +142,23 @@ def test_train_main_cli_exits_zero(tmp_path: Path) -> None:
 
     env = {
         **os.environ,
-        "PROCESSED_DATA_DIR": str(data_dir),
         "MLFLOW_TRACKING_URI": tracking_uri,
     }
     result = subprocess.run(
-        [sys.executable, "-m", "telco_churn.models.train", *_FAST_OVERRIDES],
+        [
+            sys.executable,
+            "-m",
+            "telco_churn.models.train",
+            f"paths.processed_data={data_dir}",
+            # Sandboxes run_model_logging_step's write_train_receipt call
+            # (Phase 8 PR B0) away from the real project reports/ — without
+            # this override it defaults to config.yaml's plain "reports"
+            # literal, resolved against the real project root regardless of
+            # cwd, and this test would leak a real reports/train_receipt.json
+            # into the tracked working directory on every run.
+            f"paths.reports={reports_dir}",
+            *_FAST_OVERRIDES,
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -155,12 +171,19 @@ def test_train_main_cli_exits_zero(tmp_path: Path) -> None:
         result.returncode == 0
     ), f"train CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     assert "model_logged" in result.stdout
+    assert "train_step_done" in result.stdout
 
     # Real SQLite-backed registry, not a mock — the CI guard that Step 5 never
     # registers (CLAUDE.md: an uncalibrated pipeline is a stage of construction,
     # never a registry version).
     client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
     assert client.search_registered_models() == []
+
+    receipt = json.loads(
+        (reports_dir / "train_receipt.json").read_text(encoding="utf-8")
+    )
+    assert set(receipt) == {"run_id"}
+    assert receipt["run_id"]
 
 
 def test_train_main_cli_exits_one_when_processed_data_missing(tmp_path: Path) -> None:
@@ -175,11 +198,15 @@ def test_train_main_cli_exits_one_when_processed_data_missing(tmp_path: Path) ->
 
     env = {
         **os.environ,
-        "PROCESSED_DATA_DIR": str(empty_dir),
         "MLFLOW_TRACKING_URI": f"sqlite:///{mlflow_db}",
     }
     result = subprocess.run(
-        [sys.executable, "-m", "telco_churn.models.train"],
+        [
+            sys.executable,
+            "-m",
+            "telco_churn.models.train",
+            f"paths.processed_data={empty_dir}",
+        ],
         env=env,
         capture_output=True,
         text=True,
