@@ -28,7 +28,12 @@ import pytest
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
 from telco_churn.features.accessor import FEATURES_FILENAME
-from telco_churn.utils.paths import compose_config, get_project_root
+from telco_churn.utils.paths import (
+    activate_config,
+    compose_config,
+    get_project_root,
+    reset_active_config,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -146,7 +151,16 @@ def _seed_tuning_study_run(
     }
     with mlflow.start_run(run_name="tuning_study") as run:
         tuning_result["parent_run_id"] = run.info.run_id
-    result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
+    # run_model_logging_step's training-manifest step reads the processed-
+    # features path via features_sha256() -> load_config(), not the `cfg`
+    # parameter directly — activate_config() is what makes that internal
+    # read see paths.processed_data below instead of falling back to the
+    # real project's own datasets/processed/, which doesn't exist in CI.
+    activate_config(cfg)
+    try:
+        result = log_model.run_model_logging_step(X_dev, y_dev, tuning_result, cfg)
+    finally:
+        reset_active_config()
     return str(result["run_id"])
 
 
@@ -181,7 +195,11 @@ def test_calibrate_main_cli_exits_zero_and_logs(tmp_path: Path) -> None:
     experiment_name = str(compose_config().mlflow.experiment_name)
     tracking_uri = _sqlite_experiment(tmp_path, experiment_name)
     cfg = compose_config(
-        overrides=[f"mlflow.tracking_uri={tracking_uri}", *_FAST_CALIBRATION_OVERRIDES]
+        overrides=[
+            f"mlflow.tracking_uri={tracking_uri}",
+            f"paths.processed_data={data_dir}",
+            *_FAST_CALIBRATION_OVERRIDES,
+        ]
     )
     run_id = _seed_tuning_study_run(df, manifest, cfg)
 
@@ -263,7 +281,11 @@ def test_calibrate_main_cli_exits_one_on_low_trial_count(tmp_path: Path) -> None
     experiment_name = str(compose_config().mlflow.experiment_name)
     tracking_uri = _sqlite_experiment(tmp_path, experiment_name)
     cfg = compose_config(
-        overrides=[f"mlflow.tracking_uri={tracking_uri}", *_FAST_CALIBRATION_OVERRIDES]
+        overrides=[
+            f"mlflow.tracking_uri={tracking_uri}",
+            f"paths.processed_data={data_dir}",
+            *_FAST_CALIBRATION_OVERRIDES,
+        ]
     )
     run_id = _seed_tuning_study_run(df, manifest, cfg, trial_count_below_threshold=True)
 
