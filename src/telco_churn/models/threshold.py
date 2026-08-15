@@ -1058,7 +1058,9 @@ def _write_threshold_reports(
     dev_oof_predictions.to_parquet(
         reports_dir / "dev_oof_predictions.parquet", index=False
     )
-    with open(reports_dir / "dev_oof_diagnostics.json", "w", encoding="utf-8") as f:
+    with open(
+        reports_dir / "dev_oof_diagnostics.json", "w", encoding="utf-8", newline="\n"
+    ) as f:
         json.dump(dev_oof_diagnostics, f, indent=2, default=str)
         f.write("\n")
 

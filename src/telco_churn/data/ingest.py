@@ -232,7 +232,8 @@ if __name__ == "__main__":
         receipt_path = get_project_root() / "reports" / "ingest_receipt.json"
         receipt_path.parent.mkdir(parents=True, exist_ok=True)
         receipt_path.write_text(
-            json.dumps(asdict(receipt), indent=2, sort_keys=True) + "\n"
+            json.dumps(asdict(receipt), indent=2, sort_keys=True) + "\n",
+            newline="\n",
         )
         logger.info("ingest_receipt_written", path=str(receipt_path))
     except ValueError as e:

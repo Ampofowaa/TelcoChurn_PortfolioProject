@@ -1670,7 +1670,9 @@ def _write_metrics_summary(
     summary = flatten_metrics_summary(metrics_payload, decision_payload, costs_hash)
     reports_dir = get_project_root() / str(cfg.paths.reports)
     reports_dir.mkdir(parents=True, exist_ok=True)
-    with open(reports_dir / "metrics_summary.json", "w", encoding="utf-8") as f:
+    with open(
+        reports_dir / "metrics_summary.json", "w", encoding="utf-8", newline="\n"
+    ) as f:
         json.dump(summary, f, indent=2, default=str)
         f.write("\n")
     return summary
@@ -1969,13 +1971,15 @@ def _write_reports_mirror(
     """
     reports_dir = get_project_root() / str(cfg.paths.reports)
     reports_dir.mkdir(parents=True, exist_ok=True)
-    with open(reports_dir / "metrics.json", "w", encoding="utf-8") as f:
+    with open(reports_dir / "metrics.json", "w", encoding="utf-8", newline="\n") as f:
         json.dump(payloads["metrics_payload"], f, indent=2, default=str)
         f.write("\n")
-    with open(reports_dir / "economics.json", "w", encoding="utf-8") as f:
+    with open(reports_dir / "economics.json", "w", encoding="utf-8", newline="\n") as f:
         json.dump(payloads["economics_payload"], f, indent=2, default=str)
         f.write("\n")
-    with open(reports_dir / "promotion_decision.json", "w", encoding="utf-8") as f:
+    with open(
+        reports_dir / "promotion_decision.json", "w", encoding="utf-8", newline="\n"
+    ) as f:
         json.dump(payloads["promotion_decision_payload"], f, indent=2, default=str)
         f.write("\n")
     test_predictions.to_parquet(reports_dir / "test_predictions.parquet", index=False)

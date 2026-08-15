@@ -150,7 +150,7 @@ def write_validation_receipt(
         "frame_checksum": frame_checksum(df),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", newline="\n")
     return path
 
 

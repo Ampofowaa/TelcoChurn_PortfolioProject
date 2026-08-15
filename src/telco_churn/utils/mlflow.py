@@ -370,7 +370,9 @@ def write_train_receipt(
     """
     reports_dir = _reports_dir(cfg)
     reports_dir.mkdir(parents=True, exist_ok=True)
-    with open(reports_dir / "train_receipt.json", "w", encoding="utf-8") as f:
+    with open(
+        reports_dir / "train_receipt.json", "w", encoding="utf-8", newline="\n"
+    ) as f:
         json.dump(
             {
                 "run_id": run_id,
@@ -417,7 +419,9 @@ def write_calibrate_receipt(
     """
     reports_dir = _reports_dir(cfg)
     reports_dir.mkdir(parents=True, exist_ok=True)
-    with open(reports_dir / "calibrate_receipt.json", "w", encoding="utf-8") as f:
+    with open(
+        reports_dir / "calibrate_receipt.json", "w", encoding="utf-8", newline="\n"
+    ) as f:
         json.dump(
             {
                 "run_id": run_id,
@@ -460,7 +464,9 @@ def write_eval_receipt(model_version: str, eval_run_id: str, cfg: DictConfig) ->
     """
     reports_dir = _reports_dir(cfg)
     reports_dir.mkdir(parents=True, exist_ok=True)
-    with open(reports_dir / "eval_receipt.json", "w", encoding="utf-8") as f:
+    with open(
+        reports_dir / "eval_receipt.json", "w", encoding="utf-8", newline="\n"
+    ) as f:
         json.dump(
             {"model_version": model_version, "eval_run_id": eval_run_id}, f, indent=2
         )
@@ -490,7 +496,12 @@ def write_error_analysis_receipt(
     """
     reports_dir = _reports_dir(cfg)
     reports_dir.mkdir(parents=True, exist_ok=True)
-    with open(reports_dir / "error_analysis_receipt.json", "w", encoding="utf-8") as f:
+    with open(
+        reports_dir / "error_analysis_receipt.json",
+        "w",
+        encoding="utf-8",
+        newline="\n",
+    ) as f:
         json.dump(
             {
                 "model_version": model_version,
