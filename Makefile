@@ -92,10 +92,26 @@ mlflow-ui: ## Open the MLflow tracking UI at localhost:5000
 # targets because RUN_ID/MODEL_VERSION overrides are a one-off manual/
 # debugging path DVC itself cannot express (dvc repro always uses the current
 # deps/params, never an explicit historical run/version override).
+#
+# `repro` depends on `format` deliberately: dvc.lock hashes deps by content,
+# so running the pipeline against unformatted source and only then committing
+# (letting pre-commit's black hook reformat at commit time) leaves dvc.lock
+# stale the moment the hook runs — the next `dvc repro` reruns every stage
+# whose dep it touched, for a pure whitespace change. Formatting first means
+# black finds nothing left to do at commit time, so dvc.lock and the
+# committed source agree from the start.
+#
+# STAGE is what makes this guard reach the actual documented workflow —
+# `uv run dvc repro calibrate` / `error_analysis` bypass `make` (and its
+# `format` prerequisite) entirely, which is the command a first-time run
+# genuinely needs (a bare `dvc repro` fails at `threshold` before anything is
+# registered — see CONTRIBUTING.md). `make repro STAGE=calibrate` runs the
+# same `dvc repro calibrate` but formats first, so use it instead of calling
+# `dvc repro <stage>` directly.
 # ---------------------------------------------------------------------------
 
-repro: ## Re-run only the DVC pipeline stages whose deps/params changed (single stage: dvc repro <name>, e.g. `dvc repro train`)
-	$(RUN) dvc repro
+repro: format ## Re-run DVC pipeline stages whose deps/params changed (optional STAGE=<name>, e.g. `make repro STAGE=calibrate`)
+	$(RUN) dvc repro $(STAGE)
 
 dag: ## Show the DVC pipeline DAG
 	$(RUN) dvc dag

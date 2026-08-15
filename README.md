@@ -184,16 +184,18 @@ make db-up             # start postgres:16 in Docker
 **5 — Run the pipeline through calibration**
 
 ```bash
-uv run dvc repro calibrate
+make repro STAGE=calibrate
 ```
 
 Naming `calibrate` as the target — rather than a bare `dvc repro` — tells DVC to run exactly its upstream chain and stop: `ingest` (load 7,043 rows → `customers_raw`) → `validate` (5 Pandera quality gates) → `split` (canonical dev/test partition) → `features` (SQL views → `telco_churn_features.parquet`) → `train` (LightGBM + Optuna, logs to MLflow) → `calibrate` (sigmoid calibration, fit + log only — never registers anything), then **exits 0**. It never attempts `threshold`, so there's no error to see here — `threshold` resolves its model via a *registered* version, and nothing has minted one yet, but DVC only reaches stages upstream of the target you named.
 
+`make repro STAGE=<stage>` (rather than `uv run dvc repro <stage>` directly) formats `src/` first, so pre-commit's `black` hook can't invalidate `dvc.lock` after the fact — see [CONTRIBUTING.md](CONTRIBUTING.md#pre-commit-hooks) for why that matters.
+
 **6 — Mint the challenger, then finish the pipeline**
 
 ```bash
-make register-challenger   # mints calibrate's output as a new registry version, tagged pending — uses calibrate's own receipt automatically
-uv run dvc repro error_analysis   # threshold -> evaluate -> error_analysis (calibrate and everything upstream stays cached)
+make register-challenger        # mints calibrate's output as a new registry version, tagged pending — uses calibrate's own receipt automatically
+make repro STAGE=error_analysis # threshold -> evaluate -> error_analysis (calibrate and everything upstream stays cached)
 ```
 
 `register-challenger` is a `make` target, not a `dvc.yaml` stage — a registry alias isn't a file DVC can track, so it structurally can't live in the DAG, which is also why `dvc repro calibrate` alone can never mint one for itself. Once it has run, `dvc repro error_analysis` reproduces exactly its own upstream chain — `calibrate` and everything before it are already cached and skipped, so what actually executes is `threshold → evaluate → error_analysis`, each resolving the version `register-challenger` just minted automatically. No version number to copy anywhere, and no error this time either.
@@ -212,7 +214,7 @@ make register MODEL_VERSION=<version>  # acts on the gate verdict + review: flip
 <details>
 <summary>Re-running one stage against a specific historical run instead</summary>
 
-Every command above works with no arguments because it always resolves "whatever the previous step just produced." `calibrate`/`threshold`/`evaluate`/`error-analysis` also accept an explicit override — `make calibrate RUN_ID=<run_id>` or `make threshold MODEL_VERSION=<version>` — to target a different run/version than the default chain, and `uv run dvc repro <stage>` (e.g. `uv run dvc repro train`) re-runs one DVC stage alone. Neither is needed for a first run.
+Every command above works with no arguments because it always resolves "whatever the previous step just produced." `calibrate`/`threshold`/`evaluate`/`error-analysis` also accept an explicit override — `make calibrate RUN_ID=<run_id>` or `make threshold MODEL_VERSION=<version>` — to target a different run/version than the default chain, and `make repro STAGE=<stage>` (e.g. `make repro STAGE=train`) re-runs one DVC stage alone. Neither is needed for a first run.
 
 </details>
 

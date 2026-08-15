@@ -1060,6 +1060,7 @@ def _write_threshold_reports(
     )
     with open(reports_dir / "dev_oof_diagnostics.json", "w", encoding="utf-8") as f:
         json.dump(dev_oof_diagnostics, f, indent=2, default=str)
+        f.write("\n")
 
 
 def run_threshold_step(

@@ -380,6 +380,7 @@ def write_train_receipt(
             f,
             indent=2,
         )
+        f.write("\n")
 
 
 def read_train_receipt(cfg: DictConfig) -> dict[str, Any]:
@@ -426,6 +427,7 @@ def write_calibrate_receipt(
             f,
             indent=2,
         )
+        f.write("\n")
 
 
 def read_calibrate_receipt(cfg: DictConfig) -> dict[str, Any]:
@@ -462,6 +464,7 @@ def write_eval_receipt(model_version: str, eval_run_id: str, cfg: DictConfig) ->
         json.dump(
             {"model_version": model_version, "eval_run_id": eval_run_id}, f, indent=2
         )
+        f.write("\n")
 
 
 def read_eval_receipt(cfg: DictConfig) -> dict[str, Any]:
@@ -496,6 +499,7 @@ def write_error_analysis_receipt(
             f,
             indent=2,
         )
+        f.write("\n")
 
 
 def read_error_analysis_receipt(cfg: DictConfig) -> dict[str, Any]:
