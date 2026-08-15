@@ -1,10 +1,10 @@
 {
   "model_version": "1",
-  "run_id": "05b67a6c92794f1b9cb040a141535932",
-  "eval_run_id": "f96c86e6cf064bb89442a17740aec43a",
-  "champion_version": "1",
-  "regime": "comparative",
-  "gate": "fail",
+  "run_id": "606af818991c446b9a2a3853aaa3189c",
+  "eval_run_id": "21b7266c3ff345ab983b4d878285ecb8",
+  "champion_version": null,
+  "regime": "cold_start",
+  "gate": "pass",
   "costs_config_hash": "4273028adf828b4df314723c83f0bc8cbeca42437ecc09f0e9ccd80dd4a89dcb",
   "test_pr_auc": 0.6701124581948501,
   "test_pr_auc_ci_lower": 0.618546312819462,
@@ -19,14 +19,5 @@
   "test_calibration_slope_ci_upper": 1.0999736118349694,
   "test_ev_base": 15060.896000000006,
   "test_equal_opportunity_diff": 0.35143713630752954,
-  "test_demographic_parity_diff": 0.2789767096134787,
-  "pr_auc_delta_obs": 0.0,
-  "pr_auc_delta_ci_lower": 0.0,
-  "pr_auc_delta_ci_upper": 0.0,
-  "recall_delta_obs": 0.0,
-  "recall_delta_ci_lower": 0.0,
-  "recall_delta_ci_upper": 0.0,
-  "brier_delta_obs": 0.0,
-  "brier_delta_ci_lower": 0.0,
-  "brier_delta_ci_upper": 0.0
+  "test_demographic_parity_diff": 0.2789767096134787
 }

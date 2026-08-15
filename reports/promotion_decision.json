@@ -1,42 +1,24 @@
 {
-  "regime": "comparative",
-  "gate": "fail",
+  "regime": "cold_start",
+  "gate": "pass",
   "criteria": {
     "pr_auc": {
       "role": "selection",
-      "passed": false,
+      "passed": true,
       "value": 0.6701124581948501,
-      "bar": 0.6,
-      "delta_obs": 0.0,
-      "delta_ci": [
-        0.0,
-        0.0
-      ],
-      "materiality_threshold": 0.005
+      "bar": 0.6
     },
     "recall": {
       "role": "guardrail",
       "passed": true,
       "value": 0.6978609625668449,
-      "bar": 0.65,
-      "delta_obs": 0.0,
-      "delta_ci": [
-        0.0,
-        0.0
-      ],
-      "non_inferiority_margin": 0.01
+      "bar": 0.65
     },
-    "brier": {
+    "brier_skill_score": {
       "role": "guardrail",
       "passed": true,
-      "bss_value": 0.30097921445513076,
-      "bss_bar": 0.0,
-      "delta_obs": 0.0,
-      "delta_ci": [
-        0.0,
-        0.0
-      ],
-      "non_inferiority_margin": 0.005
+      "value": 0.30097921445513076,
+      "bar": 0.0
     },
     "calibration_slope": {
       "role": "guardrail",
@@ -53,6 +35,6 @@
     }
   },
   "model_version": "1",
-  "metrics_content_hash": "db7f1d528925a47a64546ced78184b4a44aff7639a729080112352c30dfa5fbf",
-  "eval_run_id": "f96c86e6cf064bb89442a17740aec43a"
+  "metrics_content_hash": "b883797925f6f5be372350347678238f80fd349334380392ac49a92bdf1e38e5",
+  "eval_run_id": "21b7266c3ff345ab983b4d878285ecb8"
 }
