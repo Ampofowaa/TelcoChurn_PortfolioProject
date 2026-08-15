@@ -266,16 +266,13 @@ def _build_comparison_table(
     """Build the per-candidate comparison table (CV mean/std, pooled OOF AP, ROC-AUC, timings)."""
     comparison_rows: list[dict[str, Any]] = []
     for cname, res in candidate_results.items():
-        roc: float = (
-            roc_lgbm
-            if cname == "lgbm_default"
-            else roc_logreg if cname == "logreg_cv" else float("nan")
+        roc: float = {"lgbm_default": roc_lgbm, "logreg_cv": roc_logreg}.get(
+            cname, float("nan")
         )
-        pr_auc_oof: float = (
-            pr_auc_oof_lgbm
-            if cname == "lgbm_default"
-            else pr_auc_oof_logreg if cname == "logreg_cv" else float("nan")
-        )
+        pr_auc_oof: float = {
+            "lgbm_default": pr_auc_oof_lgbm,
+            "logreg_cv": pr_auc_oof_logreg,
+        }.get(cname, float("nan"))
         comparison_rows.append(
             {
                 "candidate": cname,
