@@ -76,11 +76,12 @@ Raw CSV
   └─ Ingest to Postgres (`customers_raw`) → Pandera validation (5 quality gates)
        └─ Feature engineering (SQL views on Postgres; 9-lap OOF discovery; charge_per_service adopted)
             └─ LightGBM baseline → Optuna tuning (50 trials, TPE)
-                 └─ Sigmoid calibration (CalibratedClassifierCV, cv=5) → MLflow registration (challenger alias)
-                      └─ OOF cost-optimised threshold (no leakage)
-                           └─ Sealed-test evaluation + error analysis + human review — gate: pass (Phase 7)
-                                └─ Champion registration + drift baseline + model card (Phase 7, done)
-                                     └─ FastAPI serving + Streamlit UI
+                 └─ Sigmoid calibration (CalibratedClassifierCV, cv=5; fit + log only, never registers)
+                      └─ Register challenger (MLflow registry, tagged pending — register.py, not calibration)
+                           └─ OOF cost-optimised threshold (no leakage)
+                                └─ Sealed-test evaluation + error analysis + human review — gate: pass (Phase 7)
+                                     └─ Champion registration + drift baseline + model card (Phase 7, done)
+                                          └─ FastAPI serving + Streamlit UI
 ```
 
 **Data splits** — stratified by `customerid`, sealed once before feature discovery (`data/split.py`):
@@ -164,56 +165,58 @@ make data
 
 Places the raw CSV at `datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv`.
 
-**3 — Start Postgres and load the data**
+**3 — Run tests**
+
+```bash
+uv run pytest          # unit tests — needs nothing but the install above, no Docker or pipeline run required
+make test-integration  # integration tests — spins up its own ephemeral Postgres, requires only a running Docker daemon
+```
+
+A sanity check that the install and dataset download worked, not a pipeline step — neither command depends on anything below, which is why it's not sitting in the middle of the pipeline run.
+
+**4 — Start Postgres**
 
 ```bash
 cp .env.example .env   # defaults work with Docker out of the box
 make db-up             # start postgres:16 in Docker
-make ingest            # load 7,043 rows → customers_raw
 ```
 
-**4 — Run validation and tests**
+**5 — Run the pipeline through calibration**
 
 ```bash
-make validate          # run the 5 Pandera quality gates
-uv run pytest          # unit tests (no Docker required)
-make test-integration  # integration tests (requires Docker)
+uv run dvc repro calibrate
 ```
 
-**5 — Split the data and build features**
+Naming `calibrate` as the target — rather than a bare `dvc repro` — tells DVC to run exactly its upstream chain and stop: `ingest` (load 7,043 rows → `customers_raw`) → `validate` (5 Pandera quality gates) → `split` (canonical dev/test partition) → `features` (SQL views → `telco_churn_features.parquet`) → `train` (LightGBM + Optuna, logs to MLflow) → `calibrate` (sigmoid calibration, fit + log only — never registers anything), then **exits 0**. It never attempts `threshold`, so there's no error to see here — `threshold` resolves its model via a *registered* version, and nothing has minted one yet, but DVC only reaches stages upstream of the target you named.
+
+**6 — Mint the challenger, then finish the pipeline**
 
 ```bash
-make split             # canonical dev/test partition, sealed before feature discovery
-make features          # build SQL views → write datasets/processed/telco_churn_processed.csv
+make register-challenger   # mints calibrate's output as a new registry version, tagged pending — uses calibrate's own receipt automatically
+uv run dvc repro error_analysis   # threshold -> evaluate -> error_analysis (calibrate and everything upstream stays cached)
 ```
 
-**6 — Train, calibrate, and derive the threshold**
+`register-challenger` is a `make` target, not a `dvc.yaml` stage — a registry alias isn't a file DVC can track, so it structurally can't live in the DAG, which is also why `dvc repro calibrate` alone can never mint one for itself. Once it has run, `dvc repro error_analysis` reproduces exactly its own upstream chain — `calibrate` and everything before it are already cached and skipped, so what actually executes is `threshold → evaluate → error_analysis`, each resolving the version `register-challenger` just minted automatically. No version number to copy anywhere, and no error this time either.
+
+Review the gate result and error diagnostics in MLflow (`mlflow ui`, then open this cycle's evaluation run — `metrics.json`, `economics.json`, `promotion_decision.json`, `error_analysis.json`, and `figures/` are all logged there), not the notebook: `notebooks/05-evaluation-and-error-analysis.ipynb` only reflects this cycle's numbers if someone happens to re-execute it against this exact run, and isn't reachable by a reviewer on a different machine — `review.py` itself points reviewers at the MLflow run for this reason (`make review`, next step, logs the same pointer before asking for a verdict).
+
+**7 — Record human sign-off, then promote the champion**
 
 ```bash
-make train                                     # LightGBM + Optuna tuning; logs to MLflow (note the printed run_id)
-make calibrate RUN_ID=<run_id from above>      # sigmoid calibration; registers the challenger model version
-make threshold MODEL_VERSION=<version above>   # closed-form cost-sensitive threshold, ships configs/policy/threshold.yaml
+make review VERDICT=approved APPROVER="Your Name" NOTES="..."  # verdict, approver, and a non-empty reason are all required; prints where to find this cycle's MLflow diagnostics first
+make register MODEL_VERSION=<version>  # acts on the gate verdict + review: flips the champion alias on a pass, tags rejected on a fail
 ```
 
-Each step's console output (structlog JSON) prints the `run_id` / `model_version` the next command needs.
+`register` is the one step with no automatic default — it requires an explicit `MODEL_VERSION` (printed by `register-challenger` in step 6, or `mlflow ui`), deliberately, since it is the step that can put a model into production.
 
-**7 — Evaluate on the sealed test set and run error analysis**
+<details>
+<summary>Re-running one stage against a specific historical run instead</summary>
 
-```bash
-make evaluate MODEL_VERSION=<version above>        # one-time sealed-test scoring; runs the promotion gate
-make error-analysis MODEL_VERSION=<version above>  # SHAP explainability + error diagnosis
-```
+Every command above works with no arguments because it always resolves "whatever the previous step just produced." `calibrate`/`threshold`/`evaluate`/`error-analysis` also accept an explicit override — `make calibrate RUN_ID=<run_id>` or `make threshold MODEL_VERSION=<version>` — to target a different run/version than the default chain, and `uv run dvc repro <stage>` (e.g. `uv run dvc repro train`) re-runs one DVC stage alone. Neither is needed for a first run.
 
-Opens `notebooks/05-evaluation-and-error-analysis.ipynb` to review the gate result and error diagnostics.
+</details>
 
-**8 — Record human sign-off, then promote the champion**
-
-```bash
-uv run python -m telco_churn.models.review review.verdict=approved review.approver="Your Name" review.notes="..."  # verdict, approver, and a non-empty reason are all required; prints where to find this cycle's MLflow diagnostics first
-make register MODEL_VERSION=<version above>  # acts on the gate verdict + review: flips the champion alias on a pass, tags rejected on a fail
-```
-
-**9 — Browse experiment runs**
+**8 — Browse experiment runs**
 
 `make db-up` already started the MLflow tracking server alongside Postgres —
 open [http://localhost:5000](http://localhost:5000) to explore the logged runs, the registered `telco-churn-pipeline` model, and the `challenger` alias.
@@ -228,23 +231,28 @@ src/telco_churn/
   features/                      # SQL feature views, 9-lap discovery, permutation-importance selection
   models/
     train/                       # candidate comparison, feature freeze, Optuna tuning, model logging
-    calibrate.py                 # CalibratedClassifierCV method selection + registration (challenger)
-    threshold.py                 # closed-form cost-sensitive threshold derivation
+    calibrate.py                 # CalibratedClassifierCV method selection — fit + log only, never registers
+    calibration_metrics.py       # shared Brier/ECE/Murphy-decomposition/slope helpers
+    threshold.py                 # closed-form cost-sensitive threshold + dev-OOF pre-seal screen
     evaluate.py                  # one-time sealed-test scoring + promotion gate (Phase 7)
     gate.py                      # decide_promotion — pure gate function, PR-AUC selection + 3 veto guardrails
     economics.py                 # expected-value scenarios, sensitivity, break-even analysis
-    explain.py, error_analysis.py # SHAP explainability + error diagnosis (Phase 7)
+    explain.py, error_analysis.py, shap_values.py # SHAP explainability + error diagnosis (Phase 7)
+    artifacts.py, policy_config.py, dev_features.py # shared model/registry/cost-config loaders
     drift_reference.py           # champion drift-monitoring baseline builder (Phase 7)
-    register.py                  # registry alias flip, smoke check, rollback, model card (Phase 7)
+    register.py                  # sole registry-write entry point — mint challenger, tag, flip/reject champion
+    review.py                    # human promotion-review verdict CLI (Phase 7)
     plots.py, diagnostics.py
-  utils/                         # paths, logging, db, mlflow, stats helpers
-configs/                 # Hydra YAML — training/, tuning/, calibration/, threshold/, evaluate/, error_analysis/, register/, costs.yaml, policy/, model_promotion.yaml
+  utils/                         # paths, logging, db, mlflow, stats, hashing helpers
+configs/                 # Hydra YAML — training/, tuning/, calibration/, threshold/, evaluate/, error_analysis/, review/, register/, costs.yaml, model_promotion.yaml
 sql/                     # Postgres schema + feature SQL views
 tests/unit/              # pytest unit tests (≥80 % coverage target)
 tests/integration/       # Postgres-backed tests (ingest, split, sql_features, validate) + subprocess CLI tests (train, calibrate, threshold, evaluate, error_analysis)
 pipelines/               # Prefect flows (retrain, drift check, batch predict) — Phase 10
 monitoring/              # Prometheus config + Grafana dashboard JSON — Phase 13
-datasets/                # gitignored; tracked by DVC (Phase 8)
+dvc.yaml, .dvc/, .dvcignore  # DVC pipeline — 9 stages, ingest through error_analysis (Phase 8)
+datasets/raw/             # committed to git — the source CSV DVC hashes as a stage dep, never modified
+datasets/processed/, datasets/interim/  # gitignored; DVC-cached stage outputs
 mlruns/                  # gitignored; MLflow local tracking store
 notebooks/               # 00–05: ingestion → EDA → feature discovery/engineering →
                          #        model selection/feature selection/hyperparameter tuning →

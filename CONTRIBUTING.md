@@ -18,21 +18,20 @@ Copy `.env.example` to `.env` and fill in the required values. For Phases 0–4 
 Run `make help` for the full, current list — it's generated directly from the Makefile, so it can't go stale the way a hand-maintained table here would. The typical first-time pipeline run, in order:
 
 ```bash
-make data                                       # download the raw CSV (skips if already present)
-make db-up                                      # start Postgres + MLflow in Docker
-make ingest                                     # load the CSV into Postgres
-make validate                                   # run the 5 Pandera quality gates
-make split                                      # create the canonical dev/test partition
-make features                                   # build SQL feature views
-make train                                      # LightGBM + Optuna tuning; logs to MLflow
-make calibrate RUN_ID=<run_id>                  # sigmoid calibration; registers the challenger
-make threshold MODEL_VERSION=<version>          # closed-form cost-sensitive threshold
-make evaluate MODEL_VERSION=<version>           # one-time sealed-test evaluation + gate
-make error-analysis MODEL_VERSION=<version>     # SHAP explainability + error diagnosis
-make register MODEL_VERSION=<version>           # act on the gate verdict: promote or reject
+make data                                                 # download the raw CSV (skips if already present)
+make db-up                                                # start Postgres + MLflow in Docker
+dvc repro calibrate                                       # ingest -> validate -> split -> features -> train -> calibrate; exits 0 (see below)
+make register-challenger                                  # mints calibrate's output as a new registry version, tagged pending
+dvc repro error_analysis                                  # threshold -> evaluate -> error_analysis (calibrate and upstream stay cached)
+make review VERDICT=approved APPROVER="..." NOTES="..."  # human verdict, stamped on top of evaluate's gate verdict
+make register MODEL_VERSION=<version>                     # reads the gate verdict + review: promote or reject
 ```
 
-`make train` reads the dev/test split written by `make split` — run it once before the first `make train` (it does not need to be repeated on subsequent retrains against the same data).
+`ingest`/`validate`/`split`/`features`/`train`/`calibrate`/`threshold`/`evaluate`/`error_analysis` are all DVC stages (`dvc.yaml`), not Makefile targets — `dvc.yaml` is their single definition, and every one of them resolves its input by default from whatever the previous stage's receipt says, so `dvc repro <stage>` is enough to run any of them with zero arguments. A Makefile target here would just retype `dvc.yaml`'s own `cmd:` a second time with none of DVC's caching.
+
+**`dvc repro` genuinely cannot go straight through in one call, and that split is structural, not a workflow preference — but naming the target you actually want avoids ever seeing an error for it.** `threshold`/`evaluate` resolve their model via a *registered version*, and `register.py` (never `calibrate.py`) is the sole place that mints one, so nothing downstream of `calibrate` can succeed until `register-challenger` runs. `dvc repro <stage>` reproduces exactly that stage's upstream dependency chain and stops — never anything downstream — so `dvc repro calibrate` runs `ingest` through `calibrate` and exits 0 cleanly; it never attempts `threshold` at all, because `threshold` isn't upstream of `calibrate`. (A bare `dvc repro` would attempt the whole graph in one call and genuinely fail at `threshold` with a message naming `register-challenger` as the fix — not wrong, just a scarier first-run experience than naming the target.) `register-challenger` needs no `RUN_ID` for this default path either — it reads `calibrate`'s own receipt automatically, the same way `dvc repro`'s stages do. Once it has run, `dvc repro error_analysis` reproduces its own upstream chain — `calibrate` and everything before it are already cached and skipped, so what actually executes is `threshold -> evaluate -> error_analysis`, each resolving the version `register-challenger` just minted, automatically. `review` is the actual human-in-the-loop step, and it belongs after `evaluate` (inside the `error_analysis` target's upstream chain), not before `threshold`: `evaluate` computes the automated gate verdict that `review` then stamps a human decision on top of. `register` is the one step with no automatic default — it requires an explicit `MODEL_VERSION`, deliberately, since it is the step that can put a model into production.
+
+Every command above also accepts an explicit override for re-running against a specific historical run/version instead of "whatever the previous step just produced" — `make calibrate RUN_ID=<run_id>` / `make threshold MODEL_VERSION=<version>` / `make evaluate MODEL_VERSION=<version>` / `make error-analysis MODEL_VERSION=<version>` / `make register-challenger RUN_ID=<run_id>` for a manual/debugging path `dvc repro` itself cannot express. Not needed for the sequence above. Run `make dag` to see the full stage graph, `make repro` as a synonym for a bare `dvc repro` (every stage, not just one target's upstream chain).
 
 Each step's console output (structlog JSON) prints the `run_id` / `model_version` the next command needs.
 

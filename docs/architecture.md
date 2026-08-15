@@ -11,14 +11,16 @@ The tool-level view: what infrastructure or library sits at each step, from raw 
 ```mermaid
 flowchart TD
     A["Raw CSV\nIBM Telco Dataset"] -->|ingest| B[("Data Ingestion (Phase 1)\nPostgres 16 + SQLAlchemy\ncustomers_raw")]
-    subgraph DVC["DVC (Phase 8) — reproducible pipeline"]
+    subgraph DVC["DVC (Phase 8) — reproducible pipeline: ingest through error analysis"]
         B -->|validate| C["Data Validation (Phase 2)\nPandera — 5 Quality Gates"]
         C -->|"feature engineering"| D["Feature Engineering (Phase 4)\nSQL Views + ColumnTransformer"]
         D -->|train| E["Model Training (Phase 5)\nLightGBM + Optuna + MLflow"]
+        E -->|calibrate| F1["Calibration (Phase 6)\nCalibratedClassifierCV — fit + log only"]
+        F2["Threshold (Phase 6)\ncost matrix → t*"] -->|"evaluate + gate"| G["Sealed-Test Evaluation +\nError Analysis (Phase 7)\nCustom gate (gate.py) + SHAP"]
     end
-    E -->|"calibrate + threshold"| F["Calibration + Threshold (Phase 6)\nCalibratedClassifierCV + cost matrix\n→ candidate (challenger)"]
-    F -->|"evaluate + gate"| G["Sealed-Test Evaluation +\nError Analysis (Phase 7)\nCustom gate (gate.py) + SHAP"]
-    G -->|"promote (pass) /\nreject (fail)"| H["Model Registry (Phase 7)\nMLflow — champion / challenger"]
+    F1 -->|"register-challenger\n(register.py — outside the DAG,\na registry alias isn't a file)"| RC[("Register Challenger\nMLflow registry, tagged pending")]
+    RC -->|threshold| F2
+    G -->|"review + promote (pass) /\nreject (fail)"| H["Model Registry (Phase 7)\nreview.py + register.py\nMLflow — champion / challenger"]
     subgraph CICD["CI/CD (Phase 11) & AWS Deployment (Phase 12)\nbuild, test, deploy"]
         H -->|serve| I["Serving (Phase 9)\nFastAPI + uvicorn — /predict"]
         I -->|UI| J["Demo UI (Phase 9)\nStreamlit"]
@@ -29,7 +31,7 @@ flowchart TD
     M -->|re-runs| D
 ```
 
-DVC's real boundary is tighter than the box above implies: it also covers Sealed-Test Evaluation (G) — `train → evaluate` is fully DVC-tracked — but deliberately excludes Calibration + Threshold (F) and Model Registry promotion (H). Both are decision steps on mutable state (a held-out calibration fold; the live `champion` alias) rather than deterministic data transforms, so keeping them out of `dvc repro` is by design, not oversight — folding them in would make reruns non-deterministic.
+DVC's real boundary spans the whole pipeline drawn inside the subgraph above, **including Calibration (F1) and Threshold (F2)** — both are deterministic, DVC-tracked stages (`dvc.yaml`'s `calibrate`/`threshold`), not decision steps DVC opts out of. What DVC genuinely cannot express is the registry mutation itself: minting the challenger version (`Register Challenger`) and the final promote/reject (`Model Registry`) are both registry writes, and a registry alias is not a file DVC's dependency graph can hash — that is the actual boundary. It is also why `dvc repro` runs in two calls per cycle, not one: `dvc repro calibrate` reproduces everything up to and including Calibration, then `register-challenger` mints a version, then `dvc repro error_analysis` carries Threshold through Error Analysis — Threshold structurally cannot run before a version exists for it to resolve.
 
 ## ML Workflow — a loop, not a straight line
 
@@ -44,12 +46,14 @@ flowchart TD
     E --> F["Error Analysis 1 — generative\nblind-spot profiling on baseline FNs"]
     F -.->|"hypothesis-driven\nfeatures back to FE"| D
     F --> G[Hyperparameter Tuning — Optuna]
-    G --> H[Calibration + Threshold]
-    H --> I[Sealed Test Evaluation]
+    G --> H1[Calibration]
+    H1 --> RC["Register Challenger\n(register.py — outside the DAG)"]
+    RC --> H2[Threshold]
+    H2 --> I[Sealed Test Evaluation]
     I --> J["Error Analysis 2 — confirmatory\nSHAP + FN/FP profiling of final model"]
     J --> K[Business Review]
-    K --> L["Champion Promotion\nregister.py: gate pass → alias flip;\nfail → rejected, alias unchanged"]
-    K -.->|"cost assumptions\nrevised"| H
+    K --> L["Champion Promotion\nreview.py + register.py: gate pass +\napproved → alias flip; fail → rejected, alias unchanged"]
+    K -.->|"cost assumptions\nrevised"| H2
     K -.->|"drift or\nnew data"| D
 ```
 

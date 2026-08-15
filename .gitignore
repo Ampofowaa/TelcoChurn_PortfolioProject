@@ -226,7 +226,26 @@ mlruns/
 mlflow.db
 optuna.db
 mlartifacts/
-reports/
+# reports/ is inverted, not blanket-ignored: dvc.yaml stage outs with
+# cache: false (receipt jsons, metrics_summary.json, decile_lift.csv,
+# promotion_decision.json) are small, deterministic, and meant to be
+# git-tracked directly. test_predictions.parquet is a cached out instead —
+# a real per-row data artifact (1,409 rows), not a small aggregate, so it
+# belongs with the other cached parquets (split_manifest.parquet,
+# telco_churn_features.parquet), not the receipts. Only human-only dumps and
+# the local mirrors of MLflow-owned artifacts (reports/ is not their source
+# of truth) stay ignored.
+reports/figures/
+reports/validation/
+reports/feature_discovery/
+reports/dev_oof_predictions.parquet
+reports/dev_shap_values.parquet
+reports/metrics.json
+reports/economics.json
+reports/error_analysis.json
+reports/drift_reference.json
+reports/model_card.json
+reports/promotion_review.json
 .dvc/cache/
 project_thoughts.md
 prompts.txt
