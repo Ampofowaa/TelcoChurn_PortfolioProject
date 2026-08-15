@@ -62,14 +62,14 @@ stages:
     outs:
     - path: reports/validation_receipt.json
       hash: md5
-      md5: aa0ed592cdf57191622eca7d8e73b73c
+      md5: 0486ee05049c56f25b44528cfc614593
       size: 3348
   split:
     cmd: uv run python -m telco_churn.data.split
     deps:
     - path: reports/validation_receipt.json
       hash: md5
-      md5: aa0ed592cdf57191622eca7d8e73b73c
+      md5: 0486ee05049c56f25b44528cfc614593
       size: 3348
     - path: src/telco_churn/data/split.py
       hash: md5
@@ -89,7 +89,7 @@ stages:
     deps:
     - path: reports/validation_receipt.json
       hash: md5
-      md5: aa0ed592cdf57191622eca7d8e73b73c
+      md5: 0486ee05049c56f25b44528cfc614593
       size: 3348
     - path: sql/features/
       hash: md5
@@ -170,9 +170,9 @@ stages:
       size: 23202
     - path: src/telco_churn/models/train/
       hash: md5
-      md5: dfef5ddf5c6a7e842ed85f93e2ae0ebd.dir
-      size: 303627
-      nfiles: 20
+      md5: 8b4e261a3c857dbfd58a60eb627ca6d5.dir
+      size: 137380
+      nfiles: 9
     - path: src/telco_churn/utils/stats.py
       hash: md5
       md5: 8c6b20e44f3c8c52b859354acb5a072b
@@ -285,7 +285,7 @@ stages:
     outs:
     - path: reports/train_receipt.json
       hash: md5
-      md5: cfce1b43036657c5828b64ddd54e4838
+      md5: d63d0f06d870f9fc08512317ad8ca509
       size: 171
   calibrate:
     cmd: uv run python -m telco_churn.models.calibrate
@@ -300,7 +300,7 @@ stages:
       size: 209928
     - path: reports/train_receipt.json
       hash: md5
-      md5: cfce1b43036657c5828b64ddd54e4838
+      md5: d63d0f06d870f9fc08512317ad8ca509
       size: 171
     - path: src/telco_churn/data/schema.py
       hash: md5
@@ -365,7 +365,7 @@ stages:
     outs:
     - path: reports/calibrate_receipt.json
       hash: md5
-      md5: 2f62791ae5902212cdfe61bcd270828c
+      md5: ed9ce06d99fb7f2447c103b2c6727bcb
       size: 171
   threshold:
     cmd: uv run python -m telco_churn.models.threshold
@@ -380,7 +380,7 @@ stages:
       size: 209928
     - path: reports/calibrate_receipt.json
       hash: md5
-      md5: 2f62791ae5902212cdfe61bcd270828c
+      md5: ed9ce06d99fb7f2447c103b2c6727bcb
       size: 171
     - path: src/telco_churn/data/schema.py
       hash: md5
@@ -501,7 +501,7 @@ stages:
       size: 209928
     - path: reports/calibrate_receipt.json
       hash: md5
-      md5: 2f62791ae5902212cdfe61bcd270828c
+      md5: ed9ce06d99fb7f2447c103b2c6727bcb
       size: 171
     - path: reports/policy/threshold.yaml
       hash: md5
@@ -626,11 +626,11 @@ stages:
     outs:
     - path: reports/eval_receipt.json
       hash: md5
-      md5: 357b1f64511c1b3c7c4f1dbed42766b9
+      md5: 22607cbc5c1152a683ea24f360111797
       size: 80
     - path: reports/metrics_summary.json
       hash: md5
-      md5: 57c39a8438940b7bca3d6ab58db0c0bb
+      md5: 81932a6a55c1b20b66f4559121e2946b
       size: 925
     - path: reports/plots/decile_lift.csv
       hash: md5
@@ -638,11 +638,11 @@ stages:
       size: 1285
     - path: reports/promotion_decision.json
       hash: md5
-      md5: ce270fa0dce0c6e3136afcd5821b15e6
+      md5: d6e009e3ec06bc332375523b85c9516e
       size: 869
     - path: reports/test_predictions.parquet
       hash: md5
-      md5: 4d64d9c8f0ef0be36337286082cb4b75
+      md5: 457ccfa68a85bba5ea946ee1b2fea87e
       size: 33584
   error_analysis:
     cmd: uv run python -m telco_churn.models.error_analysis
@@ -653,7 +653,7 @@ stages:
       size: 209928
     - path: reports/calibrate_receipt.json
       hash: md5
-      md5: 2f62791ae5902212cdfe61bcd270828c
+      md5: ed9ce06d99fb7f2447c103b2c6727bcb
       size: 171
     - path: reports/policy/threshold.yaml
       hash: md5
@@ -661,7 +661,7 @@ stages:
       size: 904
     - path: reports/test_predictions.parquet
       hash: md5
-      md5: 4d64d9c8f0ef0be36337286082cb4b75
+      md5: 457ccfa68a85bba5ea946ee1b2fea87e
       size: 33584
     - path: src/telco_churn/data/schema.py
       hash: md5
@@ -716,5 +716,5 @@ stages:
     outs:
     - path: reports/error_analysis_receipt.json
       hash: md5
-      md5: 7b1a872e273a00f6479c461189811439
+      md5: 7db74298963ec9b7806b6d7f6f272306
       size: 90
