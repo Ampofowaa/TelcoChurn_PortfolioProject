@@ -1044,7 +1044,9 @@ def _write_threshold_reports(
     """
     policy_path = get_project_root() / str(cfg.paths.policy) / "threshold.yaml"
     policy_path.parent.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(OmegaConf.create(policy_payload), policy_path)
+    policy_path.write_text(
+        OmegaConf.to_yaml(OmegaConf.create(policy_payload)), newline="\n"
+    )
 
     reports_dir = get_project_root() / str(cfg.paths.reports)
     reports_dir.mkdir(parents=True, exist_ok=True)

@@ -432,8 +432,8 @@ stages:
       size: 6377
     - path: src/telco_churn/models/threshold.py
       hash: md5
-      md5: 0aaef39357e97bea2326a00b9faad4d4
-      size: 46876
+      md5: 44d0ad49396eca99545e05d4130ea834
+      size: 46918
     params:
       configs/calibration/default.yaml:
         ece_n_bins: 10
@@ -486,8 +486,8 @@ stages:
       size: 10899
     - path: reports/policy/threshold.yaml
       hash: md5
-      md5: 74f249af61a710392c0ab091e300337a
-      size: 904
+      md5: a996c77bab839a8075c381b99d0c2bb1
+      size: 864
   evaluate:
     cmd: uv run python -m telco_churn.models.evaluate
     deps:
@@ -505,8 +505,8 @@ stages:
       size: 171
     - path: reports/policy/threshold.yaml
       hash: md5
-      md5: 74f249af61a710392c0ab091e300337a
-      size: 904
+      md5: a996c77bab839a8075c381b99d0c2bb1
+      size: 864
     - path: src/telco_churn/data/schema.py
       hash: md5
       md5: cd642ff5867e761c4eadc50192b417b7
@@ -626,20 +626,20 @@ stages:
     outs:
     - path: reports/eval_receipt.json
       hash: md5
-      md5: 22607cbc5c1152a683ea24f360111797
+      md5: c939dad8fad47d7e2d868810468075ac
       size: 80
     - path: reports/metrics_summary.json
       hash: md5
-      md5: 81932a6a55c1b20b66f4559121e2946b
-      size: 925
+      md5: 94e9e1439df923cd5116f4e3420cef79
+      size: 1195
     - path: reports/plots/decile_lift.csv
       hash: md5
       md5: 0783342ca984d512830554e8e6a4d86e
       size: 1285
     - path: reports/promotion_decision.json
       hash: md5
-      md5: d6e009e3ec06bc332375523b85c9516e
-      size: 869
+      md5: c9327d89c634bda926b0cea929ead523
+      size: 1216
     - path: reports/test_predictions.parquet
       hash: md5
       md5: 457ccfa68a85bba5ea946ee1b2fea87e
@@ -657,8 +657,8 @@ stages:
       size: 171
     - path: reports/policy/threshold.yaml
       hash: md5
-      md5: 74f249af61a710392c0ab091e300337a
-      size: 904
+      md5: a996c77bab839a8075c381b99d0c2bb1
+      size: 864
     - path: reports/test_predictions.parquet
       hash: md5
       md5: 457ccfa68a85bba5ea946ee1b2fea87e
@@ -716,5 +716,5 @@ stages:
     outs:
     - path: reports/error_analysis_receipt.json
       hash: md5
-      md5: 7db74298963ec9b7806b6d7f6f272306
+      md5: b5be60c50c90636489342bc03e765140
       size: 90
