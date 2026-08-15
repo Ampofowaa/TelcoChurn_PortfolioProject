@@ -226,15 +226,14 @@ mlruns/
 mlflow.db
 optuna.db
 mlartifacts/
-# reports/ is inverted, not blanket-ignored: dvc.yaml stage outs with
-# cache: false (receipt jsons, metrics_summary.json, decile_lift.csv,
-# promotion_decision.json) are small, deterministic, and meant to be
-# git-tracked directly. test_predictions.parquet is a cached out instead —
-# a real per-row data artifact (1,409 rows), not a small aggregate, so it
-# belongs with the other cached parquets (split_manifest.parquet,
-# telco_churn_features.parquet), not the receipts. Only human-only dumps and
-# the local mirrors of MLflow-owned artifacts (reports/ is not their source
-# of truth) stay ignored.
+# reports/ is inverted, not blanket-ignored: most dvc.yaml stage outs with
+# cache: false (metrics_summary.json, decile_lift.csv, promotion_decision.json)
+# are small, deterministic, and meant to be git-tracked directly.
+# test_predictions.parquet is a cached out instead — a real per-row data
+# artifact (1,409 rows), not a small aggregate, so it belongs with the other
+# cached parquets (split_manifest.parquet, telco_churn_features.parquet), not
+# the receipts. Only human-only dumps and the local mirrors of MLflow-owned
+# artifacts (reports/ is not their source of truth) stay ignored.
 reports/figures/
 reports/validation/
 reports/feature_discovery/
@@ -246,6 +245,21 @@ reports/error_analysis.json
 reports/drift_reference.json
 reports/model_card.json
 reports/promotion_review.json
+# The six *_receipt.json files (ingest, validation, train, calibrate, eval,
+# error_analysis) are the exception to "receipts are git-tracked" above.
+# Git-committing a cache: false out defeats DVC's own missing-output check:
+# a fresh clone would inherit a hash-matching receipt for a Postgres/MLflow
+# pair that doesn't actually exist yet, so `dvc repro` reports the ingest/
+# train/calibrate/evaluate/error_analysis stages up to date against infra
+# that has never been touched (see CLAUDE.md's Data Handling section). Left
+# gitignored, a fresh clone has no receipt on disk, DVC sees the out missing,
+# and the whole chain reruns for real — no manual --force workaround needed.
+reports/ingest_receipt.json
+reports/validation_receipt.json
+reports/train_receipt.json
+reports/calibrate_receipt.json
+reports/eval_receipt.json
+reports/error_analysis_receipt.json
 .dvc/cache/
 project_thoughts.md
 prompts.txt
