@@ -1,7 +1,7 @@
 {
   "model_version": "1",
-  "run_id": "606af818991c446b9a2a3853aaa3189c",
-  "eval_run_id": "21b7266c3ff345ab983b4d878285ecb8",
+  "run_id": "2e9296fd3f65495ebc99b355f69a342f",
+  "eval_run_id": "4a5fa93c18bb4f058276dbfc4a321175",
   "champion_version": null,
   "regime": "cold_start",
   "gate": "pass",
