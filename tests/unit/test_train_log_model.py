@@ -188,7 +188,11 @@ def test_run_model_logging_step_writes_train_receipt(
     receipt_path = Path(str(registration_cfg.paths.reports)) / "train_receipt.json"
     assert receipt_path.exists()
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert receipt == {"run_id": result["run_id"]}
+    assert receipt == {
+        "run_id": result["run_id"],
+        "logged_model_id": result["training_manifest"]["logged_model_id"],
+        "model_uri": result["model_uri"],
+    }
 
 
 def test_run_model_logging_step_raises_on_hyperparameter_collision(

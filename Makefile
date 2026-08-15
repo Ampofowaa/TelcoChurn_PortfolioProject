@@ -1,11 +1,19 @@
-.PHONY: help lint format test test-data test-features test-models test-integration data db-up db-down ingest validate split features train calibrate threshold evaluate error-analysis review register-challenger register pre-commit mlflow-ui clean
+.PHONY: help lint format pre-commit test test-data test-features test-models test-integration data db-up db-down mlflow-ui repro dag metrics params calibrate threshold evaluate error-analysis review register-challenger register clean
 
 .DEFAULT_GOAL := help
 
 RUN := uv run
 
+# ---------------------------------------------------------------------------
+# Meta
+# ---------------------------------------------------------------------------
+
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+
+# ---------------------------------------------------------------------------
+# Code quality
+# ---------------------------------------------------------------------------
 
 lint: ## Run ruff check + mypy on src/
 	$(RUN) ruff check src/
@@ -17,6 +25,10 @@ format: ## Auto-format src/ with ruff format + black
 
 pre-commit: ## Run all pre-commit hooks against every file
 	$(RUN) pre-commit run --all-files
+
+# ---------------------------------------------------------------------------
+# Testing
+# ---------------------------------------------------------------------------
 
 test: ## Run the full pytest suite with coverage (CI gate, fail_under=80)
 	$(RUN) pytest
@@ -39,6 +51,10 @@ test-models: ## Run models package tests with scoped coverage
 test-integration: ## Run integration tests (requires Docker; run `make db-up` first)
 	$(RUN) pytest -m integration --run-integration
 
+# ---------------------------------------------------------------------------
+# Data & infra (Postgres + MLflow)
+# ---------------------------------------------------------------------------
+
 data: ## Download the raw dataset via Kaggle CLI (skips if already present)
 	@if [ -f datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv ]; then \
 		echo "datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv already exists — skipping download."; \
@@ -55,20 +71,50 @@ db-down: ## Stop and remove the infra containers
 mlflow-ui: ## Open the MLflow tracking UI at localhost:5000
 	$(RUN) mlflow ui
 
-ingest: ## Load the raw CSV into Postgres
-	$(RUN) python -m telco_churn.data.ingest
+# ---------------------------------------------------------------------------
+# DVC pipeline (ingest -> validate -> split -> features -> train -> calibrate
+# -> threshold -> evaluate -> error_analysis)
+#
+# dvc.lock conflict policy: it is a machine-generated lockfile (stage hashes,
+# not human decisions) — on a merge/rebase conflict, never hand-edit it. Take
+# the other side wholesale and let `dvc repro` regenerate the true state from
+# source: `git checkout --theirs dvc.lock && dvc repro`. No merge driver is
+# configured for it deliberately — a driver that "merges" two stage-hash sets
+# would produce a dvc.lock that matches neither branch's actual pipeline
+# output, which is worse than forcing a manual regeneration.
+#
+# The ingest/validate/split/features/train stages have no per-run overrides —
+# `dvc.yaml`'s `cmd:` already is `uv run python -m telco_churn.<stage>`, so a
+# Makefile target here would just retype it a second time with no caching or
+# dependency-checking, and the two definitions can silently drift apart. Run
+# them via `dvc repro <stage>` (or plain `make repro` for the whole graph)
+# instead. calibrate/threshold/evaluate/error-analysis, below, keep their own
+# targets because RUN_ID/MODEL_VERSION overrides are a one-off manual/
+# debugging path DVC itself cannot express (dvc repro always uses the current
+# deps/params, never an explicit historical run/version override).
+# ---------------------------------------------------------------------------
 
-validate: ## Run the 5 Pandera data-quality gates
-	$(RUN) python -m telco_churn.data.validate
+repro: ## Re-run only the DVC pipeline stages whose deps/params changed (single stage: dvc repro <name>, e.g. `dvc repro train`)
+	$(RUN) dvc repro
 
-split: ## Create the dev/test split
-	$(RUN) python -m telco_churn.data.split
+dag: ## Show the DVC pipeline DAG
+	$(RUN) dvc dag
 
-features: ## Build SQL feature views -> write the processed dataset
-	$(RUN) python -m telco_churn.features.build
+metrics: ## Show tracked DVC metrics (reports/metrics_summary.json, threshold's dev-OOF diagnostics)
+	$(RUN) dvc metrics show
 
-train: ## Train LightGBM + Optuna tuning; logs to MLflow
-	$(RUN) python -m telco_churn.models.train
+params: ## Show DVC params changes against the last commit
+	$(RUN) dvc params diff
+
+# ---------------------------------------------------------------------------
+# Pipeline stage overrides (calibrate -> threshold -> evaluate ->
+# error-analysis)
+#
+# These already run automatically inside `dvc repro` — every target below
+# exists only so you can re-run one by hand against a specific past run or
+# model version, instead of whatever `dvc repro` would pick automatically.
+# Useful for debugging or an audit; not needed for a normal pipeline run.
+# ---------------------------------------------------------------------------
 
 calibrate: ## Calibrate probabilities (fit + log only, no registry write; optional RUN_ID=<run_id>; defaults to train.py's receipt)
 	$(RUN) python -m telco_churn.models.calibrate $(if $(RUN_ID),calibration.run_id=$(RUN_ID),)
@@ -82,6 +128,19 @@ evaluate: ## One-time sealed-test evaluation + promotion gate (optional MODEL_VE
 error-analysis: ## SHAP explainability + error diagnosis (optional MODEL_VERSION=<version>; defaults to calibrate.py's receipt)
 	$(RUN) python -m telco_churn.models.error_analysis $(if $(MODEL_VERSION),error_analysis.model_version=$(MODEL_VERSION),)
 
+# ---------------------------------------------------------------------------
+# Registry actions (register-challenger, review, register)
+#
+# None of these are DVC stages — a registry write isn't a file DVC can
+# track. Order matters and is NOT top-to-bottom: register-challenger runs
+# right after `calibrate`, before `threshold` can even start (it needs a
+# registered version to resolve); review and register run at the very end,
+# after error-analysis.
+# ---------------------------------------------------------------------------
+
+register-challenger: ## Mint the calibrated pipeline as a new challenger version (optional RUN_ID=<run_id>; defaults to calibrate.py's receipt)
+	$(RUN) python -m telco_churn.models.register $(if $(RUN_ID),register.run_id=$(RUN_ID),)
+
 review: ## Stamp a human promotion-review verdict (VERDICT=approved|rejected APPROVER="..." NOTES="..." required; optional EVAL_RUN_ID=<run_id>, defaults to evaluate.py's receipt)
 	@if [ -z "$(VERDICT)" ] || [ -z "$(APPROVER)" ] || [ -z "$(NOTES)" ]; then \
 		echo 'Error: VERDICT, APPROVER, and NOTES are all required.'; \
@@ -90,12 +149,13 @@ review: ## Stamp a human promotion-review verdict (VERDICT=approved|rejected APP
 	fi
 	$(RUN) python -m telco_churn.models.review $(if $(EVAL_RUN_ID),review.eval_run_id=$(EVAL_RUN_ID),) review.verdict=$(VERDICT) review.approver="'$(APPROVER)'" review.notes="'$(NOTES)'"
 
-register-challenger: ## Mint the calibrated pipeline as a new challenger version (optional RUN_ID=<run_id>; defaults to calibrate.py's receipt)
-	$(RUN) python -m telco_churn.models.register $(if $(RUN_ID),register.run_id=$(RUN_ID),)
-
 register: ## Act on the promotion gate verdict: flip champion, or reject (MODEL_VERSION=<version> required — no receipt fallback, deliberately explicit)
 	@if [ -z "$(MODEL_VERSION)" ]; then echo "Error: MODEL_VERSION is required. Usage: make register MODEL_VERSION=<version>"; exit 1; fi
 	$(RUN) python -m telco_churn.models.register register.model_version=$(MODEL_VERSION)
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
 
 clean: ## Remove caches, coverage artifacts, and __pycache__
 	find . -type d -name "__pycache__" -exec rm -rf {} +

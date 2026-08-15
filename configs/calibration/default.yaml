@@ -13,8 +13,11 @@ inner_cv_folds: 5
 shuffle: true
 random_state: 42
 
-# Sigmoid-vs-isotonic gate metric — mean of per-fold AP, never pooled, against training_setup.delta_threshold.
-gate_metric: per_fold_mean_pr_auc
+# Sigmoid-vs-isotonic gate metric is mean of per-fold AP, never pooled, against
+# training_setup.delta_threshold — see calibrate.py::per_fold_average_precision /
+# pr_auc_gate_passes. Not a config key: there is no second implementation to
+# switch to, so this was dead config surface (declared, never read) rather
+# than a real knob.
 
 # Block-bootstrap (by outer fold, not row) resamples for the paired ΔBrier CI.
 brier_bootstrap_n_samples: 10_000

@@ -3,7 +3,7 @@ helpers plus run_error_analysis_step's orchestration (Phase 7)."""
 
 from __future__ import annotations
 
-import inspect
+import ast
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -36,7 +36,12 @@ from telco_churn.models.error_analysis import (
     near_miss_band_from_validation,
     value_weighted_error_profile,
 )
-from telco_churn.utils.paths import activate_config, compose_config, reset_active_config
+from telco_churn.utils.paths import (
+    activate_config,
+    compose_config,
+    get_project_root,
+    reset_active_config,
+)
 
 # ---------------------------------------------------------------------------
 # error_confidence_profile
@@ -547,15 +552,127 @@ def test_column_display_names_covers_every_feature_schema_column() -> None:
 
 # ---------------------------------------------------------------------------
 # Structural guard — mirrors CLAUDE.md's "test set touched once" invariant
+#
+# Transitive, not one-hop: a single `"data.split" not in source` check on
+# error_analysis.py's own text (the guard this replaces) is defeated by a
+# one-attribute rename (`from telco_churn import data as d; d.split....`) or
+# by the same import landing one function-call away, in explain.py or the
+# analysis notebook, rather than in error_analysis.py itself. This walks the
+# real first-party import graph from all three surfaces that read
+# already-scored evaluation data instead of trusting a text match on one of
+# them.
 # ---------------------------------------------------------------------------
 
+_SRC_ROOT = get_project_root() / "src" / "telco_churn"
+_FORBIDDEN_SPLIT_MODULE = "data/split.py"
 
-def test_error_analysis_module_never_imports_data_split() -> None:
-    """error_analysis.py must not import telco_churn.data.split — the module
-    reaches evaluation data solely through reports/test_predictions.parquet
-    and reports/dev_oof_predictions.parquet, both written by evaluate.py."""
-    source = inspect.getsource(error_analysis)
-    assert "data.split" not in source
+
+def _first_party_imports(path: Path) -> set[str]:
+    """src/telco_churn-relative paths imported via `from telco_churn.X.Y import ...` in path."""
+    targets: set[str] = set()
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and (node.module == "telco_churn" or node.module.startswith("telco_churn."))
+        ):
+            continue
+        parts = node.module.split(".")[1:]
+        if not parts:
+            continue
+        flat = "/".join(parts) + ".py"
+        pkg_init = "/".join(parts) + "/__init__.py"
+        if (_SRC_ROOT / flat).exists():
+            targets.add(flat)
+        elif (_SRC_ROOT / pkg_init).exists():
+            targets.add(pkg_init)
+    return targets
+
+
+def _notebook_first_party_imports(notebook_path: Path) -> set[str]:
+    """Same import extraction as _first_party_imports, over a notebook's
+    code cells, parsed one cell at a time (magic/shell lines blanked first;
+    a whole-cell `%%` magic makes the entire cell non-Python, so that cell is
+    skipped rather than concatenated with its neighbours — cells are
+    independently executable, but not necessarily independently parseable
+    end-to-end when joined into one module, so this parses each on its own
+    rather than risk a spurious cross-cell SyntaxError hiding a real import)."""
+    cells = json.loads(notebook_path.read_text(encoding="utf-8"))["cells"]
+    targets: set[str] = set()
+    for cell in cells:
+        if cell.get("cell_type") != "code":
+            continue
+        source_lines = cell.get("source", [])
+        if source_lines and source_lines[0].lstrip().startswith("%%"):
+            continue
+        cleaned = "".join(
+            "" if line.lstrip().startswith(("%", "!")) else line
+            for line in source_lines
+        )
+        try:
+            tree = ast.parse(cleaned)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and (
+                    node.module == "telco_churn"
+                    or node.module.startswith("telco_churn.")
+                )
+            ):
+                continue
+            parts = node.module.split(".")[1:]
+            if not parts:
+                continue
+            flat = "/".join(parts) + ".py"
+            pkg_init = "/".join(parts) + "/__init__.py"
+            if (_SRC_ROOT / flat).exists():
+                targets.add(flat)
+            elif (_SRC_ROOT / pkg_init).exists():
+                targets.add(pkg_init)
+    return targets
+
+
+def _transitive_closure(roots: set[str]) -> set[str]:
+    seen: set[str] = set()
+    stack = list(roots)
+    while stack:
+        rel = stack.pop()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        path = _SRC_ROOT / rel
+        if path.exists():
+            stack.extend(_first_party_imports(path) - seen)
+    return seen
+
+
+def test_data_split_is_transitively_unreachable_from_error_analysis_surfaces() -> None:
+    """data/split.py is unreachable from error_analysis.py, explain.py, and
+    notebooks/05-evaluation-and-error-analysis.ipynb, walking real first-party
+    imports transitively rather than grepping one file's own source text.
+
+    All three read already-scored evaluation data (reports/test_predictions.parquet,
+    reports/dev_oof_predictions.parquet) written by evaluate.py — the one module
+    CLAUDE.md permits to bind the sealed test partition. A transitive import of
+    data/split.py from any of the three would be a second route to that
+    partition, undetectable by a same-file text match once the import moves
+    even one function call away.
+    """
+    notebook = (
+        get_project_root() / "notebooks" / "05-evaluation-and-error-analysis.ipynb"
+    )
+    roots = {
+        "models/error_analysis.py",
+        "models/explain.py",
+    } | _notebook_first_party_imports(notebook)
+    closure = _transitive_closure(roots)
+    assert (
+        _FORBIDDEN_SPLIT_MODULE not in closure
+    ), f"data/split.py is transitively reachable: {closure & {_FORBIDDEN_SPLIT_MODULE}}"
 
 
 # ---------------------------------------------------------------------------

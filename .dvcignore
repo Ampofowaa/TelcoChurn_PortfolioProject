@@ -1,0 +1,10 @@
+# Add patterns of files dvc should ignore, which could improve
+# the performance. Learn more at
+# https://dvc.org/doc/user-guide/dvcignore
+
+# Human-only dumps and the MLflow artifact store — never DVC-tracked outs,
+# so excluding them keeps DAG traversal/workspace scans from walking them.
+reports/figures/
+reports/validation/
+reports/feature_discovery/
+mlruns/

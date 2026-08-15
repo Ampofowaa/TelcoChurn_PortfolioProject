@@ -30,7 +30,7 @@ def base_scenario() -> CostScenario:
 
 @pytest.fixture
 def policy_fixture() -> OmegaConf:
-    """Same shape as configs/policy/threshold.yaml's `scenarios` block."""
+    """Same shape as reports/policy/threshold.yaml's `scenarios` block."""
     return OmegaConf.create(
         {
             "scenarios": {
@@ -60,7 +60,7 @@ def test_costs_config_hash_changes_iff_costs_yaml_changes(tmp_path: Path) -> Non
     """Same resolved content -> same hash; a resolved-value difference -> a
     different hash.
 
-    Pins configs/policy/threshold.yaml's provenance without a model stamp:
+    Pins reports/policy/threshold.yaml's provenance without a model stamp:
     same hash means the model changed, a different hash means the cost
     assumptions did.
     """
@@ -79,7 +79,7 @@ def test_costs_config_hash_ignores_cosmetic_formatting(tmp_path: Path) -> None:
     """A comment, re-indentation, or a CRLF/LF line-ending swap must not change
     the hash — only a resolved-value change may, or checking the same
     costs.yaml out on a different OS becomes a false provenance mismatch
-    against the hash already pinned in configs/policy/threshold.yaml.
+    against the hash already pinned in reports/policy/threshold.yaml.
     """
     path_plain = tmp_path / "costs_plain.yaml"
     path_plain.write_text("gross_margin: 0.60\nhorizon_months: 12\n", encoding="utf-8")

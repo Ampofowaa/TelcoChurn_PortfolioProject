@@ -1,4 +1,4 @@
-"""Pandera schema definitions for raw and cleaned Telco customer data."""
+"""Pandera schema definition for raw Telco customer data."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ __all__ = [
     "YES_NO_NO_PHONE",
     "YES_NO_NO_INTERNET",
     "RawSchema",
-    "CleanedSchema",
 ]
 
 # ---------------------------------------------------------------------------
@@ -89,16 +88,6 @@ class RawSchema(DataFrameModel):  # type: ignore[misc]
         """
         return ~((df["totalcharges"] == 0.0) & (df["monthlycharges"] > 0))
 
-
-class CleanedSchema(RawSchema):
-    """RawSchema with totalcharges required to be non-null.
-
-    The model training sklearn ColumnTransformer (SimpleImputer) is a prerequisite —
-    validate_clean() should be called after imputation, not before.
-    """
-
-    totalcharges: Series[float] = Field(ge=0.0, nullable=False)
-
     @pa.dataframe_check  # type: ignore[untyped-decorator]
     @classmethod
     def totalcharges_gte_monthlycharges_for_billed_customers(
@@ -111,6 +100,8 @@ class CleanedSchema(RawSchema):
         corruption or ingestion error. Zero-tenure customers (tenure=0) are
         exempt: their totalcharges is the imputed median, not an accrued billing
         total. NaN tenure rows return False from >= 1 in pandas and pass the check.
+        NaN totalcharges rows (the same zero-tenure population) also pass: NaN
+        comparisons are False in pandas, so a NaN never satisfies the "<" clause.
         """
         billed_mask = df["tenure"] >= 1
         return ~(billed_mask & (df["totalcharges"] < df["monthlycharges"]))

@@ -846,7 +846,7 @@ def _assemble_threshold_payloads(
 ) -> dict[str, Any]:
     """Assemble threshold.json, threshold.yaml (policy), and threshold_validation.json.
 
-    The two files on disk split along model-independence: configs/policy/
+    The two files on disk split along model-independence: reports/policy/
     threshold.yaml carries only the pure functions of configs/costs.yaml
     (threshold/costs/retention_rate_sensitivity), pinned by a
     costs_config_hash and carrying no model_run_id/logged_model_id — a
@@ -951,6 +951,16 @@ def _log_threshold_run(
     dev_ev_at_t_star_{scenario} as MLflow metrics for every scenario, and
     persists the EV-curve points themselves as ev_curve.parquet — the curve
     exists today only as pixels in expected_value_by_scenario.png.
+
+    Also tags this run with costs_config_hash — same tag name evaluate.py
+    sets on its own run (CLAUDE.md's business-metrics rule) — so the
+    provenance stamp payloads["policy_payload"] pins into
+    reports/policy/threshold.yaml has an MLflow-side copy too, not just the
+    local file. threshold.py's hash is computed once, at derivation time;
+    evaluate.py's is a separately-computed value at evaluate time, so the two
+    are not guaranteed identical across a `costs.yaml` edit between the two
+    steps — a mismatch here is itself a diagnostic worth surfacing, not
+    reconciled away by sharing one value.
     """
     results = derived["results"]
     ev_curves = figures["ev_curves"]
@@ -1013,6 +1023,9 @@ def _log_threshold_run(
         mlflow.set_tag(
             "dev_oof_screen_result", "pass" if not screen["failures"] else "fail"
         )
+        mlflow.set_tag(
+            "costs_config_hash", payloads["policy_payload"]["costs_config_hash"]
+        )
 
 
 def _write_threshold_reports(
@@ -1021,7 +1034,7 @@ def _write_threshold_reports(
     dev_oof_diagnostics: dict[str, Any],
     cfg: DictConfig,
 ) -> None:
-    """Write configs/policy/threshold.yaml and the reports/ dev-OOF mirror.
+    """Write reports/policy/threshold.yaml and the reports/ dev-OOF mirror.
 
     Like reports/figures/reliability_diagram.png, these are overwritten on
     every call — the copy on disk reflects the most recent local run, not a

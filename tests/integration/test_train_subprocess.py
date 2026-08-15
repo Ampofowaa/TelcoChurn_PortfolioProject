@@ -190,7 +190,7 @@ def test_train_main_cli_exits_one_when_processed_data_missing(tmp_path: Path) ->
     """train.py __main__ exits 1 when the processed CSV does not exist yet.
 
     The realistic failure mode of running `python -m telco_churn.models.train`
-    before `make features` / `make split`.
+    before `dvc repro features` / `dvc repro split`.
     """
     empty_dir = tmp_path / "empty"
     empty_dir.mkdir()

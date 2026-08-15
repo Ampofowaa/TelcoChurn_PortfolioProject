@@ -11,6 +11,7 @@ from telco_churn.data.checks import (
     check_duplicate_ids,
     check_schema,
     check_totalcharges_nulls,
+    frame_checksum,
 )
 
 # ---------------------------------------------------------------------------
@@ -49,32 +50,24 @@ def test_negative_tenure_fails_schema_check(valid_raw_df: pd.DataFrame) -> None:
     assert result.passed is False
 
 
-def test_cleaned_schema_rejects_null_totalcharges(valid_raw_df: pd.DataFrame) -> None:
-    """CleanedSchema rejects a DataFrame that still has NULL totalcharges."""
-    df = valid_raw_df.copy()
-    df.loc[0, "totalcharges"] = float("nan")
-    result = check_schema(df, cleaned=True)
-    assert result.passed is False
-
-
-def test_cleaned_schema_rejects_totalcharges_below_monthlycharges(
+def test_raw_schema_rejects_totalcharges_below_monthlycharges(
     valid_raw_df: pd.DataFrame,
 ) -> None:
-    """CleanedSchema rejects totalcharges < monthlycharges for a billed customer (tenure >= 1)."""
+    """RawSchema rejects totalcharges < monthlycharges for a billed customer (tenure >= 1)."""
     df = valid_raw_df.copy()
     # Row 0 has tenure=12; setting totalcharges below monthlycharges violates the invariant.
     df.loc[0, "totalcharges"] = df.loc[0, "monthlycharges"] * 0.5
-    result = check_schema(df, cleaned=True)
+    result = check_schema(df)
     assert result.passed is False
 
 
-def test_cleaned_schema_allows_totalcharges_equal_monthlycharges(
+def test_raw_schema_allows_totalcharges_equal_monthlycharges(
     valid_raw_df: pd.DataFrame,
 ) -> None:
-    """CleanedSchema accepts totalcharges == monthlycharges (first billing cycle)."""
+    """RawSchema accepts totalcharges == monthlycharges (first billing cycle)."""
     df = valid_raw_df.copy()
     df.loc[0, "totalcharges"] = df.loc[0, "monthlycharges"]
-    result = check_schema(df, cleaned=True)
+    result = check_schema(df)
     assert result.passed is True
 
 
@@ -82,7 +75,7 @@ def test_raw_schema_accepts_null_totalcharges(
     zero_tenure_df: pd.DataFrame,
 ) -> None:
     """RawSchema accepts NULL totalcharges (expected for zero-tenure customers)."""
-    result = check_schema(zero_tenure_df, cleaned=False)
+    result = check_schema(zero_tenure_df)
     assert result.passed is True
 
 
@@ -306,3 +299,28 @@ def test_null_rate_check_covers_all_non_nullable_schema_columns(
     ), "monthlycharges must be covered by Gate 5 null-rate checks"
     assert monthly_check.passed is False
     assert monthly_check.failure_severity == Severity.WARNING
+
+
+# ---------------------------------------------------------------------------
+# frame_checksum
+# ---------------------------------------------------------------------------
+
+
+def test_frame_checksum_is_stable_across_calls(valid_raw_df: pd.DataFrame) -> None:
+    """frame_checksum returns identical output for identical input, called twice."""
+    assert frame_checksum(valid_raw_df) == frame_checksum(valid_raw_df)
+
+
+def test_frame_checksum_changes_on_value_change(valid_raw_df: pd.DataFrame) -> None:
+    """Changing a single cell's value changes the checksum."""
+    before = frame_checksum(valid_raw_df)
+    df = valid_raw_df.copy()
+    df.loc[0, "tenure"] = df.loc[0, "tenure"] + 1
+    assert frame_checksum(df) != before
+
+
+def test_frame_checksum_unaffected_by_index_labels(valid_raw_df: pd.DataFrame) -> None:
+    """Reindexing without changing row content or order leaves the checksum unchanged."""
+    reindexed = valid_raw_df.copy()
+    reindexed.index = reindexed.index + 1000
+    assert frame_checksum(valid_raw_df) == frame_checksum(reindexed)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -13,8 +14,8 @@ from telco_churn.data.validate import (
     ValidationError,
     ValidationResult,
     save_validation_report,
-    validate_clean,
     validate_raw,
+    write_validation_receipt,
 )
 from telco_churn.utils.paths import load_config
 
@@ -75,13 +76,6 @@ def test_validate_raw_defaults_match_checks_gate_constants() -> None:
     constant — not just when someone edits this test's own expectation.
     """
     params = inspect.signature(validate_raw).parameters
-    assert params["min_rows"].default == MIN_ROWS
-    assert params["max_null_rate"].default == MAX_NULL_RATE
-
-
-def test_validate_clean_defaults_match_checks_gate_constants() -> None:
-    """validate_clean's min_rows/max_null_rate defaults must equal checks.py's."""
-    params = inspect.signature(validate_clean).parameters
     assert params["min_rows"].default == MIN_ROWS
     assert params["max_null_rate"].default == MAX_NULL_RATE
 
@@ -149,32 +143,6 @@ def test_empty_df_fails_validate_raw(
 
 
 # ---------------------------------------------------------------------------
-# validate_clean
-# ---------------------------------------------------------------------------
-
-
-def test_validate_clean_fails_when_nulls_remain(
-    valid_raw_df: pd.DataFrame, tmp_path: Path
-) -> None:
-    """validate_clean returns an error when totalcharges still contains NULLs."""
-    df = valid_raw_df.copy()
-    df.loc[0, "totalcharges"] = float("nan")
-    result = validate_clean(df, strict=False, reports_dir=tmp_path)
-    assert result.can_proceed is False
-
-
-def test_validate_clean_strict_raises_on_blocking_error(
-    valid_raw_df: pd.DataFrame, tmp_path: Path
-) -> None:
-    """validate_clean with strict=True raises ValidationError when errors exist."""
-    df = valid_raw_df.copy()
-    df.loc[0, "totalcharges"] = float("nan")
-    with pytest.raises(ValidationError) as exc_info:
-        validate_clean(df, strict=True, reports_dir=tmp_path)
-    assert len(exc_info.value.result.errors) >= 1
-
-
-# ---------------------------------------------------------------------------
 # save_validation_report
 # ---------------------------------------------------------------------------
 
@@ -217,3 +185,65 @@ def test_save_validation_report_returns_none_when_all_pass(
     result = validate_raw(large_valid_df, strict=False, reports_dir=tmp_path)
     report_dir = save_validation_report(result, base_dir=tmp_path)
     assert report_dir is None
+
+
+# ---------------------------------------------------------------------------
+# write_validation_receipt
+# ---------------------------------------------------------------------------
+
+
+def test_write_validation_receipt_writes_on_success(
+    large_valid_df: pd.DataFrame, tmp_path: Path
+) -> None:
+    """write_validation_receipt writes a file even when every check passes."""
+    result = validate_raw(large_valid_df, strict=False, reports_dir=tmp_path)
+    receipt_path = write_validation_receipt(
+        result, large_valid_df, path=tmp_path / "validation_receipt.json"
+    )
+    assert receipt_path.exists()
+
+
+def test_write_validation_receipt_writes_on_failure(
+    valid_raw_df: pd.DataFrame, tmp_path: Path
+) -> None:
+    """write_validation_receipt writes a file even when a blocking check fails."""
+    df = valid_raw_df.copy()
+    df.loc[0, "churn"] = 9
+    result = validate_raw(df, strict=False, reports_dir=tmp_path)
+    assert result.can_proceed is False
+    receipt_path = write_validation_receipt(
+        result, df, path=tmp_path / "validation_receipt.json"
+    )
+    assert receipt_path.exists()
+
+
+def test_write_validation_receipt_is_deterministic(
+    large_valid_df: pd.DataFrame, tmp_path: Path
+) -> None:
+    """Identical checks and data produce byte-identical receipts across calls."""
+    result = validate_raw(large_valid_df, strict=False, reports_dir=tmp_path)
+    first = write_validation_receipt(
+        result, large_valid_df, path=tmp_path / "first.json"
+    )
+    second = write_validation_receipt(
+        result, large_valid_df, path=tmp_path / "second.json"
+    )
+    assert first.read_text() == second.read_text()
+
+
+def test_write_validation_receipt_contains_check_outcomes_and_checksum(
+    large_valid_df: pd.DataFrame, tmp_path: Path
+) -> None:
+    """The receipt carries every check's name/passed/severity/affected_rows plus a frame checksum."""
+    result = validate_raw(large_valid_df, strict=False, reports_dir=tmp_path)
+    receipt_path = write_validation_receipt(
+        result, large_valid_df, path=tmp_path / "validation_receipt.json"
+    )
+    payload = json.loads(receipt_path.read_text())
+    assert len(payload["checks"]) == len(result.checks)
+    for entry in payload["checks"]:
+        assert {"name", "passed", "failure_severity", "affected_rows"} <= entry.keys()
+    assert isinstance(payload["frame_checksum"], str)
+    assert payload["frame_checksum"]
+    assert "timestamp" not in payload
+    assert "run_id" not in payload

@@ -1,0 +1,149 @@
+{
+  "checks": [
+    {
+      "affected_rows": 0,
+      "failure_severity": "ERROR",
+      "name": "schema",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "ERROR",
+      "name": "duplicate_ids",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "ERROR",
+      "name": "churn_labels",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "totalcharges_unexpected_nulls",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "row_count",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_churn",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_contract_type",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_dependents",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_deviceprotection",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_gender",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_has_partner",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_internetservice",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_monthlycharges",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_multiplelines",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_onlinebackup",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_onlinesecurity",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_paperlessbilling",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_paymentmethod",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_phoneservice",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_seniorcitizen",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_streamingmovies",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_streamingtv",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_techsupport",
+      "passed": true
+    },
+    {
+      "affected_rows": 0,
+      "failure_severity": "WARNING",
+      "name": "null_rate_tenure",
+      "passed": true
+    }
+  ],
+  "frame_checksum": "af1b32d1443b5f09eae0f1211a09ea9f4dc47552ededc60951a4396ab5fe20b2"
+}

@@ -357,10 +357,10 @@ def run_model_logging_step(
     registration, on the calibrated artifact, resolved via this manifest's
     logged_model_uri.
 
-    Writes reports/train_receipt.json ({"run_id"}) — the pointer
-    calibrate.py's __main__ reads by default when no explicit
-    calibration.run_id override is given (see utils/mlflow.py's module
-    docstring for why a local receipt is safe here).
+    Writes reports/train_receipt.json ({"run_id", "logged_model_id",
+    "model_uri"}) — the pointer calibrate.py's __main__ reads by default when
+    no explicit calibration.run_id override is given (see utils/mlflow.py's
+    module docstring for why a local receipt is safe here).
 
     Returns {"run_id", "model_uri", "parity_ok", "training_manifest"}.
     """
@@ -446,7 +446,7 @@ def run_model_logging_step(
         "model is not safe to log."
     )
 
-    write_train_receipt(run_id, cfg)
+    write_train_receipt(run_id, model_info.model_id, model_info.model_uri, cfg)
 
     logger.info(
         "model_logged",

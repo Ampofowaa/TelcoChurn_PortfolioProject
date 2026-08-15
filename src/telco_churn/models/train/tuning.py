@@ -336,14 +336,22 @@ def _study_name(cfg: DictConfig, committed_features: list[str]) -> str:
     unconditional, unlike the retired `_dvc_hash`, which read a `.dvc`
     sidecar that never existed for a pipeline-stage output and was
     permanently `"unknown"`. `config_digest` hashes frozen features plus the
-    tuning config (search space, CV scheme, early-stopping settings, pruner)
-    — everything that must stay fixed across a study's trials for Optuna's
-    per-parameter distributions to stay valid, plus the pruner's
+    tuning config (search space, CV scheme, early-stopping settings, pruner,
+    sampler, objective) — everything that must stay fixed across a study's
+    trials for Optuna's per-parameter distributions to stay valid and for its
+    stored trial values to mean the same thing, plus the pruner's
     n_warmup_steps: a trial pruned under one policy and a trial that ran
     unpruned under another aren't a fair comparison, so mixing them into one
-    pool would let 1-SE selection silently compare apples to oranges. A
-    change to either hash starts a fresh study instead of silently mixing
-    incompatible trials into an old one.
+    pool would let 1-SE selection silently compare apples to oranges. `metric`
+    and `direction` guard against the same failure at the objective level — a
+    metric swap or a maximize/minimize flip changes what a stored trial value
+    even means, and a `direction` flip is worse than incomparable: trials good
+    under "maximize" would read as bad under "minimize" and vice versa.
+    `sampler_seed`/`n_startup_trials` guard the reproducibility claim in this
+    docstring's own first line — two runs with a different seed or warm-up
+    budget aren't "the same inputs" even though nothing about the search
+    space changed. A change to any of these starts a fresh study instead of
+    silently mixing incompatible trials into an old one.
     """
     data_hash = features_sha256()
     tuning_cfg = cfg.tuning
@@ -357,11 +365,41 @@ def _study_name(cfg: DictConfig, committed_features: list[str]) -> str:
         "es_validation_size": float(tuning_cfg.es_validation_size),
         "pruner": str(tuning_cfg.pruner),
         "pruner_n_warmup_steps": int(tuning_cfg.pruner_n_warmup_steps),
+        "metric": str(tuning_cfg.metric),
+        "direction": str(tuning_cfg.direction),
+        "sampler_seed": int(tuning_cfg.sampler_seed),
+        "n_startup_trials": int(tuning_cfg.n_startup_trials),
     }
     config_digest = hashlib.sha256(
         json.dumps(config_key, sort_keys=True, default=str).encode()
     ).hexdigest()
     return f"tuning_{data_hash[:8]}_{config_digest[:8]}"
+
+
+def _discard_incomplete_study_unless_resuming(
+    storage: optuna.storages.BaseStorage,
+    study_name: str,
+    n_trials_requested: int,
+    resume: bool,
+) -> None:
+    """Delete a same-named study left incomplete by a prior invocation, unless
+    `tuning.resume` explicitly opts into continuing it.
+
+    A complete study (>= n_trials_requested trials already recorded) is
+    always reused regardless of `resume` — that's a cache hit, not a resume
+    decision, and is handled by `optuna.create_study`'s own `load_if_exists`
+    afterward. An *incomplete* study is ambiguous: it might be a deliberate
+    in-progress run worth continuing, or a crashed/interrupted process's
+    leftover state. Defaulting to discard-and-restart keeps a stale partial
+    study from silently pooling with a later invocation's trials.
+    """
+    try:
+        existing = optuna.load_study(study_name=study_name, storage=storage)
+    except KeyError:
+        return
+    if len(existing.trials) >= n_trials_requested or resume:
+        return
+    optuna.delete_study(study_name=study_name, storage=storage)
 
 
 def _build_optuna_study(
@@ -375,6 +413,11 @@ def _build_optuna_study(
 
     Study creation and CV-split resolution don't need an active MLflow run —
     only trial execution does, since each trial opens its own nested run.
+
+    A same-named incomplete study from a prior invocation is discarded first
+    unless `tuning.resume` is true (see `_discard_incomplete_study_unless_resuming`)
+    — `load_if_exists=True` below then either finds nothing (fresh study) or
+    finds a study eligible to be reused (complete, or resume explicitly requested).
     """
     tuning_cfg = cfg.tuning
     random_state = int(tuning_cfg.random_state)
@@ -409,9 +452,16 @@ def _build_optuna_study(
         n_startup_trials=int(tuning_cfg.n_startup_trials),
     )
     study_name = _study_name(cfg, committed_features)
+    study_storage = storage if storage is not None else _build_optuna_storage()
+    _discard_incomplete_study_unless_resuming(
+        study_storage,
+        study_name,
+        n_trials_requested=int(tuning_cfg.n_trials),
+        resume=bool(tuning_cfg.resume),
+    )
     study = optuna.create_study(
         study_name=study_name,
-        storage=storage if storage is not None else _build_optuna_storage(),
+        storage=study_storage,
         load_if_exists=True,
         direction=str(tuning_cfg.direction),
         sampler=sampler,
@@ -448,10 +498,15 @@ def _run_study_trials(
     already open. load_if_exists=True resumes a study interrupted mid-run
     (e.g. a crashed process) rather than losing its trials — n_remaining_trials
     guards against piling n_trials more on top of a study that already
-    reached n_trials on every re-run.
+    reached n_trials on every re-run. n_trials_before (captured ahead of
+    optimize) is this invocation's reused-trial count — whatever
+    `_discard_incomplete_study_unless_resuming` left the study holding, be
+    that zero (fresh study) or a prior invocation's trials (complete, or
+    resume explicitly requested).
     """
     study = setup["study"]
     tuning_cfg = setup["tuning_cfg"]
+    n_trials_before = len(study.trials)
 
     objective = partial(
         _tuning_objective,
@@ -467,7 +522,7 @@ def _run_study_trials(
         pruning_enabled=setup["pruning_enabled"],
         study_name=setup["study_name"],
     )
-    n_remaining_trials = max(int(tuning_cfg.n_trials) - len(study.trials), 0)
+    n_remaining_trials = max(int(tuning_cfg.n_trials) - n_trials_before, 0)
     if n_remaining_trials > 0:
         study.optimize(
             objective,
@@ -479,7 +534,7 @@ def _run_study_trials(
         logger.info(
             "tuning_study_already_complete",
             study_name=setup["study_name"],
-            n_trials=len(study.trials),
+            n_trials=n_trials_before,
         )
 
     n_failed_trials = sum(
@@ -510,7 +565,12 @@ def _run_study_trials(
             "exceptions before re-running."
         )
 
-    return {"n_failed_trials": n_failed_trials, "n_pruned_trials": n_pruned_trials}
+    return {
+        "n_failed_trials": n_failed_trials,
+        "n_pruned_trials": n_pruned_trials,
+        "n_trials_reused": n_trials_before,
+        "n_trials_run_this_invocation": len(study.trials) - n_trials_before,
+    }
 
 
 def _summarize_completed_trials(
@@ -674,6 +734,10 @@ def _log_tuning_artifacts(
             "n_pruned_trials": trial_result["n_pruned_trials"],
             "n_boundary_hits": sum(boundary_hits.values()),
             "n_failed_trials": trial_result["n_failed_trials"],
+            "n_trials_reused": trial_result["n_trials_reused"],
+            "n_trials_run_this_invocation": trial_result[
+                "n_trials_run_this_invocation"
+            ],
             # int(): MLflow metrics must be numeric. Surfaces the too-few-trials
             # warning (logged above, ephemeral) as a persistent, queryable
             # signal in the MLflow UI/API, not just a vanished log line.
@@ -723,6 +787,10 @@ def run_tuning_step(
     Idempotent against a study that already reached n_trials: only the trials
     still needed to reach n_trials are run, so re-running against a completed
     study reuses its existing trials instead of piling n_trials more on top.
+    An *incomplete* same-named study is only reused when cfg.tuning.resume is
+    true — otherwise it's discarded and a fresh study starts in its place
+    (see _discard_incomplete_study_unless_resuming). tuning_summary's
+    n_trials_reused/n_trials_run_this_invocation record which case applied.
 
     Also logs fANOVA hyperparameter importance — tuning/hyperparameter_importance.png
     and the underlying per-parameter values (tuning/hyperparameter_importance.json,
@@ -760,6 +828,7 @@ def run_tuning_step(
             {
                 "optuna_study_name": setup["study_name"],
                 "n_trials": int(tuning_cfg.n_trials),
+                "resume": bool(tuning_cfg.resume),
                 "sampler": "tpe",
                 "sampler_seed": int(tuning_cfg.sampler_seed),
                 "n_startup_trials": int(tuning_cfg.n_startup_trials),
@@ -817,6 +886,10 @@ def run_tuning_step(
             "n_completed_trials": len(trial_summaries),
             "n_pruned_trials": trial_result["n_pruned_trials"],
             "n_failed_trials": trial_result["n_failed_trials"],
+            "n_trials_reused": trial_result["n_trials_reused"],
+            "n_trials_run_this_invocation": trial_result[
+                "n_trials_run_this_invocation"
+            ],
             "min_completed_trials": setup["min_completed_trials"],
             "trial_count_below_threshold": summary["trial_count_below_threshold"],
             "selection_rule": str(tuning_cfg.selection_rule),

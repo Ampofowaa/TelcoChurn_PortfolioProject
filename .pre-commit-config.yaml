@@ -85,14 +85,18 @@ repos:
     hooks:
       - id: detect-secrets
         args: ['--baseline', '.secrets.baseline']
-        # configs/policy/threshold.yaml is machine-generated (OmegaConf.save, no
-        # comments preserved) and always carries a costs_config_hash sha256 hex
-        # digest by design — a false-positive high-entropy-string hit on every
-        # regeneration, not a secret. An inline `pragma: allowlist secret` would
-        # be silently wiped by the next `threshold.py` run, so it's excluded here
-        # instead.
+        # Every reports/ receipt/summary file (ingest_receipt.json,
+        # validation_receipt.json, metrics_summary.json, promotion_decision.json,
+        # policy/threshold.yaml, ...) is machine-generated and always carries at
+        # least one sha256 hex digest by design — git SHA, data_content_hash,
+        # costs_config_hash, metrics_content_hash — a false-positive
+        # high-entropy-string hit on every regeneration, not a secret. An inline
+        # `pragma: allowlist secret` would be silently wiped by the next pipeline
+        # run, so the whole directory is excluded here instead of enumerating
+        # each file (which would need updating every time a new receipt is
+        # added).
         # Notebooks that keep their outputs (same 00-/01-/0[a-z]-/… set nbstripout
         # exempts, see that hook's exclude below) embed matplotlib figures as
         # base64-encoded PNG cell output — always high-entropy, never a secret,
         # and an inline pragma can't reach inside embedded JSON cell output.
-        exclude: \.secrets\.baseline|configs/policy/threshold\.yaml|notebooks/(_archive/|0[0-9][a-z]?-)
+        exclude: \.secrets\.baseline|reports/|notebooks/(_archive/|0[0-9][a-z]?-)

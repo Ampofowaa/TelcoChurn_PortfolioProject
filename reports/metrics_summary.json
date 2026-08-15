@@ -1,0 +1,23 @@
+{
+  "model_version": "1",
+  "run_id": "461ab6046aa7432b983b476fce8c6bd4",
+  "eval_run_id": "e179264a73df4bb285f06d7ea06077ba",
+  "champion_version": null,
+  "regime": "cold_start",
+  "gate": "pass",
+  "costs_config_hash": "4273028adf828b4df314723c83f0bc8cbeca42437ecc09f0e9ccd80dd4a89dcb",
+  "test_pr_auc": 0.6701124581948501,
+  "test_pr_auc_ci_lower": 0.618546312819462,
+  "test_pr_auc_ci_upper": 0.7140489050944702,
+  "test_recall": 0.6978609625668449,
+  "test_recall_ci_lower": 0.6509580459607666,
+  "test_recall_ci_upper": 0.7433896702031417,
+  "test_brier": 0.13629504129469,
+  "test_bss": 0.30097921445513076,
+  "test_calibration_slope": 0.9920540078451244,
+  "test_calibration_slope_ci_lower": 0.8909209005081888,
+  "test_calibration_slope_ci_upper": 1.0999736118349694,
+  "test_ev_base": 15060.896000000006,
+  "test_equal_opportunity_diff": 0.35143713630752954,
+  "test_demographic_parity_diff": 0.2789767096134787
+}

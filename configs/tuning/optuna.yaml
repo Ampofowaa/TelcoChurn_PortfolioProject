@@ -4,6 +4,16 @@ n_trials: 50
 direction: maximize
 metric: average_precision   # PR-AUC; sole selection metric (one-metric invariant)
 
+# Whether to continue an interrupted (< n_trials) study left behind by a prior
+# invocation under the same content-addressed name. false (default) discards it
+# and starts fresh instead — a partial study is presumptively crash residue, not
+# a handoff point: resuming it from a fresh process means running new trials
+# against a sampler/pruner mid-state this process never built. A *complete*
+# study (>= n_trials already recorded) is always reused regardless of this flag
+# — that's a cache hit, not a resume decision. Set true only for a deliberate
+# crash-recovery re-run.
+resume: false
+
 # Wall-clock cap for study.optimize, alongside n_trials — stops an automated retrain from hanging the schedule; only checked between trials, not mid-fit. null disables it.
 timeout_seconds: 5400   # 90 min; generous multiple of expected 50-trial runtime
 

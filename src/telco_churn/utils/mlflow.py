@@ -44,6 +44,7 @@ from typing import Any
 import mlflow
 import mlflow.tracking
 from mlflow.entities import Experiment
+from mlflow.exceptions import MlflowException
 from omegaconf import DictConfig
 from pandas.errors import Pandas4Warning
 
@@ -68,6 +69,7 @@ __all__ = [
     "read_eval_receipt",
     "write_error_analysis_receipt",
     "read_error_analysis_receipt",
+    "find_dangling_receipts",
     "TRAINING_CYCLE_RUN_DESCRIPTION",
 ]
 
@@ -351,16 +353,33 @@ def _reports_dir(cfg: DictConfig) -> Path:
     return get_project_root() / str(cfg.paths.reports)
 
 
-def write_train_receipt(run_id: str, cfg: DictConfig) -> None:
+def write_train_receipt(
+    run_id: str,
+    logged_model_id: str,
+    model_uri: str,
+    cfg: DictConfig,
+) -> None:
     """Write reports/train_receipt.json — the pointer calibrate.py reads by default.
 
     Identifiers only, never evidence — see this module's docstring. The
-    explicit calibration.run_id override never reads this file.
+    explicit calibration.run_id override never reads this file. Carries the
+    same {run_id, logged_model_id, model_uri} triple as
+    calibrate_receipt.json — DVC declares this file as the `train` stage's
+    out, so it must be self-contained (readable without a live MLflow query)
+    for anything that inspects it outside calibrate.py's own resolution path.
     """
     reports_dir = _reports_dir(cfg)
     reports_dir.mkdir(parents=True, exist_ok=True)
     with open(reports_dir / "train_receipt.json", "w", encoding="utf-8") as f:
-        json.dump({"run_id": run_id}, f, indent=2)
+        json.dump(
+            {
+                "run_id": run_id,
+                "logged_model_id": logged_model_id,
+                "model_uri": model_uri,
+            },
+            f,
+            indent=2,
+        )
 
 
 def read_train_receipt(cfg: DictConfig) -> dict[str, Any]:
@@ -546,6 +565,51 @@ def set_registered_model_description(name: str, description: str) -> None:
     mlflow.tracking.MlflowClient().update_registered_model(
         name=name, description=description
     )
+
+
+def find_dangling_receipts(
+    reports_dir: Path, tracking_uri: str, registered_model_name: str
+) -> list[str]:
+    """Resolve every reports/*_receipt.json's identifiers against tracking_uri;
+    return one message per identifier that fails to resolve.
+
+    Catches "DVC cache intact, MLflow gone": `dvc repro` trusts a receipt's
+    presence and content hash alone, so it reports every stage cached and
+    skips re-running even when the tracking store behind those receipts has
+    been recreated from scratch (e.g. `docker compose down -v`) — silent
+    until something downstream actually tries to load the run or model the
+    receipt points at. Not wired to a Makefile target yet (that is Phase 8's
+    tooling section); this is the reusable check such a target would call.
+
+    Every receipt shape in this module is covered generically rather than by
+    a per-file case: any key ending in "run_id" is resolved via get_run,
+    "logged_model_id" via get_logged_model, "model_version" via
+    get_model_version(registered_model_name, ...). ingest_receipt.json and
+    validation_receipt.json carry neither — nothing to resolve, not a
+    dangling reference — so they are silently skipped rather than flagged.
+    """
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+    offenders: list[str] = []
+    for receipt_path in sorted(reports_dir.glob("*_receipt.json")):
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        for key, value in payload.items():
+            if not value:
+                continue
+            try:
+                if key == "logged_model_id":
+                    client.get_logged_model(str(value))
+                elif key == "model_version":
+                    client.get_model_version(registered_model_name, str(value))
+                elif key.endswith("run_id"):
+                    client.get_run(str(value))
+                else:
+                    continue
+            except MlflowException as exc:
+                offenders.append(
+                    f"{receipt_path.name}: {key}={value!r} unresolvable "
+                    f"({exc.error_code})"
+                )
+    return offenders
 
 
 def set_logged_model_description(model_id: str, description: str) -> None:

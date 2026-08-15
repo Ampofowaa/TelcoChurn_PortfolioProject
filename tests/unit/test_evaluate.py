@@ -23,6 +23,7 @@ from telco_churn.models.economics import capacity_budget_check
 from telco_churn.models.evaluate import (
     build_gate_inputs,
     comparative_deltas,
+    flatten_metrics_summary,
     resolve_incumbent_summary,
     sealed_test_business_impact,
     sealed_test_calibration_report,
@@ -99,7 +100,7 @@ def y_proba_fixture() -> tuple[pd.Series, np.ndarray]:
 
 @pytest.fixture
 def policy_fixture() -> DictConfig:
-    """Same shape as configs/policy/threshold.yaml's `scenarios` block."""
+    """Same shape as reports/policy/threshold.yaml's `scenarios` block."""
     return OmegaConf.create(
         {
             "scenarios": {
@@ -1338,6 +1339,111 @@ def test_promotion_decision_cold_start_gate_fails_below_pr_auc_bar(
     )
     assert result["gate"] == "fail"
     assert result["criteria"]["pr_auc"]["passed"] is False
+
+
+# ---------------------------------------------------------------------------
+# flatten_metrics_summary
+# ---------------------------------------------------------------------------
+
+
+def _metrics_payload_fixture() -> dict[str, Any]:
+    return {
+        "model_version": "3",
+        "run_id": "run-abc",
+        "champion_version": "2",
+        "ranking": {"pr_auc": 0.65, "pr_auc_ci_lower": 0.60, "pr_auc_ci_upper": 0.70},
+        "classification": [
+            {
+                "scenario": "base",
+                "recall": 0.70,
+                "recall_ci_lower": 0.64,
+                "recall_ci_upper": 0.76,
+            },
+        ],
+        "calibration": {
+            "brier": 0.15,
+            "bss": 0.30,
+            "calibration_slope": {
+                "slope": 1.02,
+                "slope_ci_lower": 0.90,
+                "slope_ci_upper": 1.15,
+            },
+        },
+        "business_impact": {"scenarios": {"base": {"ev": 12.5}}},
+        "sliced": {
+            "test": {
+                "equal_opportunity_diff": 0.04,
+                "demographic_parity_diff": 0.06,
+            },
+        },
+    }
+
+
+def _decision_payload_fixture(regime: str) -> dict[str, Any]:
+    criteria: dict[str, Any] = {
+        "pr_auc": {"passed": True},
+        "recall": {"passed": True},
+        "brier": {"passed": True},
+        "calibration_slope": {"passed": True},
+    }
+    if regime == "comparative":
+        criteria["pr_auc"].update(delta_obs=0.02, delta_ci=[0.01, 0.03])
+        criteria["recall"].update(delta_obs=0.01, delta_ci=[-0.01, 0.03])
+        criteria["brier"].update(delta_obs=-0.01, delta_ci=[-0.02, 0.00])
+    return {
+        "regime": regime,
+        "gate": "pass",
+        "criteria": criteria,
+        "eval_run_id": "eval-run-xyz",
+    }
+
+
+def test_flatten_metrics_summary_cold_start_omits_delta_keys() -> None:
+    """Cold start has no incumbent to delta against — the comparative-only
+    keys must be entirely absent, not present-and-null."""
+    summary = flatten_metrics_summary(
+        _metrics_payload_fixture(), _decision_payload_fixture("cold_start"), "hash-a"
+    )
+    for key in (
+        "pr_auc_delta_obs",
+        "recall_delta_obs",
+        "brier_delta_obs",
+    ):
+        assert key not in summary
+    assert summary["model_version"] == "3"
+    assert summary["eval_run_id"] == "eval-run-xyz"
+    assert summary["champion_version"] == "2"
+    assert summary["regime"] == "cold_start"
+    assert summary["gate"] == "pass"
+    assert summary["costs_config_hash"] == "hash-a"
+    assert summary["test_pr_auc"] == 0.65
+    assert summary["test_pr_auc_ci_lower"] == 0.60
+    assert summary["test_pr_auc_ci_upper"] == 0.70
+    assert summary["test_recall"] == 0.70
+    assert summary["test_recall_ci_lower"] == 0.64
+    assert summary["test_recall_ci_upper"] == 0.76
+    assert summary["test_brier"] == 0.15
+    assert summary["test_bss"] == 0.30
+    assert summary["test_calibration_slope"] == 1.02
+    assert summary["test_calibration_slope_ci_lower"] == 0.90
+    assert summary["test_calibration_slope_ci_upper"] == 1.15
+    assert summary["test_ev_base"] == 12.5
+    assert summary["test_equal_opportunity_diff"] == 0.04
+    assert summary["test_demographic_parity_diff"] == 0.06
+
+
+def test_flatten_metrics_summary_comparative_includes_deltas() -> None:
+    """Comparative regime threads gate.py's own paired-bootstrap deltas through verbatim."""
+    decision_payload = _decision_payload_fixture("comparative")
+    summary = flatten_metrics_summary(
+        _metrics_payload_fixture(), decision_payload, "hash-b"
+    )
+    assert summary["regime"] == "comparative"
+    for criterion in ("pr_auc", "recall", "brier"):
+        entry = decision_payload["criteria"][criterion]
+        assert summary[f"{criterion}_delta_obs"] == entry["delta_obs"]
+        assert summary[f"{criterion}_delta_ci_lower"] == entry["delta_ci"][0]
+        assert summary[f"{criterion}_delta_ci_upper"] == entry["delta_ci"][1]
 
 
 # ---------------------------------------------------------------------------

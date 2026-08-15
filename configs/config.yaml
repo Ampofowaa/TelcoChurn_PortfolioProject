@@ -62,7 +62,13 @@ paths:
   feature_discovery_reports: ${paths.reports}/feature_discovery
   validation_reports: ${paths.reports}/validation
   figures: ${paths.reports}/figures
-  policy: configs/policy
+  plots: ${paths.reports}/plots
+  # Generated (threshold.py writes it, OmegaConf.save), not authored — lives
+  # under reports/, not configs/, so it's physically distinct from hand-edited
+  # Hydra configs even though downstream code (policy_config.py) loads it back
+  # as configuration. Prevents a hand-edit here from being silently clobbered
+  # by the next `threshold` stage run.
+  policy: ${paths.reports}/policy
   costs_config: configs/costs.yaml
   model_promotion_config: configs/model_promotion.yaml
 

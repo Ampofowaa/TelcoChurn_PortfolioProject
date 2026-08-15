@@ -422,6 +422,98 @@ def test_study_name_changes_when_search_space_changes(
     assert name_a != name_b
 
 
+def test_study_name_changes_when_metric_or_sampling_config_changes(
+    tuning_cfg: DictConfig, tmp_path: Path
+) -> None:
+    """A metric, direction, sampler_seed, or n_startup_trials edit each mints
+    a new study name.
+
+    Regression test for the study-key completeness gap: none of these four
+    fields were part of config_digest before, so editing any of them (e.g. a
+    maximize/minimize flip) silently resumed the old study and pooled trials
+    whose stored values meant something different under the new config into
+    the same 1-SE selection pool — worse than incomparable for a direction
+    flip, since trials good under "maximize" would read as bad under
+    "minimize" and vice versa.
+    """
+    features_dir = tmp_path / "features"
+    features_dir.mkdir()
+    (features_dir / "telco_churn_features.parquet").write_bytes(b"content")
+    committed_features = ["tenure", "monthlycharges"]
+
+    edits = {
+        "metric": "roc_auc",
+        "direction": "minimize",
+        "sampler_seed": 7,
+        "n_startup_trials": 5,
+    }
+
+    try:
+        activate_config(
+            OmegaConf.create({"paths": {"processed_data": str(features_dir)}})
+        )
+        base_name = tuning._study_name(tuning_cfg, committed_features)
+        for key, new_value in edits.items():
+            variant_cfg = tuning_cfg.copy()
+            variant_cfg.tuning[key] = new_value
+            variant_name = tuning._study_name(variant_cfg, committed_features)
+            assert (
+                variant_name != base_name
+            ), f"{key} edit did not change the study name"
+    finally:
+        reset_active_config()
+
+
+# ---------------------------------------------------------------------------
+# _discard_incomplete_study_unless_resuming (C1)
+# ---------------------------------------------------------------------------
+
+
+def test_discard_incomplete_study_deletes_when_not_resuming() -> None:
+    """An incomplete same-named study is deleted when resume is False."""
+    storage = optuna.storages.InMemoryStorage()
+    optuna.create_study(study_name="s", storage=storage, direction="maximize")
+    tuning._discard_incomplete_study_unless_resuming(
+        storage, "s", n_trials_requested=3, resume=False
+    )
+    with pytest.raises(KeyError):
+        optuna.load_study(study_name="s", storage=storage)
+
+
+def test_discard_incomplete_study_keeps_when_resuming() -> None:
+    """An incomplete same-named study survives when resume is explicitly True."""
+    storage = optuna.storages.InMemoryStorage()
+    optuna.create_study(study_name="s", storage=storage, direction="maximize")
+    tuning._discard_incomplete_study_unless_resuming(
+        storage, "s", n_trials_requested=3, resume=True
+    )
+    optuna.load_study(study_name="s", storage=storage)  # does not raise
+
+
+def test_discard_incomplete_study_keeps_complete_study_regardless_of_resume() -> None:
+    """A study that already reached n_trials_requested is never deleted —
+    that's a cache hit, not a resume decision."""
+    storage = optuna.storages.InMemoryStorage()
+    study = optuna.create_study(study_name="s", storage=storage, direction="maximize")
+    for _ in range(3):
+        study.add_trial(
+            optuna.trial.create_trial(value=0.5, params={}, distributions={})
+        )
+    tuning._discard_incomplete_study_unless_resuming(
+        storage, "s", n_trials_requested=3, resume=False
+    )
+    reloaded = optuna.load_study(study_name="s", storage=storage)
+    assert len(reloaded.trials) == 3
+
+
+def test_discard_incomplete_study_no_op_when_study_absent() -> None:
+    """No study under that name yet — nothing to discard, nothing raised."""
+    storage = optuna.storages.InMemoryStorage()
+    tuning._discard_incomplete_study_unless_resuming(
+        storage, "missing", n_trials_requested=3, resume=False
+    )
+
+
 # ---------------------------------------------------------------------------
 # run_tuning_step (C1) — end-to-end smoke test on a tiny synthetic study
 # ---------------------------------------------------------------------------
@@ -468,6 +560,8 @@ def tuning_cfg() -> DictConfig:
             "tuning": {
                 "n_trials": 3,
                 "direction": "maximize",
+                "metric": "average_precision",
+                "resume": False,
                 "cv_folds": 2,
                 "random_state": 42,
                 "n_estimators_ceiling": 50,
@@ -970,6 +1064,107 @@ def test_run_tuning_step_is_idempotent_against_completed_study(
         == tuning_cfg.tuning.n_trials
     )
     assert second["n_completed_trials"] == first["n_completed_trials"]
+    assert first["tuning_summary"]["n_trials_reused"] == 0
+    assert (
+        first["tuning_summary"]["n_trials_run_this_invocation"]
+        == tuning_cfg.tuning.n_trials
+    )
+    assert second["tuning_summary"]["n_trials_reused"] == tuning_cfg.tuning.n_trials
+    assert second["tuning_summary"]["n_trials_run_this_invocation"] == 0
+
+
+def test_run_tuning_step_uses_different_study_for_different_data_content_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """Two invocations under different data_content_hash values mint two
+    independent studies rather than one resuming the other's trials — the
+    regression this project's retired _dvc_hash silently permitted (see
+    _study_name's docstring).
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+    storage = optuna.storages.InMemoryStorage()
+
+    monkeypatch.setattr(tuning, "features_sha256", lambda path=None: "a" * 64)
+    first = tuning.run_tuning_step(
+        X_dev, y_dev, committed_features, tuning_cfg, storage=storage
+    )
+
+    monkeypatch.setattr(tuning, "features_sha256", lambda path=None: "b" * 64)
+    second = tuning.run_tuning_step(
+        X_dev, y_dev, committed_features, tuning_cfg, storage=storage
+    )
+
+    client = mlflow.tracking.MlflowClient()
+    first_study_name = client.get_run(first["parent_run_id"]).data.params[
+        "optuna_study_name"
+    ]
+    second_study_name = client.get_run(second["parent_run_id"]).data.params[
+        "optuna_study_name"
+    ]
+    assert first_study_name != second_study_name
+    assert first["tuning_summary"]["n_trials_reused"] == 0
+    assert second["tuning_summary"]["n_trials_reused"] == 0
+
+
+def test_run_tuning_step_discards_incomplete_study_by_default(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """A same-named incomplete study left by a prior invocation is discarded,
+    not resumed, when tuning.resume is left at its default (False) — starting
+    fresh trials rather than risking a stale sampler/pruner mid-state.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+    storage = optuna.storages.InMemoryStorage()
+
+    tuning_cfg.tuning.n_trials = 1
+    tuning.run_tuning_step(
+        X_dev, y_dev, committed_features, tuning_cfg, storage=storage
+    )
+
+    tuning_cfg.tuning.n_trials = 3  # n_trials isn't part of the study-name hash
+    second = tuning.run_tuning_step(
+        X_dev, y_dev, committed_features, tuning_cfg, storage=storage
+    )
+
+    assert second["tuning_summary"]["n_trials_reused"] == 0
+    assert second["tuning_summary"]["n_trials_run_this_invocation"] == 3
+
+
+def test_run_tuning_step_resumes_incomplete_study_when_resume_true(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """tuning.resume=true explicitly opts into continuing a same-named
+    incomplete study instead of discarding it.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+    storage = optuna.storages.InMemoryStorage()
+
+    tuning_cfg.tuning.n_trials = 1
+    tuning.run_tuning_step(
+        X_dev, y_dev, committed_features, tuning_cfg, storage=storage
+    )
+
+    tuning_cfg.tuning.n_trials = 3
+    tuning_cfg.tuning.resume = True
+    second = tuning.run_tuning_step(
+        X_dev, y_dev, committed_features, tuning_cfg, storage=storage
+    )
+
+    assert second["tuning_summary"]["n_trials_reused"] == 1
+    assert second["tuning_summary"]["n_trials_run_this_invocation"] == 2
 
 
 def test_run_tuning_step_logs_dev_input_once_on_parent_run(

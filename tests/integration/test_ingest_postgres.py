@@ -1,5 +1,6 @@
 """Integration tests: CSV → Postgres ingest via testcontainers."""
 
+import json
 import os
 import subprocess
 import sys
@@ -59,9 +60,10 @@ def sample_csv(tmp_path: Path) -> Path:
 
 
 def test_ingest_row_count(pg_engine: Engine, sample_csv: Path) -> None:
-    """ingest() returns the correct row count."""
-    n = ingest(sample_csv, pg_engine)
-    assert n == 5
+    """ingest() returns an IngestReceipt carrying the correct row count."""
+    receipt = ingest(sample_csv, pg_engine)
+    assert receipt.rows_loaded == 5
+    assert receipt.csv_rows == 5
 
 
 def test_ingest_persists_to_db(pg_engine: Engine, sample_csv: Path) -> None:
@@ -195,6 +197,11 @@ def test_ingest_main_cli_exits_zero(
     with pg_engine.connect() as conn:
         count = conn.execute(text("SELECT COUNT(*) FROM customers_raw")).scalar()
     assert count == 5
+    receipt_path = _PROJECT_ROOT / "reports" / "ingest_receipt.json"
+    assert receipt_path.exists()
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["rows_loaded"] == 5
+    assert receipt["csv_rows"] == 5
 
 
 def test_ingest_main_cli_exits_one_on_missing_csv(pg_url: str, tmp_path: Path) -> None:

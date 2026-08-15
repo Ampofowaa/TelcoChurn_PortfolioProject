@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -86,6 +87,11 @@ def test_validate_main_exits_zero_on_valid_data(
     assert (
         result.returncode == 0
     ), f"validate CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    receipt_path = _PROJECT_ROOT / "reports" / "validation_receipt.json"
+    assert receipt_path.exists()
+    payload = json.loads(receipt_path.read_text())
+    assert "timestamp" not in payload
+    assert "frame_checksum" in payload
 
 
 def test_validate_main_exits_one_on_blocking_error(

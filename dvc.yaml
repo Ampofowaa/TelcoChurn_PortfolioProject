@@ -1,0 +1,249 @@
+stages:
+  ingest:
+    cmd: uv run python -m telco_churn.data.ingest
+    deps:
+      - src/telco_churn/data/ingest.py
+      - src/telco_churn/data/schema.py
+      - src/telco_churn/data/checks.py
+      - src/telco_churn/data/validate.py
+      - sql/schema/001_create_raw.sql
+      - datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv
+    params:
+      - configs/config.yaml:
+          - validation.min_rows
+          - validation.max_null_rate
+    outs:
+      - reports/ingest_receipt.json:
+          cache: false
+
+  validate:
+    cmd: uv run python -m telco_churn.data.validate
+    deps:
+      - src/telco_churn/data/validate.py
+      - src/telco_churn/data/checks.py
+      - src/telco_churn/data/schema.py
+      - reports/ingest_receipt.json
+    params:
+      - configs/config.yaml:
+          - validation.min_rows
+          - validation.max_null_rate
+    outs:
+      - reports/validation_receipt.json:
+          cache: false
+
+  split:
+    cmd: uv run python -m telco_churn.data.split
+    deps:
+      - src/telco_churn/data/split.py
+      - reports/validation_receipt.json
+    params:
+      - configs/config.yaml:
+          - random_seed
+          - training_setup.test_size
+    outs:
+      - datasets/processed/split_manifest.parquet
+
+  features:
+    cmd: uv run python -m telco_churn.features.build
+    deps:
+      - src/telco_churn/features/build.py
+      - src/telco_churn/features/sql_features.py
+      - src/telco_churn/features/schema.py
+      - src/telco_churn/features/accessor.py
+      - src/telco_churn/data/schema.py
+      - sql/features/
+      - reports/validation_receipt.json
+    outs:
+      - datasets/processed/telco_churn_features.parquet
+
+  train:
+    cmd: uv run python -m telco_churn.models.train
+    deps:
+      - src/telco_churn/models/train/
+      - src/telco_churn/models/diagnostics.py
+      - src/telco_churn/models/calibration_metrics.py
+      - src/telco_churn/features/select.py
+      - src/telco_churn/features/preprocessing.py
+      - src/telco_churn/features/schema.py
+      - src/telco_churn/features/generate.py
+      - src/telco_churn/features/accessor.py
+      - src/telco_churn/data/split.py
+      - src/telco_churn/data/schema.py
+      - src/telco_churn/utils/stats.py
+      - datasets/processed/split_manifest.parquet
+      - datasets/processed/telco_churn_features.parquet
+    params:
+      - configs/config.yaml:
+          - random_seed
+          - training_setup
+          - mlflow.registered_model_name
+      - configs/calibration/default.yaml:
+          - ece_n_bins
+          - ece_strategy
+      - configs/training/lightgbm.yaml:
+      - configs/training/logreg.yaml:
+      - configs/training/feature_selection.yaml:
+      - configs/tuning/optuna.yaml:
+    outs:
+      - reports/train_receipt.json:
+          cache: false
+
+  calibrate:
+    cmd: uv run python -m telco_churn.models.calibrate
+    deps:
+      - src/telco_churn/models/calibrate.py
+      - src/telco_churn/models/calibration_metrics.py
+      - src/telco_churn/models/artifacts.py
+      - src/telco_churn/models/shap_values.py
+      - src/telco_churn/models/explain.py
+      - src/telco_churn/models/dev_features.py
+      - src/telco_churn/data/split.py
+      - src/telco_churn/data/schema.py
+      - src/telco_churn/features/schema.py
+      - src/telco_churn/features/accessor.py
+      - src/telco_churn/utils/stats.py
+      - datasets/processed/split_manifest.parquet
+      - datasets/processed/telco_churn_features.parquet
+      - reports/train_receipt.json
+    params:
+      - configs/config.yaml:
+          - training_setup.delta_threshold
+          - mlflow.registered_model_name
+      - configs/calibration/default.yaml:
+          - method
+          - outer_cv_folds
+          - inner_cv_folds
+          - shuffle
+          - random_state
+          - brier_bootstrap_n_samples
+          - slope_bootstrap_n_samples
+          - ece_n_bins
+          - ece_strategy
+          - golden_n_rows
+          - override_trial_count_gate
+    outs:
+      - reports/calibrate_receipt.json:
+          cache: false
+
+  threshold:
+    cmd: uv run python -m telco_churn.models.threshold
+    deps:
+      - src/telco_churn/models/threshold.py
+      - src/telco_churn/models/diagnostics.py
+      - src/telco_churn/models/gate.py
+      - src/telco_churn/models/explain.py
+      - src/telco_churn/models/artifacts.py
+      - src/telco_churn/models/policy_config.py
+      - src/telco_churn/models/calibration_metrics.py
+      - src/telco_churn/models/dev_features.py
+      - src/telco_churn/features/preprocessing.py
+      - src/telco_churn/features/schema.py
+      - src/telco_churn/data/split.py
+      - src/telco_churn/data/schema.py
+      - src/telco_churn/features/accessor.py
+      - datasets/processed/split_manifest.parquet
+      - datasets/processed/telco_churn_features.parquet
+      - reports/calibrate_receipt.json
+    params:
+      - configs/config.yaml:
+          - mlflow.registered_model_name
+      - configs/threshold/default.yaml:
+          - random_state
+          - n_bootstrap
+          - v3_top_k_features
+          - v3_min_direction_magnitude
+      - configs/calibration/default.yaml:
+          - ece_n_bins
+          - ece_strategy
+      - configs/costs.yaml:
+      - configs/model_promotion.yaml:
+          - calibration_slope_band
+    metrics:
+      - reports/policy/threshold.yaml:
+          cache: false
+      - reports/dev_oof_diagnostics.json:
+          cache: false
+
+  evaluate:
+    cmd: uv run python -m telco_churn.models.evaluate
+    deps:
+      - src/telco_churn/models/evaluate.py
+      - src/telco_churn/models/gate.py
+      - src/telco_churn/models/diagnostics.py
+      - src/telco_churn/models/economics.py
+      - src/telco_churn/models/plots.py
+      - src/telco_churn/models/calibration_metrics.py
+      - src/telco_churn/models/artifacts.py
+      - src/telco_churn/models/policy_config.py
+      - src/telco_churn/utils/hashing.py
+      - src/telco_churn/data/split.py
+      - src/telco_churn/data/schema.py
+      - src/telco_churn/features/preprocessing.py
+      - src/telco_churn/features/schema.py
+      - src/telco_churn/features/accessor.py
+      - src/telco_churn/utils/stats.py
+      - datasets/processed/split_manifest.parquet
+      - datasets/processed/telco_churn_features.parquet
+      - reports/calibrate_receipt.json
+      - reports/policy/threshold.yaml
+    params:
+      - configs/config.yaml:
+          - training_setup.fixed_recall_thresholds
+          - mlflow.registered_model_name
+      - configs/evaluate/default.yaml:
+      - configs/calibration/default.yaml:
+          - ece_n_bins
+          - ece_strategy
+      - configs/costs.yaml:
+      - configs/model_promotion.yaml:
+    outs:
+      - reports/promotion_decision.json:
+          cache: false
+      - reports/eval_receipt.json:
+          cache: false
+      - reports/test_predictions.parquet
+    metrics:
+      - reports/metrics_summary.json:
+          cache: false
+    plots:
+      - reports/plots/decile_lift.csv:
+          cache: false
+          x: decile
+          y: cumulative_capture_rate
+          x_label: Decile
+          y_label: Cumulative capture rate
+          title: Decile Gains Chart
+
+  error_analysis:
+    cmd: uv run python -m telco_churn.models.error_analysis
+    deps:
+      - src/telco_churn/models/error_analysis.py
+      - src/telco_churn/models/explain.py
+      - src/telco_churn/models/shap_values.py
+      - src/telco_churn/models/artifacts.py
+      - src/telco_churn/models/policy_config.py
+      - src/telco_churn/models/gate.py
+      - src/telco_churn/features/accessor.py
+      - src/telco_churn/features/schema.py
+      - src/telco_churn/data/schema.py
+      - datasets/processed/telco_churn_features.parquet
+      - reports/calibrate_receipt.json
+      - reports/test_predictions.parquet
+      - reports/policy/threshold.yaml
+    params:
+      - configs/config.yaml:
+          - mlflow.registered_model_name
+      - configs/error_analysis/default.yaml:
+          - near_miss_band
+          - n_value_deciles
+          - min_cohort_support
+          - n_quantile_bins
+          - top_k_cohorts
+          - top_k_dependence_features
+          - top_k_cohort_gap_features
+          - top_k_cohort_gap_features_fp_tn
+          - n_local_explanation_examples
+          - local_explanation_top_k
+    outs:
+      - reports/error_analysis_receipt.json:
+          cache: false
