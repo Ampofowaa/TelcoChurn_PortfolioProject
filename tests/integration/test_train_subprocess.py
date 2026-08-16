@@ -182,15 +182,17 @@ def test_train_main_cli_exits_zero(tmp_path: Path) -> None:
     receipt = json.loads(
         (reports_dir / "train_receipt.json").read_text(encoding="utf-8")
     )
-    assert set(receipt) == {"run_id"}
+    assert set(receipt) == {"run_id", "logged_model_id", "model_uri"}
     assert receipt["run_id"]
+    assert receipt["logged_model_id"]
+    assert receipt["model_uri"]
 
 
 def test_train_main_cli_exits_one_when_processed_data_missing(tmp_path: Path) -> None:
     """train.py __main__ exits 1 when the processed CSV does not exist yet.
 
     The realistic failure mode of running `python -m telco_churn.models.train`
-    before `make features` / `make split`.
+    before `dvc repro features` / `dvc repro split`.
     """
     empty_dir = tmp_path / "empty"
     empty_dir.mkdir()

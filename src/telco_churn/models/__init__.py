@@ -6,14 +6,16 @@ comparison.py (notebook-only) and feature_audit.py -> tuning.py ->
 log_model.py each take the prior step's return value as an argument, share
 one dev-data snapshot, and (tuning.py/log_model.py) even share one MLflow
 run; there is no standalone use for a hyperparameter search that never gets
-fit, so they run behind one `__main__.py` and one `make train`. Every other
-module here (calibrate.py, threshold.py, evaluate.py, error_analysis.py,
+fit, so they run behind one `__main__.py` and one `dvc repro train`. Every
+other module here (calibrate.py, threshold.py, evaluate.py, error_analysis.py,
 review.py, register.py) is independently invocable because its reason to
 run is external to the step before it — a costs.yaml edit (threshold.py), a
 recalibration with no retrain (calibrate.py), a human review on human time
 (review.py), a human approval decision on human time (register.py) — so
-each gets its own CLI entry point, `make` target, and (Phase 8) DVC stage
-where applicable (review.py and register.py mutate the registry and are
+each gets its own CLI entry point and DVC stage where applicable, plus a
+`make` target for calibrate.py/threshold.py/evaluate.py/error_analysis.py's
+RUN_ID/MODEL_VERSION overrides and for review.py/register.py, which have no
+DVC stage at all (review.py and register.py mutate the registry and are
 excluded from the DVC DAG — see register.py's own docstring), addressed by
 an explicit run_id/model_version rather than "whatever train just
 produced."

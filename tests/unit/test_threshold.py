@@ -480,7 +480,7 @@ def full_cfg(
 
     paths.figures/paths.policy point at an absolute tmp_path — get_project_root()
     joined with an absolute path resolves to that absolute path, sandboxing
-    every write away from the real reports/figures/ and configs/policy/.
+    every write away from the real reports/figures/ and reports/policy/.
 
     paths.costs_config points at a real (placeholder) file rather than the
     real configs/costs.yaml: load_costs_config() is monkeypatched per-test to
@@ -944,7 +944,7 @@ def test_run_threshold_step_writes_policy_file(
     costs_cfg: OmegaConf,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """configs/policy/threshold.yaml (sandboxed to tmp_path here) mirrors the
+    """reports/policy/threshold.yaml (sandboxed to tmp_path here) mirrors the
     policy-only half — no model stamp, since t* is a pure function of
     configs/costs.yaml and must not go stale across a rollback.
     """
@@ -1110,6 +1110,9 @@ def test_run_threshold_step_screens_dev_oof_slope_and_writes_reports(
         _assert_dev_oof_report_shapes(frame, diagnostics, dev_split)
         run = client.get_run(run_id)
         assert run.data.tags["dev_oof_screen_result"] == "fail"
+        assert run.data.tags["costs_config_hash"] == threshold.costs_config_hash(
+            Path(str(full_cfg.paths.costs_config))
+        )
         return
 
     reports_dir = Path(str(full_cfg.paths.reports))
@@ -1136,6 +1139,10 @@ def test_run_threshold_step_screens_dev_oof_slope_and_writes_reports(
     assert (run.data.tags["dev_oof_screen_result"] == "pass") == result[
         "dev_oof_screen_passed"
     ]
+    assert (
+        run.data.tags["costs_config_hash"]
+        == result["policy_payload"]["costs_config_hash"]
+    )
 
     artifact_paths = {a.path for a in client.list_artifacts(run_id, "threshold")}
     assert "threshold/dev_oof_diagnostics.json" in artifact_paths

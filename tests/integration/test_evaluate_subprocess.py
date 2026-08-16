@@ -55,6 +55,7 @@ import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import make_split, partition, write_split
 from telco_churn.features.accessor import FEATURES_FILENAME
+from telco_churn.models.policy_config import costs_config_hash
 from telco_churn.utils.paths import (
     activate_config,
     compose_config,
@@ -448,6 +449,34 @@ def test_evaluate_main_cli_exits_zero_and_writes_reports(
         "logged_model_id",
     }
     assert len(test_predictions) > 0
+
+    metrics_summary = json.loads(
+        (reports_dir / "metrics_summary.json").read_text(encoding="utf-8")
+    )
+    assert metrics_summary["regime"] == "cold_start"
+    assert metrics_summary["gate"] == decision["gate"]
+    assert metrics_summary["eval_run_id"] == decision["eval_run_id"]
+    # Cold start has no incumbent to delta against — the comparative-only
+    # keys must be entirely absent, not present-and-null.
+    for key in ("pr_auc_delta_obs", "recall_delta_obs", "brier_delta_obs"):
+        assert key not in metrics_summary
+    for key in (
+        "test_pr_auc",
+        "test_recall",
+        "test_brier",
+        "test_bss",
+        "test_calibration_slope",
+        "test_ev_base",
+        "test_equal_opportunity_diff",
+        "test_demographic_parity_diff",
+    ):
+        assert key in metrics_summary
+    assert metrics_summary["costs_config_hash"] == costs_config_hash(
+        Path(str(registered_evaluation_model["costs_path"]))
+    )
+
+    decile_lift = pd.read_csv(reports_dir / "plots" / "decile_lift.csv")
+    assert len(decile_lift) == 10
 
     # Written by threshold.py's folded-in dev-OOF screen (customerid, y_true,
     # p_hat — no re-logged segment columns, since nothing downstream needs

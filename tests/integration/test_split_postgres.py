@@ -120,7 +120,7 @@ def test_split_main_cli_exits_one_when_customers_raw_missing(tmp_path: Path) -> 
     """split.py __main__ exits 1 when customers_raw does not exist yet.
 
     Uses a fresh, unseeded container (ingest never ran) — the realistic failure
-    mode of running `make split` before `make ingest`. pd.read_sql_table raises
+    mode of running `dvc repro split` before `dvc repro ingest`. pd.read_sql_table raises
     ValueError when the table is absent, caught by split.py's ValueError branch,
     so no manifest is written.
     """

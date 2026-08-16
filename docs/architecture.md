@@ -2,7 +2,7 @@
 
 > **What each view is for:** System Architecture is the tool-level infrastructure flow, ingest to monitoring; ML Workflow is the modelling lifecycle and its feedback loops; Data Flow is the artifacts moving through ingestion into training; MLflow Layout is the run/registry structure one training cycle builds up inside MLflow.
 >
-> Ingestion through champion promotion (Phases 1–7) is implemented, verified against the code that produces it; everything past that (Phases 8–14) is target only. The System Architecture diagram below is the one view spanning both ranges — everything through Model Registry is built, Serving onward is not. The ML Workflow diagram stays entirely within the built range: its first feedback loop (Error Analysis 1 → Feature Engineering) is an iteration within a single training cycle, not an Orchestration concern; its other two (Business Review → Calibration/Threshold or Feature Engineering) are the triggers Orchestration (Phase 10) will eventually automate — for now they're manual. The Data Flow and MLflow Layout diagrams also stay entirely within the built range — keep them in sync whenever the underlying modules change shape.
+> Ingestion through the DVC pipeline wrap (Phases 1–8) is implemented, verified against the code that produces it; everything past that (Phases 9–14) is target only. The System Architecture diagram below is the one view spanning both ranges — everything through Model Registry is built, Serving onward is not. The ML Workflow diagram stays entirely within the built range: its first feedback loop (Error Analysis 1 → Feature Engineering) is an iteration within a single training cycle, not an Orchestration concern; its other two (Business Review → Calibration/Threshold or Feature Engineering) are the triggers Orchestration (Phase 10) will eventually automate — for now they're manual. The Data Flow and MLflow Layout diagrams also stay entirely within the built range — keep them in sync whenever the underlying modules change shape.
 
 ## System Architecture
 
@@ -11,14 +11,16 @@ The tool-level view: what infrastructure or library sits at each step, from raw 
 ```mermaid
 flowchart TD
     A["Raw CSV\nIBM Telco Dataset"] -->|ingest| B[("Data Ingestion (Phase 1)\nPostgres 16 + SQLAlchemy\ncustomers_raw")]
-    subgraph DVC["DVC (Phase 8) — reproducible pipeline"]
+    subgraph DVC["DVC (Phase 8) — reproducible pipeline: ingest through error analysis"]
         B -->|validate| C["Data Validation (Phase 2)\nPandera — 5 Quality Gates"]
         C -->|"feature engineering"| D["Feature Engineering (Phase 4)\nSQL Views + ColumnTransformer"]
         D -->|train| E["Model Training (Phase 5)\nLightGBM + Optuna + MLflow"]
+        E -->|calibrate| F1["Calibration (Phase 6)\nCalibratedClassifierCV — fit + log only"]
+        F2["Threshold (Phase 6)\ncost matrix → t*"] -->|"evaluate + gate"| G["Sealed-Test Evaluation +\nError Analysis (Phase 7)\nCustom gate (gate.py) + SHAP"]
     end
-    E -->|"calibrate + threshold"| F["Calibration + Threshold (Phase 6)\nCalibratedClassifierCV + cost matrix\n→ candidate (challenger)"]
-    F -->|"evaluate + gate"| G["Sealed-Test Evaluation +\nError Analysis (Phase 7)\nCustom gate (gate.py) + SHAP"]
-    G -->|"promote (pass) /\nreject (fail)"| H["Model Registry (Phase 7)\nMLflow — champion / challenger"]
+    F1 -->|"register-challenger\n(register.py — outside the DAG,\na registry alias isn't a file)"| RC[("Register Challenger\nMLflow registry, tagged pending")]
+    RC -->|threshold| F2
+    G -->|"review + promote (pass) /\nreject (fail)"| H["Model Registry (Phase 7)\nreview.py + register.py\nMLflow — champion / challenger"]
     subgraph CICD["CI/CD (Phase 11) & AWS Deployment (Phase 12)\nbuild, test, deploy"]
         H -->|serve| I["Serving (Phase 9)\nFastAPI + uvicorn — /predict"]
         I -->|UI| J["Demo UI (Phase 9)\nStreamlit"]
@@ -29,7 +31,7 @@ flowchart TD
     M -->|re-runs| D
 ```
 
-DVC's real boundary is tighter than the box above implies: it also covers Sealed-Test Evaluation (G) — `train → evaluate` is fully DVC-tracked — but deliberately excludes Calibration + Threshold (F) and Model Registry promotion (H). Both are decision steps on mutable state (a held-out calibration fold; the live `champion` alias) rather than deterministic data transforms, so keeping them out of `dvc repro` is by design, not oversight — folding them in would make reruns non-deterministic.
+DVC's real boundary spans the whole pipeline drawn inside the subgraph above, **including Calibration (F1) and Threshold (F2)** — both are deterministic, DVC-tracked stages (`dvc.yaml`'s `calibrate`/`threshold`), not decision steps DVC opts out of. What DVC genuinely cannot express is the registry mutation itself: minting the challenger version (`Register Challenger`) and the final promote/reject (`Model Registry`) are both registry writes, and a registry alias is not a file DVC's dependency graph can hash — that is the actual boundary. It is also why `dvc repro` runs in two calls per cycle, not one: `dvc repro calibrate` reproduces everything up to and including Calibration, then `register-challenger` mints a version, then `dvc repro error_analysis` carries Threshold through Error Analysis — Threshold structurally cannot run before a version exists for it to resolve.
 
 ## ML Workflow — a loop, not a straight line
 
@@ -44,12 +46,14 @@ flowchart TD
     E --> F["Error Analysis 1 — generative\nblind-spot profiling on baseline FNs"]
     F -.->|"hypothesis-driven\nfeatures back to FE"| D
     F --> G[Hyperparameter Tuning — Optuna]
-    G --> H[Calibration + Threshold]
-    H --> I[Sealed Test Evaluation]
+    G --> H1[Calibration]
+    H1 --> RC["Register Challenger\n(register.py — outside the DAG)"]
+    RC --> H2[Threshold]
+    H2 --> I[Sealed Test Evaluation]
     I --> J["Error Analysis 2 — confirmatory\nSHAP + FN/FP profiling of final model"]
     J --> K[Business Review]
-    K --> L["Champion Promotion\nregister.py: gate pass → alias flip;\nfail → rejected, alias unchanged"]
-    K -.->|"cost assumptions\nrevised"| H
+    K --> L["Champion Promotion\nreview.py + register.py: gate pass +\napproved → alias flip; fail → rejected, alias unchanged"]
+    K -.->|"cost assumptions\nrevised"| H2
     K -.->|"drift or\nnew data"| D
 ```
 
@@ -62,14 +66,16 @@ This shows *artifacts* — what each stage actually reads and writes, and which 
 ```mermaid
 flowchart TD
     A["Raw CSV\ndatasets/raw/ — read-only,\nsource of truth"] -->|ingest.py| B[("Postgres\ncustomers_raw")]
-    B -->|"validate.py\nreports only — nothing\ndownstream depends on this yet"| V["Pandera\n5 Quality Gates"]
+    B -->|validate.py| V["Pandera\n5 Quality Gates"]
+    V -.->|"reports/validation_receipt.json\nDVC dep — invalidation edge only,\nneither stage reads its contents"| C
+    V -.->|"reports/validation_receipt.json"| D
     B -->|"split.py\nre-validates inline, then\nreads only (customerid, churn)"| C["split_manifest.parquet\ncustomerid → dev/test label\n(no features, no churn column)"]
-    B -->|"features/build.py\nSQL views, ALL 7,043 customers,\nno validation call"| D["telco_churn_processed.csv\nfull engineered feature set,\ndev + test not yet separated"]
+    B -->|"features/build.py\nSQL views, ALL 7,043 customers,\nno validation call"| D["telco_churn_features.parquet\nfull engineered feature set,\ndev + test not yet separated"]
     C --> E["models/train/\nfile-only for training data —\nmerges by customerid, keeps dev rows"]
     D --> E
 ```
 
-`V` is a dead end by design, for now: `split.py` and `features/build.py` both read straight from `customers_raw`, independent of whether `validate.py` ran — there's no DVC DAG (Phase 8) yet enforcing "validate must pass first," just documented intent. `models/train/` isn't fully DB-free either — `tuning.py` opens its own Postgres connection for Optuna's crash-resilient trial storage (a separate schema, same server as MLflow's backend); only the *training data* (features + split labels) is file-only.
+`V` is no longer a dead end as of Phase 8: `split.py` and `features/build.py` both still read their actual data straight from `customers_raw` (`validate.py`'s job is quality gating, not producing a queryable artifact), but `dvc.yaml`'s DAG now makes both stages `dep` on `reports/validation_receipt.json` as an invalidation edge — a failing gate exits 1 before either stage runs, and DVC will not consider `split`/`features` up to date without a passing validation behind them. This is DVC-enforced, not just documented intent. `models/train/` isn't fully DB-free either — `tuning.py` opens its own Postgres connection for Optuna's crash-resilient trial storage (a separate schema, same server as MLflow's backend); only the *training data* (features + split labels) is file-only.
 
 ## MLflow Layout — Training Through Promotion (Phases 5–7)
 

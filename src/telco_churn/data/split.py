@@ -105,7 +105,7 @@ def load_split(path: Path | None = None) -> pd.DataFrame:
     resolved = path if path is not None else _default_manifest_path()
     if not resolved.exists():
         raise FileNotFoundError(
-            f"Split manifest not found at {resolved}. Run `make split` first."
+            f"Split manifest not found at {resolved}. Run `dvc repro split` first."
         )
     return pd.read_parquet(resolved)
 
@@ -171,7 +171,6 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     from sqlalchemy.exc import SQLAlchemyError
 
-    from telco_churn.data.validate import ValidationError, validate_raw
     from telco_churn.utils.db import get_engine
     from telco_churn.utils.logging import configure_logging
     from telco_churn.utils.paths import activate_config, compose_config
@@ -185,12 +184,6 @@ if __name__ == "__main__":
     try:
         engine = get_engine()
         df = pd.read_sql_table(_RAW_TABLE, engine)
-        validate_raw(
-            df,
-            strict=True,
-            min_rows=int(cfg.validation.min_rows),
-            max_null_rate=float(cfg.validation.max_null_rate),
-        )
         manifest = make_split(
             ids=df["customerid"],
             labels=df["churn"],
@@ -212,13 +205,6 @@ if __name__ == "__main__":
         sys.exit(1)
     except ValueError as e:
         logger.error("split_invalid", error=str(e), exc_info=True)
-        sys.exit(1)
-    except ValidationError as e:
-        logger.error(
-            "split_blocked_by_validation",
-            errors=len(e.result.errors),
-            exc_info=True,
-        )
         sys.exit(1)
     except SQLAlchemyError as e:
         logger.error("split_db_error", error=str(e), exc_info=True)

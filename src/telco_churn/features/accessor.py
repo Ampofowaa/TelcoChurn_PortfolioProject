@@ -1,8 +1,8 @@
 """Single accessor for the processed features table — path, format, and content hash.
 
 Reads telco_churn_features.parquet, written by features/build.py's __main__
-(`make features`) — the file Phase 8's dvc.yaml will declare as the `features`
-stage's output once that wiring lands. Every consumer (train/common.py,
+(`dvc repro features`) — the file dvc.yaml declares as the `features` stage's
+output. Every consumer (train/common.py,
 calibrate.py, evaluate.py, threshold.py) reads through load_features() rather
 than constructing the path/format inline, so a future format change is a
 one-function edit instead of a rewrite across modules.

@@ -1,0 +1,40 @@
+{
+  "regime": "cold_start",
+  "gate": "pass",
+  "criteria": {
+    "pr_auc": {
+      "role": "selection",
+      "passed": true,
+      "value": 0.6701124581948501,
+      "bar": 0.6
+    },
+    "recall": {
+      "role": "guardrail",
+      "passed": true,
+      "value": 0.6978609625668449,
+      "bar": 0.65
+    },
+    "brier_skill_score": {
+      "role": "guardrail",
+      "passed": true,
+      "value": 0.30097921445513076,
+      "bar": 0.0
+    },
+    "calibration_slope": {
+      "role": "guardrail",
+      "passed": true,
+      "value": 0.9920540078451244,
+      "ci": [
+        0.8909209005081888,
+        1.0999736118349694
+      ],
+      "band": [
+        0.8,
+        1.25
+      ]
+    }
+  },
+  "model_version": "1",
+  "metrics_content_hash": "a45ecbcbf8d681a5fb686701e918500568ac23cf9094eeb637c671e514e67862",
+  "eval_run_id": "4a5fa93c18bb4f058276dbfc4a321175"
+}

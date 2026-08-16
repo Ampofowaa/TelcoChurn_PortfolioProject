@@ -405,7 +405,7 @@ def check_threshold_provenance(
     """Raise ValueError if the threshold's model stamp doesn't match the model being evaluated.
 
     threshold.py splits the derived threshold into a model-independent policy
-    file (configs/policy/threshold.yaml — a pure function of costs.yaml,
+    file (reports/policy/threshold.yaml — a pure function of costs.yaml,
     carrying no model stamp) and a model-dependent validation artifact
     (threshold_validation.json). "A re-calibration invalidates a previously-
     derived threshold" (threshold.py's own docstring) is aspirational until

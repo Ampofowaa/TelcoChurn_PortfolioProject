@@ -57,7 +57,7 @@ def load_costs_config(path: Path | None = None) -> DictConfig:
 def costs_config_hash(path: Path | None = None) -> str:
     """Return the sha256 content hash of configs/costs.yaml's resolved values.
 
-    Pins provenance for configs/policy/threshold.yaml, which is model-
+    Pins provenance for reports/policy/threshold.yaml, which is model-
     independent by construction (t* = c/(r × LTV) is a pure function of
     costs.yaml) and so carries no model stamp: same hash means the model
     changed, a different hash means the cost assumptions did. Hashes the
@@ -98,7 +98,7 @@ def expected_value_at_threshold(
 
 
 def load_policy_thresholds(cfg: DictConfig) -> DictConfig:
-    """Load configs/policy/threshold.yaml — the model-independent scenario thresholds.
+    """Load reports/policy/threshold.yaml — the model-independent scenario thresholds.
 
     Carries no model stamp by construction (t* = c/(r × LTV) is a pure
     function of cost parameters, never of the model). Lives here rather than
@@ -112,7 +112,7 @@ def load_policy_thresholds(cfg: DictConfig) -> DictConfig:
 
 
 def resolve_policy_scenarios(policy: DictConfig) -> dict[str, CostScenario]:
-    """Reconstruct each shipped scenario's CostScenario from configs/policy/threshold.yaml.
+    """Reconstruct each shipped scenario's CostScenario from reports/policy/threshold.yaml.
 
     Reads the already-resolved cost/LTV/ARPU values `run_threshold_step`
     persisted at derivation time, rather than recomputing ARPU quantiles from
@@ -132,7 +132,7 @@ def resolve_policy_scenarios(policy: DictConfig) -> dict[str, CostScenario]:
 
 
 def resolve_policy_thresholds_by_scenario(policy: DictConfig) -> dict[str, float]:
-    """{scenario_name: t*} from configs/policy/threshold.yaml."""
+    """{scenario_name: t*} from reports/policy/threshold.yaml."""
     return {
         str(name): float(entry.threshold) for name, entry in policy.scenarios.items()
     }

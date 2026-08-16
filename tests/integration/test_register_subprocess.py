@@ -59,6 +59,7 @@ import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.data.split import load_split, make_split, partition, write_split
 from telco_churn.features.accessor import FEATURES_FILENAME
+from telco_churn.models.policy_config import costs_config_hash
 from telco_churn.utils.paths import (
     activate_config,
     compose_config,
@@ -805,6 +806,27 @@ def test_evaluate_cli_comparative_regime_reads_champion_historical_predictions(
     # numbers are traceable to its own historical eval run, read via
     # load_incumbent_proba, never a live re-score of its fitted pipeline.
     assert incumbent["eval_run_id"] == champion_eval_run_id
+
+    metrics_summary = json.loads(
+        (reports_dir / "metrics_summary.json").read_text(encoding="utf-8")
+    )
+    assert metrics_summary["regime"] == "comparative"
+    assert metrics_summary["costs_config_hash"] == costs_config_hash(
+        Path(str(reviewed_model["costs_path"]))
+    )
+    for key in ("test_equal_opportunity_diff", "test_demographic_parity_diff"):
+        assert key in metrics_summary
+    for criterion in ("pr_auc", "recall", "brier"):
+        gate_criterion = decision["criteria"][criterion]
+        assert metrics_summary[f"{criterion}_delta_obs"] == pytest.approx(
+            gate_criterion["delta_obs"]
+        )
+        assert metrics_summary[f"{criterion}_delta_ci_lower"] == pytest.approx(
+            gate_criterion["delta_ci"][0]
+        )
+        assert metrics_summary[f"{criterion}_delta_ci_upper"] == pytest.approx(
+            gate_criterion["delta_ci"][1]
+        )
 
 
 def test_register_cli_refresh_reference_version_repoints_champion_tags(

@@ -1045,7 +1045,7 @@ def _build_governance_section(
             ),
             "maintainer": "Richlove Frimpong (see README.md § Author for contact)",
             "hyperparameters_and_provenance": (
-                "Full hyperparameters, git SHA, DVC data hash, and the "
+                "Full hyperparameters, git SHA, data content hash, and the "
                 "family-comparison paired-Δ are in training_manifest.json "
                 "on this run — not duplicated here."
             ),

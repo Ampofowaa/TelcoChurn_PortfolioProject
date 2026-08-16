@@ -154,7 +154,7 @@ def test_write_split_creates_parent_dirs(
 
 def test_load_split_missing_raises(tmp_path: Path) -> None:
     """Loading a nonexistent manifest fails loudly rather than returning empty."""
-    with pytest.raises(FileNotFoundError, match="Run `make split` first"):
+    with pytest.raises(FileNotFoundError, match="Run `dvc repro split` first"):
         load_split(tmp_path / "does_not_exist.parquet")
 
 

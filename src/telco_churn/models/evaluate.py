@@ -118,6 +118,7 @@ __all__ = [
     "comparative_deltas",
     "demographic_parity_difference_by_axis",
     "equal_opportunity_difference_by_axis",
+    "flatten_metrics_summary",
     "load_incumbent_proba",
     "load_test_customer_ids",
     "load_test_features",
@@ -1582,6 +1583,110 @@ def _assemble_metrics_and_economics_payloads(
     }
 
 
+def flatten_metrics_summary(
+    metrics_payload: dict[str, Any],
+    decision_payload: dict[str, Any],
+    costs_hash: str,
+) -> dict[str, Any]:
+    """Flatten metrics.json + promotion_decision.json into the small, diffable cross-cycle surface.
+
+    reports/metrics_summary.json is what a reviewer actually diffs across
+    cycles: identity fields, the four gate criteria (PR-AUC, recall at the
+    base scenario, Brier/BSS, calibration slope) with their CI bounds,
+    test_ev_base, the §0 V2 fairness gaps (equal_opportunity/demographic_
+    parity — CLAUDE.md names these as the one pair of sliced numbers that
+    should be plottable across cycles, unlike the rest of `sliced`, which
+    stays artifact-only), costs_config_hash, and — comparative regime only —
+    the paired-bootstrap deltas gate.py judged them against. No t*:
+    reports/policy/threshold.yaml is already its own DVC metrics entry (the
+    threshold stage), so repeating it here would track the same fact twice.
+
+    costs_hash is a parameter, not computed here, so this stays a pure
+    function — the caller (_write_metrics_summary) resolves it the same way
+    _log_evaluation_run/threshold.py's _assemble_threshold_payloads already
+    do independently. Included alongside test_ev_base for the same reason
+    _log_evaluation_run tags it on the run at all: a shift in test_ev_base
+    between cycles is otherwise ambiguous between "the model changed" and
+    "someone edited configs/costs.yaml" — this makes that call legible
+    without cross-referencing the run's tags.
+
+    Takes decision_payload (promotion_decision_payload) rather than a
+    separate `regime` argument — decision_payload already carries `regime`
+    as decide_promotion's own return field, and a second, independently-
+    passed regime argument could disagree with the payload it was read from.
+    Call after _log_evaluation_run, once decision_payload["eval_run_id"] has
+    been stamped — not before.
+    """
+    classification_by_scenario = {
+        cast(str, row["scenario"]): row for row in metrics_payload["classification"]
+    }
+    base_row = classification_by_scenario["base"]
+    calibration = metrics_payload["calibration"]
+    slope = calibration["calibration_slope"]
+    ranking = metrics_payload["ranking"]
+    sliced_test = metrics_payload["sliced"]["test"]
+    regime = decision_payload["regime"]
+    criteria = decision_payload["criteria"]
+
+    summary: dict[str, Any] = {
+        "model_version": metrics_payload["model_version"],
+        "run_id": metrics_payload["run_id"],
+        "eval_run_id": decision_payload["eval_run_id"],
+        "champion_version": metrics_payload["champion_version"],
+        "regime": regime,
+        "gate": decision_payload["gate"],
+        "costs_config_hash": costs_hash,
+        "test_pr_auc": ranking["pr_auc"],
+        "test_pr_auc_ci_lower": ranking["pr_auc_ci_lower"],
+        "test_pr_auc_ci_upper": ranking["pr_auc_ci_upper"],
+        "test_recall": base_row["recall"],
+        "test_recall_ci_lower": base_row["recall_ci_lower"],
+        "test_recall_ci_upper": base_row["recall_ci_upper"],
+        "test_brier": calibration["brier"],
+        "test_bss": calibration["bss"],
+        "test_calibration_slope": slope["slope"],
+        "test_calibration_slope_ci_lower": slope["slope_ci_lower"],
+        "test_calibration_slope_ci_upper": slope["slope_ci_upper"],
+        "test_ev_base": metrics_payload["business_impact"]["scenarios"]["base"]["ev"],
+        "test_equal_opportunity_diff": sliced_test["equal_opportunity_diff"],
+        "test_demographic_parity_diff": sliced_test["demographic_parity_diff"],
+    }
+
+    if regime == "comparative":
+        for criterion_name in ("pr_auc", "recall", "brier"):
+            entry = criteria[criterion_name]
+            summary[f"{criterion_name}_delta_obs"] = entry["delta_obs"]
+            summary[f"{criterion_name}_delta_ci_lower"] = entry["delta_ci"][0]
+            summary[f"{criterion_name}_delta_ci_upper"] = entry["delta_ci"][1]
+
+    return summary
+
+
+def _write_metrics_summary(
+    metrics_payload: dict[str, Any], decision_payload: dict[str, Any], cfg: DictConfig
+) -> dict[str, Any]:
+    """Compute and write reports/metrics_summary.json via flatten_metrics_summary."""
+    costs_hash = costs_config_hash(get_project_root() / str(cfg.paths.costs_config))
+    summary = flatten_metrics_summary(metrics_payload, decision_payload, costs_hash)
+    reports_dir = get_project_root() / str(cfg.paths.reports)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(
+        reports_dir / "metrics_summary.json", "w", encoding="utf-8", newline="\n"
+    ) as f:
+        json.dump(summary, f, indent=2, default=str)
+        f.write("\n")
+    return summary
+
+
+def _write_decile_lift_csv(
+    decile_rows: list[dict[str, float]], cfg: DictConfig
+) -> None:
+    """Write reports/plots/decile_lift.csv from sealed_test_decile_lift's own output — no second computation."""
+    plots_dir = get_project_root() / str(cfg.paths.plots)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(decile_rows).to_csv(plots_dir / "decile_lift.csv", index=False)
+
+
 def _render_evaluation_figures(
     y_test: pd.Series,
     proba: NDArray[np.float64],
@@ -1866,12 +1971,17 @@ def _write_reports_mirror(
     """
     reports_dir = get_project_root() / str(cfg.paths.reports)
     reports_dir.mkdir(parents=True, exist_ok=True)
-    with open(reports_dir / "metrics.json", "w", encoding="utf-8") as f:
+    with open(reports_dir / "metrics.json", "w", encoding="utf-8", newline="\n") as f:
         json.dump(payloads["metrics_payload"], f, indent=2, default=str)
-    with open(reports_dir / "economics.json", "w", encoding="utf-8") as f:
+        f.write("\n")
+    with open(reports_dir / "economics.json", "w", encoding="utf-8", newline="\n") as f:
         json.dump(payloads["economics_payload"], f, indent=2, default=str)
-    with open(reports_dir / "promotion_decision.json", "w", encoding="utf-8") as f:
+        f.write("\n")
+    with open(
+        reports_dir / "promotion_decision.json", "w", encoding="utf-8", newline="\n"
+    ) as f:
         json.dump(payloads["promotion_decision_payload"], f, indent=2, default=str)
+        f.write("\n")
     test_predictions.to_parquet(reports_dir / "test_predictions.parquet", index=False)
 
 
@@ -1948,6 +2058,10 @@ def run_evaluation_step(
 
     write_eval_receipt(model_version, eval_run_id, cfg)
     _write_reports_mirror(payloads, test_predictions, cfg)
+    _write_metrics_summary(
+        payloads["metrics_payload"], payloads["promotion_decision_payload"], cfg
+    )
+    _write_decile_lift_csv(core_metrics["decile_rows"], cfg)
 
     decision = decision_result["decision"]
     logger.info(

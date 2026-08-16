@@ -18,7 +18,7 @@ import pandera as pa
 import pytest
 from helpers import make_row
 
-from telco_churn.data.schema import CleanedSchema, RawSchema
+from telco_churn.data.schema import RawSchema
 
 _DDL_PATH = (
     Path(__file__).resolve().parents[2] / "sql" / "schema" / "001_create_raw.sql"
@@ -60,14 +60,14 @@ def test_ddl_and_rawschema_define_same_columns() -> None:
     ), f"Columns in RawSchema but missing from DDL: {only_in_schema}"
 
 
-def test_cleaned_schema_rejects_billed_customer_with_totalcharges_below_monthlycharges() -> (
+def test_raw_schema_rejects_billed_customer_with_totalcharges_below_monthlycharges() -> (
     None
 ):
-    """CleanedSchema must reject totalcharges < monthlycharges for billed (tenure>=1) customers.
+    """RawSchema must reject totalcharges < monthlycharges for billed (tenure>=1) customers.
 
     make_row() defaults to tenure=12 and monthlycharges=29.85; passing totalcharges=10.0
     creates a row where the invariant is violated.
     """
     df = pd.DataFrame([make_row(totalcharges=10.0)])
     with pytest.raises(pa.errors.SchemaError):
-        CleanedSchema.validate(df)
+        RawSchema.validate(df)

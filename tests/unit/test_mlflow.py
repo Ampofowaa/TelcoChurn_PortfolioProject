@@ -417,11 +417,15 @@ def reports_cfg(tmp_path: Path) -> DictConfig:
 
 
 def test_write_and_read_train_receipt_round_trips(reports_cfg: DictConfig) -> None:
-    write_train_receipt("a_run_id", reports_cfg)
+    write_train_receipt("a_run_id", "m-123", "models:/m-123", reports_cfg)
 
     receipt = read_train_receipt(reports_cfg)
 
-    assert receipt == {"run_id": "a_run_id"}
+    assert receipt == {
+        "run_id": "a_run_id",
+        "logged_model_id": "m-123",
+        "model_uri": "models:/m-123",
+    }
 
 
 def test_read_train_receipt_raises_when_absent(reports_cfg: DictConfig) -> None:

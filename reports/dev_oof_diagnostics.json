@@ -1,0 +1,383 @@
+{
+  "segment_pr_auc": [
+    {
+      "segment": "contract_type",
+      "value": "Month-to-month",
+      "n": 3095,
+      "pr_auc_obs": 0.7001203217564165,
+      "pr_auc_ci_lower": 0.6727677806707782,
+      "pr_auc_ci_upper": 0.7266996761226515,
+      "axis": "contract_type",
+      "churn_rate_floor": 0.4284329563812601
+    },
+    {
+      "segment": "contract_type",
+      "value": "One year",
+      "n": 1178,
+      "pr_auc_obs": 0.20382917931058148,
+      "pr_auc_ci_lower": 0.16495356108254805,
+      "pr_auc_ci_upper": 0.26484306181509315,
+      "axis": "contract_type",
+      "churn_rate_floor": 0.11035653650254669
+    },
+    {
+      "segment": "contract_type",
+      "value": "Two year",
+      "n": 1361,
+      "pr_auc_obs": 0.06311305772597357,
+      "pr_auc_ci_lower": 0.04060676657109803,
+      "pr_auc_ci_upper": 0.10384836878008524,
+      "axis": "contract_type",
+      "churn_rate_floor": 0.028655400440852314
+    },
+    {
+      "segment": "tenure_cohort",
+      "value": "0-12m",
+      "n": 1756,
+      "pr_auc_obs": 0.7568272064956131,
+      "pr_auc_ci_lower": 0.7264887961120972,
+      "pr_auc_ci_upper": 0.7893879079485011,
+      "axis": "tenure_cohort",
+      "churn_rate_floor": 0.47380410022779046
+    },
+    {
+      "segment": "tenure_cohort",
+      "value": "13-24m",
+      "n": 810,
+      "pr_auc_obs": 0.5768332297546231,
+      "pr_auc_ci_lower": 0.5115831194930375,
+      "pr_auc_ci_upper": 0.6423986567450004,
+      "axis": "tenure_cohort",
+      "churn_rate_floor": 0.28888888888888886
+    },
+    {
+      "segment": "tenure_cohort",
+      "value": "25-48m",
+      "n": 1272,
+      "pr_auc_obs": 0.5092626540761936,
+      "pr_auc_ci_lower": 0.4438450640080922,
+      "pr_auc_ci_upper": 0.5739364397138914,
+      "axis": "tenure_cohort",
+      "churn_rate_floor": 0.20518867924528303
+    },
+    {
+      "segment": "tenure_cohort",
+      "value": "49-65m",
+      "n": 977,
+      "pr_auc_obs": 0.3604316132111567,
+      "pr_auc_ci_lower": 0.28176787776036427,
+      "pr_auc_ci_upper": 0.4541205880330173,
+      "axis": "tenure_cohort",
+      "churn_rate_floor": 0.12077789150460594
+    },
+    {
+      "segment": "tenure_cohort",
+      "value": "65+m",
+      "n": 819,
+      "pr_auc_obs": 0.2556436612511762,
+      "pr_auc_ci_lower": 0.17065271144806415,
+      "pr_auc_ci_upper": 0.378840062014858,
+      "axis": "tenure_cohort",
+      "churn_rate_floor": 0.06105006105006105
+    },
+    {
+      "segment": "internetservice",
+      "value": "DSL",
+      "n": 1934,
+      "pr_auc_obs": 0.5277366169616735,
+      "pr_auc_ci_lower": 0.47108855836254643,
+      "pr_auc_ci_upper": 0.5816029430312751,
+      "axis": "internetservice",
+      "churn_rate_floor": 0.19027921406411583
+    },
+    {
+      "segment": "internetservice",
+      "value": "Fiber optic",
+      "n": 2493,
+      "pr_auc_obs": 0.7230709624133806,
+      "pr_auc_ci_lower": 0.6908622807800266,
+      "pr_auc_ci_upper": 0.7513088826668534,
+      "axis": "internetservice",
+      "churn_rate_floor": 0.4159647011632571
+    },
+    {
+      "segment": "internetservice",
+      "value": "No",
+      "n": 1207,
+      "pr_auc_obs": 0.29835373259729653,
+      "pr_auc_ci_lower": 0.22319472350801914,
+      "pr_auc_ci_upper": 0.38768003183699484,
+      "axis": "internetservice",
+      "churn_rate_floor": 0.07456503728251865
+    }
+  ],
+  "segment_collapse_flagged": [],
+  "segment_decision_rates": [
+    {
+      "segment": "gender",
+      "value": "Female",
+      "n": 2772,
+      "selection_rate": 0.31385281385281383,
+      "fnr": 0.3019867549668874,
+      "fpr": 0.1700545364402578,
+      "precision": 0.6057471264367816,
+      "axis": "gender"
+    },
+    {
+      "segment": "gender",
+      "value": "Male",
+      "n": 2862,
+      "selection_rate": 0.3039832285115304,
+      "fnr": 0.32297297297297295,
+      "fpr": 0.17389255419415645,
+      "precision": 0.5758620689655173,
+      "axis": "gender"
+    },
+    {
+      "segment": "seniorcitizen",
+      "value": "0",
+      "n": 4726,
+      "selection_rate": 0.26555226407109606,
+      "fnr": 0.3491921005385996,
+      "fpr": 0.14673311184939092,
+      "precision": 0.5776892430278885,
+      "axis": "seniorcitizen"
+    },
+    {
+      "segment": "seniorcitizen",
+      "value": "1",
+      "n": 908,
+      "selection_rate": 0.5341409691629956,
+      "fnr": 0.2047244094488189,
+      "fpr": 0.34535104364326374,
+      "precision": 0.6247422680412371,
+      "axis": "seniorcitizen"
+    },
+    {
+      "segment": "has_partner",
+      "value": "No",
+      "n": 2936,
+      "selection_rate": 0.40497275204359673,
+      "fnr": 0.26239669421487605,
+      "fpr": 0.24136178861788618,
+      "precision": 0.6005046257359126,
+      "axis": "has_partner"
+    },
+    {
+      "segment": "has_partner",
+      "value": "Yes",
+      "n": 2698,
+      "selection_rate": 0.20422535211267606,
+      "fnr": 0.40417457305502846,
+      "fpr": 0.10916628281897743,
+      "precision": 0.5698729582577132,
+      "axis": "has_partner"
+    },
+    {
+      "segment": "dependents",
+      "value": "No",
+      "n": 3924,
+      "selection_rate": 0.3748725790010194,
+      "fnr": 0.27986906710310966,
+      "fpr": 0.21872686898593635,
+      "precision": 0.5982324949014276,
+      "axis": "dependents"
+    },
+    {
+      "segment": "dependents",
+      "value": "Yes",
+      "n": 1710,
+      "selection_rate": 0.15730994152046784,
+      "fnr": 0.45787545787545786,
+      "fpr": 0.08420320111343076,
+      "precision": 0.550185873605948,
+      "axis": "dependents"
+    }
+  ],
+  "equal_opportunity_gap_by_axis": {
+    "gender": 0.020986218006085522,
+    "seniorcitizen": 0.14446769108978072,
+    "has_partner": 0.14177787884015242,
+    "dependents": 0.1780063907723482
+  },
+  "demographic_parity_gap_by_axis": {
+    "gender": 0.009869585341283404,
+    "seniorcitizen": 0.2685887050918995,
+    "has_partner": 0.20074739993092067,
+    "dependents": 0.21756263748055155
+  },
+  "equal_opportunity_gap_flagged": {
+    "seniorcitizen": 0.14446769108978072,
+    "has_partner": 0.14177787884015242,
+    "dependents": 0.1780063907723482
+  },
+  "demographic_parity_gap_flagged": {
+    "seniorcitizen": 0.2685887050918995,
+    "has_partner": 0.20074739993092067,
+    "dependents": 0.21756263748055155
+  },
+  "segment_calibration": [
+    {
+      "axis": "gender",
+      "value": "Female",
+      "n": 2772,
+      "slope": 1.026267412967348,
+      "slope_ci_lower": 0.9530791578799122,
+      "slope_ci_upper": 1.1057344525057506,
+      "ece": 0.021608911694731545
+    },
+    {
+      "axis": "gender",
+      "value": "Male",
+      "n": 2862,
+      "slope": 1.0006096285387975,
+      "slope_ci_lower": 0.9312665707275017,
+      "slope_ci_upper": 1.0872282257676578,
+      "ece": 0.0296239869372281
+    },
+    {
+      "axis": "seniorcitizen",
+      "value": "0",
+      "n": 4726,
+      "slope": 1.010299439734742,
+      "slope_ci_lower": 0.9502851654854912,
+      "slope_ci_upper": 1.0757351294589204,
+      "ece": 0.028164940621119655
+    },
+    {
+      "axis": "seniorcitizen",
+      "value": "1",
+      "n": 908,
+      "slope": 0.991096202983883,
+      "slope_ci_lower": 0.8552446232390557,
+      "slope_ci_upper": 1.1572591393947163,
+      "ece": 0.03810055689691507
+    },
+    {
+      "axis": "has_partner",
+      "value": "No",
+      "n": 2936,
+      "slope": 0.9994774742130167,
+      "slope_ci_lower": 0.928483357867239,
+      "slope_ci_upper": 1.070530913651442,
+      "ece": 0.03525461606007712
+    },
+    {
+      "axis": "has_partner",
+      "value": "Yes",
+      "n": 2698,
+      "slope": 1.0235944651679902,
+      "slope_ci_lower": 0.9470723275831416,
+      "slope_ci_upper": 1.1098108739200805,
+      "ece": 0.016020914688898602
+    },
+    {
+      "axis": "dependents",
+      "value": "No",
+      "n": 3924,
+      "slope": 0.9996840040143489,
+      "slope_ci_lower": 0.9352543582402915,
+      "slope_ci_upper": 1.0708413680631867,
+      "ece": 0.0313308649647708
+    },
+    {
+      "axis": "dependents",
+      "value": "Yes",
+      "n": 1710,
+      "slope": 1.0225853968587564,
+      "slope_ci_lower": 0.9252825081401055,
+      "slope_ci_upper": 1.135375659653783,
+      "ece": 0.020291824145597322
+    }
+  ],
+  "calibration_collapse_flagged": [],
+  "direction_sanity_result": {
+    "checked_features": [
+      {
+        "feature": "multi_cat__contract_type_Month-to-month",
+        "checked": true,
+        "matched_eda_relationship": "month-to-month",
+        "expected_sign": 1,
+        "observed_direction": 0.994895155469766,
+        "contradicts": false
+      },
+      {
+        "feature": "numeric__tenure",
+        "checked": true,
+        "matched_eda_relationship": "tenure",
+        "expected_sign": -1,
+        "observed_direction": -0.8967446695516224,
+        "contradicts": false
+      },
+      {
+        "feature": "numeric__monthlycharges",
+        "checked": true,
+        "matched_eda_relationship": "monthlycharges",
+        "expected_sign": 1,
+        "observed_direction": 0.8735262027937859,
+        "contradicts": false
+      },
+      {
+        "feature": "multi_cat__techsupport_No",
+        "checked": true,
+        "matched_eda_relationship": "techsupport_no",
+        "expected_sign": 1,
+        "observed_direction": 0.9881380652056009,
+        "contradicts": false
+      },
+      {
+        "feature": "multi_cat__contract_type_Two year",
+        "checked": true,
+        "matched_eda_relationship": "two year",
+        "expected_sign": -1,
+        "observed_direction": -0.988895401134214,
+        "contradicts": false
+      },
+      {
+        "feature": "multi_cat__onlinesecurity_No",
+        "checked": true,
+        "matched_eda_relationship": "onlinesecurity_no",
+        "expected_sign": 1,
+        "observed_direction": 0.9883246083235704,
+        "contradicts": false
+      },
+      {
+        "feature": "multi_cat__internetservice_Fiber optic",
+        "checked": true,
+        "matched_eda_relationship": "fiber optic",
+        "expected_sign": 1,
+        "observed_direction": 0.9664064465324127,
+        "contradicts": false
+      },
+      {
+        "feature": "multi_cat__paymentmethod_Electronic check",
+        "checked": true,
+        "matched_eda_relationship": "electronic check",
+        "expected_sign": 1,
+        "observed_direction": 0.9833076947444073,
+        "contradicts": false
+      }
+    ],
+    "violations": [],
+    "passed": true
+  },
+  "direction_check_feature_names": [
+    "multi_cat__contract_type_Month-to-month",
+    "numeric__tenure",
+    "numeric__monthlycharges",
+    "multi_cat__techsupport_No",
+    "multi_cat__contract_type_Two year",
+    "multi_cat__onlinesecurity_No",
+    "multi_cat__internetservice_Fiber optic",
+    "multi_cat__paymentmethod_Electronic check"
+  ],
+  "direction_checked_count": 8,
+  "direction_weak_signal_count": 0,
+  "direction_sanity_elbow_check": {
+    "configured_k": 8,
+    "elbow_delta": 0.0434841660221347,
+    "plateau_median_delta": 0.009179217074515994,
+    "ratio": 4.737241277674824,
+    "valid": true
+  }
+}

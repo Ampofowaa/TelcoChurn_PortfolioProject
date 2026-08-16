@@ -1,15 +1,16 @@
-"""Two-tier validation gate definitions and result types for raw and cleaned Telco data."""
+"""Two-tier validation gate definitions and result types for raw Telco data."""
 
 from __future__ import annotations
 
 import enum
+import hashlib
 from dataclasses import dataclass, field
 from typing import Final
 
 import pandas as pd
 from pandera.errors import SchemaErrors
 
-from telco_churn.data.schema import CleanedSchema, RawSchema
+from telco_churn.data.schema import RawSchema
 
 __all__ = [
     "Severity",
@@ -21,6 +22,7 @@ __all__ = [
     "check_churn_labels",
     "check_totalcharges_nulls",
     "check_distribution_sanity",
+    "frame_checksum",
 ]
 
 # ---------------------------------------------------------------------------
@@ -76,17 +78,13 @@ MAX_NULL_RATE: Final[float] = 0.05
 # ---------------------------------------------------------------------------
 
 
-def check_schema(df: pd.DataFrame, cleaned: bool = False) -> CheckResult:
+def check_schema(df: pd.DataFrame) -> CheckResult:
     """Gate 1 — column presence, types, value ranges, and categorical values.
 
-    Uses RawSchema when cleaned=False, CleanedSchema when cleaned=True.
     Severity: ERROR — a schema failure means downstream stages cannot safely run.
     """
     try:
-        if cleaned:
-            CleanedSchema.validate(df, lazy=True)
-        else:
-            RawSchema.validate(df, lazy=True)
+        RawSchema.validate(df, lazy=True)
         return CheckResult(
             name="schema",
             failure_severity=Severity.ERROR,
@@ -311,3 +309,16 @@ def check_distribution_sanity(
             )
 
     return results
+
+
+def frame_checksum(df: pd.DataFrame) -> str:
+    """Deterministic sha256 of a DataFrame's column order and row values.
+
+    Lets a receipt file stand in for "this exact DataFrame" without writing the
+    DataFrame itself to disk — used by both the ingest and validate receipts.
+    Two DataFrames with the same columns, in the same order, holding the same
+    values produce the same checksum regardless of index labels.
+    """
+    row_hashes = pd.util.hash_pandas_object(df, index=False).to_numpy()
+    payload = ",".join(df.columns) + "|" + row_hashes.tobytes().hex()
+    return hashlib.sha256(payload.encode()).hexdigest()

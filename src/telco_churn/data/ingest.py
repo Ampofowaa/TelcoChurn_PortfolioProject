@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from telco_churn.data.checks import MAX_NULL_RATE, MIN_ROWS
+from telco_churn.data.checks import MAX_NULL_RATE, MIN_ROWS, frame_checksum
 from telco_churn.data.schema import RawSchema
 from telco_churn.data.validate import ValidationError, validate_raw
 from telco_churn.utils.db import get_engine
@@ -16,10 +17,27 @@ from telco_churn.utils.logging import get_logger
 from telco_churn.utils.paths import get_project_root
 
 __all__ = [
+    "IngestReceipt",
     "load_raw_csv",
     "setup_schema",
     "ingest",
 ]
+
+
+@dataclass(frozen=True)
+class IngestReceipt:
+    """Outcome of one ingest() call — the DVC `ingest` stage's file stand-in for the Postgres write.
+
+    DVC outs must be files; the real result of ingest() is rows in Postgres,
+    which cannot itself be a dep or an out. This receipt is the hashable
+    artifact that stands in for that side effect.
+    """
+
+    rows_loaded: int
+    csv_rows: int
+    null_counts: dict[str, int]
+    frame_checksum: str
+
 
 logger = get_logger(__name__)
 
@@ -139,7 +157,7 @@ def ingest(
     engine: Engine | None = None,
     min_rows: int = MIN_ROWS,
     max_null_rate: float = MAX_NULL_RATE,
-) -> int:
+) -> IngestReceipt:
     """Load the raw Telco CSV into the customers_raw Postgres table.
 
     Uses the industry-standard staging table pattern:
@@ -149,7 +167,7 @@ def ingest(
 
     This mirrors the dbt incremental model pattern used in production warehouses
     (Snowflake / BigQuery MERGE). The main table's PRIMARY KEY is never dropped;
-    the merge is fully atomic. Returns the number of rows loaded.
+    the merge is fully atomic. Returns an IngestReceipt describing the load.
 
     min_rows/max_null_rate feed validate_raw's gate-5 thresholds and default to
     the same checks.py constants validate_raw itself falls back to, so a direct
@@ -180,11 +198,18 @@ def ingest(
             "not per-row constraint violations."
         )
     logger.info("merge_complete", db_rows=n, csv_rows=csv_rows, table="customers_raw")
-    return n
+    return IngestReceipt(
+        rows_loaded=n,
+        csv_rows=csv_rows,
+        null_counts={col: int(df[col].isna().sum()) for col in df.columns},
+        frame_checksum=frame_checksum(df),
+    )
 
 
 if __name__ == "__main__":
+    import json
     import sys
+    from dataclasses import asdict
 
     from dotenv import load_dotenv
 
@@ -199,11 +224,18 @@ if __name__ == "__main__":
     csv_path = get_project_root() / cfg.paths.raw_data
 
     try:
-        ingest(
+        receipt = ingest(
             path=csv_path,
             min_rows=int(cfg.validation.min_rows),
             max_null_rate=float(cfg.validation.max_null_rate),
         )
+        receipt_path = get_project_root() / "reports" / "ingest_receipt.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(
+            json.dumps(asdict(receipt), indent=2, sort_keys=True) + "\n",
+            newline="\n",
+        )
+        logger.info("ingest_receipt_written", path=str(receipt_path))
     except ValueError as e:
         logger.error("ingest_schema_mismatch", error=str(e), exc_info=True)
         sys.exit(1)

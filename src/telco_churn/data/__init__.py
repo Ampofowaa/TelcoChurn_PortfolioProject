@@ -4,7 +4,7 @@ import importlib
 from typing import Any
 
 from telco_churn.data.checks import CheckResult, Severity
-from telco_churn.data.schema import CleanedSchema, RawSchema
+from telco_churn.data.schema import RawSchema
 
 __all__ = [
     # result types — needed to annotate / inspect validate_raw output
@@ -12,8 +12,7 @@ __all__ = [
     "Severity",
     "ValidationError",
     "ValidationResult",
-    # schemas — callers that validate DataFrames directly
-    "CleanedSchema",
+    # schema — callers that validate DataFrames directly
     "RawSchema",
     # canonical split — constants + helpers
     "DEV",
@@ -28,7 +27,7 @@ __all__ = [
     # pipeline entry points
     "ingest",
     "save_validation_report",
-    "validate_clean",
+    "write_validation_receipt",
     "validate_raw",
 ]
 
@@ -46,7 +45,7 @@ _LAZY_SOURCES: dict[str, str] = {
     "ValidationError": "telco_churn.data.validate",
     "ValidationResult": "telco_churn.data.validate",
     "save_validation_report": "telco_churn.data.validate",
-    "validate_clean": "telco_churn.data.validate",
+    "write_validation_receipt": "telco_churn.data.validate",
     "validate_raw": "telco_churn.data.validate",
 }
 

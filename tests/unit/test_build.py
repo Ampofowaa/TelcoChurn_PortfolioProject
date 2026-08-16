@@ -20,6 +20,7 @@ from telco_churn.features import (
     FeatureOutputSchema,
     build_feature_df,
 )
+from telco_churn.features.build import _reject_if_empty
 from telco_churn.utils.paths import get_project_root
 
 # ---------------------------------------------------------------------------
@@ -156,6 +157,23 @@ def test_build_feature_df_empty_dataframe_raises() -> None:
     """build_feature_df raises SchemaError when the input has no columns."""
     with pytest.raises(SchemaError):
         build_feature_df(pd.DataFrame())
+
+
+# ---------------------------------------------------------------------------
+# _reject_if_empty — zero-row guard (schema checks pass vacuously on 0 rows)
+# ---------------------------------------------------------------------------
+
+
+def test_reject_if_empty_raises_on_zero_rows() -> None:
+    """_reject_if_empty raises ValueError on a well-formed but zero-row DataFrame."""
+    empty_df = pd.DataFrame(columns=list(_make_feature_row().keys()))
+    with pytest.raises(ValueError, match="zero rows"):
+        _reject_if_empty(empty_df)
+
+
+def test_reject_if_empty_passes_on_non_empty_df(minimal_df: pd.DataFrame) -> None:
+    """_reject_if_empty is a no-op when the DataFrame has rows."""
+    _reject_if_empty(minimal_df)
 
 
 # ---------------------------------------------------------------------------
