@@ -3,8 +3,8 @@
 [![CI](https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/actions/workflows/ci.yml/badge.svg)](https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/actions/workflows/ci.yml)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-835%20passing-brightgreen)](CONTRIBUTING.md#testing)
-[![Coverage](https://img.shields.io/badge/coverage-95.7%25-brightgreen)](CONTRIBUTING.md#testing)
+[![Tests](https://img.shields.io/badge/tests-998%20passing-brightgreen)](CONTRIBUTING.md#testing)
+[![Coverage](https://img.shields.io/badge/coverage-96.8%25-brightgreen)](CONTRIBUTING.md#testing)
 
 Predicts which telecom customers are likely to churn and quantifies the revenue impact of early intervention. Built as a production-grade system covering the full MLOps lifecycle: data ingestion → validation → feature engineering → model training → calibration → cost-sensitive threshold optimisation → serving → monitoring.
 
@@ -107,7 +107,7 @@ Raw CSV
 | Calibration | `CalibratedClassifierCV` (sigmoid) |
 | Cost-sensitive threshold | Closed-form `t* = c / (r × LTV)`, 3-scenario cost model |
 | Explainability | SHAP (`TreeExplainer`) |
-| Pipeline versioning (Phase 8) | DVC |
+| Pipeline versioning | DVC |
 | Serving (Phase 9) | FastAPI + Streamlit |
 | Orchestration (Phase 10) | Prefect |
 | Infrastructure | Docker, Postgres |
@@ -130,7 +130,7 @@ Raw CSV
 | 6 | Calibration + cost-sensitive threshold | ✅ Done |
 | 7a | Sealed test-set evaluation, error analysis, human review — gate: pass | ✅ Done |
 | 7b | Registry promotion, drift baseline, model card (`register.py`, `drift_reference.py`) | ✅ Done |
-| 8 | DVC pipeline wrap | 🔜 Next |
+| 8 | DVC pipeline wrap — 9-stage reproducible DAG (`dvc.yaml`), `ingest` through `error_analysis` | ✅ Done |
 | 9 | Serving + UI — FastAPI + Streamlit | 🔜 Next |
 | 10 | Orchestration — Prefect retrain/drift flows | ⏸ Scoped, deferred until after 12 |
 | 11 | CI/CD — GitHub Actions | 🔜 Next |
@@ -138,7 +138,7 @@ Raw CSV
 | 13 | Monitoring — Prometheus/Grafana/Evidently | ⏸ Scoped, deferred until after 12 |
 | 14 | Documentation polish | Planned |
 
-**Current focus:** 8 → 9 → 11 → 12 — DVC, serving, CI/CD, and cloud deployment, in that order, since each is a dependency of the next and together they form one working, deployed system. Orchestration (10) and monitoring (13) are fully scoped but deliberately sequenced *after* deployment — both are more meaningful run against a live system with real traffic than built ahead of one.
+**Current focus:** 9 → 11 → 12 — serving, CI/CD, and cloud deployment, in that order, since each is a dependency of the next and together they form one working, deployed system. Orchestration (10) and monitoring (13) are fully scoped but deliberately sequenced *after* deployment — both are more meaningful run against a live system with real traffic than built ahead of one.
 
 See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full phase-by-phase roadmap and the execution-order rationale.
 

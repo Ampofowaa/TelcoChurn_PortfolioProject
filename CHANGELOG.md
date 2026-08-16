@@ -10,58 +10,65 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ## [Unreleased]
 
+---
+
+## [0.8.0] - 2026-08-15 — Phase 8: DVC Pipeline Wrap
+
+*Wraps `ingest → validate → split → features → train → calibrate → threshold → evaluate → error_analysis` as a 9-stage, content-hashed DVC DAG, reproducible end to end via `dvc repro`. Required extracting registry writes out of `calibrate.py`/`evaluate.py`/`error_analysis.py` into `register.py` as the sole registry-mutating module, switching model resolution to run-id receipts, and splitting the automated gate verdict from the human review.*
+
 ### Added
-- **`src/telco_churn/utils/mlflow.py`** — receipt mechanism (`write_train_receipt`/`read_train_receipt`, `write_calibrate_receipt`/`read_calibrate_receipt`) plus `resolve_model_version_from_run_id`/`resolve_model_identifier`. `models/train/log_model.py`/`models/calibrate.py` write `reports/{train,calibrate}_receipt.json`; `calibrate.py`/`threshold.py`/`evaluate.py`/`error_analysis.py` resolve their upstream model from an explicit `run_id`/`model_version` override or, absent both, the receipt — chaining the pipeline without copy-pasted CLI identifiers between commands. Giving both an explicit `run_id` and `model_version` raises `ValueError` rather than silently preferring one.
-- **`src/telco_churn/models/evaluate.py`** — new `check_threshold_screen_passed`, called alongside `check_threshold_provenance` at every downstream reader (`evaluate.py`, `error_analysis.py`); raises `RuntimeError` if `threshold_validation.json`'s dev-OOF calibration screen failed.
-- **`src/telco_churn/models/gate.py`** — comparative-regime recall guardrail gains a non-inferiority check (vetoes iff `recall_delta_ci_upper < -bars.recall_non_inferiority_margin`) alongside its existing absolute floor: a candidate could previously clear the 0.65 recall floor while still being a large regression from a stronger incumbent (e.g. 0.90 → 0.66), with nothing comparing the two. New `GateBars.recall_non_inferiority_margin` field (`configs/model_promotion.yaml: 0.01`) and `GateInputs.recall_delta_obs/_ci_lower/_ci_upper`, computed by `evaluate.py::comparative_deltas` (now takes a `base_threshold` param — `t*` is shared between candidate and incumbent since it's derived from `configs/costs.yaml`, not either model's own distribution) via `utils.stats.paired_bootstrap_metric_ci`. `tests/unit/test_gate.py` (28 → 33 tests) covers both the veto and non-veto-for-want-of-evidence paths.
-- **`tests/unit/test_calibrate.py`, `test_evaluate.py`** — closes a code-review gap where the calibration reload-parity-failure path and the evaluation run's MLflow orchestration (tag-setting, model_id/dataset wiring) had no direct test coverage, only indirect coverage through the pure functions they call. `test_run_calibration_step_parity_failure_leaves_tagged_pending_orphan` forces a reload-parity failure and asserts the version stays `pending` and unaliased; `test_log_evaluation_run_wires_model_id_dataset_and_tags_correctly` exercises `evaluate.py`'s `_log_evaluation_run` against a real tmp-scoped MLflow store rather than a mocked client. *(B1 below moves model-version tagging out of both `calibrate.py` and `evaluate.py` into `register.py`; the two tests are updated accordingly rather than describing code that no longer exists.)*
-- **`src/telco_churn/models/train/feature_selection.py`** (new module) — `run_feature_selection_step`: the mechanism that actually decides `features/schema.py::COMMITTED_FEATURES` via the full-vs-reduced paired-bootstrap ablation, mirroring `candidates.py`/`comparison.py`'s role for the model-family decision. Replaces the logic previously hand-inlined in `notebooks/03b-feature-selection.ipynb`'s "On-demand ablation review" cell (which had also gone stale — it read the retired `training_setup.cv_folds`/`cv_repeats` config keys and would have raised `ConfigAttributeError` if run). Logs a `selection_review` run to its own `telco-churn-feature-selection-review` MLflow experiment (bootstrap metrics/decision, the Δ-distribution plot, `review/per_fold_stability.csv`, `review/permutation_importance_table.csv`, `review/group_importance.json`, `review/shap_importance_audit.csv`, `review/high_shap_dropouts.txt`, `review/recommended_committed_features.txt`). `tests/unit/test_train_feature_selection.py` (11 tests).
-- **`tests/unit/test_architecture.py`** — new guard, `test_processed_data_path_is_read_only_by_its_canonical_resolvers`: `cfg.paths.processed_data` may only be read directly in `features/accessor.py`, `data/split.py`, and (temporarily, pending the `data_content_hash` fix) `models/train/common.py::_dvc_hash`. Closes the last open gap from the `activate_config`/config-literal work — a second, possibly diverging path resolution elsewhere would previously go undetected.
-- **`src/telco_churn/models/evaluate.py`** — comparative-regime `metrics.json` gains an `incumbent_summary` block (`version`, `pr_auc`, `recall`, `brier`, `calibration_slope`, `costs_config_hash`) alongside the candidate's own numbers, via new `resolve_incumbent_summary` (reads the champion version's own gate-criteria tags, already set on every version evaluate.py has scored, plus `costs_config_hash` off that version's own `eval_run_id` run). Previously a reviewer or the model card could only see the candidate's absolute numbers plus the Δ vs. incumbent in one file — the incumbent's own absolute numbers required opening its own eval run. `costs_config_hash` lets a reviewer tell "incumbent recall regressed" apart from "incumbent was never scored under today's cost assumptions" — the recall-delta guardrail runs both models through the *current* `t*`, but the incumbent's tagged recall was measured under whatever `costs.yaml` was live at its own promotion. `None` on cold start.
-- **PR B1 — promotion-decision integrity.** New `src/telco_churn/models/review.py` (+ `configs/review/default.yaml`): a standalone CLI wrapping `gate.py::record_review`, independent of Jupyter (`python -m telco_churn.models.review review.eval_run_id=<id> review.verdict=approved review.approver="..."`; `review.eval_run_id` falls back to `reports/eval_receipt.json` when omitted). It stamps `promotion_review.json` — a separate, append-only document (`{eval_run_id, metrics_content_hash, entries: [{verdict, notes, approver, reviewed_at}, ...]}`) logged onto the eval run — and never touches the registry; `register.py`'s own CLI reads the stamped verdict and mints/flips/rejects separately. `tests/unit/test_review.py` (4 tests), `tests/integration/test_review_subprocess.py` (2 tests).
-- **`src/telco_churn/models/register.py`** — new `register_challenger(cfg, run_id, model_uri, logged_model_id) -> version`, extracted from `calibrate.py` (see Changed below): mints the calibrated pipeline as a registry version, tags it `promotion_status: pending` at mint time, verifies reload parity against `golden_predictions.json` (`_check_golden_parity`, the same helper `run_registration_step`'s own pre-/post-flip checks use), and points `challenger` at it. Runs as `register.py`'s own CLI mint mode (`register.run_id` given, or neither `register.run_id` nor `register.model_version` given — defaulting to `reports/calibrate_receipt.json` — dispatches to it; `register.model_version` dispatches to the existing promote/reject path; giving both raises), never called from `calibrate.py`'s own process — a second process can only be handed identifiers, not an in-memory `log_model` `ModelInfo`. `tests/unit/test_register.py` gains 2 tests covering the mint/pending/alias-point path and the parity-failure-leaves-pending-unaliased path; `tests/integration/test_register_subprocess.py` gains coverage for both CLI dispatch modes.
-- **`src/telco_churn/utils/mlflow.py`** — new `write_eval_receipt`/`read_eval_receipt` and `write_error_analysis_receipt`/`read_error_analysis_receipt`, mirroring the existing `calibrate_receipt` pair: `evaluate.py`/`error_analysis.py` write `reports/{eval,error_analysis}_receipt.json` as `register.py`'s bootstrap pointer to this cycle's eval/error_analysis run on a version's first registration pass (see Changed below for why the receipt, not a tag, is now the channel).
-- **`src/telco_churn/models/register.py`** — new `refresh_champion_reference(model_version, cfg)`, closing the gap the `data_content_hash` guard above exposes: `register.py`'s ordinary path trusts an already-tagged `eval_run_id` forever (by design), so nothing wires a champion's later out-of-band cold-start re-evaluation (the guard's prescribed recovery when the processed-features file changes underneath it) back into its own model-version tags. Does not run the gate, does not consult `require_review`, and never touches `promotion_status` or the `champion`/`challenger` alias — it only re-points `eval_run_id` and the four gate-criteria tags at the fresh run, after verifying it resolves from `reports/eval_receipt.json`, carries `regime: cold_start` (never a comparison against some other incumbent), and passes the same `promotion_decision.json`/`metrics.json` hash-verification `_load_and_verify_evaluation_artifacts` already does for a fresh promotion. Requires `model_version` to already carry `promotion_status: promoted` — refreshing a pending/rejected version's tags has no meaning. Logs a new `"reference_refreshed"` `champion_history()` entry (alongside the existing `"promoted"`/`"rolled_back"` actions). New CLI mode, `register.refresh_reference_version=<version>` (`configs/register/default.yaml`), mutually exclusive with `model_version`/`run_id`. `tests/unit/test_register.py` (+6 tests), `tests/integration/test_register_subprocess.py` (+2 tests: the real cold-start-re-evaluation-then-refresh round trip through both CLIs, and the three-way CLI ambiguity check).
-- **PR B2 — V3 pre-seal screen.** New `src/telco_churn/models/shap_values.py` — the sole `shap`-importing module under `models/`: `unwrap_calibrated_pipeline`/`compute_shap_values`, extracted verbatim (renamed off "test") from `error_analysis.py`'s former `_shap_values_for_test_rows`, shared by `calibrate.py` (dev) and `error_analysis.py` (test). `tests/unit/test_shap_values.py` (5 tests, against a real small fitted `CalibratedClassifierCV`).
-- **`src/telco_churn/models/explain.py`** gains `EXPECTED_EDA_DIRECTIONS`, `direction_sanity_check`, `check_top_k_elbow` (moved from `error_analysis.py`, made public since both are now called cross-module by `threshold.py`) and new `feature_directions` (every transformed feature's signed direction, for `calibrate.py`'s dev-SHAP summary). Corresponding tests moved/added to `tests/unit/test_explain.py`.
-- **`src/telco_churn/models/calibrate.py`** — `run_calibration_step` now computes dev-SHAP once, on the champion's own development-partition rows (never the sealed test set), and logs `dev_shap_values.parquet` (the full per-row matrix) plus `calibration/dev_shap_summary.json` (every transformed feature's `(mean_abs_shap, direction)`, sorted descending) — the evidence `threshold.py`'s V3 pre-seal veto binds on. `tests/unit/test_calibrate.py` gains 2 tests for the new artifacts.
-- **`src/telco_churn/models/threshold.py`** — the dev-OOF pre-seal screen now binds a second criterion, V3 (direction sanity), alongside the existing calibration-slope band: new `load_dev_shap_summary` (raises loudly, naming the run, if a hand-run older model version predates dev-SHAP logging — V3 is never silently skipped) and `_run_v3_direction_sanity`, which ranks the dev-SHAP summary, cuts at `v3_top_k_features`, excludes any feature whose `|direction|` falls below `v3_min_direction_magnitude` from the checked set, and calls `explain.direction_sanity_check`. `_run_dev_oof_screen`'s `screen_passed: bool` becomes `failures: list[dict]` (`{criterion, detail, remediation}`) — exactly two possible entries, `calibration_slope` and `v3_direction_sanity`; V1/V2/V2b stay reported-only. A V3 veto with zero checked features (nothing in the top-k both EDA-keyed and past the magnitude floor) is itself a failure — a veto that never fired validated nothing. `dev_oof_diagnostics.json` gains `v3_direction_sanity`, `v3_top_k_feature_names`, `v3_checked_count`, `v3_weak_count`. New `configs/threshold/default.yaml` keys `v3_top_k_features: 8` and `v3_min_direction_magnitude: 0.3`, both derived by hand off a real dev-SHAP ranking (mandatory sequence: land the SHAP logging, run it, inspect the ranking, derive the constants, then land the binding screen) — see `ANALYSIS.md` §0.
-- **`src/telco_churn/models/evaluate.py`** — `check_threshold_screen_passed` reads `validation_payload["failures"]` (a list) instead of `["screen_passed"]` (a bool); raises naming every failing criterion.
-- **`src/telco_churn/models/register.py`** — `run_registration_step` gains an independent backstop re-check (`check_threshold_screen_passed(load_threshold_validation(run_id, cfg))`), mirroring `evaluate.py`/`error_analysis.py`'s own re-checks — closes the out-of-band manual `evaluate` → `register` path. The model card's `v3_direction_sanity_violations` flag now reads the binding dev-side verdict (`dev_oof_diagnostics_carried_through.v3_direction_sanity`) instead of `error_analysis.json`'s reported-only test-side re-audit.
-- **`src/telco_churn/models/error_analysis.py`** — its own SHAP-based direction-sanity check is now a reported-only re-audit of the *same* feature set `threshold.py` already vetoed on dev (`dev_oof_diagnostics.json`'s `v3_top_k_feature_names`, fetched via `runs:/<run_id>/threshold/…`, never the local `reports/` path) — no independent test-side cutoff of its own. Renamed `direction_sanity_check` → `direction_sanity_check_test` throughout (payload key, MLflow tag, metric name). The dependence-plot grid now renders the union of `top_k_dependence_features`' own test-side ranking and the inherited dev audit set, sorted by test mean-\|SHAP\|, with panel titles marked `[audit-set]`/`[CONTRADICTS]`. `configs/error_analysis/default.yaml`'s `top_k_shap_features` renamed `top_k_dependence_features`, decoupled from V3 (dependence plots and `shap_importance_*` metrics only).
-- **`ANALYSIS.md`** §0 — "The human review" section split: a new "The pre-seal automated screen (V3)" subsection documents the binding dev-SHAP veto now enforced in `threshold.py` before the sealed test set is ever opened; "The human review" itself now covers only the reported V1/V2/V2b diagnostics and the approve/reject verdict, V3 having already been resolved by the time a reviewer sees the model.
-- **`notebooks/05-evaluation-and-error-analysis.ipynb`** — §7's direction-sanity-check cell/markdown updated for the `direction_sanity_check_test` rename and reframed as a reported-only re-audit of `threshold.py`'s already-resolved pre-seal veto, not the veto itself.
-- **PR C — stage-entry-point extraction.** Five new leaf modules, none carrying a `__main__` block, so `calibrate.py`/`threshold.py`/`evaluate.py`/`error_analysis.py`/`register.py` stop importing library code out of one another's stage-entry-point modules: **`src/telco_churn/models/calibration_metrics.py`** (`pooled_brier`, `brier_skill_score`, `expected_calibration_error`, `murphy_decomposition`, `calibration_slope`, moved from `calibrate.py`); **`src/telco_churn/models/artifacts.py`** (`load_training_manifest`, `committed_features_from_manifest`, `unfitted_pipeline_from_manifest`, `load_dev_oof_predictions`, `load_fitted_model`, `resolve_champion_version`, `load_threshold_validation`, `load_dev_oof_diagnostics`) — deliberately excludes any `data.split`-touching loader, per `PROJECT_PLAN.md` §565/§1577/§1708: `artifacts.py` is shared by `error_analysis.py`, which must never become transitively reachable to `data.split` (the invariant Phase 8's future stage-9 reachability guard checks for); **`src/telco_churn/models/dev_features.py`** (new — `load_dev_features`, `load_dev_customer_ids`, and a new public `load_dev_partition`, the de-duplicated name for `calibrate.py`'s and `threshold.py`'s previously-identical private `_load_dev_partition`) — split out from `artifacts.py` for exactly that reason, imported only by `calibrate.py`/`threshold.py`/`register.py`, never by `error_analysis.py`; **`src/telco_churn/models/policy_config.py`** (`CostScenario`, `load_costs_config`, `costs_config_hash`, `expected_value_at_threshold`, `load_policy_thresholds`, `resolve_policy_scenarios`, `resolve_policy_thresholds_by_scenario`, moved from `threshold.py`, plus `load_model_promotion_bars` moved from `utils/mlflow.py` — its function-local `GateBars` import, there only to dodge a circular import through `models/__init__.py → train → utils.mlflow`, becomes a normal module-level import once the function lives in `models/`, since nothing in that cycle touches `policy_config.py`); **`src/telco_churn/utils/hashing.py`** (`content_hash`, moved from `evaluate.py`). `models/gate.py` gains `check_threshold_provenance`/`check_threshold_screen_passed`, moved from `evaluate.py` (both pure, stdlib-only, matching `gate.py`'s existing "no I/O, no MLflow" contract) since `error_analysis.py`/`register.py` both needed them too, not only `evaluate.py`. Discovered during implementation (not in the originally scoped move-list, confirmed necessary for the new guard below to pass with zero violations): `check_threshold_screen_passed` had to move alongside its sibling `check_threshold_provenance`; `load_dev_oof_diagnostics` had to join `artifacts.py`'s move-list; `expected_value_at_threshold` had to join `policy_config.py`'s (`economics.py` imports it alongside `CostScenario`, and `threshold.py` imports it back for its own `derive_threshold`).
-- **`tests/unit/test_architecture.py`** — new `test_no_module_imports_from_a_dunder_main_bearing_module`: no module under `src/` may import a name from a module carrying a `if __name__ == "__main__":` block, except through a small, explicit `_MAIN_MODULE_IMPORT_ALLOWANCES` table (mirroring the existing `_PROCESSED_DATA_PATH_READERS` pattern) — three pre-existing, unrelated allowances (`data/split.py`/`features/build.py`'s legitimate dev/test-partition and `__main__`-CLI-to-`__main__`-CLI imports; `data/validate.py` imported by `data/ingest.py` and by `data/split.py`'s own CLI) — no `models/`-side allowance, since `calibrate.py` and `register.py` do not cross-import at all (the call-site decoupling entry above removes the one models/-side allowance this guard originally carried).
-- **New `tests/unit/test_calibration_metrics.py`, `test_artifacts.py`, `test_policy_config.py`, `test_hashing.py`** — the relevant test functions moved out of `test_calibrate.py`/`test_threshold.py`/`test_evaluate.py`/`test_mlflow.py`/`test_gate.py` to track their symbols' new homes; `check_threshold_provenance`/`check_threshold_screen_passed`'s tests moved into `test_gate.py`.
-- **`notebooks/05-evaluation-and-error-analysis.ipynb`** — new "Incumbent comparison — candidate vs. champion" subsection (§2): renders `metrics["incumbent_summary"]` side by side with the candidate's own PR-AUC/recall/Brier/calibration slope, plus `promotion_decision["criteria"]`'s paired-bootstrap deltas — both already computed by `evaluate.py`/`gate.py` in the comparative regime but never surfaced anywhere in the notebook. Shows a cold-start placeholder while no champion is registered (today's state). The `criteria_df` cell is also made regime-robust (rounds `delta_obs`/`delta_ci`/`bss_value`/etc. when present, not only cold-start's `value`/`bar`/`ci`/`band`), since the comparative-regime rendering had never actually been exercised.
+- **`dvc.yaml`, `dvc.lock`, `.dvc/`, `.dvcignore`** — 9 stages with explicit `deps`/`params`/`outs`; receipts (`cache: false`) stand in for side effects DVC can't hash (Postgres rows, MLflow runs). No remote yet — local cache only through Phase 11.
+- **`Makefile`** — `repro`/`dag`/`metrics`/`params` targets; `dvc.lock` merge-conflict policy documented (never hand-edit, regenerate via `dvc repro`).
+- **`data/validate.py::write_validation_receipt`** — unconditional, deterministic writer for `reports/validation_receipt.json`, giving `split`/`features` a DVC-enforced "validate must pass first" edge.
+- **`data/ingest.py`** — emits `reports/ingest_receipt.json` as `ingest`'s DVC out.
+- **`data/schema.py`** — `CleanedSchema` deleted; its one live invariant promoted onto `RawSchema`. `validate_clean` and the `cleaned` param removed with it.
+- **`configs/policy/threshold.yaml` → `reports/policy/threshold.yaml`** — moved so it can be a DVC `metrics:` out of the `threshold` stage.
+- **`utils/mlflow.py`** — receipt read/write helpers (`{train,calibrate,eval,error_analysis}_receipt`) and `resolve_model_identifier`; every stage resolves its upstream model by run-id/version override or receipt.
+- **`models/gate.py`** — comparative-regime recall guardrail gains a non-inferiority check alongside its absolute floor (`GateBars.recall_non_inferiority_margin`). `tests/unit/test_gate.py` 28 → 33 tests.
+- **`models/train/feature_selection.py`** (new) — `run_feature_selection_step`, the mechanism deciding `features/schema.py::COMMITTED_FEATURES` via paired-bootstrap ablation. `tests/unit/test_train_feature_selection.py` (11 tests).
+- **PR B1.** New `models/review.py` + `configs/review/default.yaml` — standalone CLI stamping append-only `promotion_review.json` onto the eval run, independent of Jupyter. `tests/unit/test_review.py` (4), `tests/integration/test_review_subprocess.py` (2).
+- **`models/register.py::register_challenger`** — extracted from `calibrate.py`: mints the calibrated pipeline as a registry version, tags `promotion_status: pending`, verifies reload parity, points `challenger`.
+- **`models/register.py::refresh_champion_reference`** — re-points a promoted champion's `eval_run_id`/gate-criteria tags at a fresh out-of-band re-evaluation. `tests/unit/test_register.py` (+6), `tests/integration/test_register_subprocess.py` (+2).
+- **PR B2.** New `models/shap_values.py` (`unwrap_calibrated_pipeline`/`compute_shap_values`), shared by `calibrate.py` (dev) and `error_analysis.py` (test). `tests/unit/test_shap_values.py` (5).
+- **`models/calibrate.py`** — logs dev-SHAP once per cycle (`dev_shap_values.parquet`, `calibration/dev_shap_summary.json`), the evidence `threshold.py`'s V3 veto binds on.
+- **`models/threshold.py`** — dev-OOF pre-seal screen binds a second criterion, V3 (direction sanity), alongside the calibration-slope band. New `configs/threshold/default.yaml` keys `v3_top_k_features`/`v3_min_direction_magnitude`, derived from a real dev-SHAP ranking (`ANALYSIS.md` §0).
+- **PR C.** Five new leaf modules so `calibrate.py`/`threshold.py`/`evaluate.py`/`error_analysis.py`/`register.py` stop cross-importing: `models/calibration_metrics.py`, `models/artifacts.py`, `models/dev_features.py`, `models/policy_config.py`, `utils/hashing.py`.
+- **`tests/unit/test_architecture.py`** — new `test_no_module_imports_from_a_dunder_main_bearing_module`, enforcing the cross-import ban above.
+- **`notebooks/05-evaluation-and-error-analysis.ipynb`** — new "Incumbent comparison" subsection rendering `metrics["incumbent_summary"]` and the comparative-regime bootstrap deltas.
 
 ### Changed
-- **`src/telco_churn/models/review.py`** — `notes` is now hard-required and refused if blank (`configs/review/default.yaml`'s `notes` default changed from `""` to `null`, matching `verdict`/`approver`); a new `_print_review_guidance` logs where to find this cycle's MLflow diagnostics (`metrics.json`, `economics.json`, `promotion_decision.json`, `error_analysis.json`, `figures/`, all under the run's `eval_run_id`) before validating any input, since the CLI itself renders nothing. Points at the MLflow run specifically, not the notebook or the local `reports/` mirror — neither is reachable by a reviewer who isn't the same person, on the same machine, that ran `evaluate.py`/`error_analysis.py`.
-- **`notebooks/05-evaluation-and-error-analysis.ipynb`** — closing `## 8. Human review — model risk sign-off` section removed (its markdown framing and the `gate.record_review` code cell); `models/review.py` is now the sole path that produces `promotion_review.json`, the notebook renders diagnostics only. Now-dead imports (`record_review`, `mlflow.tracking`, `mlflow.artifacts`, `datetime`/`timezone`) pruned from the notebook's imports cell; the closing `## Summary` cell no longer references a verdict "recorded below."
-- **`src/telco_churn/models/evaluate.py`** — `load_fitted_model` takes an explicit `model_uri` instead of `model_version` (the receipt path passes calibrate.py's own stored run-scoped URI; the explicit-override path builds the registry URI). `check_threshold_provenance` compares on `logged_model_id` instead of `(run_id, model_version)`. `run_evaluation_step`/`run_threshold_step`/`run_error_analysis_step` now take an already-resolved `(run_id, model_version[, model_uri])` instead of re-deriving `run_id` from `model_version` internally.
-- **`src/telco_churn/models/threshold.py`** — `threshold_payload`/`validation_payload`'s `model_version` stamp replaced with `logged_model_id` (`model_run_id` kept as a non-load-bearing locator); `validation_payload` gains `screen_passed`, the model-dependent half of the dev-OOF calibration screen.
-- **`src/telco_churn/models/evaluate.py`** — `reports/test_predictions.parquet` gains a `logged_model_id` column; `error_analysis.py` checks it against its own resolved id and raises on mismatch, closing a stale-copy-on-hand-run-rollback hole.
-- **`src/telco_churn/models/error_analysis.py`** — `_load_dev_oof_diagnostics_carrythrough` (a local `reports/metrics.json` read) deleted; replaced by `evaluate.load_dev_oof_diagnostics(run_id, cfg)`, resolved via MLflow by run_id. The four `v1_flagged`/`v2_*_flagged`/`v2b_flagged` keys are now indexed directly (raise if missing) instead of `.get(key, [])`/`.get(key, {})`, which previously rendered "nothing flagged" indistinguishably from "not assessed."
-- **`configs/{threshold,evaluate,error_analysis}/default.yaml`** — gain a `run_id: null` key alongside the existing `model_version: null`.
-- **`src/telco_churn/models/train/__main__.py`** — captures `run_model_logging_step`'s return value and logs a `train_step_done` event (`run_id`, `model_uri`, `parity_ok`), matching the completion-log pattern every other stage's `__main__` already follows; previously the result was discarded.
-- **`src/telco_churn/models/gate.py`** — comparative-regime PR-AUC selection now also requires the candidate's own PR-AUC to clear the cold-start bar (`>= bars.pr_auc_bar`), not only a materially positive Δ vs the incumbent. Closes a bar-creep gap: without the floor, a champion lineage is only ever checked against its immediate predecessor, so a later increase to `pr_auc_bar` in `configs/model_promotion.yaml` would never re-bind an existing lineage.
-- **`src/telco_churn/models/gate.py`** — comparative-regime Brier guardrail reinstates the absolute BSS floor (`candidate.bss > 0.0`, vs. `DummyClassifier(prior)`) alongside its existing non-inferiority Δ check. Guards against "biocreep" (the non-inferiority-trial failure mode): a lineage that is merely non-inferior to its immediate predecessor every cycle, and never re-anchored to a fixed baseline, could otherwise drift arbitrarily far below the reference over many cycles with nothing to catch it.
-- **`src/telco_churn/models/gate.py`, `models/evaluate.py`** — `decide_promotion` takes an explicit `regime: Literal["cold_start", "comparative"]` parameter instead of an `incumbent: GateInputs | None` argument whose field values were never read by the function (the comparative Δ fields already live on `candidate`, computed upstream). Removes `evaluate.py`'s `_INCUMBENT_EXISTS_MARKER`, a zero-filled `GateInputs` sentinel that existed only to be non-`None` — closes a latent footgun where a future reader could plausibly reach for `incumbent.pr_auc`/`.bss`/etc. and silently get `0.0` back.
-- **`ANALYSIS.md`** §0 — comparative-regime gate table and intro rewritten to document all three guardrail changes above (recall's new non-inferiority check, Brier's reinstated absolute floor, and the shared floor+non-inferiority rationale).
+- **`models/review.py`** — `notes` is now hard-required; logs where a reviewer finds this cycle's MLflow diagnostics before validating input.
+- **`models/evaluate.py`** — `load_fitted_model` takes an explicit `model_uri`; step orchestrators take an already-resolved `(run_id, model_version[, model_uri])` instead of re-deriving it; `load_incumbent_proba` reads the champion's own `test_predictions.parquet` instead of re-scoring it live, checked against `champion_data_content_hash`.
+- **`models/evaluate.py::resolve_evaluation_champion`** — explicit `champion_version` override that never touches the live `champion` alias; omitted, falls back to a live alias read.
+- **`models/threshold.py`** — `model_version` stamp replaced with `logged_model_id`; `validation_payload` gains `screen_passed`.
+- **`models/error_analysis.py`** — dev-OOF diagnostics resolved via `evaluate.load_dev_oof_diagnostics(run_id, cfg)` over MLflow instead of a local file; SHAP-based direction-sanity check is now a reported-only re-audit of the feature set `threshold.py` already vetoed on dev.
+- **`models/gate.py`** — comparative-regime PR-AUC selection now also requires the candidate to clear the cold-start bar, not only a positive Δ; Brier guardrail reinstates the absolute BSS floor alongside its non-inferiority check.
+- **`models/gate.py`, `models/evaluate.py`** — `decide_promotion` takes an explicit `regime` parameter instead of an unused `incumbent` argument; no longer returns a `review` field.
+- **`models/calibrate.py`** — no longer performs any registry write; fits, logs, and writes `reports/calibrate_receipt.json` only.
+- **`models/evaluate.py`, `models/error_analysis.py`** — stop writing model-version tags; `register.py` is now the sole writer.
+- **`models/register.py`** — reads `promotion_review.json`'s last entry for the human verdict; a `rejected` verdict routes through `_tag_rejected` like every other reject path.
+- **`configs/config.yaml`** — `paths.processed_data` is now a plain literal, not an `${oc.env:...}` interpolation DVC can't hash; overrides go through Hydra CLI overrides via new `utils/paths.py::activate_config`/`reset_active_config`.
+- **`data/ingest.py`** — `--csv-path` CLI flag removed; raw CSV path now set via `paths.raw_data=<path>` like every other entry point.
+- **`models/train/feature_freeze.py` → `feature_audit.py`** (renamed) — no longer runs the ~85,000-scoring-pass keep-vs-reduce comparison every cycle; committed features now read from `features/schema.py::COMMITTED_FEATURES`; the module only audits the committed set, doesn't decide it.
+- **`features/accessor.py`, `features/build.py`** — processed-features artifact moved from `telco_churn_processed.csv` to `telco_churn_features.parquet`.
+- **`models/train/__main__.py`** — automated pipeline now runs Steps 3-5 directly against the frozen model family; Steps 1-2 (family comparison) moved to notebook-only.
+- **`models/train/selection_review.py` → `feature_selection.py`** (renamed) — the module decides `COMMITTED_FEATURES`, doesn't just review it.
+- **`CLAUDE.md`** — Model Registry section rewritten to describe `register.py` as the sole entry point for minting/tagging/pointing/flipping.
 - **`README.md`** — Tests/Coverage badges refreshed to 835 passed / 51 skipped, 95.7% coverage.
-- **`ANALYSIS.md`** — stale `train.py`/`compute_shap_audit` references in §4a/§4b/§8's artifact table corrected to their current `models/train/` package locations, left behind by the orchestrator-decomposition pass ([0.7.6]).
-- **`CONTRIBUTING.md`** — `make test-integration` note corrected (each test spins up its own ephemeral Postgres via `testcontainers`; `make db-up` isn't a prerequisite); Submitting a PR section documents CI's unit/integration job split and its PR-to-`main` trigger.
-- **`configs/config.yaml`** — `paths.processed_data` is now a plain literal instead of `${oc.env:PROCESSED_DATA_DIR,datasets/processed/}`. DVC hashes stage params as written, so an unresolved `${oc.env:...}` string could never be tracked correctly; overrides now go through Hydra CLI overrides (`paths.processed_data=<path>`) via the new `activate_config()`, not an environment variable.
-- **`src/telco_churn/utils/paths.py`** — new `activate_config(cfg)` / `reset_active_config()` install (and clear) a process-global config that `load_config()` now checks first. Lets a composed, override-applied config reach modules that call `load_config()` internally (e.g. `features/accessor.py`) without threading a `cfg` parameter through every call site — the mechanism `PROCESSED_DATA_DIR` used to provide via the environment.
-- **`src/telco_churn/data/ingest.py`** — the `--csv-path` CLI flag is removed. The raw CSV path is now set the same way every other entry point takes an override: `paths.raw_data=<path>` via Hydra's CLI composition, so all entry points take overrides identically.
-- **`src/telco_churn/models/train/feature_freeze.py`** — `run_feature_audit_step` (renamed from `run_selection_step` — see below) no longer runs the CV-wrapped keep-vs-reduce comparison (`~85,000` scoring passes across 100 folds) automatically on every training cycle; the committed feature set is read from the new `features/schema.py::COMMITTED_FEATURES` constant instead of being computed inline. Per `ANALYSIS.md` §4b: run `de4fac8e` found the full set wins materially and significantly (paired-bootstrap Δ = 0.008, CI [0.005, 0.011], p < 0.001), so the comparison's `decision == "reduced"` branch was never taken across any logged `feature_selection` run, and `COMMITTED_FEATURES` currently reflects that finding. Signature drops the now-unused `candidate_results` parameter. What still runs every cycle is one all-dev `features.select.mint_committed_list` fit (permutation-importance table, including the correlated-group rescue) and a non-gating SHAP audit, scored against the full candidate space regardless of what's committed — the diagnostic surface that feeds the model card and `error_analysis.py`, deliberately re-run each cycle since it describes the model actually being promoted.
-- **`src/telco_churn/features/schema.py`** — new `COMMITTED_FEATURES` constant: the model's actual input space, a hand-maintained subset of `FEATURE_SCHEMA` (currently equal to it), edited only via reviewed PR when a re-run of the selection ablation concludes differently. Re-exported from `features/build.py` alongside `FEATURE_SCHEMA`.
-- **`src/telco_churn/features/select.py`** — `PermutationImportanceSelector` now exposes `group_importance_` (the joint permutation importance computed for any `correlated_groups` entry whose members all failed the individual floor), logged as `selection/group_importance.json` on the `feature_selection` run. New `ABLATION_N_BOOTSTRAP` module constant (replaces `configs/training/feature_selection.yaml`'s removed `bootstrap_n_samples` — see Removed) and updated module docstring distinguishing the live per-cycle diagnostic from the notebook-only ablation.
-- **`configs/training/feature_selection.yaml`** — gains a `[gender, seniorcitizen, has_partner, dependents]` `correlated_groups` entry alongside the existing `[tenure, totalcharges, monthlycharges]`. Confirmed the rescue's joint-permutation trigger fires (all four members fail the floor individually) and recorded the returned `group_importance = 0.00116` — below the 0.005 floor, so the block stays dropped, but the number is now available for a fairness-motivated removal decision to price against.
-- **`notebooks/03b-feature-selection.ipynb`** — rewritten as the importance-diagnostic walkthrough: renders the live per-cycle diagnostic (§1–2, §4), and gains a new "On-demand ablation review" section that calls `run_selection_cv`/`reduced_set_bootstrap_test` directly against current dev data — genuinely re-runnable, not a replay of historical numbers — logging to its own `telco-churn-feature-selection-review` MLflow experiment, separate from `telco-churn-training`, triggered only deliberately (a new engineered feature, a per-feature drift signal, or a scheduled review), never automatically.
-- **`src/telco_churn/models/train/__main__.py`** — no longer calls `run_candidate_step`/`run_comparison_step` (Steps 1-2); the automated pipeline now runs `_load_dev_features` -> Step 3 -> Step 4 -> Step 5 directly against the frozen model family. The LogReg-winner warn-and-skip branch is removed along with it — nothing left decides a family to skip against.
-- **`src/telco_churn/models/train/common.py`** — new `COMMITTED_MODEL_FAMILY` constant (currently `"lightgbm"`) and `COMMITTED_MODEL_FAMILY_DECISION_RUN_ID` (the MLflow `model_comparison` run backing it, `01a0100b92a34c7a964879cf541fd6f3`), mirroring `features/schema.py::COMMITTED_FEATURES`'s discipline: edited only via reviewed PR after a fresh `03a-model-selection.ipynb` review. Per `ANALYSIS.md` §4a: LightGBM wins materially and significantly (paired-bootstrap Δ = 0.007, CI [0.002, 0.012], p < 0.001), reinforced by build-specific rationale.
+
+### Removed
+- **`models/train/feature_freeze.py`** — the automated `decision == "reduced"` branch and its full-vs-reduced figures; the underlying comparison functions remain, called only from the notebook's on-demand review.
+- **`configs/config.yaml`, `configs/training/feature_selection.yaml`** — dead CV/bootstrap config keys, replaced by module-level constants once their automated-pipeline call sites were removed.
+
+### Fixed
+- **`tests/integration/test_train_subprocess.py`** — a receipt-writer leak into the tracked working directory; now `tmp_path`-scoped like the other subprocess suites.
+- **`models/evaluate.py`, `models/register.py`** — the four `champion`-alias lookups now check MLflow's `error_code` instead of catching every `MlflowException` as "not found," so a transient error can no longer silently flip the gate to cold-start regime.
+- **`models/register.py::rollback_champion`** — no longer raises on a first-ever promotion with nothing tagged `promoted`; unsets the alias and records a `rolled_back` event.
+- **`models/calibrate.py`** — `promotion_status: pending` now tagged immediately after mint, before the parity check — previously a parity failure left the version untagged, invisible to the rollback rule and the pending-reaper.
+- **`models/register.py`** — the `promoted` tag now only lands after the post-flip drift-reference/model-card build succeeds; a failure rolls the alias back and re-raises.
+- **`models/error_analysis.py`** — per-feature SHAP metrics capped to `top_k_shap_features` instead of one metric key per one-hot-expanded feature.
+- **Phases 1-7 QA pass (13 smaller items)** — `CleanedSchema`/`validate_clean` wired into `build.py`'s `__main__`; an Optuna `max_depth`/`num_leaves` coupling attempt reverted after it excluded the 1-SE rule's preferred region; new `capacity_budget_check` diagnostic; Optuna's Postgres schema now created from a versioned `sql/schema/002_create_optuna_schema.sql` file; assorted stale-docstring/comment fixes and one mis-named test corrected.
+- **`.gitignore`** — the six per-cycle receipts gitignored instead of git-committed — a committed receipt hash-matched `dvc.lock` on a fresh clone even though the fresh backend had never run, so `dvc repro` skipped stages against empty infra.
 - **`src/telco_churn/models/train/log_model.py`** — `_build_training_manifest`'s `model_comparison` section (the recomputed paired-Δ vs LogReg) replaced by `model_family_committed` (`model_family`, `decision_reference`, `decision_run_id` — referenced from `common.py`, never recomputed). `run_model_logging_step` drops the now-unused `comparison` parameter.
 - **`src/telco_churn/models/train/candidates.py`, `comparison.py`** — module docstrings updated: notebook-only (`03a-model-selection.ipynb`), not called from the automated pipeline. `run_candidate_step`/`run_comparison_step`/`run_diagnostics_step` gain explicit `cv_folds`/`cv_repeats`/`n_bootstrap`/`segment_n_bootstrap` parameters (defaulting to the new `_FAMILY_REVIEW_*` module constants below) so notebook call sites need no override while test fixtures still can, same pattern `reduced_set_bootstrap_test`'s `n_bootstrap` parameter already established.
 - **`notebooks/03a-model-selection.ipynb`** — rewritten from a passive renderer ("already ran via `python -m telco_churn.models.train`") to the on-demand trigger: §1 now calls `run_candidate_step`/`run_comparison_step` directly against a freshly loaded dev partition, logging its own `dummy_prior`/`logreg_cv`/`lgbm_default`/`model_comparison` MLflow runs, then prints the `model_comparison` run id to cite as `COMMITTED_MODEL_FAMILY_DECISION_RUN_ID`. The bias/variance diagnostic loop (§4) reuses that same loaded dev partition instead of a second independent load.
@@ -134,46 +141,17 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 *Every Phase 5–7 `run_*_step` function had grown into a single 250–540 line block mixing load/compute/plot/MLflow-log concerns; this pass splits each into named, single-purpose helper functions with no behavior change, dedupes a handful of copy-pasted blocks, and separately lands leftover CI/warning-suppression fixes and test-coverage backfill from Phase 7 QA. Full suite: 815 passed, 51 skipped, 95.71% coverage.*
 
 ### Changed
-- **`src/telco_churn/models/error_analysis.py`, `evaluate.py`, `register.py`, `calibrate.py`, `threshold.py`** — each `run_*_step` orchestrator decomposed into named stage helpers (`_load_*`, `_compute_*`, `_render_*_figures`, `_log_*_run`, etc.); orchestrator bodies shrank from 410–474 lines of code to 63–137. `register.py`'s `_assemble_model_card` similarly split into `_build_business_case_section`/`_build_risks_and_limitations_section`/`_build_governance_section`/`_build_technical_appendix_section`. `error_analysis.py`'s illustrative-case waterfall slicing (`fn_end`/`fp_end`/`tp_end` offsets) is now computed once and pre-sliced inside `_compute_illustrative_cases`, rather than re-derived at the render call site.
-- **`src/telco_churn/models/train/tuning.py`, `feature_freeze.py`, `log_model.py`, `comparison.py`** — same decomposition applied to each Phase 5 step's orchestrator (e.g. `_build_optuna_study`/`_run_study_trials`/`_summarize_completed_trials`; `_scale_n_estimators`/`_run_two_count_diagnostic`); all four now call `utils.mlflow.ensure_experiment_metadata` instead of hand-rolling `mlflow.set_tracking_uri`/`set_experiment`.
-- **`src/telco_churn/models/explain.py`, `features/select.py`** — duplicated signed-direction correlation logic (`dependence_points`/`binary_feature_effects`) extracted to `_signed_direction`; duplicated preprocessor+selector construction (`_build_selection_pipeline`/`mint_committed_list`) extracted to `_build_selector`.
-- **`src/telco_churn/models/error_analysis.py`** — dropped its private reimplementation of `utils.mlflow.resolve_logged_model_id` in favor of the shared import.
-- **`src/telco_churn/models/train/common.py`** — new shared `_plot_bootstrap_delta` (was duplicated inline in `comparison.py`/`feature_freeze.py`) and `_build_dev_dataset` (was duplicated in `candidates.py`).
+- **`models/error_analysis.py`, `evaluate.py`, `register.py`, `calibrate.py`, `threshold.py`** — each `run_*_step` orchestrator decomposed into named stage helpers; bodies shrank from 410–474 lines to 63–137.
+- **`models/train/tuning.py`, `feature_freeze.py`, `log_model.py`, `comparison.py`** — same decomposition; all four now call `utils.mlflow.ensure_experiment_metadata` instead of hand-rolling MLflow setup.
+- **`models/explain.py`, `features/select.py`** — duplicated signed-direction and preprocessor/selector construction logic extracted to shared helpers.
+- **`models/error_analysis.py`** — dropped its private reimplementation of `utils.mlflow.resolve_logged_model_id`.
 
 ### Fixed
-- **`src/telco_churn/utils/mlflow.py`** — silences three confirmed-benign MLflow warnings (dataset-digest `Pandas4Warning`, ambiguous dataset-source registration, integer-schema inference hint) at `resolve_tracking_uri`, the one choke point every training-cycle module passes through before its first MLflow call.
-- **`src/telco_churn/features/select.py`, `models/error_analysis.py`, `models/explain.py`, `features/preprocessing.py`** — migrated off shap's deprecated `TreeExplainer.shap_values()` to the `__call__` API; `build_preprocessor` now sets `transform="pandas"` itself instead of every caller doing it.
-- **`src/telco_churn/models/calibrate.py`, `models/evaluate.py`** — `calibration_slope`'s bootstrap fit uses `C=1e10` instead of `C=np.inf` (avoids an sklearn 1.8 migration-shim warning); sealed-test bootstrap CIs suppress `nanpercentile`'s benign all-NaN warning when a resample has zero predicted positives.
-- **`src/telco_churn/data/eda.py`** — `compute_chi2_tests` now calls the existing `utils.stats.cramers_v` instead of a duplicated inline calculation.
-- **`.pre-commit-config.yaml`** — mypy hook's `additional_dependencies` expanded to the project's full runtime dependency set (`lightgbm` pinned to match `uv.lock`), fixing false import/type errors the hook's isolated environment produced after `pyproject.toml`'s `ignore_missing_imports` was scoped down from a blanket rule.
-- **`.github/workflows/ci.yml`, `pyproject.toml`** — unit tests run under `pytest-xdist`; integration tests split into a separate scheduled/on-demand job; `mypy`'s `ignore_missing_imports` scoped to the handful of libraries that actually lack stubs.
-- **`tests/`** — shared fixtures scoped to module level across several suites for `pytest-xdist`-safe parallel execution; new `tests/unit/test_paths.py`; backfilled coverage for `utils/stats.py` and `utils/logging.py`.
-
----
-
-## [0.7.4] - 2026-07-30 — Phase 7 Completion: Pre-Seal Dev-OOF Screen, Full-Refit Descoping & First Champion Promotion
-
-*Closes the gap between what `CLAUDE.md`/0.7.3 already documented as `register.py`'s contract and what the rest of the pipeline actually wrote: `evaluate.py`/`error_analysis.py` now tag the model version `eval_run_id`/`error_analysis_run_id` `register.py` resolves by. Adds Phase 6's pre-seal screen (`threshold.py` re-runs `ANALYSIS.md` §0's V1/V2/V2b dev-OOF diagnostics and the calibration-slope band check before the sealed test set is ever touched), retires the full-data-refit design (`refit.py` was never implemented and is no longer planned — `register.py` promotes the exact artifact `evaluate.py` scored), and runs the project's first real promotion: `telco-churn-pipeline` v1 → `champion`, 2026-07-30 13:00:37 UTC.*
-
-### Added
-- **`src/telco_churn/models/threshold.py`** — `run_threshold_step`'s new last step: fetches `calibrate.py`'s logged dev-OOF vector and calibration slope (never recomputes either), screens the slope against `ANALYSIS.md` §0's `[0.80, 1.25]` band via `gate.py::slope_passes`, and computes V1 (segment collapse)/V2 (fairness disparity)/V2b (per-group calibration) on that same vector. Raises `RuntimeError` (subprocess exit 1) if the slope's CI falls entirely outside the band — a hard stop before the one-time sealed-test evaluation is ever spent on a badly-calibrated candidate. Writes `reports/dev_oof_predictions.parquet`/`dev_oof_diagnostics.json`, both logged under the run's new `threshold/` artifact subpath. New `build_dev_oof_screen_frame`, `compute_dev_oof_diagnostics`; `load_policy_thresholds`/`resolve_policy_scenarios`/`resolve_policy_thresholds_by_scenario` moved here from `evaluate.py` (their writer, per CLAUDE.md's reader/writer-locality convention).
-- **`src/telco_churn/models/diagnostics.py`** — `build_segment_lookup`, `ROBUSTNESS_AXES`/`FAIRNESS_AXES`, and the V1/V2/V2b computation itself (`sliced_ranking_metrics`/`flag_segment_collapse`, `sliced_decision_rates` + `equal_opportunity_difference_by_axis`/`demographic_parity_difference_by_axis`, `sliced_calibration`/`flag_calibration_collapse`) moved here from `evaluate.py` so `threshold.py`'s dev-OOF screen and `evaluate.py`'s sealed-test reporting slices share one implementation instead of two.
-- **`src/telco_churn/utils/mlflow.py`** — `resolve_model_run_id`, `resolve_logged_model_id`, `load_model_promotion_bars` (moved from `evaluate.py`; `threshold.py` needs them too, and `evaluate.py` already imports from `threshold.py`, so a shared import-safe home avoids a circular import). `ensure_experiment_metadata`, `set_run_description`, `set_registered_model_description`, `set_logged_model_description` — MLflow experiment/run/registry/model overview-page descriptions, previously absent or hand-rolled per module (`candidates.py`'s inline experiment-tag block is now one call).
-- **`tests/unit/test_diagnostics.py`** (+274 lines), **`tests/unit/test_threshold.py`** (+246), **`tests/unit/test_calibrate.py`** (+81) — coverage for the moved V1/V2/V2b helpers and the dev-OOF screen's pass/fail paths; **`tests/integration/test_threshold_subprocess.py`** (+72), **`test_evaluate_subprocess.py`** (+49), **`test_error_analysis_subprocess.py`** (+28) — subprocess coverage for the screen's exit-1 path and the `eval_run_id`/`error_analysis_run_id` tags.
-
-### Changed
-- **`src/telco_churn/models/evaluate.py`** — no longer computes V1/V2/V2b itself; fetches `threshold.py`'s already-computed `dev_oof_diagnostics.json` by explicit `run_id` (`load_dev_oof_diagnostics`) instead of a second `load_dev_oof_with_segments` derivation. Now tags the model version `eval_run_id` — the read half of `register.py`'s tag-based resolution (`CLAUDE.md` § MLflow Model Registry) that was documented in 0.7.3 but not yet written anywhere until this pass.
-- **`src/telco_churn/models/error_analysis.py`** — reads `calibrate.py`'s dev-OOF vector via `threshold.load_dev_oof_predictions` (by `run_id`, from MLflow) instead of a local `reports/dev_oof_predictions.parquet` mirror that only reflected whichever run last executed `threshold.py` on this machine. Now tags the model version `error_analysis_run_id`, the other half of the same resolution path.
-- **`src/telco_churn/models/gate.py`** — `_slope_passes` made public (`slope_passes`); `threshold.py`'s dev-OOF screen reuses it rather than reimplementing the same band check.
-- **`src/telco_churn/models/calibrate.py`** — registers with model-version tag `training_data_scope: dev` (renamed from `refit_scope`, which implied a `full` counterpart that no longer exists — see Removed); sets registry/model/version overview descriptions via the new `mlflow.py` helpers; run/model/dev-OOF/golden-fixture artifacts now logged under a `calibration/` subpath instead of the run root.
-- **`candidates.py`, `comparison.py`, `feature_freeze.py`, `log_model.py`** (`models/train/`) — call `ensure_experiment_metadata`/`set_run_description` instead of each hand-rolling its own experiment tags; `log_model.py` additionally logs `target_column` as a run param.
-- **`configs/config.yaml`** — registers `register: default` as a Hydra defaults-list entry (`register.py` was runnable from 0.7.3 but not wired into config composition until now); **`configs/threshold/default.yaml`** gains `n_bootstrap` (dev-OOF screen resample count, distinct from the argmax-EV bootstrap); **`configs/calibration/default.yaml`** gains `golden_n_rows`.
-- **`ANALYSIS.md`** §0 — the promotion-gate table and V1–V3 review section rewritten in plainer language for the reviewer-facing audience; removed the "champion isn't the model the gate measured" dual dev/full-refit calibration subsection, now moot. §8 rewritten from the archived notebook's placeholder to the real event: `telco-churn-pipeline` v1 promoted to `champion`, 2026-07-30 13:00:37 UTC, no separate refit.
-- **`CLAUDE.md`, `PROJECT_PLAN.md`** — every `refit.py`/`refit_scope`/two-artifact-registry reference removed (the design these described was superseded before it was ever implemented); Phase 6's checklist gains the pre-seal dev-OOF screen as its last step; `register.py`'s tag-based cross-cycle resolution (`eval_run_id`, `error_analysis_run_id`) documented as the rule this pass makes real.
-- **`notebooks/04-calibration-and-threshold.ipynb`, `notebooks/05-evaluation-and-error-analysis.ipynb`** — re-executed against the pipeline above; notebook 05's closing cells now render the real promotion verdict and timestamp.
-
-### Removed
-- **The full-data-refit design (`refit.py`)** — never implemented, and descoped from Phase 7 rather than built: `register.py` promotes the exact artifact `evaluate.py` scored, with no second fit. The `refit_scope: dev | full` model-version tag is retired along with it; `training_data_scope: dev` (`calibrate.py`) replaces it and carries no `full` counterpart.
+- **`utils/mlflow.py`** — silences three confirmed-benign MLflow warnings at `resolve_tracking_uri`.
+- **`features/select.py`, `models/error_analysis.py`, `models/explain.py`, `features/preprocessing.py`** — migrated off shap's deprecated `TreeExplainer.shap_values()`.
+- **`models/calibrate.py`, `models/evaluate.py`** — `calibration_slope`'s bootstrap fit avoids an sklearn 1.8 migration-shim warning; sealed-test bootstrap CIs suppress a benign all-NaN warning.
+- **`.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `pyproject.toml`** — mypy hook dependencies expanded to match `uv.lock`; unit tests run under `pytest-xdist`; integration tests split into a scheduled/on-demand job.
+- **`tests/`** — fixtures scoped to module level for parallel-safe execution; backfilled coverage for `utils/stats.py`/`utils/logging.py`.
 
 ---
 
@@ -194,18 +172,42 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ---
 
+## [0.7.4] - 2026-07-30 — Phase 7 Completion: Pre-Seal Dev-OOF Screen, Full-Refit Descoping & First Champion Promotion
+
+*Closes the gap between what `CLAUDE.md`/0.7.3 already documented as `register.py`'s contract and what the rest of the pipeline actually wrote: `evaluate.py`/`error_analysis.py` now tag the model version `eval_run_id`/`error_analysis_run_id` `register.py` resolves by. Adds Phase 6's pre-seal screen (`threshold.py` re-runs `ANALYSIS.md` §0's V1/V2/V2b dev-OOF diagnostics and the calibration-slope band check before the sealed test set is ever touched), retires the full-data-refit design (`refit.py` was never implemented and is no longer planned — `register.py` promotes the exact artifact `evaluate.py` scored), and runs the project's first real promotion: `telco-churn-pipeline` v1 → `champion`, 2026-07-30 13:00:37 UTC.*
+
+### Added
+- **`src/telco_churn/models/threshold.py`** — `run_threshold_step`'s new last step: screens the calibration slope against `ANALYSIS.md` §0's `[0.80, 1.25]` band (`gate.py::slope_passes`) and computes V1/V2/V2b on the dev-OOF vector, raising `RuntimeError` before the one-time sealed-test evaluation runs on a badly-calibrated candidate. Writes `dev_oof_predictions.parquet`/`dev_oof_diagnostics.json`.
+- **`src/telco_churn/models/diagnostics.py`** — the V1/V2/V2b computation moved here from `evaluate.py` so `threshold.py`'s dev-OOF screen and `evaluate.py`'s sealed-test slices share one implementation.
+- **`src/telco_churn/utils/mlflow.py`** — `resolve_model_run_id`, `resolve_logged_model_id`, `load_model_promotion_bars`, `ensure_experiment_metadata`, and description-setting helpers for MLflow experiment/run/registry/model overview pages.
+- **`tests/unit/test_diagnostics.py`** (+274), **`test_threshold.py`** (+246), **`test_calibrate.py`** (+81); **`tests/integration/test_threshold_subprocess.py`** (+72), **`test_evaluate_subprocess.py`** (+49), **`test_error_analysis_subprocess.py`** (+28) — dev-OOF screen and `eval_run_id`/`error_analysis_run_id` tag coverage.
+
+### Changed
+- **`src/telco_churn/models/evaluate.py`** — no longer computes V1/V2/V2b itself; fetches `threshold.py`'s `dev_oof_diagnostics.json` by explicit `run_id`. Now tags the model version `eval_run_id`.
+- **`src/telco_churn/models/error_analysis.py`** — reads `calibrate.py`'s dev-OOF vector via MLflow instead of a local file mirror; now tags the model version `error_analysis_run_id`.
+- **`src/telco_churn/models/gate.py`** — `_slope_passes` made public (`slope_passes`); reused by `threshold.py`'s dev-OOF screen.
+- **`src/telco_churn/models/calibrate.py`** — model-version tag `refit_scope` renamed `training_data_scope: dev`; artifacts now logged under a `calibration/` subpath instead of the run root.
+- **`configs/config.yaml`, `configs/threshold/default.yaml`, `configs/calibration/default.yaml`** — `register: default` wired into config composition; `threshold` gains `n_bootstrap`; `calibration` gains `golden_n_rows`.
+- **`ANALYSIS.md`** §0 rewritten in plainer language for the reviewer audience; §8 records the real promotion event (`telco-churn-pipeline` v1 → `champion`, 2026-07-30 13:00:37 UTC).
+- **`CLAUDE.md`, `PROJECT_PLAN.md`** — every `refit.py`/`refit_scope` reference removed; Phase 6's checklist gains the pre-seal dev-OOF screen.
+
+### Removed
+- **The full-data-refit design (`refit.py`)** — never implemented, descoped from Phase 7: `register.py` promotes the exact artifact `evaluate.py` scored, no second fit. `refit_scope: dev | full` tag retired with it.
+
+---
+
 ## [0.7.3] - 2026-07-28 — Phase 7 Completion: Registry Promotion & Drift Reference
 
 *Closes Phase 7: the promotion gate's verdict is now acted on — `register.py` flips the `champion` alias, builds the drift-monitoring baseline, and assembles the stakeholder-facing model card, completing the evaluate → gate → register cycle.*
 
 ### Added
-- **`src/telco_churn/models/register.py`** — `run_registration_step`: reads the persisted gate verdict (never recomputes it), a two-phase-commit serving smoke check (pre-flip by explicit version URI, post-flip through the `champion` alias with automatic rollback on failure), and writes `drift_reference.json`/`model_card.json` onto the promoted run. `promote_to_alias`, `rollback_champion` (selects the highest `promotion_status: promoted` version, never by version arithmetic), `check_environment_parity`/`EnvironmentMismatchError` (guards the golden-parity check's floating-point tolerance against dependency drift).
-- **`src/telco_churn/models/drift_reference.py`** — `build_reference`: pure builder for the champion's drift-monitoring baseline (per-feature distributions, out-of-sample score distribution, churn prevalence), consumed by `register.py` and Phase 10/13's monitoring.
-- **`configs/register/default.yaml`** — registry promotion step configuration (`require_review`, `alias`, `golden_atol`, `environment_packages`, `drift_reference_n_bins`).
-- **`tests/unit/test_register.py`** (17 tests), **`tests/unit/test_drift_reference.py`**, **`tests/integration/test_register_subprocess.py`** (3 tests) — full step-order coverage: idempotent re-invocation, fail-fast gate-fail short-circuit, manifest/error-analysis gates, environment-mismatch vs. genuine smoke-check-failure distinction, post-flip rollback, and emergency rollback's highest-`promoted`-not-highest-version selection.
+- **`src/telco_churn/models/register.py`** — `run_registration_step`: reads the persisted gate verdict, a two-phase-commit serving smoke check (pre-flip by version URI, post-flip through the `champion` alias with automatic rollback on failure), writes `drift_reference.json`/`model_card.json`. `rollback_champion` selects the highest `promotion_status: promoted` version, never by version arithmetic.
+- **`src/telco_churn/models/drift_reference.py`** — `build_reference`: pure builder for the champion's drift-monitoring baseline.
+- **`configs/register/default.yaml`** — registry promotion step configuration.
+- **`tests/unit/test_register.py`** (17), **`test_drift_reference.py`**, **`tests/integration/test_register_subprocess.py`** (3) — step-order, rollback, and environment-mismatch coverage.
 
 ### Changed
-- **`src/telco_churn/models/calibrate.py`** — the registration step now tags every newly minted version `promotion_status: pending` at mint time (the crash-safe default `register.py`'s rollback query depends on), and logs `golden_predictions.json` — customerid-pinned dev rows plus the in-memory fitted pipeline's reference scores, captured before serialization — the independent reference `register.py`'s serving-parity check verifies against. New `select_golden_rows` helper; `configs/calibration/default.yaml` gains `golden_n_rows`.
+- **`src/telco_churn/models/calibrate.py`** — tags every newly minted version `promotion_status: pending` at mint time; logs `golden_predictions.json` (customerid-pinned dev rows + reference scores) as the independent reference `register.py`'s serving-parity check verifies against.
 
 ---
 
@@ -267,218 +269,90 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ## [0.6.3] - 2026-07-18 — Phase 7 Prerequisites: Tree-Count Scaling & Dataset Lineage (Run 2)
 
-*The one modelling fix in the Prerequisites section, shipped alone per the two-run ordering
-Run 1 established: `n_estimators` was derived from Optuna's early-stopped median on each CV
-fold's carved-down training partition (3,606 rows) and applied unscaled to the larger final
-dev fit (5,634 rows), systematically under-boosting every shipped model. Scaling it moves CV
-PR-AUC, BSS, ECE, and the empirical threshold checks — all attributable to this one change,
-confirmed against Run 1's now-established baseline. A second, independently-additive fix
-extends Run 1's dataset-lineage logging to the three step-level MLflow runs it missed.*
+*`n_estimators` was derived from Optuna's early-stopped median on each CV fold's carved-down training partition and applied unscaled to the larger final dev fit, systematically under-boosting every shipped model. Scaling it moves CV PR-AUC/BSS/ECE and the empirical threshold checks. A second, independent fix extends Run 1's dataset-lineage logging to the three step-level MLflow runs it missed.*
 
 ### Added
-- `src/telco_churn/models/train/log_model.py` — `n_estimators` scaled by
-  `n_final_fit / n_fold_fit` before the final dev fit, taking the shipped tree count from 94 to
-  **147**; derivation and diagnostic in `ANALYSIS.md` §4c.
-- `src/telco_churn/models/train/common.py::_log_dev_input` — dataset-lineage `log_input` now
-  fires from the `model_comparison`, `feature_selection`, and `tuning_study` runs, which
-  previously opened without recording what dataset they touched.
-- `src/telco_churn/models/calibrate.py::calibration_slope` — adds an analytic (Wald) CI
-  cross-checking the existing bootstrap CI (they agree closely); surfaced an intercept
-  miscalibration the slope alone is blind to. Finding recorded in `ANALYSIS.md` §9 limitation
-  #14.
-- `configs/calibration/default.yaml` — `method` pinned from `auto` to **`sigmoid`**, the
-  winner resolved from Run 2's `calibration_summary.json`.
-- `ANALYSIS.md` — records the tree-count scaling derivation (§4c), the calibration-intercept
-  finding and new limitation #14, and the resulting Δ across the calibration and threshold
-  tables.
+- `models/train/log_model.py` — `n_estimators` scaled by `n_final_fit / n_fold_fit` before the final dev fit, tree count 94 → **147** (`ANALYSIS.md` §4c).
+- `models/train/common.py::_log_dev_input` — dataset-lineage `log_input` now fires from the `model_comparison`, `feature_selection`, and `tuning_study` runs.
+- `models/calibrate.py::calibration_slope` — adds an analytic (Wald) CI cross-checking the bootstrap CI; surfaced an intercept miscalibration (`ANALYSIS.md` §9 #14).
+- `configs/calibration/default.yaml` — `method` pinned from `auto` to **`sigmoid`**.
 
 ### Changed
-- **Run 2 measurement** — dev CV PR-AUC (sigmoid) 0.6669 → 0.6684, BSS 0.3098 → 0.3111,
-  ECE 0.0217 → 0.0222, base-scenario empirical threshold 0.4428 → 0.4150 (within its bootstrap
-  CI; closed-form `t* = 0.3941` unchanged). Notebooks `03a`–`03c` and `04` re-executed against
-  the Run 2 pipeline.
+- **Run 2 measurement** — dev CV PR-AUC (sigmoid) 0.6669 → 0.6684, BSS 0.3098 → 0.3111, ECE 0.0217 → 0.0222, base-scenario empirical threshold 0.4428 → 0.4150 (closed-form `t* = 0.3941` unchanged). Notebooks `03a`–`03c`/`04` re-executed.
 
 ---
 
 ## [0.6.2] - 2026-07-16 — Phase 7 Prerequisites: MLflow Lineage & Evidence-Persistence Fixes (Run 1)
 
-*Four logging/lineage defects found while designing Phase 7, all in already-shipped Phase 5/6
-code — none of which changes a computed number. Verified via a hard reset (Postgres volume,
-`mlruns/`, `mlflow.db`) and full rebuild: every existing number in `ANALYSIS.md` §4–§6
-reproduced identically, confirming the pipeline is deterministic and these fixes are inert.*
+*Four logging/lineage defects found while designing Phase 7, all in already-shipped Phase 5/6 code — none change a computed number. Verified via a hard reset and full rebuild: every existing number in `ANALYSIS.md` §4–§6 reproduced identically.*
 
 ### Added
-- `configs/config.yaml`, `src/telco_churn/utils/mlflow.py::resolve_tracking_uri` — tracking-URI
-  fallback now resolves to `sqlite:///mlflow.db`, not the bare `mlruns` file store (raises as of
-  MLflow 3.14).
-- `src/telco_churn/models/train/log_model.py`, `src/telco_churn/models/calibrate.py` —
-  `logged_model_id` persisted to `training_manifest.json` and as a model-version tag, giving the
-  registry a path to the `LoggedModel` Phase 7's evaluation logging attaches metrics to.
-- `src/telco_churn/models/train/candidates.py` — logged dataset `source` now resolves through
-  `features/accessor.py::features_path()` instead of a hardcoded path.
-- `src/telco_churn/models/calibrate.py::calibration_slope` — Cox calibration slope + bootstrap CI,
-  logged in `calibration_summary.json` alongside the dev-OOF probability vector
-  (`dev_oof_predictions.parquet`), previously computed and discarded.
-- `src/telco_churn/models/calibrate.py`, `src/telco_churn/models/threshold.py` — dev calibration/
-  threshold metrics (`dev_brier`, `dev_bss`, `t_star_{scenario}`, etc.) now logged as MLflow
-  metrics, not only inside JSON artifacts; the EV curve persisted as `ev_curve.parquet`.
-- `src/telco_churn/models/threshold.py::expected_value_at_threshold`, `costs_config_hash` — new
-  pure functions; `configs/policy/threshold.yaml` pinned by `costs_config_hash` instead of a
-  model stamp.
+- `configs/config.yaml`, `utils/mlflow.py::resolve_tracking_uri` — fallback now resolves to `sqlite:///mlflow.db`, not the bare `mlruns` file store (raises as of MLflow 3.14).
+- `models/train/log_model.py`, `models/calibrate.py` — `logged_model_id` persisted to `training_manifest.json` and as a model-version tag.
+- `models/train/candidates.py` — logged dataset `source` resolves through `features/accessor.py::features_path()` instead of a hardcoded path.
+- `models/calibrate.py::calibration_slope` — Cox calibration slope + bootstrap CI, logged in `calibration_summary.json` alongside the dev-OOF probability vector, previously computed and discarded.
+- `models/calibrate.py`, `models/threshold.py` — dev calibration/threshold metrics now logged as MLflow metrics, not only inside JSON artifacts.
+- `models/threshold.py::expected_value_at_threshold`, `costs_config_hash` — new pure functions; `configs/policy/threshold.yaml` pinned by `costs_config_hash` instead of a model stamp.
 
 ### Changed
-- **Run 1 reproducibility audit** — registry holds exactly one version (`refit_scope: dev`,
-  aliased `challenger`); every family-comparison delta, frozen feature set, tuned hyperparameter,
-  calibration diagnostic, and threshold value matched `ANALYSIS.md` exactly. Clears Run 2 to
-  isolate its own effect against this baseline.
+- **Run 1 reproducibility audit** — registry holds exactly one version; every family-comparison delta, frozen feature set, tuned hyperparameter, calibration diagnostic, and threshold value matched `ANALYSIS.md` exactly.
 
 ---
 
 ## [0.6.1] - 2026-07-14 — Phase 6 QA Pass: Test Isolation & Calibration-Selection Hardening
 
-*A QA pass over Phase 6 found the calibrate/threshold unit tests were not hermetic
-(silently falling through to real, gitignored project data instead of the synthetic
-fixtures every other test uses), the `calibration.method='auto'` decision path — the
-mode that actually produced the shipped model — had two branches with no real test
-coverage, and `calibration_summary.json`'s `switch_decision` field had three
-inconsistent shapes depending on which branch produced it. All are fixed; none change
-the currently-registered model or its documented Phase 6 numbers.*
+*A QA pass over Phase 6 found the calibrate/threshold unit tests were not hermetic (silently falling through to real project data), the `calibration.method='auto'` path had two untested branches, and `switch_decision` had three inconsistent shapes depending on which branch produced it. None change the currently-registered model.*
 
 ### Fixed
-- **`tests/unit/test_calibrate.py`, `tests/unit/test_threshold.py`** — `run_calibration_step`/
-  `run_threshold_step` tests called `load_dev_features()` with no override, which falls
-  through to real disk (`load_features()` → `partition()` → `load_split()`) reading the
-  gitignored `datasets/processed/` directory; passed only because that directory happened
-  to exist locally. Added a `sandboxed_dev_features` fixture (`test_calibrate.py`) and the
-  equivalent inline patch in `test_threshold.py`'s `registered_model_version` fixture,
-  redirecting both `calibrate.load_dev_features` and `threshold.py`'s separate
-  `from ... import load_dev_features` binding to the synthetic `dev_split` fixture.
-  Verified hermetic by re-running with `PROCESSED_DATA_DIR` pointed at a nonexistent path.
-- **`src/telco_churn/models/calibrate.py::select_calibration_method`** — in
-  `calibration.method='auto'` mode, only isotonic's per-fold AP was checked against
-  `pr_auc_gate_passes`; sigmoid (the fallback method whenever isotonic is disqualified)
-  was never itself gated, unlike pinned mode. Added the same gate check to sigmoid,
-  raising `ValueError` rather than silently registering a model with degraded ranking.
-- **`CLAUDE.md`** — Data Handling section referenced `features/io.py::load_features()`;
-  corrected to `features/accessor.py::load_features()`, the actual Phase 6 module name.
+- **`tests/unit/test_calibrate.py`, `test_threshold.py`** — tests fell through to real disk instead of synthetic fixtures; added a `sandboxed_dev_features` fixture redirecting `load_dev_features` to the synthetic `dev_split` fixture. Verified hermetic.
+- **`src/telco_churn/models/calibrate.py::select_calibration_method`** — in `'auto'` mode, sigmoid (the fallback whenever isotonic is disqualified) was never itself PR-AUC-gated, unlike pinned mode. Added the same gate check, raising `ValueError` rather than silently registering a degraded model.
+- **`CLAUDE.md`** — Data Handling section corrected `features/io.py` → `features/accessor.py::load_features()`.
 
 ### Added
-- **`tests/unit/test_accessor.py`** — dedicated unit tests for
-  `src/telco_churn/features/accessor.py` (previously untested directly): `features_path`
-  override behavior, `load_features` schema-validation failures (missing column, wrong
-  dtype, zero-byte file, header-only file), and `features_sha256` hash stability/content-
-  sensitivity. `features/accessor.py` now at 100% line coverage; wired into
-  `Makefile`'s `test-features` target.
-- **`tests/unit/test_calibrate.py`** — two tests closing previously-uncovered branches of
-  `select_calibration_method`'s `'auto'` mode: `isotonic_disqualified_pr_auc_gate` (real,
-  unmocked run) and the real Brier-bootstrap switch decision (isotonic forced past the
-  PR-AUC gate, everything else genuinely computed). `calibrate.py` now at 98% line
-  coverage.
+- **`tests/unit/test_accessor.py`** — dedicated tests for `features/accessor.py`: path override, schema-validation failures, hash stability. Now at 100% line coverage.
+- **`tests/unit/test_calibrate.py`** — two tests closing previously-uncovered branches of `select_calibration_method`'s `'auto'` mode. `calibrate.py` now at 98% line coverage.
 
 ### Changed
-- **`src/telco_churn/models/calibrate.py::select_calibration_method`** —
-  `switch_decision` is now always present in the return value with the same six keys
-  (`method`, `decision_rule`, `delta_brier_obs`, `delta_brier_ci_lower`,
-  `delta_brier_ci_upper`, `n_bootstrap`) regardless of which branch produced it —
-  previously absent entirely in pinned mode and a 2-key dict when isotonic was
-  disqualified, versus the full 6-key dict from a real Brier-bootstrap decision.
-  `run_calibration_step` reads it via direct indexing instead of `selection.get(...)`.
-- **`ANALYSIS.md`** §5 — added a note on the sigmoid-vs-isotonic switch decision's
-  paired bootstrap CI: it resamples only `outer_cv_folds` (= 5) paired fold-level Brier
-  differences, a small effective resample space; not load-bearing for the shipped v1
-  decision since the PR-AUC gate resolved it first, but worth revisiting if a future
-  retrain's decision actually reaches the Brier bootstrap.
+- **`src/telco_churn/models/calibrate.py::select_calibration_method`** — `switch_decision` now always returns the same six keys regardless of which branch produced it, instead of a 2-key dict in one branch and 6-key in another.
+- **`ANALYSIS.md`** §5 — notes the sigmoid-vs-isotonic switch's paired bootstrap CI resamples only 5 folds, a small effective space; not load-bearing for the shipped v1 decision.
 
 ---
 
 ## [0.6.0] - 2026-07-13 — Phase 6: Calibration & Cost-Sensitive Threshold
 
-*Wraps the tuned LightGBM pipeline in sigmoid calibration (pooled Brier 0.1345, Brier
-Skill Score 0.31 — 16.5% better than uncalibrated) and derives the production decision
-threshold from a closed-form cost model (`t* = c/(r×LTV)`), not an empirical
-cost-matrix cutoff — the point where the model becomes a business decision, not just a
-ranking. Base scenario ships at `t* = 0.3941` (30.8% contact rate), agreeing with its
-empirical argmax-EV check. This phase performs the training cycle's single MLflow
-registration, pointing `challenger` at the calibrated pipeline; promotion to `champion`
-remains Phase 7's job.*
+*Wraps the tuned LightGBM pipeline in sigmoid calibration (pooled Brier 0.1345, BSS 0.31) and derives the production threshold from a closed-form cost model (`t* = c/(r×LTV)`), not an empirical cost-matrix cutoff. Base scenario ships at `t* = 0.3941` (30.8% contact rate), agreeing with its empirical argmax-EV check. Performs the training cycle's single MLflow registration, pointing `challenger` at the calibrated pipeline.*
 
 ### Added
-- **`src/telco_churn/models/calibrate.py`** — `CalibratedClassifierCV(ensemble=False)`
-  cross-fit on the dev set; sigmoid selected over isotonic via a PR-AUC-preservation gate.
-  Registers the calibrated pipeline as `telco-churn-pipeline` / `challenger` — the training
-  cycle's single registration. Detail in `ANALYSIS.md` §5.
-- **`src/telco_churn/models/threshold.py`** — closed-form operating threshold
-  `t* = c / (r × LTV)`, replacing the classical cost-matrix rule. Ships `threshold.json` /
-  `configs/policy/threshold.yaml` with per-scenario thresholds and an empirical argmax-EV
-  agreement check. Detail in `ANALYSIS.md` §6.
-- **`src/telco_churn/models/plots.py`** — reliability-diagram, expected-value-curve, and
-  retention-sensitivity plotting helpers.
-- **`src/telco_churn/features/accessor.py`** — `load_features()`, the single accessor owning
-  the processed-features path, format, and `sha256` content hash.
-- **`src/telco_churn/utils/mlflow.py`** — `resolve_tracking_uri()`, extracted from
-  `models/train/common.py` for reuse.
-- **`src/telco_churn/utils/stats.py::paired_bootstrap_ci`** — generic paired-bootstrap CI,
-  extracted from `comparison.py` and reused by `threshold.py`.
-- `configs/calibration/default.yaml`, `configs/costs.yaml`, `configs/threshold/default.yaml`
-  — calibration, cost-scenario, and threshold-derivation config.
-- `notebooks/04-calibration-and-threshold.ipynb` — reliability diagrams, cost curves,
-  threshold-by-scenario and sensitivity plots.
-- `tests/unit/test_calibrate.py`, `test_threshold.py`, `test_mlflow.py`,
-  `tests/integration/test_calibrate_subprocess.py`, `test_threshold_subprocess.py` —
-  suite now 420 passed / 38 skipped, 94.15% coverage (up from 371 tests in Phase 5).
+- **`src/telco_churn/models/calibrate.py`** — `CalibratedClassifierCV(ensemble=False)` cross-fit on the dev set; sigmoid selected over isotonic via a PR-AUC-preservation gate. Registers as `telco-churn-pipeline` / `challenger` (`ANALYSIS.md` §5).
+- **`src/telco_churn/models/threshold.py`** — closed-form `t* = c / (r × LTV)`, replacing the classical cost-matrix rule (`ANALYSIS.md` §6).
+- **`src/telco_churn/models/plots.py`** — reliability-diagram, EV-curve, and retention-sensitivity plotting helpers.
+- **`src/telco_churn/features/accessor.py`** — `load_features()`, the single accessor owning the processed-features path/format/hash.
+- **`src/telco_churn/utils/stats.py::paired_bootstrap_ci`** — generic paired-bootstrap CI, extracted from `comparison.py`.
+- `configs/calibration/default.yaml`, `configs/costs.yaml`, `configs/threshold/default.yaml`; `notebooks/04-calibration-and-threshold.ipynb`.
+- `tests/unit/test_calibrate.py`, `test_threshold.py`, `test_mlflow.py`, plus subprocess integration tests — suite now 420 passed / 38 skipped, 94.15% coverage.
 
 ### Changed
-- **`ANALYSIS.md`** — added §5 Probability Calibration and §6 Business Impact & Threshold
-  Selection; corrected several inaccuracies inherited from the exploratory-pass narrative
-  (nested CV mechanics, isotonic-overfitting explanation, ARPU characterization) and removed
-  an unreproducible recall/precision figure.
-- **`README.md`** — results table, data-splits description, and pipeline diagram corrected to
-  match the real Phase 5/6 pipeline; tech stack and quick start extended through
-  calibrate → threshold.
-- **`Makefile`** — `train` target now runs the module directly (was a premature `dvc repro`);
-  `calibrate`/`threshold` targets added; `test-models` file list fixed.
-- **`configs/config.yaml`** — registers `calibration`/`threshold` Hydra defaults; adds
-  `paths.figures`/`paths.policy`/`paths.costs_config`.
-- **`PROJECT_PLAN.md`** — Phase 6 marked done.
-- **Notebooks** (`00`, `01`, `02a`, `02b`, `03c`, `04`) — cross-references and "continue to"
-  pointers completed end-to-end; stream-output fragmentation (a Windows/ipykernel artifact)
-  normalized via `scripts/fix_notebook_outputs.py`.
+- **`ANALYSIS.md`** — added §5 Probability Calibration and §6 Business Impact & Threshold Selection; corrected several inaccuracies inherited from the exploratory-pass narrative.
+- **`README.md`** — results, data-splits, and pipeline diagram corrected to match the real pipeline; extended through calibrate → threshold.
+- **`Makefile`** — `train` runs the module directly; `calibrate`/`threshold` targets added.
+- **`configs/config.yaml`** — registers `calibration`/`threshold` Hydra defaults.
+- **Notebooks** (`00`, `01`, `02a`, `02b`, `03c`, `04`) — cross-references completed; stream-output fragmentation normalized via `scripts/fix_notebook_outputs.py`.
 
 ---
 
 ## [0.5.4] - 2026-07-11 — Phase 5→6 Bridge: Registration Boundary Remediation
 
-*Phase 5 shipped before the registry boundary in `CLAUDE.md` § "Run artifacts vs. registry
-versions" was written, and had registered the uncalibrated pipeline as `challenger` — not a valid
-rollback target under that boundary. This bridge removes registration from Phase 5 (deferred to
-Phase 6's `calibrate.py`), fixes two defects surfaced in the same code paths, and rebuilds the
-pipeline from a hard reset (`mlruns/` and the Postgres volume both cleared) to prove it still
-reproduces from zero — `mlruns/1/` went from 223 leaked/historical run directories to 3.*
+*Phase 5 shipped before `CLAUDE.md`'s registry boundary was written, and had registered the uncalibrated pipeline as `challenger` — not a valid rollback target under that boundary. This bridge removes registration from Phase 5 (deferred to Phase 6's `calibrate.py`), fixes two defects in the same code paths, and rebuilds from a hard reset to prove it reproduces from zero.*
 
 ### Changed
-- **`src/telco_churn/models/train/log_model.py`** (replaces `registration.py`) —
-  `run_model_logging_step` logs the tuned `Pipeline` onto the `tuning_study` run without
-  `registered_model_name=` or a `challenger` alias; adds `training_manifest["logged_model_uri"]`
-  as the permanent handle Phase 6 resolves by.
-- **`tests/unit/test_train_log_model.py`** (renamed from `test_train_registration.py`) — asserts
-  `search_registered_models()` stays empty after Step 5, and that the logged signature declares a
-  float output.
-- **`ANALYSIS.md`** §4c "Registration — `challenger`" renamed to "Model logging (not registered)";
-  **`notebooks/03c-hyperparameter-tuning.ipynb`** — registration narrative and the two cells that
-  resolved runs via the `challenger` alias updated to resolve by run recency/tag instead.
-- **`PROJECT_PLAN.md`** Phase 5 deliverable updated to log-only, no registration.
+- **`src/telco_churn/models/train/log_model.py`** (replaces `registration.py`) — logs the tuned `Pipeline` without `registered_model_name=` or a `challenger` alias; adds `training_manifest["logged_model_uri"]` as the permanent handle Phase 6 resolves by.
+- **`tests/unit/test_train_log_model.py`** (renamed) — asserts `search_registered_models()` stays empty after Step 5.
+- **`ANALYSIS.md`, `notebooks/03c-hyperparameter-tuning.ipynb`, `PROJECT_PLAN.md`** — registration narrative and Phase 5 deliverable updated to log-only, no registration.
 
 ### Fixed
-- **`models/train/common.py::_resolve_tracking_uri`** — a bare relative tracking URI (the default
-  on any fresh clone with no `.env`) resolved to a Windows path MLflow's store registry rejected
-  (`urlparse` read the drive letter as scheme `'c'`); now anchored via `.as_uri()`.
-- **MLflow test-fixture artifact leak** — five unit-test fixtures plus the subprocess integration
-  test pointed the tracking URI at a tmp SQLite store but left the artifact root defaulting to
-  `./mlruns`, leaking run directories into the repo on every test run. Fixed via a shared
-  `conftest.py` fixture with an explicit `artifact_location`.
-- **Logged model signature declared `predict()` output (int labels), not `predict_proba()`** —
-  `pyfunc_predict_fn` was left at its default, so the pyfunc flavour served argmax labels while the
-  signature described probabilities; now explicit.
+- **`models/train/common.py::_resolve_tracking_uri`** — a bare relative tracking URI resolved to a Windows path MLflow's store registry rejected (`urlparse` read the drive letter as scheme `'c'`); now anchored via `.as_uri()`.
+- **MLflow test-fixture artifact leak** — several fixtures left the artifact root defaulting to `./mlruns`, leaking run directories into the repo on every test run. Fixed via a shared `conftest.py` fixture with an explicit `artifact_location`.
+- **Logged model signature declared `predict()` output, not `predict_proba()`** — `pyfunc_predict_fn` left at its default; now explicit.
 
 ---
 
@@ -506,119 +380,55 @@ indirectly through the full subprocess integration test. No production code chan
 
 ## [0.5.2] - 2026-07-08 — Phase 5 Steps 4-5: Hyperparameter Tuning & Challenger Registration
 
-*A 50-trial TPE Optuna study tunes LightGBM on the frozen feature set (single stratified 5-fold,
-`average_precision`; `n_estimators` resolved per fold by early stopping). The 1-SE rule selects a
-more-regularized trial than raw-best: CV PR-AUC rises from 0.6582 (reduced set, default
-hyperparameters) to 0.6659 while the train-vs-CV gap narrows from 0.1362 to 0.0328. The tuned
-pipeline is registered as `telco-churn-pipeline` / `challenger` — uncalibrated and un-thresholded,
-not serving-ready (Phase 6/7).*
+*A 50-trial TPE Optuna study tunes LightGBM on the frozen feature set. The 1-SE rule selects a more-regularized trial than raw-best: CV PR-AUC rises from 0.6582 to 0.6659 while the train-vs-CV gap narrows from 0.1362 to 0.0328. Registered as `telco-churn-pipeline` / `challenger` — uncalibrated, not serving-ready.*
 
 ### Added
-- **`src/telco_churn/models/train/tuning.py`** — Step 4: `run_tuning_step`, a Postgres-backed
-  Optuna TPE study with content-addressed study naming (data hash + committed features + search
-  space + CV scheme, so an incompatible trial pool can never mix silently).
-- `select_best_trial` (`argmax`/`1se`) and `boundary_hit_check`; nested per-trial MLflow child
-  runs under one `tuning_study` parent run.
-- **`src/telco_churn/models/train/registration.py`** — Step 5: `run_registration_step` refits the
-  selected trial on all of development, logs the pipeline as pyfunc, asserts a log→reload→predict
-  parity check, and registers `telco-churn-pipeline` / alias `challenger`.
-- **`configs/tuning/optuna.yaml`** — search space and study knobs (`n_trials=50`, `cv_folds=5`,
-  `selection_rule=1se`, `pruner=median`, `sampler_seed=42`).
-- **`training_manifest.json`** (logged at registration) — git SHA, DVC data hash, hyperparameters,
-  CV PR-AUC, paired-Δ vs. LogReg, and `tuning_summary`.
-- **`tests/unit/test_train_tuning.py`** (24), **`test_train_registration.py`** (4) — 1-SE
-  selection-rule branches, boundary-hit warnings, idempotent re-run, reload-parity failure path.
-- **`tests/integration/test_train_subprocess.py`** (2) — subprocess test of the full Steps 1-5
-  composition path.
+- **`src/telco_churn/models/train/tuning.py`** — Step 4: `run_tuning_step`, a Postgres-backed Optuna TPE study with content-addressed study naming so an incompatible trial pool can never mix silently. `select_best_trial` (`argmax`/`1se`), `boundary_hit_check`.
+- **`src/telco_churn/models/train/registration.py`** — Step 5: refits the selected trial on all of development, asserts log→reload→predict parity, registers `telco-churn-pipeline` / `challenger`.
+- **`configs/tuning/optuna.yaml`** — search space and study knobs (`n_trials=50`, `cv_folds=5`, `selection_rule=1se`).
+- **`training_manifest.json`** (logged at registration) — git SHA, data hash, hyperparameters, CV PR-AUC, paired-Δ vs. LogReg, `tuning_summary`.
+- **`tests/unit/test_train_tuning.py`** (24), **`test_train_registration.py`** (4); **`tests/integration/test_train_subprocess.py`** (2) — 1-SE selection, boundary-hit, reload-parity, full Steps 1-5 composition coverage.
 
 ### Changed
-- **`ANALYSIS.md`** §4c — Optuna study result recorded: selected trial (1-SE rule) vs. raw-best;
-  boundary-hit check clears on all 8 tuned hyperparameters; CV PR-AUC 0.6582 → 0.6659, train–CV gap
-  0.1362 → 0.0328. Registration result recorded: `telco-churn-pipeline` version 1, alias
-  `challenger`, `n_estimators=59` fixed on the full-development refit.
+- **`ANALYSIS.md`** §4c — Optuna result recorded: selected trial vs. raw-best, boundary-hit check clears on all 8 hyperparameters; registration result: `telco-churn-pipeline` v1, alias `challenger`, `n_estimators=59`.
 
 ---
 
 ## [0.5.1] - 2026-07-03 — Phase 5 Step 3: Permutation-Importance Feature Selection
 
-*Replaces Step 3's gain-based null-importance selector with permutation importance measured
-against a synthetic noise-decoy column — the same rule Phase 4 discovery's Screen 4 already uses,
-now shared end-to-end and model-agnostic by construction, unlike gain. Adds a non-gating SHAP
-audit over the full feature space (flagging any dropped feature that would outrank a kept one),
-and replaces the keep-vs-reduce adoption test with a paired-bootstrap test mirroring Step 2's
-model-family decision, rather than an unpaired interval-containment check. Re-running Step 3
-against real data: the full 20-feature set is retained, and decisively so under the paired test
-(Δ = 0.0173, 95% CI [0.0104, 0.0246], `material_full_win`) — sharper than the near-miss the
-earlier unpaired test reported for the same underlying gap.*
+*Replaces Step 3's gain-based null-importance selector with permutation importance vs. a synthetic noise-decoy column, adds a non-gating SHAP audit, and replaces the keep-vs-reduce adoption test with a paired-bootstrap test. Re-run: the full 20-feature set is retained decisively (Δ = 0.0173, 95% CI [0.0104, 0.0246], `material_full_win`).*
 
 ### Added
-- **`src/telco_churn/features/select.py`** — `PermutationImportanceSelector` replaces
-  `NullImportanceSelector` (grouped permutation importance vs. a synthetic decoy column);
-  `compute_shap_audit()` adds a non-gating SHAP diagnostic; `reduced_set_bootstrap_test()`
-  replaces the unpaired within-CI adoption check with a paired-bootstrap test.
-- **`shap`** added as a project dependency (`pyproject.toml`).
+- **`src/telco_churn/features/select.py`** — `PermutationImportanceSelector` replaces `NullImportanceSelector`; `compute_shap_audit()`; `reduced_set_bootstrap_test()` replaces the unpaired within-CI adoption check.
+- **`shap`** added as a project dependency.
 
 ### Changed
-- **`src/telco_churn/models/train/feature_freeze.py`** — calls the new SHAP audit after minting
-  the committed list; adopts the reduced set by default, overriding to full only on
-  `material_full_win`.
-- **`configs/training/selection.yaml`** — `n_permutations`/`cutoff_percentile` renamed to
-  `n_repeats`/`noise_floor_margin`; adds its own `inner_val_size` key.
-- **`tests/unit/test_select.py`** — rewritten onto the new API; adds permutation-importance,
-  SHAP-audit, and bootstrap-test coverage.
-- **`ANALYSIS.md`** §4 — rewritten with the real re-run result: full 20-feature set retained
-  (Δ = 0.0173, CI [0.0104, 0.0246]); flags §5's Optuna results as stale pending re-run.
-- **`notebooks/03b-feature-selection.ipynb`** — rewritten to render the paired-bootstrap test
-  and permutation-importance/SHAP tables; re-executed against the real MLflow run.
-- **`PROJECT_PLAN.md`**, **`docs/phase-5-tasks.md`** — Step 3 description and adoption test
-  rewritten for the new method.
+- **`src/telco_churn/models/train/feature_freeze.py`** — calls the new SHAP audit; adopts the reduced set by default, overriding to full only on `material_full_win`.
+- **`configs/training/selection.yaml`** — `n_permutations`/`cutoff_percentile` renamed `n_repeats`/`noise_floor_margin`.
+- **`tests/unit/test_select.py`, `notebooks/03b-feature-selection.ipynb`, `ANALYSIS.md` §4, `PROJECT_PLAN.md`** — rewritten for the new method and re-run result.
 
 ### Fixed
-- **`tests/unit/test_train_common.py::test_compose_config_loads_expected_structure`** — asserted
-  the old `selection.n_permutations`/`cutoff_percentile` config keys; updated to the renamed keys.
+- **`tests/unit/test_train_common.py`** — asserted the old renamed config keys; updated.
 
 ---
 
 ## [0.5.0] - 2026-07-03 — Phase 5 Steps 1-2: Model Selection (Candidate Comparison & Diagnostics)
 
-*Candidate bake-off — `DummyClassifier(strategy='prior')`, `LogisticRegressionCV`, and default-config
-LightGBM — on one shared `RepeatedStratifiedKFold` over the canonical dev split. LightGBM is
-adopted as the modelling family under the pre-registered paired-bootstrap decision rule:
-Δ = +0.0071 PR-AUC, 95% CI [+0.0029, +0.0113], clears the Δ*=0.005 materiality threshold
-(`material_lgbm_win`). Non-gating fixed-recall and per-segment robustness/fairness diagnostics are
-logged alongside the decision — they flag concerns but never decide the family (CLAUDE.md's
-one-metric invariant).*
+*Candidate bake-off — `DummyClassifier`, `LogisticRegressionCV`, default-config LightGBM — on one shared `RepeatedStratifiedKFold`. LightGBM adopted under the pre-registered paired-bootstrap rule: Δ = +0.0071 PR-AUC, 95% CI [+0.0029, +0.0113], clears the Δ*=0.005 threshold (`material_lgbm_win`). Non-gating fixed-recall and per-segment diagnostics logged alongside, never deciding the family.*
 
 ### Added
-- **`src/telco_churn/features/schema.py`** — `FeatureSchema` frozen dataclass replacing the bare
-  `list[str]` column-group constants previously in `features/build.py`.
-- **`src/telco_churn/features/preprocessing.py`** — `build_linear_preprocessor` (OHE + scaling,
-  tenure-cohort binning) for the `DummyClassifier`/`LogisticRegressionCV` baselines.
-- **`src/telco_churn/models/train/common.py`** — shared helpers reused by every training step:
-  CV scoring, default hyperparameters, dev-split loading, tracking-URI/git/DVC resolution.
-- **`src/telco_churn/models/train/candidates.py`** — Step 1: CV-scores the three candidates on
-  one shared `RepeatedStratifiedKFold(10×10)`; hard-assertion leakage canary on the dummy
-  candidate; each candidate logged as its own MLflow run.
-- **`src/telco_churn/models/train/comparison.py`** — Step 2: `bootstrap_comparison`, a paired
-  bootstrap on Δ = AP(LGBM) − AP(LogReg) under the pre-registered `Δ*=0.005` decision rule.
-- `run_diagnostics_step` — fixed-recall precision/F1 profile and per-segment robustness/fairness
-  flags; both logged but never gating.
-- **`src/telco_churn/models/diagnostics.py`** — pure helpers: `fixed_recall_profile`,
-  `segment_oof_errors`, `segment_bootstrap_delta`, `generalization_gap`, `learning_curve_points`.
-- **`src/telco_churn/models/train/__main__.py`** — CLI entry point; runs Steps 1-2 (3-5 once the
-  family is confirmed), exits 1 on invalid data or a broken leakage canary.
-- **`configs/training/lightgbm.yaml`**, **`configs/training/logreg.yaml`** — candidate
-  hyperparameters plus shared LightGBM determinism/imbalance knobs.
-- **`docker/mlflow/Dockerfile`**, **`sql/schema/000_create_mlflow_db.sql`**, `docker-compose.yml`
-  `mlflow` service — Postgres-backed MLflow tracking server, started via
-  `docker compose --profile infra up -d`.
-- **`tests/unit/test_train_candidates.py`** (4), **`test_train_comparison.py`** (13),
-  **`test_train_common.py`** (15), **`test_diagnostics.py`** (25) — leakage-canary, metric-
-  logging, decision-rule, and segment-diagnostics coverage.
+- **`src/telco_churn/features/schema.py`** — `FeatureSchema` frozen dataclass replacing bare `list[str]` column-group constants.
+- **`src/telco_churn/features/preprocessing.py`** — `build_linear_preprocessor` for the `DummyClassifier`/`LogisticRegressionCV` baselines.
+- **`src/telco_churn/models/train/common.py`** — shared helpers reused by every training step.
+- **`src/telco_churn/models/train/candidates.py`** — Step 1: CV-scores the three candidates; hard-assertion leakage canary on the dummy candidate.
+- **`src/telco_churn/models/train/comparison.py`** — Step 2: `bootstrap_comparison`, paired bootstrap on Δ = AP(LGBM) − AP(LogReg).
+- **`src/telco_churn/models/diagnostics.py`** — pure helpers: `fixed_recall_profile`, `segment_oof_errors`, `segment_bootstrap_delta`, `generalization_gap`, `learning_curve_points`.
+- **`src/telco_churn/models/train/__main__.py`** — CLI entry point.
+- **`configs/training/lightgbm.yaml`**, **`configs/training/logreg.yaml`**; Postgres-backed MLflow tracking server (`docker/mlflow/`, `docker-compose.yml`).
+- **`tests/unit/test_train_candidates.py`** (4), **`test_train_comparison.py`** (13), **`test_train_common.py`** (15), **`test_diagnostics.py`** (25).
 
 ### Changed
-- **`ANALYSIS.md`** — Step 2 model-selection result recorded: `material_lgbm_win`
-  (Δ = +0.0071, 95% CI [+0.0029, +0.0113]).
+- **`ANALYSIS.md`** — Step 2 result recorded: `material_lgbm_win` (Δ = +0.0071, 95% CI [+0.0029, +0.0113]).
 
 ---
 
@@ -993,7 +803,8 @@ phases build on.*
 <!-- Version comparison links: the `origin` remote (github.com/Ampofowaa/TelcoChurn_PortfolioProject)
 already exists, but no `vX.Y.Z` tags have been pushed yet, so these links would 404 if uncommented
 now. Un-comment once tags are pushed for each released version below.
-[Unreleased]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.6...HEAD
+[Unreleased]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.6...v0.8.0
 [0.7.6]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.3...v0.7.4

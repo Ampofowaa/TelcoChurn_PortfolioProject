@@ -2,7 +2,7 @@
 
 > **What each view is for:** System Architecture is the tool-level infrastructure flow, ingest to monitoring; ML Workflow is the modelling lifecycle and its feedback loops; Data Flow is the artifacts moving through ingestion into training; MLflow Layout is the run/registry structure one training cycle builds up inside MLflow.
 >
-> Ingestion through champion promotion (Phases 1–7) is implemented, verified against the code that produces it; everything past that (Phases 8–14) is target only. The System Architecture diagram below is the one view spanning both ranges — everything through Model Registry is built, Serving onward is not. The ML Workflow diagram stays entirely within the built range: its first feedback loop (Error Analysis 1 → Feature Engineering) is an iteration within a single training cycle, not an Orchestration concern; its other two (Business Review → Calibration/Threshold or Feature Engineering) are the triggers Orchestration (Phase 10) will eventually automate — for now they're manual. The Data Flow and MLflow Layout diagrams also stay entirely within the built range — keep them in sync whenever the underlying modules change shape.
+> Ingestion through the DVC pipeline wrap (Phases 1–8) is implemented, verified against the code that produces it; everything past that (Phases 9–14) is target only. The System Architecture diagram below is the one view spanning both ranges — everything through Model Registry is built, Serving onward is not. The ML Workflow diagram stays entirely within the built range: its first feedback loop (Error Analysis 1 → Feature Engineering) is an iteration within a single training cycle, not an Orchestration concern; its other two (Business Review → Calibration/Threshold or Feature Engineering) are the triggers Orchestration (Phase 10) will eventually automate — for now they're manual. The Data Flow and MLflow Layout diagrams also stay entirely within the built range — keep them in sync whenever the underlying modules change shape.
 
 ## System Architecture
 
@@ -66,14 +66,16 @@ This shows *artifacts* — what each stage actually reads and writes, and which 
 ```mermaid
 flowchart TD
     A["Raw CSV\ndatasets/raw/ — read-only,\nsource of truth"] -->|ingest.py| B[("Postgres\ncustomers_raw")]
-    B -->|"validate.py\nreports only — nothing\ndownstream depends on this yet"| V["Pandera\n5 Quality Gates"]
+    B -->|validate.py| V["Pandera\n5 Quality Gates"]
+    V -.->|"reports/validation_receipt.json\nDVC dep — invalidation edge only,\nneither stage reads its contents"| C
+    V -.->|"reports/validation_receipt.json"| D
     B -->|"split.py\nre-validates inline, then\nreads only (customerid, churn)"| C["split_manifest.parquet\ncustomerid → dev/test label\n(no features, no churn column)"]
-    B -->|"features/build.py\nSQL views, ALL 7,043 customers,\nno validation call"| D["telco_churn_processed.csv\nfull engineered feature set,\ndev + test not yet separated"]
+    B -->|"features/build.py\nSQL views, ALL 7,043 customers,\nno validation call"| D["telco_churn_features.parquet\nfull engineered feature set,\ndev + test not yet separated"]
     C --> E["models/train/\nfile-only for training data —\nmerges by customerid, keeps dev rows"]
     D --> E
 ```
 
-`V` is a dead end by design, for now: `split.py` and `features/build.py` both read straight from `customers_raw`, independent of whether `validate.py` ran — there's no DVC DAG (Phase 8) yet enforcing "validate must pass first," just documented intent. `models/train/` isn't fully DB-free either — `tuning.py` opens its own Postgres connection for Optuna's crash-resilient trial storage (a separate schema, same server as MLflow's backend); only the *training data* (features + split labels) is file-only.
+`V` is no longer a dead end as of Phase 8: `split.py` and `features/build.py` both still read their actual data straight from `customers_raw` (`validate.py`'s job is quality gating, not producing a queryable artifact), but `dvc.yaml`'s DAG now makes both stages `dep` on `reports/validation_receipt.json` as an invalidation edge — a failing gate exits 1 before either stage runs, and DVC will not consider `split`/`features` up to date without a passing validation behind them. This is DVC-enforced, not just documented intent. `models/train/` isn't fully DB-free either — `tuning.py` opens its own Postgres connection for Optuna's crash-resilient trial storage (a separate schema, same server as MLflow's backend); only the *training data* (features + split labels) is file-only.
 
 ## MLflow Layout — Training Through Promotion (Phases 5–7)
 

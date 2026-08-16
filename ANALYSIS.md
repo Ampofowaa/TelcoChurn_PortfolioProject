@@ -582,7 +582,7 @@ The tuned pipeline (`tree_preprocessor` + LightGBM at the 1-SE hyperparameters a
 |---|---|
 | Model signature + input example | Logged (`mlflow.sklearn.log_model`) |
 | Log → reload → predict parity | **Passed** — reloaded pipeline's predictions match the in-memory model exactly on a 5-row dev sample |
-| `training_manifest.json` | Populated: git SHA, DVC data hash, hyperparameters, `feature_space` (20) / `feature_columns` (20), CV PR-AUC, paired-Δ vs LogReg with full bootstrap CI, and `tuning_summary` — the engineering audit trail |
+| `training_manifest.json` | Populated: git SHA, data content hash, hyperparameters, `feature_space` (20) / `feature_columns` (20), CV PR-AUC, paired-Δ vs LogReg with full bootstrap CI, and `tuning_summary` — the engineering audit trail |
 | Registered | **Not at this stage** — logged only (`models:/m-e76b0cb546c8471eab6d52efdc08c5a1`), no `registered_model_name`, no alias |
 
 **This logged pipeline is the raw tuned model** — uncalibrated, un-thresholded, and not evaluated on the sealed test set. Nothing downstream should serve it directly: model calibration (`models/calibrate.py`) performs the training cycle's *single* registration — pointing the `challenger` alias at the calibrated artifact, not this one — Phase 7 evaluates on the sealed test once and promotes `champion`, and only `champion` is ever loaded by serving (Phase 9). Registering an intermediate, uncalibrated artifact here would leave two versions per cycle with no way to tell which is the valid rollback target — every registered version must be a valid one, and an uncalibrated intermediate is not.
@@ -863,7 +863,7 @@ Registered model: **`telco-churn-pipeline`**, version **1**, alias **`champion`*
 | `model/` | `calibrate.py` | MLflow pyfunc — `mlflow.sklearn.load_model()` |
 | `feature_space.txt` / `feature_columns.txt` | `models/train/log_model.py` | Full feature space vs. the subset that survived selection into the model |
 | `preprocessing.pkl` | `models/train/log_model.py` | Fitted `ColumnTransformer` |
-| `training_manifest.json` | `models/train/log_model.py` | Git SHA, DVC hash, hyperparameters, tuning summary |
+| `training_manifest.json` | `models/train/log_model.py` | Git SHA, data content hash, hyperparameters, tuning summary |
 | `registration/drift_reference.json` | `register.py` | Monitoring baseline |
 | `registration/model_card.json` | `register.py` | Stakeholder-facing summary |
 

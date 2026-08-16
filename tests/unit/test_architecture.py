@@ -743,6 +743,23 @@ def _is_env_resolved(file_rel: str, key: str) -> bool:
     return isinstance(node, str) and "oc.env:" in node
 
 
+def _env_resolved_keys(file_rel: str) -> set[str]:
+    """Every dotted key in file_rel whose raw YAML value is an ${oc.env:...} interpolation."""
+    doc = yaml.safe_load((_ROOT / file_rel).read_text(encoding="utf-8"))
+
+    def walk(node: Any, prefix: str) -> set[str]:
+        if isinstance(node, dict):
+            found: set[str] = set()
+            for k, v in node.items():
+                found |= walk(v, f"{prefix}.{k}" if prefix else str(k))
+            return found
+        if isinstance(node, str) and "oc.env:" in node:
+            return {prefix}
+        return set()
+
+    return walk(doc, "")
+
+
 def _is_exempt_cfg_key(dotted: str, file_rel: str, key: str) -> bool:
     """The 4-category exemption list: env-resolved, identity tokens, paths.* (whole prefix), mlflow.experiment_name."""
     if dotted in _EXEMPT_EXACT_CFG_KEYS:
@@ -923,6 +940,44 @@ def test_params_match_reads() -> None:
                 offenders.append(
                     f"{stage_name}: {rel}:{lineno} reads cfg.{dotted} "
                     f"({file_rel}::{key}) not declared in params:"
+                )
+
+    assert offenders == [], offenders
+
+
+def test_dvc_yaml_never_declares_an_env_resolved_param() -> None:
+    """No stage's params: declares a key (or whole file) whose raw YAML value
+    is an ${oc.env:...} interpolation, e.g. configs/config.yaml's
+    mlflow.tracking_uri or database.url.
+
+    DVC's own YAML parser has no notion of Hydra's ${oc.env:...} syntax, so a
+    declared env-resolved key hashes the literal, unresolved interpolation
+    string forever -- unchanged regardless of which MLflow/Postgres instance
+    is actually live -- silently un-tracking the param while looking handled
+    (CLAUDE.md's params: exemptions, category 1). Complements
+    test_params_match_reads, which only asserts read subset declared and
+    would never flag this: an over-declared env key is never a *missing*
+    declaration, so this is the guard for the opposite direction, scoped to
+    this one exemption category rather than general phantom-param detection
+    (still advisory/future work per that test's own docstring).
+    """
+    stages = _dvc_stages()
+    offenders: list[str] = []
+    for stage_name, stage in stages.items():
+        whole_files, keyed = _dvc_declared_params(stage)
+        for file_rel, keys in keyed.items():
+            for key in keys:
+                if _is_env_resolved(file_rel, key):
+                    offenders.append(
+                        f"{stage_name}: declares env-resolved {file_rel}::{key} "
+                        "under params: -- DVC hashes the unresolved "
+                        "${oc.env:...} literal, never the live value"
+                    )
+        for file_rel in whole_files:
+            for key in sorted(_env_resolved_keys(file_rel)):
+                offenders.append(
+                    f"{stage_name}: declares {file_rel} whole under params:, "
+                    f"which includes env-resolved key {key}"
                 )
 
     assert offenders == [], offenders
