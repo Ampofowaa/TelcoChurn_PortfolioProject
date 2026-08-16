@@ -1265,7 +1265,11 @@ def test_run_tuning_step_skips_importance_artifacts_when_fanova_fails(
     def _raise(*args: object, **kwargs: object) -> None:
         raise RuntimeError("not enough trials")
 
-    monkeypatch.setattr(optuna.importance, "get_param_importances", _raise)
+    # Patches the evaluator's method rather than the free function
+    # optuna.importance.get_param_importances — monkeypatching that
+    # module-level name doesn't reliably stick before this class has been
+    # constructed once in-process; patching the class method does.
+    monkeypatch.setattr(optuna.importance.FanovaImportanceEvaluator, "evaluate", _raise)
     warning_mock = Mock()
     monkeypatch.setattr(tuning.logger, "warning", warning_mock)
     log_dict_mock = Mock()
