@@ -5,7 +5,7 @@ See [README.md](README.md) for the project overview and pipeline, and [CLAUDE.md
 ## Setup
 
 ```bash
-uv sync
+uv sync --all-extras
 pre-commit install
 ```
 
@@ -40,7 +40,7 @@ Each step's console output (structlog JSON) prints the `run_id` / `model_version
 - `uv run pytest` — full unit suite, no Docker required.
 - `uv run pytest -k "test_name"` — a single test by name.
 - `make test-integration` — integration tests; requires a running Docker daemon. Each test spins up its own ephemeral Postgres via `testcontainers` and points MLflow at a tmp-scoped SQLite file, so `make db-up` is not a prerequisite.
-- `make test-data` / `make test-features` / `make test-models` — scoped coverage per package, for running one phase's tests in isolation without a false `fail_under=80` failure from unrelated packages.
+- `make test-data` / `make test-features` / `make test-models` / `make test-serving` — scoped coverage per package, for running one phase's tests in isolation without a false `fail_under=80` failure from unrelated packages.
 - Every new package under `src/telco_churn/` needs its own scoped `make test-<package>` target (see `CLAUDE.md`'s Testing section for the required pattern and coverage conventions).
 
 ## Pre-commit hooks

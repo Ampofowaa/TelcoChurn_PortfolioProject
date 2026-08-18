@@ -38,6 +38,7 @@ __all__ = [
     "load_dev_oof_diagnostics",
     "load_fitted_model",
     "resolve_champion_version",
+    "resolve_challenger_version",
     "load_threshold_validation",
 ]
 
@@ -121,31 +122,53 @@ def load_fitted_model(model_uri: str, cfg: DictConfig) -> Pipeline:
     return model
 
 
-def resolve_champion_version(cfg: DictConfig) -> str | None:
-    """Resolve the `champion` alias to an explicit version number, once.
+def _resolve_alias_version(alias: str, cfg: DictConfig) -> str | None:
+    """Resolve `alias` to an explicit version number, once.
 
-    A single read of "does a champion exist, and which version" — never
-    re-read afterward as a moving pointer. Returns None on cold start (no
-    champion alias yet); a not-yet-registered model means the same thing.
+    A single read of "does this alias exist, and which version" — never
+    re-read afterward as a moving pointer. Returns None when the alias isn't
+    set (or the model isn't registered yet at all).
 
-    MLflow's SqlAlchemy-backed registry reports these two cold-start shapes
+    MLflow's SqlAlchemy-backed registry reports these two "not set" shapes
     with different error codes — RESOURCE_DOES_NOT_EXIST when the model was
-    never registered, INVALID_PARAMETER_VALUE when it exists but no
-    `champion` alias was ever set — so both, and only both, are read as "no
-    champion." Any other MlflowException (a transient/auth/server failure)
-    must propagate rather than be misread as cold start, which would
-    silently switch the gate to the wrong regime.
+    never registered, INVALID_PARAMETER_VALUE when it exists but this alias
+    was never set — so both, and only both, are read as "unset." Any other
+    MlflowException (a transient/auth/server failure) must propagate rather
+    than be misread as unset, which would silently switch the caller to the
+    wrong regime (e.g. the gate's cold-start path, or predict.py serving with
+    no champion loaded).
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
     registered_model_name = str(cfg.mlflow.registered_model_name)
     client = mlflow.tracking.MlflowClient()
     try:
-        version = client.get_model_version_by_alias(registered_model_name, "champion")
+        version = client.get_model_version_by_alias(registered_model_name, alias)
     except MlflowException as exc:
         if exc.error_code not in ("RESOURCE_DOES_NOT_EXIST", "INVALID_PARAMETER_VALUE"):
             raise
         return None
     return str(version.version)
+
+
+def resolve_champion_version(cfg: DictConfig) -> str | None:
+    """Resolve the `champion` alias to an explicit version number, once.
+
+    Returns None on cold start (no champion alias yet); a not-yet-registered
+    model means the same thing. See _resolve_alias_version for the shared
+    cold-start error-code handling this and resolve_challenger_version both
+    rely on.
+    """
+    return _resolve_alias_version("champion", cfg)
+
+
+def resolve_challenger_version(cfg: DictConfig) -> str | None:
+    """Resolve the `challenger` alias to an explicit version number, once.
+
+    Returns None in the common case — no challenger currently staged.
+    serving/predict.py's shadow/canary mechanism treats this as "nothing to
+    route to," not an error.
+    """
+    return _resolve_alias_version("challenger", cfg)
 
 
 def load_threshold_validation(run_id: str, cfg: DictConfig) -> dict[str, Any]:

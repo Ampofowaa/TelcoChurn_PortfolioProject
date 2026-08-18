@@ -98,6 +98,153 @@ flowchart TD
 
 **The registry version's state travels through tags, not just an alias.** Each version starts `promotion_status: pending` — the safe default, since a crash mid-cycle should never look like a pass or a legitimate rollback target. `register.py` is the only step that writes a model-version tag: it resolves the evaluation/error-analysis identity from the tag if a prior pass already wrote it, else from `evaluate.py`'s/`error_analysis.py`'s receipts, tags it, re-verifies the gate and the human review verdict, and flips the status to `promoted` or `rejected` — which is why a rollback should always target the highest version tagged `promoted`, never "the previous version number": a rejected or crashed cycle leaves behind a version that otherwise looks the same.
 
+## Shadow/Canary Serving — `serving/predict.py` (Phase 9)
+
+`register.py`'s mint-to-flip gap (`register_challenger` mints `challenger`; a
+separate, later call flips `champion` on a pass) leaves both aliases
+simultaneously resolvable for as long as evaluation and review take. That gap
+is the precondition shadow/canary needs, and `serving/predict.py` is where
+the mechanism actually lives — continuously available to any traffic that
+hits scoring whenever a `challenger` exists, independent of whether a retrain
+cycle is in progress.
+
+```mermaid
+flowchart TD
+    A["score_request(X, customer_ids, runtime, cfg)"] --> B["Always score champion\n(predict_proba, vectorized)"]
+    A --> C{"challenger present AND\n(shadow.enabled OR canary.enabled)?"}
+    C -->|no| D["served = champion\nno challenger call at all"]
+    C -->|yes| E["Also score challenger\n(predict_proba, vectorized,\nonly the evaluated rows)"]
+    E --> F{"canary.enabled?"}
+    F -->|no| G["canary_mask = all False"]
+    F -->|yes| H["canary_mask[i] =\nsha256(customerid_i + ':' + challenger_version) % 10_000\n< fraction * 10_000\n(missing customerid -> always False)"]
+    G --> I["evaluated_mask = shadow.enabled\n(canary never routes)"]
+    H --> J["evaluated_mask = canary_mask OR shadow.enabled"]
+    I --> K["For each evaluated row:\nlog shadow_canary_dual_score\n(both scores, both versions, served, mode)\nobserve shadow_canary_score_distance{mode}\ninc shadow_canary_agreement_total{agree, mode}"]
+    J --> K
+    K --> L{"canary_mask[i]?"}
+    L -->|"yes (canary routed)"| M["served = challenger for row i"]
+    L -->|"no"| N["served = champion for row i\n(shadow only ever logs)"]
+    D --> O
+    M --> O
+    N --> O
+    O["Every row, evaluated or not:\ninc predictions_total{route, model_version}\nobserve predicted_probability{model_version}\ninc predictions_above_threshold_total{model_version}\n(iff served_proba >= served_threshold)"]
+```
+
+**Five Prometheus metrics come out of this one function, not two.** The
+`route` label on the three general-purpose counters/histograms
+(`predictions_total`, `predicted_probability`,
+`predictions_above_threshold_total`) is `"champion"` for a row that was
+never evaluated against the challenger at all, or the dual-score entry's own
+`mode` (`"shadow"`/`"canary"`) for a row that was — so a canary configured
+at `fraction=0.1` can be confirmed as actually landing near 10 % of traffic
+by reading `predictions_total{route="canary"}` against the total, rather
+than just trusting the config. The other two
+(`shadow_canary_score_distance`, a histogram of
+`abs(challenger_score - champion_score)`, and
+`shadow_canary_agreement_total`, a counter of whether champion and
+challenger landed on the same side of their own respective thresholds) are
+observed only for evaluated rows, labelled `mode` and (for agreement)
+`agree`. None of the five carry a `model_version` label on the
+shadow/canary-specific pair — the champion/challenger comparison already
+spans exactly two versions, one per side. `serving/app.py`'s `GET /metrics`
+exposes all five with no extra wiring: `prometheus_fastapi_instrumentator`
+exposes the whole default registry `prometheus_client` registered these
+five onto at import time, not just the metrics it instrumented itself.
+
+**Two independent, config-gated toggles (`configs/serving/api.yaml`:
+`shadow.enabled`, `canary.enabled` + `canary.fraction`), both off by
+default.** Shadow scores every request against the challenger for
+comparison but never serves its opinion — zero routing risk, pure
+observability. Canary actually routes a consistent-hash slice of traffic to
+the challenger — bounded routing risk, needed because some failure modes
+only surface once a model's output has real consequences. They solve
+different problems and are built as separate mechanisms, not one flag with
+two readings; both can be on at once, in which case a row outside the canary
+bucket is still dual-scored (because shadow says so) but served by champion.
+
+**Canary bucketing is consistent hashing on `customerid`, salted with the
+challenger's own `model_version`
+(`sha256(f"{customerid}:{challenger_version}") % 10_000 < fraction *
+10_000`), never per-request randomness** — the same customer lands in the
+same bucket for the life of one challenger's canary window instead of
+flapping between models call to call. The salt is what makes that window
+one *fresh, independent* customer slice rather than the identical subset on
+every canary this project ever runs: since the challenger's version is part
+of the hash key, a customer's bucket assignment reshuffles the next time
+`challenger` moves to a different version, even though it stays fixed for
+as long as the current version is under test. A request with no
+`customerid` (a prospect scored in manual/what-if mode) is never
+canary-routed: no targeting key means the default variant (champion), the
+same rule feature-flag platforms (LaunchDarkly, OpenFeature) use.
+
+**`resolve_champion_model`/`resolve_challenger_model` are the single
+indirection point** — no call site anywhere resolves `models:/…@champion` or
+`@challenger` directly. Both poll on a TTL, diff the target version's
+MLflow-logged dependencies against what's installed
+(`environment_parity.py::diff_environment`) before hot-reloading, and — for
+the champion — fail-open on a refresh problem (keep serving the last-known-
+good bundle, log a warning) but fail-closed on the very first load (no
+champion in memory yet, nothing safe to fall back to). A challenger problem
+is never a reason to disrupt champion traffic either way. The SHAP explainer
+and the threshold policy travel inside the same `ModelBundle` a reload swaps
+in one piece, so neither can end up paired with a different model version's
+score.
+
+**Evidence below is *not* from `tests/unit/test_predict.py` itself — that
+suite deliberately fits its champion/challenger pair on synthetic data for
+speed and determinism (see its module docstring). Regenerating this
+snippet's realism requires the thing the unit tests are built to avoid:
+real customers.** So it is produced by a small one-off script, run the same
+way the mechanism test is structured (two real
+`CalibratedClassifierCV(LGBMClassifier)` pipelines registered as
+`champion`/`challenger` against a tmp-scoped MLflow store) but fit on real
+`tenure`/`monthlycharges` values and real churn labels from
+`data.split.partition`'s **dev** side only, loaded straight from
+`datasets/processed/split_manifest.parquet` — never the sealed test side.
+Six dev-partition customers, one per tenure sextile, were then scored
+through the real `score_request` with `shadow.enabled=true` (champion `t*
+= 0.4`, challenger `t* = 0.6`, versions 1/2):
+
+```json
+{"customerid": "1087-GRUYI", "champion_version": "1", "champion_score": 0.052926906761486600, "challenger_version": "2", "challenger_score": 0.052268186900639425, "served": "champion", "mode": "shadow", "event": "shadow_canary_dual_score"}
+{"customerid": "4189-NAKJS", "champion_version": "1", "champion_score": 0.085580031785222140, "challenger_version": "2", "challenger_score": 0.084804168943478090, "served": "champion", "mode": "shadow", "event": "shadow_canary_dual_score"}
+{"customerid": "7321-ZNSLA", "champion_version": "1", "champion_score": 0.381320170055880400, "challenger_version": "2", "challenger_score": 0.381786367680829000, "served": "champion", "mode": "shadow", "event": "shadow_canary_dual_score"}
+{"customerid": "6968-GMKPR", "champion_version": "1", "champion_score": 0.131177544000207730, "challenger_version": "2", "challenger_score": 0.130389959439198650, "served": "champion", "mode": "shadow", "event": "shadow_canary_dual_score"}
+{"customerid": "0971-QIFJK", "champion_version": "1", "champion_score": 0.044880156423729396, "challenger_version": "2", "challenger_score": 0.044270441986991246, "served": "champion", "mode": "shadow", "event": "shadow_canary_dual_score"}
+{"customerid": "8909-BOLNL", "champion_version": "1", "champion_score": 0.382721088645554760, "challenger_version": "2", "challenger_score": 0.383196816141353000, "served": "champion", "mode": "shadow", "event": "shadow_canary_dual_score"}
+```
+
+Every row carries `served: "champion"` (shadow never routes) and both
+model versions/scores side by side — exactly what an offline job needs to
+later compute agreement rate and score-distance between champion and
+challenger. This particular batch happens to land all six on the same side
+of both thresholds, which is exactly what the Prometheus counters below
+confirm rather than assert on faith:
+
+```text
+shadow_canary_score_distance_count{mode="shadow"}          6
+shadow_canary_score_distance_sum{mode="shadow"}             0.003773806821085267
+shadow_canary_agreement_total{agree="true", mode="shadow"}  6
+predictions_total{route="shadow", model_version="1"}        6
+predicted_probability_count{model_version="1"}              6
+predicted_probability_sum{model_version="1"}                1.0786058976720811
+```
+
+Switching to `canary.enabled=true, fraction=1.0` against the same runtime
+routes every row to the challenger instead (`served: "challenger"`,
+`mode: "canary"`); `fraction=0.0` routes none — both re-verified directly
+against `tests/unit/test_predict.py::test_score_request_canary_fraction_one_routes_everyone_to_challenger`
+and `::test_score_request_canary_fraction_zero_routes_everyone_to_champion`,
+which pin this behavior on their own synthetic fixture (23/23 tests in that
+file pass on the current code). Phase 10's `require_traffic_validation`
+seam is where a real canary observation window's *result* would eventually
+gate a promotion — this project's static dataset has no live traffic for
+that window to observe, so that decision layer is honestly stubbed to
+no-op rather than faked with replayed rows standing in for a real verdict.
+The routing/logging/metrics *mechanism* documented here is real and tested;
+a live production shadow/canary result is not, and must never be implied
+as one.
+
 ## Emergency Rollback — `register.py::rollback_champion`
 
 Two independent triggers write to the same append-only `promotion_log` tag on the registered model, so "what was champion before this one" is always a direct index into one history, never a tag-scan-and-`max()` reconstruction.

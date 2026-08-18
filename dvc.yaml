@@ -13,8 +13,7 @@ stages:
           - validation.min_rows
           - validation.max_null_rate
     outs:
-      - reports/ingest_receipt.json:
-          cache: false
+      - reports/ingest_receipt.json
 
   validate:
     cmd: uv run python -m telco_churn.data.validate
@@ -28,8 +27,7 @@ stages:
           - validation.min_rows
           - validation.max_null_rate
     outs:
-      - reports/validation_receipt.json:
-          cache: false
+      - reports/validation_receipt.json
 
   split:
     cmd: uv run python -m telco_churn.data.split
@@ -85,8 +83,7 @@ stages:
       - configs/training/feature_selection.yaml:
       - configs/tuning/optuna.yaml:
     outs:
-      - reports/train_receipt.json:
-          cache: false
+      - reports/train_receipt.json
 
   calibrate:
     cmd: uv run python -m telco_churn.models.calibrate
@@ -122,8 +119,7 @@ stages:
           - golden_n_rows
           - override_trial_count_gate
     outs:
-      - reports/calibrate_receipt.json:
-          cache: false
+      - reports/calibrate_receipt.json
 
   threshold:
     cmd: uv run python -m telco_churn.models.threshold
@@ -199,8 +195,7 @@ stages:
     outs:
       - reports/promotion_decision.json:
           cache: false
-      - reports/eval_receipt.json:
-          cache: false
+      - reports/eval_receipt.json
       - reports/test_predictions.parquet
     metrics:
       - reports/metrics_summary.json:
@@ -245,5 +240,4 @@ stages:
           - n_local_explanation_examples
           - local_explanation_top_k
     outs:
-      - reports/error_analysis_receipt.json:
-          cache: false
+      - reports/error_analysis_receipt.json

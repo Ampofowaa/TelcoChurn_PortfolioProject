@@ -1,0 +1,247 @@
+"""Integration tests: the FastAPI app (serving/app.py) via TestClient.
+
+Exercises the real ASGI request path — lifespan startup/shutdown, the
+`/predict`, `/predict/batch`, `/customer/{customerid}`, `/health`, `/ready`,
+and `/metrics` routes — against a real (tmp-scoped) MLflow-registered
+champion and a real (testcontainers) Postgres customers_raw table. Unlike
+tests/unit/test_predict.py/test_contact_policy.py, which call predict.py's
+functions directly, this file is the one place the HTTP layer itself
+(FastAPI routing, request validation, dependency injection, the lifespan
+hook) is under test.
+
+Fixtures (serving_champion/serving_postgres_url/serving_env/
+serving_customer_payload) live in conftest.py, shared with
+test_serving_parity.py — see its module docstring for why the registered
+model name can't be redirected per-test.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+
+from telco_churn.serving.app import app
+
+pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+def api_client(serving_env: dict[str, Any]) -> Iterator[TestClient]:
+    """A TestClient whose lifespan startup has already loaded the seeded
+    champion — the context-manager form is required for FastAPI to actually
+    run the `lifespan` startup/shutdown hooks (a bare TestClient(app) without
+    `with` never triggers them).
+    """
+    with TestClient(app) as client:
+        yield client
+
+
+def test_health_returns_ok_with_no_dependency_checks(api_client: TestClient) -> None:
+    response = api_client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_ready_reports_the_loaded_champion(
+    api_client: TestClient, serving_champion: dict[str, Any]
+) -> None:
+    response = api_client.get("/ready")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["model_version"] == serving_champion["model_version"]
+    assert body["run_id"] == serving_champion["run_id"]
+
+
+def test_predict_returns_probability_threshold_decision_and_explanation(
+    api_client: TestClient,
+    serving_champion: dict[str, Any],
+    serving_customer_payload: Any,
+) -> None:
+    payload = serving_customer_payload("prospect-0001", tenure=5, monthlycharges=30.0)
+
+    response = api_client.post("/predict", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["customerid"] == "prospect-0001"
+    assert 0.0 <= body["probability"] <= 1.0
+    assert body["threshold"] == pytest.approx(serving_champion["threshold"])
+    assert body["decision"] == (body["probability"] >= body["threshold"])
+    assert body["model_version"] == serving_champion["model_version"]
+    assert body["explanation"] is not None
+    assert 1 <= len(body["explanation"]["top_features"]) <= 5
+    # decision/threshold: no contact/capacity_limit is ever computed for a
+    # single customer in isolation — see serving/schemas.py::PredictResponse.
+    assert "contact" not in body
+    assert "capacity_limit" not in body
+
+
+def test_predict_without_explanation_omits_it(
+    api_client: TestClient, serving_customer_payload: Any
+) -> None:
+    payload = serving_customer_payload("prospect-0002", tenure=40, monthlycharges=75.0)
+    payload["include_explanation"] = False
+
+    response = api_client.post("/predict", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["explanation"] is None
+
+
+def test_customer_lookup_returns_raw_fields(api_client: TestClient) -> None:
+    response = api_client.get("/customer/serve-0001")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["customerid"] == "serve-0001"
+    assert body["tenure"] == 5
+    assert body["monthlycharges"] == pytest.approx(30.0)
+    assert "churn" not in body
+
+
+def test_customer_lookup_404_for_unknown_id(api_client: TestClient) -> None:
+    response = api_client.get("/customer/does-not-exist")
+    assert response.status_code == 404
+
+
+def test_predict_batch_id_only_resolution_partial_success(
+    api_client: TestClient, serving_champion: dict[str, Any]
+) -> None:
+    """Two known customerids resolve and score; one unknown customerid is
+    reported as a resolution_error, not a whole-batch failure.
+    """
+    payload = [
+        {"customerid": "serve-0001"},
+        {"customerid": "serve-0002"},
+        {"customerid": "does-not-exist"},
+    ]
+
+    response = api_client.post("/predict/batch", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["results"]) == 2
+    assert len(body["errors"]) == 1
+    assert body["errors"][0]["customerid"] == "does-not-exist"
+    assert body["errors"][0]["reason"] == "resolution_error"
+    for result in body["results"]:
+        assert result["model_version"] == serving_champion["model_version"]
+        assert result["decision"] == (result["probability"] >= result["threshold"])
+        assert isinstance(result["contact"], bool)
+    assert body["capacity_limit"] > 0
+
+
+def test_predict_batch_over_max_size_returns_413(api_client: TestClient) -> None:
+    payload = [{"customerid": f"overflow-{i}"} for i in range(501)]
+
+    response = api_client.post("/predict/batch", json=payload)
+
+    assert response.status_code == 413
+
+
+def test_metrics_exposes_prediction_counters_after_traffic(
+    api_client: TestClient, serving_customer_payload: Any
+) -> None:
+    payload = serving_customer_payload("prospect-0003", tenure=70, monthlycharges=110.0)
+    predict_response = api_client.post("/predict", json=payload)
+    assert predict_response.status_code == 200
+
+    response = api_client.get("/metrics")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "predictions_total" in body
+    assert "predicted_probability" in body
+    assert "predictions_above_threshold_total" in body
+
+
+# ---------------------------------------------------------------------------
+# serving.auth.enabled=true path — off by default (see require_api_key's
+# docstring), but this is the exact code path Phase 12's public deployment
+# turns on, so both the 401/pass-through behavior and the fail-fast startup
+# guard need real coverage, not just the off-by-default happy path above.
+# ---------------------------------------------------------------------------
+
+
+def test_predict_401s_with_no_api_key_when_auth_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    serving_env: dict[str, Any],
+    compose_config_with_auth_enabled: None,
+    serving_customer_payload: Any,
+) -> None:
+    monkeypatch.setenv("API_KEY", "test-secret-key")
+    payload = serving_customer_payload(
+        "prospect-auth-0001", tenure=5, monthlycharges=30.0
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/predict", json=payload)
+
+    assert response.status_code == 401
+
+
+def test_predict_401s_with_wrong_api_key_when_auth_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    serving_env: dict[str, Any],
+    compose_config_with_auth_enabled: None,
+    serving_customer_payload: Any,
+) -> None:
+    monkeypatch.setenv("API_KEY", "test-secret-key")
+    payload = serving_customer_payload(
+        "prospect-auth-0002", tenure=5, monthlycharges=30.0
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/predict", json=payload, headers={"X-API-Key": "wrong-key"}
+        )
+
+    assert response.status_code == 401
+
+
+def test_predict_succeeds_with_correct_api_key_when_auth_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    serving_env: dict[str, Any],
+    compose_config_with_auth_enabled: None,
+    serving_customer_payload: Any,
+) -> None:
+    monkeypatch.setenv("API_KEY", "test-secret-key")
+    payload = serving_customer_payload(
+        "prospect-auth-0003", tenure=5, monthlycharges=30.0
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/predict", json=payload, headers={"X-API-Key": "test-secret-key"}
+        )
+
+    assert response.status_code == 200
+
+
+def test_health_and_ready_stay_unauthenticated_when_auth_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    serving_env: dict[str, Any],
+    compose_config_with_auth_enabled: None,
+) -> None:
+    monkeypatch.setenv("API_KEY", "test-secret-key")
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/ready").status_code == 200
+        assert client.get("/metrics").status_code == 200
+
+
+def test_startup_raises_when_auth_enabled_without_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+    serving_env: dict[str, Any],
+    compose_config_with_auth_enabled: None,
+) -> None:
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="API_KEY"):
+        with TestClient(app):
+            pass

@@ -1,4 +1,4 @@
-﻿"""Unit tests for src/telco_churn/features/generate.py.
+"""Unit tests for src/telco_churn/features/generate.py.
 
 Synthetic data strategy
 -----------------------
@@ -27,6 +27,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from sklearn.metrics import average_precision_score
 from sklearn.tree import DecisionTreeClassifier
 
@@ -332,6 +334,62 @@ def test_compute_charge_per_service_clips_zero_service_count_to_one() -> None:
     """A customer with no active services divides by 1, not 0 — no divide-by-zero."""
     df = _cps_row(monthlycharges=19.90)
     assert compute_charge_per_service(df).iloc[0] == pytest.approx(19.90)
+
+
+_MONTHLYCHARGES_STRATEGY = st.floats(min_value=0.0, max_value=200.0, allow_nan=False)
+_YES_NO_STRATEGY = st.sampled_from(["Yes", "No"])
+_INTERNET_STRATEGY = st.sampled_from(["DSL", "Fiber optic", "No"])
+
+
+@given(
+    monthlycharges=_MONTHLYCHARGES_STRATEGY,
+    phoneservice=_YES_NO_STRATEGY,
+    multiplelines=_YES_NO_STRATEGY,
+    internetservice=_INTERNET_STRATEGY,
+    onlinesecurity=_YES_NO_STRATEGY,
+    onlinebackup=_YES_NO_STRATEGY,
+    deviceprotection=_YES_NO_STRATEGY,
+    techsupport=_YES_NO_STRATEGY,
+    streamingtv=_YES_NO_STRATEGY,
+    streamingmovies=_YES_NO_STRATEGY,
+)
+@settings(max_examples=100, deadline=None)
+def test_compute_charge_per_service_is_always_a_valid_non_negative_float(
+    monthlycharges: float,
+    phoneservice: str,
+    multiplelines: str,
+    internetservice: str,
+    onlinesecurity: str,
+    onlinebackup: str,
+    deviceprotection: str,
+    techsupport: str,
+    streamingtv: str,
+    streamingmovies: str,
+) -> None:
+    """The output serving/predict.py's _assemble_model_input feeds straight into
+    predict_proba with no schema check of its own (unlike the training-time
+    FeatureOutputSchema Pandera contract, which asserts ge=0.0, nullable=False
+    on this exact column) — so this pins the guarantee at the unit level
+    instead, over the full space of active-service combinations including
+    the zero-active-services edge case the .clip(lower=1) guard exists for.
+    """
+    df = _cps_row(
+        monthlycharges=monthlycharges,
+        phoneservice=phoneservice,
+        multiplelines=multiplelines,
+        internetservice=internetservice,
+        onlinesecurity=onlinesecurity,
+        onlinebackup=onlinebackup,
+        deviceprotection=deviceprotection,
+        techsupport=techsupport,
+        streamingtv=streamingtv,
+        streamingmovies=streamingmovies,
+    )
+    result = compute_charge_per_service(df)
+
+    assert result.dtype == np.float64
+    assert not result.isna().any()
+    assert (result >= 0.0).all()
 
 
 # ---------------------------------------------------------------------------

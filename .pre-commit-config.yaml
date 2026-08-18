@@ -18,43 +18,6 @@ repos:
     hooks:
       - id: black
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v2.1.0
-    hooks:
-      - id: mypy
-        args: [--config-file=pyproject.toml, src/]
-        pass_filenames: false
-        # Needed for real import resolution now that pyproject.toml's mypy
-        # override is scoped to the handful of libraries that actually lack
-        # stubs/py.typed, not a blanket ignore_missing_imports — mypy's
-        # isolated hook env otherwise can't see any of the project's runtime
-        # deps and reports every one of them as import-not-found. Mirrors
-        # [project.dependencies]; pytest/nbformat are hook-only extras.
-        additional_dependencies:
-          [
-            pytest,
-            nbformat,
-            hydra-core,
-            lightgbm==4.6.0, # pinned: unpinned resolves a newer lightgbm whose
-            # predict_proba stub types the return as list, not ndarray, and
-            # X[:, 1] doesn't typecheck against list — a hook-env-only false
-            # positive absent under the version this project actually locks.
-            matplotlib,
-            numpy,
-            optuna,
-            pandas,
-            psycopg2-binary,
-            python-dotenv,
-            scikit-learn,
-            scipy,
-            sqlalchemy,
-            structlog,
-            pandera,
-            mlflow,
-            pyarrow,
-            shap,
-          ]
-
   - repo: https://github.com/kynan/nbstripout
     rev: 0.9.1
     hooks:
@@ -66,6 +29,25 @@ repos:
 
   - repo: local
     hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy --config-file=pyproject.toml src/
+        language: system
+        pass_filenames: false
+        types: [python]
+        # Runs inside the project's own uv-managed venv instead of an
+        # isolated pre-commit environment. The isolated mirrors-mypy hook
+        # needed a hand-maintained additional_dependencies list mirroring
+        # every package src/ imports (base deps + all three
+        # [project.optional-dependencies] extras — serving/ui/training all
+        # type-check as one src/ tree) and had drifted stale more than once
+        # as those extras grew; installing that list from scratch is also
+        # slow enough on a fresh cache to time out a CI/commit step. `uv run`
+        # reuses the venv this project already maintains for every other
+        # command in this file (ruff, pytest, dvc repro, ...), so there is
+        # nothing left to keep in sync by hand.
+        require_serial: true
+
       - id: upgrade-notebooks
         name: upgrade notebooks to nbformat 4.5
         entry: python scripts/upgrade_notebooks.py

@@ -10,7 +10,7 @@ defaults:
   - review: default       # human promotion-review CLI knobs → cfg.review
   - register: default     # registry promotion knobs → cfg.register
   # - data: telco          # pending
-  # - serving: api         # pending
+  - serving: api          # cfg.serving — serving/predict.py, serving/app.py
   - _self_
 
 # The dev/test split seed (data/split.py) and the CV-fold seed for models/train/.

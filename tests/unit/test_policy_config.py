@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
+import mlflow
 import numpy as np
 import pytest
 from omegaconf import OmegaConf
@@ -12,7 +14,9 @@ from telco_churn.models.policy_config import (
     CostScenario,
     costs_config_hash,
     expected_value_at_threshold,
+    expected_value_per_customer,
     load_model_promotion_bars,
+    load_threshold_payload,
     resolve_policy_scenarios,
     resolve_policy_thresholds_by_scenario,
 )
@@ -140,6 +144,32 @@ def test_expected_value_at_threshold_hand_computed(
 
 
 # ---------------------------------------------------------------------------
+# expected_value_per_customer
+# ---------------------------------------------------------------------------
+
+
+def test_expected_value_per_customer_hand_computed(base_scenario: CostScenario) -> None:
+    """EV_i = p_i * (r * LTV) - c, elementwise, no ground truth involved:
+    r*LTV = 0.5*500 = 250, c = 100 -> EV = 250*p - 100.
+    """
+    proba = np.array([0.9, 0.4, 0.0])
+    ev = expected_value_per_customer(proba, base_scenario)
+    np.testing.assert_allclose(ev, [125.0, 0.0, -100.0])
+
+
+def test_expected_value_per_customer_is_strictly_increasing_in_proba(
+    base_scenario: CostScenario,
+) -> None:
+    """r, LTV, cost are scenario-level constants, so EV is a strictly
+    increasing function of p alone (ANALYSIS.md §0) — ranking by EV and
+    ranking by raw probability must agree row-for-row.
+    """
+    proba = np.array([0.1, 0.9, 0.5, 0.3, 0.7])
+    ev = expected_value_per_customer(proba, base_scenario)
+    assert list(np.argsort(-ev)) == list(np.argsort(-proba))
+
+
+# ---------------------------------------------------------------------------
 # resolve_policy_scenarios / resolve_policy_thresholds_by_scenario
 # ---------------------------------------------------------------------------
 
@@ -160,6 +190,76 @@ def test_resolve_policy_thresholds_by_scenario(policy_fixture: OmegaConf) -> Non
     """One threshold per named scenario, matching the policy's own `threshold` field."""
     thresholds = resolve_policy_thresholds_by_scenario(policy_fixture)
     assert thresholds == {"conservative": 0.27, "base": 0.39, "optimistic": 0.50}
+
+
+# ---------------------------------------------------------------------------
+# load_threshold_payload
+# ---------------------------------------------------------------------------
+
+
+def test_load_threshold_payload_reads_the_models_own_run(
+    mlflow_test_experiment: Callable[[str], str],
+) -> None:
+    """Reads threshold/threshold.json off an explicit run_id — the
+    MLflow-run-scoped counterpart to the local reports/policy/threshold.yaml
+    reader, exercised against a real (tmp-scoped) tracking store rather than
+    mocked, the same discipline test_register.py's registry tests use."""
+    tracking_uri = mlflow_test_experiment("test-load-threshold-payload")
+    threshold_payload = {
+        "threshold": 0.39,
+        "scenario": "base",
+        "scenarios": {
+            "conservative": {
+                "threshold": 0.27,
+                "costs": {"c": 22.0, "r": 0.20, "ltv": 408.0, "arpu": 56.7},
+            },
+            "base": {
+                "threshold": 0.39,
+                "costs": {"c": 67.76, "r": 0.30, "ltv": 573.12, "arpu": 79.6},
+            },
+        },
+    }
+    with mlflow.start_run() as run:
+        mlflow.log_dict(threshold_payload, "threshold/threshold.json")
+        run_id = run.info.run_id
+
+    cfg = OmegaConf.create({"mlflow": {"tracking_uri": tracking_uri}})
+    payload = load_threshold_payload(run_id, cfg)
+
+    assert payload.threshold == pytest.approx(0.39)
+    assert set(payload.scenarios) == {"conservative", "base"}
+
+
+def test_load_threshold_payload_is_a_drop_in_for_resolve_policy_helpers(
+    mlflow_test_experiment: Callable[[str], str],
+) -> None:
+    """threshold_payload's `scenarios` block carries the same .threshold/
+    .costs.{arpu,ltv,c,r} shape as reports/policy/threshold.yaml's — so
+    resolve_policy_scenarios/resolve_policy_thresholds_by_scenario work on
+    load_threshold_payload's return with no separate reconstruction."""
+    tracking_uri = mlflow_test_experiment("test-load-threshold-payload-drop-in")
+    threshold_payload = {
+        "threshold": 0.39,
+        "scenarios": {
+            "base": {
+                "threshold": 0.39,
+                "costs": {"c": 67.76, "r": 0.30, "ltv": 573.12, "arpu": 79.6},
+            },
+        },
+    }
+    with mlflow.start_run() as run:
+        mlflow.log_dict(threshold_payload, "threshold/threshold.json")
+        run_id = run.info.run_id
+
+    cfg = OmegaConf.create({"mlflow": {"tracking_uri": tracking_uri}})
+    payload = load_threshold_payload(run_id, cfg)
+
+    scenarios = resolve_policy_scenarios(payload)
+    thresholds = resolve_policy_thresholds_by_scenario(payload)
+
+    assert scenarios["base"].cost == pytest.approx(67.76)
+    assert scenarios["base"].retention_rate == pytest.approx(0.30)
+    assert thresholds["base"] == pytest.approx(0.39)
 
 
 # ---------------------------------------------------------------------------

@@ -14,11 +14,14 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import mlflow
+import mlflow.artifacts
 import numpy as np
 from numpy.typing import NDArray
 from omegaconf import DictConfig, OmegaConf
 
 from telco_churn.models.gate import GateBars
+from telco_churn.utils.mlflow import resolve_tracking_uri
 from telco_churn.utils.paths import get_project_root
 
 __all__ = [
@@ -26,7 +29,9 @@ __all__ = [
     "load_costs_config",
     "costs_config_hash",
     "expected_value_at_threshold",
+    "expected_value_per_customer",
     "load_policy_thresholds",
+    "load_threshold_payload",
     "resolve_policy_scenarios",
     "resolve_policy_thresholds_by_scenario",
     "load_model_promotion_bars",
@@ -97,6 +102,19 @@ def expected_value_at_threshold(
     )
 
 
+def expected_value_per_customer(
+    proba: NDArray[np.float64], scenario: CostScenario
+) -> NDArray[np.float64]:
+    """Prospective per-customer expected value, elementwise: p_i * (r * LTV) - c.
+
+    Distinct from expected_value_at_threshold, which needs ground-truth y to
+    report a *realized* aggregate EV for evaluation. Ranking candidates at
+    serving time has no y to consult, only the model's own probability, so
+    this is the formula serving/contact_policy.py::select_contacts ranks by.
+    """
+    return proba * (scenario.retention_rate * scenario.ltv) - scenario.cost
+
+
 def load_policy_thresholds(cfg: DictConfig) -> DictConfig:
     """Load reports/policy/threshold.yaml — the model-independent scenario thresholds.
 
@@ -107,6 +125,33 @@ def load_policy_thresholds(cfg: DictConfig) -> DictConfig:
     """
     path = get_project_root() / str(cfg.paths.policy) / "threshold.yaml"
     loaded = OmegaConf.load(path)
+    assert isinstance(loaded, DictConfig)
+    return loaded
+
+
+def load_threshold_payload(run_id: str, cfg: DictConfig) -> DictConfig:
+    """Load threshold/threshold.json off the model's own MLflow run.
+
+    The model-run-scoped counterpart to load_policy_thresholds' local-file
+    read: reports/policy/threshold.yaml is model-independent by construction
+    (t* is a pure function of costs.yaml, never of which model is deployed)
+    and lives on local disk, which a served container has no guarantee even
+    exists. serving/predict.py resolves the champion's (or challenger's) own
+    run_id from its ModelVersion and reads this artifact instead, so the
+    threshold travels with the model version the same way drift_reference.json
+    does — a rollback to a different champion must not leave the API serving
+    a threshold derived for a version it no longer runs.
+
+    threshold.py's threshold_payload["scenarios"] is the raw per-scenario
+    results dict — each entry already carries .threshold and
+    .costs.{arpu,ltv,c,r}, the exact shape resolve_policy_scenarios/
+    resolve_policy_thresholds_by_scenario read off load_policy_thresholds'
+    own return value — so this function's DictConfig return is a drop-in for
+    both of those, no separate reconstruction needed.
+    """
+    mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
+    payload = mlflow.artifacts.load_dict(f"runs:/{run_id}/threshold/threshold.json")
+    loaded = OmegaConf.create(payload)
     assert isinstance(loaded, DictConfig)
     return loaded
 

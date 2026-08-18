@@ -3,7 +3,7 @@
 [![CI](https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/actions/workflows/ci.yml/badge.svg)](https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/actions/workflows/ci.yml)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-998%20passing-brightgreen)](CONTRIBUTING.md#testing)
+[![Tests](https://img.shields.io/badge/tests-1085%20passing-brightgreen)](CONTRIBUTING.md#testing)
 [![Coverage](https://img.shields.io/badge/coverage-96.8%25-brightgreen)](CONTRIBUTING.md#testing)
 
 Predicts which telecom customers are likely to churn and quantifies the revenue impact of early intervention. Built as a production-grade system covering the full MLOps lifecycle: data ingestion → validation → feature engineering → model training → calibration → cost-sensitive threshold optimisation → serving → monitoring.
@@ -20,9 +20,12 @@ Known limitations & open questions → **[ANALYSIS.md §9](ANALYSIS.md#9-known-l
 ### Contents
 
 - [Results](#results-sealed-test-set-evaluation)
-- [Dataset](#dataset)
 - [Pipeline](#pipeline)
+- [Dataset](#dataset)
 - [Tech Stack](#tech-stack)
+- [Modelling](#modelling)
+- [Pipeline Versioning (DVC)](#pipeline-versioning-dvc)
+- [Serving](#serving)
 - [Project Status](#project-status)
 - [Quick Start](#quick-start)
 - [Project Structure](#project-structure)
@@ -56,6 +59,23 @@ Known limitations & open questions → **[ANALYSIS.md §9](ANALYSIS.md#9-known-l
 
 ---
 
+## Pipeline
+
+```
+Raw CSV
+  └─ Ingest → Postgres (`customers_raw`)
+       └─ Validation (Pandera, 5 quality gates)
+            └─ Feature engineering (SQL views; 9-lap out-of-fold discovery search over candidate features)
+                 └─ Model training (LightGBM + Optuna tuning) → calibration → register challenger
+                      └─ Threshold → sealed-test evaluation → error analysis → human review
+                           └─ Champion registration
+                                └─ Serving (FastAPI + Streamlit)
+```
+
+Mechanism and rationale for each stage below → [Modelling](#modelling), [Pipeline Versioning](#pipeline-versioning-dvc), [Serving](#serving). This is the simplified view — full tool-level architecture, feedback loops, and MLflow run layout → [docs/architecture.md](docs/architecture.md).
+
+---
+
 ## Dataset
 
 | Property | Detail |
@@ -66,23 +86,6 @@ Known limitations & open questions → **[ANALYSIS.md §9](ANALYSIS.md#9-known-l
 | Target | `Churn` — left within the last month |
 | Class split | 73.5 % No / 26.5 % Yes (2.8:1 imbalance) |
 | Missing data | 11 `TotalCharges` NaN — zero-tenure customers, imputed with median |
-
----
-
-## Pipeline
-
-```
-Raw CSV
-  └─ Ingest to Postgres (`customers_raw`) → Pandera validation (5 quality gates)
-       └─ Feature engineering (SQL views on Postgres; 9-lap OOF discovery; charge_per_service adopted)
-            └─ LightGBM baseline → Optuna tuning (50 trials, TPE)
-                 └─ Sigmoid calibration (CalibratedClassifierCV, cv=5; fit + log only, never registers)
-                      └─ Register challenger (MLflow registry, tagged pending — register.py, not calibration)
-                           └─ OOF cost-optimised threshold (no leakage)
-                                └─ Sealed-test evaluation + error analysis + human review — gate: pass (Phase 7)
-                                     └─ Champion registration + drift baseline + model card (Phase 7, done)
-                                          └─ FastAPI serving + Streamlit UI
-```
 
 **Data splits** — stratified by `customerid`, sealed once before feature discovery (`data/split.py`):
 
@@ -102,17 +105,72 @@ Raw CSV
 | Data validation | Pandera (5 quality gates) |
 | Feature engineering | SQL views on Postgres (`customer_features`) |
 | Experiment tracking | MLflow |
-| Modelling | LightGBM (tuned challenger); `LogisticRegressionCV` baseline compared; `DummyClassifier(strategy='prior')` as leakage safeguard + BSS reference |
-| Hyperparameter tuning | Optuna (TPE sampler, 50 trials) |
-| Calibration | `CalibratedClassifierCV` (sigmoid) |
-| Cost-sensitive threshold | Closed-form `t* = c / (r × LTV)`, 3-scenario cost model |
-| Explainability | SHAP (`TreeExplainer`) |
-| Pipeline versioning | DVC |
-| Serving (Phase 9) | FastAPI + Streamlit |
+| Modelling | LightGBM, `LogisticRegressionCV`, `DummyClassifier` (see [Modelling](#modelling)) |
+| Hyperparameter tuning | Optuna |
+| Calibration | `CalibratedClassifierCV` |
+| Explainability | SHAP |
+| Pipeline versioning | DVC (see [Pipeline Versioning](#pipeline-versioning-dvc)) |
+| Serving | FastAPI + Streamlit (see [Serving](#serving)) |
+| Monitoring instrumentation | `prometheus_client` |
 | Orchestration (Phase 10) | Prefect |
 | Infrastructure | Docker, Postgres |
 | CI/CD | GitHub Actions |
 | Cloud (Phase 12) | AWS ECR + App Runner + RDS + S3 |
+
+---
+
+## Modelling
+
+Mechanism only — the reasoning behind each choice (why LightGBM over `LogisticRegressionCV`, why sigmoid calibration, why these guardrails) lives in `ANALYSIS.md`, linked per row rather than repeated here.
+
+| Stage | Mechanism |
+|---|---|
+| **Family selection** | Three candidates cross-validated on the dev partition — `DummyClassifier(strategy='prior')` (leakage safeguard + BSS floor), `LogisticRegressionCV` baseline, LightGBM challenger. PR-AUC is the sole selection criterion. → [ANALYSIS.md §4a](ANALYSIS.md#4a-model-selection) |
+| **Feature selection** | Permutation-importance ablation over 100 CV folds, stability-voted rather than decided from a single all-dev fit. → [ANALYSIS.md §4b](ANALYSIS.md#4b-feature-selection-concluded-ablation--importance-diagnostic) |
+| **Hyperparameter tuning** | Optuna, TPE sampler, 50 trials; final pick is the 1-SE-rule value, not the raw-best trial. → [ANALYSIS.md §4c](ANALYSIS.md#4c-hyperparameter-tuning-optuna) |
+| **Calibration** | `CalibratedClassifierCV` (sigmoid) — fit and logged only; `calibrate.py` never registers a model on its own. → [ANALYSIS.md §5](ANALYSIS.md#5-probability-calibration) |
+| **Threshold** | Closed-form `t* = c / (r × LTV)` from `configs/costs.yaml`, derived out-of-fold with no leakage into the sealed test set. → [ANALYSIS.md §6](ANALYSIS.md#6-business-impact--threshold-selection) |
+| **Promotion gate** | PR-AUC drives selection; three veto-only guardrails (recall at `t*`, Brier, calibration slope) can reject a candidate but never promote one. → [ANALYSIS.md §0](ANALYSIS.md#success-criterion--the-promotion-gate) |
+| **Registration** | `register.py` is the sole registry-write entry point — mints the challenger, tags it `pending`, and flips (or rejects) the `champion` alias only after both the automated gate and a human review pass. → [ANALYSIS.md §8](ANALYSIS.md#8-model-registration--promotion) |
+
+Full modelling narrative, every number, every deviation from the archived exploratory pass → [ANALYSIS.md](ANALYSIS.md).
+
+---
+
+## Pipeline Versioning (DVC)
+
+`dvc.yaml` wraps the file-producing half of the pipeline above as a reproducible, content-hashed DAG — the registry-mutating half (minting/tagging/flipping a model version) structurally cannot live in it, since a registry alias isn't a file DVC can hash.
+
+| Component | What it does |
+|---|---|
+| **9-stage DAG** (`dvc.yaml`) | `ingest → validate → split → features → train → calibrate → threshold → evaluate → error_analysis`, each stage's `deps`/`params`/`outs` explicitly declared. `dvc repro <stage>` only re-runs that stage and its upstream chain when something it actually depends on changed — never the whole DAG unconditionally. |
+| **Registry writes stay outside the DAG** | `register.py` (mint challenger, tag, flip/reject champion) runs as its own step, never a `dvc.yaml` stage. A full training cycle is therefore two `dvc repro` calls bracketing one registration step, not one — [Quick Start steps 5–7](#quick-start) run through it. |
+| **Receipts bridge the two worlds** | Six small JSON receipts (`reports/*_receipt.json`) stand in for side effects DVC can't hash directly — a Postgres load, an MLflow run — giving `validate`/`train`/`calibrate`/`eval`/`error_analysis` a real dependency edge on "did the step before me actually succeed," not just "did its script exit 0." |
+| **Local cache only** | No DVC remote yet — `.dvc/cache` is local-only through Phase 11; Phase 12 adds an S3 remote for shared caching, not a migration off the current setup. |
+
+```bash
+dvc repro <stage>   # re-run one stage and its upstream chain
+dvc dag             # print the pipeline DAG
+dvc metrics show    # diff metrics.json / params across commits
+```
+
+Run it yourself → [Quick Start step 5](#quick-start). Full architecture → [docs/architecture.md](docs/architecture.md).
+
+---
+
+## Serving
+
+The champion (`telco-churn-pipeline@champion` in the MLflow registry) is served behind a FastAPI app, with a Streamlit UI as a thin client — both run as their own Docker images and come up together with one `docker compose up`.
+
+| Component | What it does |
+|---|---|
+| **FastAPI** (`serving/app.py`, `serving/predict.py`) | Loads the champion at startup and hot-reloads it on a TTL poll — a promotion is just an MLflow alias flip, so a new champion goes live without a redeploy. Exposes `POST /predict`, `POST /predict/batch`, `GET /customer/{id}`, `GET /health`/`GET /ready` (liveness vs. readiness), and `GET /metrics` (Prometheus). Runs on `uvicorn` inside `docker/api/Dockerfile`, a multi-stage build from the project's own `uv.lock`. |
+| **Contact policy** | `POST /predict/batch` doesn't just score every row — it ranks them by expected value and caps who gets contacted at a configurable `contact_capacity`/`campaign_budget`, so the response reflects an operationally realistic campaign, not an unlimited-budget fantasy. |
+| **Shadow/canary rollout** | Config-gated, off by default: whenever a `challenger` model exists in the registry, it can be dual-scored against every request for comparison (**shadow**, zero routing risk) or actually serve a consistent-hash slice of live traffic (**canary**). Mechanism, Prometheus metrics, and a real evidence log → [docs/architecture.md § Shadow/Canary Serving](docs/architecture.md#shadowcanary-serving--servingpredictpy-phase-9). |
+| **Streamlit UI** (`ui/streamlit_app.py`) | Look up a real customer, run a what-if scenario, bulk-score a CSV, or read the champion's model card — all driven through the same FastAPI endpoints a real client would call. [`examples/sample_batch_predictions.csv`](examples/sample_batch_predictions.csv) demonstrates all three `/predict/batch` item shapes in one upload (ID-only, full inline, ID-plus-override). Runs from `docker/ui/Dockerfile`, same build pattern as the API image. |
+| **Docker Compose** | `docker-compose.yml` wires four services — `postgres`, `mlflow`, `fastapi`, `streamlit` — so `docker compose up -d --build` brings up the entire stack in one command, with `fastapi`/`streamlit` waiting on `postgres`/`mlflow` via `depends_on`. |
+
+Run it yourself → [Quick Start step 9](#quick-start).
 
 ---
 
@@ -131,14 +189,14 @@ Raw CSV
 | 7a | Sealed test-set evaluation, error analysis, human review — gate: pass | ✅ Done |
 | 7b | Registry promotion, drift baseline, model card (`register.py`, `drift_reference.py`) | ✅ Done |
 | 8 | DVC pipeline wrap — 9-stage reproducible DAG (`dvc.yaml`), `ingest` through `error_analysis` | ✅ Done |
-| 9 | Serving + UI — FastAPI + Streamlit | 🔜 Next |
-| 10 | Orchestration — Prefect retrain/drift flows | ⏸ Scoped, deferred until after 12 |
-| 11 | CI/CD — GitHub Actions | 🔜 Next |
-| 12 | AWS deployment | 🔜 Next |
+| 9 | Serving + UI — FastAPI + Streamlit, shadow/canary rollout mechanism | ✅ Done |
+| 10 | Orchestration — Prefect retrain/drift flows | 🔜 Next |
+| 11 | CI/CD — GitHub Actions | ⏳ Queued after 10 |
+| 12 | AWS deployment | ⏳ Queued after 11 |
 | 13 | Monitoring — Prometheus/Grafana/Evidently | ⏸ Scoped, deferred until after 12 |
 | 14 | Documentation polish | Planned |
 
-**Current focus:** 9 → 11 → 12 — serving, CI/CD, and cloud deployment, in that order, since each is a dependency of the next and together they form one working, deployed system. Orchestration (10) and monitoring (13) are fully scoped but deliberately sequenced *after* deployment — both are more meaningful run against a live system with real traffic than built ahead of one.
+**Current focus:** 10 → 11 → 12 — orchestration, then CI/CD, then cloud deployment. Monitoring (13) stays deferred until after 12 — it needs a live system to alert on. Orchestration doesn't have that same dependency: this dataset never has live traffic for the retrain/drift flows to route through either way (`ANALYSIS.md` §9 item 13), so there's no reason to wait on deployment before building the mechanism.
 
 See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full phase-by-phase roadmap and the execution-order rationale.
 
@@ -153,7 +211,7 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full phase-by-phase roadmap and t
 ```bash
 git clone <repo-url>
 cd TelcoChurn_PortfolioProject
-uv sync
+uv sync --all-extras
 pre-commit install
 ```
 
@@ -184,32 +242,28 @@ make db-up             # start postgres:16 in Docker
 **5 — Run the pipeline through calibration**
 
 ```bash
-make repro STAGE=calibrate
+make repro STAGE=calibrate   # ingest -> validate -> split -> features -> train -> calibrate
 ```
 
-Naming `calibrate` as the target — rather than a bare `dvc repro` — tells DVC to run exactly its upstream chain and stop: `ingest` (load 7,043 rows → `customers_raw`) → `validate` (5 Pandera quality gates) → `split` (canonical dev/test partition) → `features` (SQL views → `telco_churn_features.parquet`) → `train` (LightGBM + Optuna, logs to MLflow) → `calibrate` (sigmoid calibration, fit + log only — never registers anything), then **exits 0**. It never attempts `threshold`, so there's no error to see here — `threshold` resolves its model via a *registered* version, and nothing has minted one yet, but DVC only reaches stages upstream of the target you named.
-
-`make repro STAGE=<stage>` (rather than `uv run dvc repro <stage>` directly) formats `src/` first, so pre-commit's `black` hook can't invalidate `dvc.lock` after the fact — see [CONTRIBUTING.md](CONTRIBUTING.md#pre-commit-hooks) for why that matters.
+Exits 0 without touching `threshold` — that stage needs a registered model version, minted next. See [Pipeline Versioning](#pipeline-versioning-dvc) for why this is deliberate, not a partial failure.
 
 **6 — Mint the challenger, then finish the pipeline**
 
 ```bash
-make register-challenger        # mints calibrate's output as a new registry version, tagged pending — uses calibrate's own receipt automatically
-make repro STAGE=error_analysis # threshold -> evaluate -> error_analysis (calibrate and everything upstream stays cached)
+make register-challenger        # mints calibrate's output as a new registry version, tagged pending
+make repro STAGE=error_analysis # threshold -> evaluate -> error_analysis
 ```
 
-`register-challenger` is a `make` target, not a `dvc.yaml` stage — a registry alias isn't a file DVC can track, so it structurally can't live in the DAG, which is also why `dvc repro calibrate` alone can never mint one for itself. Once it has run, `dvc repro error_analysis` reproduces exactly its own upstream chain — `calibrate` and everything before it are already cached and skipped, so what actually executes is `threshold → evaluate → error_analysis`, each resolving the version `register-challenger` just minted automatically. No version number to copy anywhere, and no error this time either.
-
-Review the gate result and error diagnostics in MLflow (`mlflow ui`, then open this cycle's evaluation run — `metrics.json`, `economics.json`, `promotion_decision.json`, `error_analysis.json`, and `figures/` are all logged there), not the notebook: `notebooks/05-evaluation-and-error-analysis.ipynb` only reflects this cycle's numbers if someone happens to re-execute it against this exact run, and isn't reachable by a reviewer on a different machine — `review.py` itself points reviewers at the MLflow run for this reason (`make review`, next step, logs the same pointer before asking for a verdict).
+Review the gate result in MLflow (`mlflow ui` → this cycle's `evaluation` run) rather than the notebook, which only reflects this cycle if someone re-executes it.
 
 **7 — Record human sign-off, then promote the champion**
 
 ```bash
-make review VERDICT=approved APPROVER="Your Name" NOTES="..."  # verdict, approver, and a non-empty reason are all required; prints where to find this cycle's MLflow diagnostics first
-make register MODEL_VERSION=<version>  # acts on the gate verdict + review: flips the champion alias on a pass, tags rejected on a fail
+make review VERDICT=approved APPROVER="Your Name" NOTES="..."
+make register MODEL_VERSION=<version>  # flips champion on a pass, tags rejected on a fail
 ```
 
-`register` is the one step with no automatic default — it requires an explicit `MODEL_VERSION` (printed by `register-challenger` in step 6, or `mlflow ui`), deliberately, since it is the step that can put a model into production.
+`MODEL_VERSION` (printed by step 6, or `mlflow ui`) has no default — deliberately, since this is the step that can put a model into production.
 
 <details>
 <summary>Re-running one stage against a specific historical run instead</summary>
@@ -223,6 +277,22 @@ Every command above works with no arguments because it always resolves "whatever
 `make db-up` already started the MLflow tracking server alongside Postgres —
 open [http://localhost:5000](http://localhost:5000) to explore the logged runs, the registered `telco-churn-pipeline` model, and the `challenger` alias.
 
+**9 — Serve the champion and try it**
+
+```bash
+docker compose up -d --build   # full stack: postgres, mlflow, fastapi, streamlit
+```
+
+Once `/ready` returns `200` (`curl http://localhost:8000/ready`), open [http://localhost:8501](http://localhost:8501) for the Streamlit UI, or hit the API directly:
+
+```bash
+curl -X POST http://localhost:8000/predict/batch \
+  -H "Content-Type: application/json" \
+  -d '[{"customerid":"2446-BEGGB"},{"customerid":"8766-PAFNE"}]'
+```
+
+Try the Bulk CSV tab with [`examples/sample_batch_predictions.csv`](examples/sample_batch_predictions.csv) — see [Serving](#serving) for what it demonstrates. `make smoke-test-serving` runs the same checks as a script; `docker compose down` tears the stack back down.
+
 ---
 
 ## Project Structure
@@ -233,25 +303,27 @@ src/telco_churn/
   features/                      # SQL feature views, 9-lap discovery, permutation-importance selection
   models/
     train/                       # candidate comparison, feature freeze, Optuna tuning, model logging
-    calibrate.py                 # CalibratedClassifierCV method selection — fit + log only, never registers
-    calibration_metrics.py       # shared Brier/ECE/Murphy-decomposition/slope helpers
-    threshold.py                 # closed-form cost-sensitive threshold + dev-OOF pre-seal screen
-    evaluate.py                  # one-time sealed-test scoring + promotion gate (Phase 7)
-    gate.py                      # decide_promotion — pure gate function, PR-AUC selection + 3 veto guardrails
-    economics.py                 # expected-value scenarios, sensitivity, break-even analysis
-    explain.py, error_analysis.py, shap_values.py # SHAP explainability + error diagnosis (Phase 7)
-    artifacts.py, policy_config.py, dev_features.py # shared model/registry/cost-config loaders
-    drift_reference.py           # champion drift-monitoring baseline builder (Phase 7)
-    register.py                  # sole registry-write entry point — mint challenger, tag, flip/reject champion
-    review.py                    # human promotion-review verdict CLI (Phase 7)
+    calibrate.py, threshold.py, evaluate.py, gate.py    # calibration, threshold, sealed-test evaluation, promotion gate
+    economics.py, explain.py, error_analysis.py, shap_values.py  # business impact, SHAP, error diagnosis
+    register.py, review.py       # registry writes, human review verdict
+    drift_reference.py, environment_parity.py  # drift baseline, hot-reload dependency diff
+    artifacts.py, policy_config.py, dev_features.py, calibration_metrics.py  # shared loaders/helpers
     plots.py, diagnostics.py
+  serving/                       # FastAPI app + shadow/canary-aware scoring
+    predict.py, app.py           # hot-reloading model bundle, /predict endpoints
+    contact_policy.py, customer_lookup.py, schemas.py  # contact ranking, Postgres lookup, request/response models
+  ui/                            # Streamlit demo app
+    streamlit_app.py             # Lookup, Manual/what-if, Bulk CSV, About-this-model tabs
   utils/                         # paths, logging, db, mlflow, stats, hashing helpers
-configs/                 # Hydra YAML — training/, tuning/, calibration/, threshold/, evaluate/, error_analysis/, review/, register/, costs.yaml, model_promotion.yaml
+configs/                 # Hydra YAML — training/, tuning/, calibration/, threshold/, evaluate/, error_analysis/, review/, register/, serving/, costs.yaml, model_promotion.yaml
 sql/                     # Postgres schema + feature SQL views
 tests/unit/              # pytest unit tests (≥80 % coverage target)
-tests/integration/       # Postgres-backed tests (ingest, split, sql_features, validate) + subprocess CLI tests (train, calibrate, threshold, evaluate, error_analysis)
+tests/integration/       # Postgres-backed tests (ingest, split, sql_features, validate) + subprocess CLI tests (train, calibrate, threshold, evaluate, error_analysis, predict) + FastAPI TestClient suite
+tests/streamlit/         # headless Streamlit `AppTest` smoke suite (Phase 9)
 pipelines/               # Prefect flows (retrain, drift check, batch predict) — Phase 10
 monitoring/              # Prometheus config + Grafana dashboard JSON — Phase 13
+docker/api/, docker/ui/  # multi-stage Dockerfiles (FastAPI, Streamlit), built from uv.lock (Phase 9)
+examples/                # sample_batch_predictions.csv — real dev-partition customer IDs for /predict/batch and the Bulk CSV tab
 dvc.yaml, .dvc/, .dvcignore  # DVC pipeline — 9 stages, ingest through error_analysis (Phase 8)
 datasets/raw/             # committed to git — the source CSV DVC hashes as a stage dep, never modified
 datasets/processed/, datasets/interim/  # gitignored; DVC-cached stage outputs
