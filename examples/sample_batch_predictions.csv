@@ -1,0 +1,9 @@
+note,customerid,gender,seniorcitizen,has_partner,dependents,tenure,phoneservice,multiplelines,internetservice,onlinesecurity,onlinebackup,deviceprotection,techsupport,streamingtv,streamingmovies,contract_type,paperlessbilling,paymentmethod,monthlycharges,totalcharges
+ID-only - resolved from Postgres,2446-BEGGB,,,,,,,,,,,,,,,,,,
+ID-only - resolved from Postgres,7465-ZZRVX,,,,,,,,,,,,,,,,,,
+ID-only - resolved from Postgres,3496-LFSZU,,,,,,,,,,,,,,,,,,
+ID-only - resolved from Postgres,6064-PUPMC,,,,,,,,,,,,,,,,,,
+ID-only - resolved from Postgres,8766-PAFNE,,,,,,,,,,,,,,,,,,
+Full inline - new prospect (no customerid; never touches Postgres),,Female,0,No,No,0,Yes,No,Fiber optic,No,No,No,No,No,No,Month-to-month,Yes,Electronic check,75.0,
+Partial override - what if this customer switched to month-to-month at a higher rate,9592-ERDKV,,,,,,,,,,,,,,,Month-to-month,,,95.0,
+Partial override - what if this customer dropped tech support,0440-EKDCF,,,,,,,,,,,,No,,,,,,52.0,

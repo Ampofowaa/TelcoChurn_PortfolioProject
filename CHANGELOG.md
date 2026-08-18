@@ -12,6 +12,37 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ---
 
+## [0.9.0] - 2026-08-18 — Phase 9: Serving + Streamlit UI
+
+*Stands up the champion-serving path end to end: FastAPI (`/predict`, `/predict/batch`, `/customer/{id}`, `/health`, `/ready`, `/metrics`) with hot-reload and a capacity-constrained contact policy, plus a config-gated shadow/canary mechanism that continuously dual-scores traffic against a `challenger` whenever one exists. Streamlit UI and both Docker images complete a locally-runnable full stack (`docker compose up`). The champion alias still flips on an offline gate alone — shadow/canary is real routing/logging/metrics machinery, not a live-traffic validation gate, since this dataset has no live traffic to validate against (`ANALYSIS.md` §9 item 13).*
+
+### Added
+- **`src/telco_churn/models/policy_config.py::expected_value_per_customer`**, **`serving/contact_policy.py::select_contacts`** — capacity-constrained contact policy: ranks by expected value, caps at `contact_capacity`/`campaign_budget`.
+- **`src/telco_churn/serving/schemas.py`** — Pydantic v2 request/response models; `customerid` pass-through only, stripped before `predict_proba`. Structural guard ties `CustomerFeatures`'s field set to `FEATURE_SCHEMA`'s raw columns (`tests/unit/test_schemas.py`).
+- **`src/telco_churn/serving/predict.py`** — champion load at startup; `resolve_serving_model` TTL-polls `champion`/`challenger`, diffing logged dependencies against what's installed (`models/environment_parity.py`) before hot-reloading — fail-open on a refresh problem, fail-closed on the first load. Shadow/canary routing (`resolve_champion_model`/`resolve_challenger_model`, consistent-hash canary bucketing on `customerid` salted by the challenger's own `model_version`) and five Prometheus metrics (`predictions_total`, `predicted_probability`, `predictions_above_threshold_total`, `shadow_canary_score_distance`, `shadow_canary_agreement_total`). SHAP explainer and threshold policy reload in lockstep with the model inside one `ModelBundle`.
+- **`src/telco_churn/serving/app.py`** — `POST /predict` (probability + optional SHAP explanation), `POST /predict/batch` (three item shapes, partial success, 500-row cap), `GET /customer/{id}`, `GET /health` (liveness only), `GET /ready` (503 pre-load, graceful SIGTERM drain), `GET /metrics`. Optional API-key auth (`configs/serving/api.yaml: auth.enabled`, off by default), never applied to `/health`/`/ready`/`/metrics`.
+- **`src/telco_churn/ui/streamlit_app.py`** — Lookup, Manual/what-if, Bulk CSV, and "About this model" tabs; widgets sourced from `features/schema.py`'s constraint sets.
+- **`docker/api/Dockerfile`, `docker/ui/Dockerfile`** — multi-stage, built from `uv.lock`. `docker-compose.yml` gains `fastapi`/`streamlit` services, unprofiled so bare `docker compose up -d` brings up the full stack.
+- **`scripts/smoke_test_serving.sh`**, `make smoke-test-serving` — curls `/ready`, `/predict`, `/customer/<id>` against a running compose stack.
+- **`docs/architecture.md`** — new Shadow/Canary Serving section: mechanism flowchart, Prometheus metric labelling scheme, and a real log/metrics snippet from real dev-partition customers run through the actual mechanism.
+- **`examples/sample_batch_predictions.csv`** — 8 real dev-partition customers demonstrating all three `/predict/batch` item shapes (ID-only, full inline "new prospect," ID-plus-partial-override) in one upload; referenced from the Streamlit Bulk CSV tab and the README Quick Start.
+- Test suite: `tests/unit/test_predict.py` (23), `test_contact_policy.py`, `test_schemas.py`, `test_environment_parity.py`; `tests/integration/test_api.py` (9), `test_predict_subprocess.py`, `test_serving_parity.py`; `tests/streamlit/test_streamlit_app.py`. New `make test-serving` scoped target.
+
+### Changed
+- **`docker-compose.yml`** — `postgres`/`mlflow` lose `profiles: [infra]` (Compose refuses to resolve an unprofiled service's `depends_on` into an inactive profile); infra-only startup is now `docker compose up -d postgres mlflow`. Updated to match in `CLAUDE.md`, `Makefile` (`db-up`/`db-down`), `PROJECT_PLAN.md`, `notebooks/00-data-ingestion.ipynb`.
+- **`ANALYSIS.md`** §9 — gains items 13–16 on the monitoring/shadow-canary stack's mechanism-vs-live-traffic-validation boundary, capacity-pool interference between canary and champion cohorts, and the per-model cost-scenario staleness risk between a champion and a later challenger.
+- **`README.md`** — Phase 9 marked done (Project Status, pipeline diagram, Tech Stack); restructured into Results → Dataset → Tech Stack → Pipeline → Modelling → Pipeline Versioning (DVC) → Serving, each of the last three a mechanism-only table linking out to `ANALYSIS.md`/`docs/architecture.md` for rationale rather than restating it; Quick Start gains a step to bring up the full compose stack and try `/predict`/`/predict/batch`/the Streamlit UI; Project Structure lists `serving/`, `ui/`, `docker/`, `examples/`.
+
+### Fixed
+- **`src/telco_churn/serving/app.py`** — `lifespan()` was `await`ing the initial model load directly in ASGI startup; uvicorn's own `Server.startup()` only opens its listening socket *after* lifespan startup returns, so with no champion yet to resolve, `/health` (meant to be reachable unconditionally) was unreachable too, not just `/ready`. Fixed by moving the initial load onto the same background task the hot-reload poll already runs on. Caught by `tests/integration/test_predict_subprocess.py`, a real uvicorn subprocess over a real socket.
+- **`src/telco_churn/serving/predict.py::score_request`** — canary-only mode (shadow disabled) was scoring the challenger against the full batch instead of only the bucketed subset; a real canary router never double-scores every request the way shadow does.
+- **`src/telco_churn/serving/predict.py::_canary_bucket_mask`** — bucketing now salted with the challenger's own `model_version`, so the canary population reshuffles the next time `challenger` moves to a different version instead of being the same customer subset on every canary this project ever runs.
+- **`src/telco_churn/serving/app.py::require_api_key`** — compared the API key with `!=`, not constant-time; fixed with `secrets.compare_digest`.
+- **`docker-compose.yml`** — MLflow 3.14's server-side Host-header allowlist rejected the Compose DNS name (`mlflow`) `fastapi`/`streamlit` reach it through; fixed via `MLFLOW_SERVER_ALLOWED_HOSTS` with the needed `:*` wildcard entries.
+- **`src/telco_churn/ui/streamlit_app.py::_render_bulk_tab`** — no client-side row-count check against `batch.max_size`; now shown against the live limit and disables submission over it, instead of only surfacing the API's `413` after upload.
+
+---
+
 ## [0.8.0] - 2026-08-15 — Phase 8: DVC Pipeline Wrap
 
 *Wraps `ingest → validate → split → features → train → calibrate → threshold → evaluate → error_analysis` as a 9-stage, content-hashed DVC DAG, reproducible end to end via `dvc repro`. Required extracting registry writes out of `calibrate.py`/`evaluate.py`/`error_analysis.py` into `register.py` as the sole registry-mutating module, switching model resolution to run-id receipts, and splitting the automated gate verdict from the human review.*
