@@ -12,7 +12,9 @@ from sklearn.pipeline import Pipeline
 
 from telco_churn.features.preprocessing import build_preprocessor
 from telco_churn.models.shap_values import (
+    build_tree_explainer,
     compute_shap_values,
+    explain_with_explainer,
     unwrap_calibrated_pipeline,
 )
 
@@ -119,6 +121,36 @@ def test_compute_shap_values_feature_names_match_transformed_columns(
         preprocessor, booster, X
     )
     assert feature_names == list(preprocessor.get_feature_names_out())
+
+
+# ---------------------------------------------------------------------------
+# build_tree_explainer / explain_with_explainer
+# ---------------------------------------------------------------------------
+
+
+def test_explain_with_cached_explainer_matches_compute_shap_values(
+    fitted_calibrated_pipeline: tuple[CalibratedClassifierCV, pd.DataFrame],
+) -> None:
+    """A cached explainer, reused across calls, reproduces compute_shap_values'
+    one-shot output exactly — the equivalence serving/predict.py's caching
+    seam depends on."""
+    calibrated, X = fitted_calibrated_pipeline
+    preprocessor, booster = unwrap_calibrated_pipeline(calibrated)
+
+    one_shot = compute_shap_values(preprocessor, booster, X)
+
+    explainer = build_tree_explainer(booster)
+    cached_first = explain_with_explainer(explainer, preprocessor, X)
+    cached_second = explain_with_explainer(explainer, preprocessor, X.iloc[:5])
+
+    np.testing.assert_allclose(one_shot[0], cached_first[0])
+    assert one_shot[1] == cached_first[1]
+    assert one_shot[2] == pytest.approx(cached_first[2])
+    np.testing.assert_allclose(one_shot[3], cached_first[3])
+
+    # The same cached explainer, reused on a smaller slice, is untouched by
+    # the earlier call — no per-call mutable state leaking across requests.
+    np.testing.assert_allclose(cached_second[0], one_shot[0][:5])
 
 
 def test_compute_shap_values_shap_values_are_2d() -> None:

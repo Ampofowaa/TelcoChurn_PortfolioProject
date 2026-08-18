@@ -1,0 +1,395 @@
+"""FastAPI serving app — the process uvicorn runs (`telco_churn.serving.app:app`).
+
+**Versioning decision, recorded rather than left implicit: routes ship
+unversioned this phase (`/predict`, not `/predict/v1`).** There is no
+external consumer yet — this phase's own tests, Phase 10's `/ready` poll, and
+Phase 11's CI all live in this repo and can move in lockstep with a route
+rename. Adopt an `/v1` prefix no later than Phase 11, before either of those
+consumers exists to break.
+
+**Config is resolved once, in `lifespan`, and stashed on `app.state` — not at
+import time.** `compose_config()`/`activate_config()` need Hydra's config
+directory and (for the champion load) a reachable MLflow; running them at
+module import would make importing this module for a test fail before a test
+even gets to choose what to mock. Every request handler reads `request.app.state.cfg`
+instead of a module-level global.
+
+**`serving/predict.py` (Task 3) already owns hot-reload, shadow/canary
+routing, and five of the module's Prometheus metrics; `serving/customer_lookup.py`
+owns Postgres ID-resolution — this module is a thin HTTP skin over both, not
+a second implementation of either.** `GET /metrics` needs no per-metric code
+of its own: `prometheus_fastapi_instrumentator`'s `Instrumentator().expose(app)`
+serves the entire default `prometheus_client` registry, which already
+contains every metric `predict.py` registered at import time.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import secrets
+import signal
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from omegaconf import DictConfig
+from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import ValidationError
+
+from telco_churn.models.policy_config import load_costs_config
+from telco_churn.serving import customer_lookup, predict
+from telco_churn.serving.contact_policy import select_contacts
+from telco_churn.serving.schemas import (
+    BatchPredictionError,
+    BatchPredictionResult,
+    BatchPredictItem,
+    BatchPredictResponse,
+    CustomerFeatures,
+    PredictRequest,
+    PredictResponse,
+)
+from telco_churn.utils.db import dispose_async_engine, get_async_engine
+from telco_churn.utils.logging import configure_logging, get_logger
+from telco_churn.utils.paths import activate_config, compose_config
+
+__all__ = ["app", "lifespan", "require_api_key", "get_runtime"]
+
+logger = get_logger(__name__)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Startup: load config, start the initial-load-then-poll background
+    task, and return (`yield`) immediately. Shutdown: flip readiness first,
+    then drain.
+
+    **The initial champion load must never be awaited directly in this
+    function's own body.** uvicorn's own `Server.startup()` awaits the ASGI
+    lifespan's startup phase (this function, up to its `yield`) *before* it
+    ever calls `loop.create_server(...)` — the listening socket isn't even
+    opened yet, let alone accepting connections, until this coroutine
+    reaches `yield`. `load_serving_state_with_retry` retries forever on a
+    genuine cold start with no `champion` alias to resolve, so awaiting it
+    here would mean the socket never opens at all: not just `/ready`, but
+    `/health` too — the liveness probe this project's own design explicitly
+    says "must never restart-loop a process that was never actually broken"
+    (see `health()`'s docstring below) — would be unreachable for as long as
+    MLflow has nothing to serve. Folding the initial load into the same
+    background task the periodic hot-reload poll already runs on fixes
+    this: `yield` happens right after the task is spawned, uvicorn opens the
+    socket immediately, and `/health`/`/ready` (503, via `get_runtime`'s and
+    `ready()`'s own `app.state.runtime is None`/`app.state.ready` checks)
+    are reachable the whole time the task is still retrying underneath.
+
+    The SIGTERM handler is registered separately from (and ahead of) the
+    normal shutdown path below, because App Runner's scale-to-zero sends
+    SIGTERM routinely, not just on deploys — by the time Starlette's own
+    shutdown event fires, uvicorn has typically already stopped accepting
+    new connections, which is too late for '/ready' to have warned the
+    platform to stop routing here in the first place. Falls back to a no-op
+    where add_signal_handler isn't available (Windows dev boxes) — the
+    container runtime (Linux) this matters for supports it.
+    """
+    load_dotenv()
+    configure_logging()
+    cfg = compose_config()
+    activate_config(cfg)
+    if bool(cfg.serving.auth.enabled) and not os.environ.get("API_KEY"):
+        raise RuntimeError(
+            "serving.auth.enabled=true but the API_KEY environment variable "
+            "is not set — every request to an authenticated route would be "
+            "rejected unconditionally."
+        )
+
+    app.state.cfg = cfg
+    app.state.ready = False
+    app.state.runtime = None
+
+    def _flip_not_ready() -> None:
+        app.state.ready = False
+        logger.warning("sigterm_received_readiness_flipped_to_not_ready")
+
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, _flip_not_ready)
+    except (NotImplementedError, AttributeError):
+        logger.warning("sigterm_handler_unavailable_on_this_platform")
+
+    async def _load_and_poll_loop() -> None:
+        interval = float(cfg.serving.poll_interval_seconds)
+        app.state.runtime = await predict.load_serving_state_with_retry(cfg)
+        app.state.ready = True
+        logger.info(
+            "serving_ready",
+            model_version=app.state.runtime.champion.model_version,
+            run_id=app.state.runtime.champion.run_id,
+        )
+        while True:
+            await asyncio.sleep(interval)
+            app.state.runtime = predict.resolve_serving_model(cfg, app.state.runtime)
+
+    poll_task = asyncio.create_task(_load_and_poll_loop())
+
+    yield
+
+    app.state.ready = False
+    poll_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await poll_task
+    await dispose_async_engine()
+
+
+app = FastAPI(title="Telco Churn Serving API", lifespan=lifespan)
+Instrumentator().instrument(app).expose(app, include_in_schema=False)
+
+
+def require_api_key(
+    request: Request, x_api_key: str | None = Header(default=None, alias="X-API-Key")
+) -> None:
+    """Config-gated API-key dependency for the three customer-data routes.
+
+    Off by default (configs/serving/api.yaml: auth.enabled) — never applied
+    to /health, /ready, or /metrics, which must stay reachable by an infra
+    probe or a Prometheus scraper with no credential to present.
+    """
+    cfg: DictConfig = request.app.state.cfg
+    if not bool(cfg.serving.auth.enabled):
+        return
+    expected = os.environ.get("API_KEY")
+    if not expected or not x_api_key or not secrets.compare_digest(x_api_key, expected):
+        raise HTTPException(status_code=401, detail="missing or invalid API key")
+
+
+def get_runtime(request: Request) -> predict.ServingRuntime:
+    """The loaded ServingRuntime, or 503 before the first successful load."""
+    runtime: predict.ServingRuntime | None = getattr(request.app.state, "runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="model not loaded yet")
+    return runtime
+
+
+def _request_id(request: Request) -> str:
+    return request.headers.get("x-request-id") or str(uuid.uuid4())
+
+
+@app.post(
+    "/predict", response_model=PredictResponse, dependencies=[Depends(require_api_key)]
+)
+async def predict_endpoint(
+    payload: PredictRequest,
+    request: Request,
+    runtime: predict.ServingRuntime = Depends(get_runtime),
+) -> PredictResponse:
+    """Single-customer prediction — probability/threshold/decision, plus an
+    opt-in local SHAP explanation. Never carries `contact`/`capacity_limit`:
+    one customer in isolation has no population to be capacity-ranked
+    against (serving/contact_policy.py::select_contacts is wired into
+    /predict/batch alone, below).
+    """
+    cfg: DictConfig = request.app.state.cfg
+    response = predict.predict_single(payload, runtime, cfg)
+    logger.info(
+        "prediction_served",
+        request_id=_request_id(request),
+        customerid=response.customerid,
+        features=payload.model_dump(exclude={"include_explanation"}),
+        probability=response.probability,
+        threshold=response.threshold,
+        decision=response.decision,
+        model_version=response.model_version,
+    )
+    return response
+
+
+@app.post(
+    "/predict/batch",
+    response_model=BatchPredictResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def predict_batch_endpoint(
+    payload: list[dict[str, Any]],
+    request: Request,
+    runtime: predict.ServingRuntime = Depends(get_runtime),
+) -> BatchPredictResponse:
+    """Batch scoring with partial success and capacity-constrained contact ranking.
+
+    Accepts `list[dict[str, Any]]` rather than `list[CustomerFeatures]` so a
+    malformed row can be collected as an error instead of 422-ing the whole
+    batch — FastAPI validates a declared Pydantic-model list body in full
+    before the handler ever runs, which partial success needs to bypass.
+
+    `decision`/`contact` are computed against whichever model actually
+    served each row — `decision_threshold` equals `threshold` for every row
+    (both are that row's served model's own calibrated bar), rather than
+    being pinned to the champion's `base` scenario `t*` regardless of who
+    scored the row. Pinning to champion's threshold would make a
+    canary-routed row's eligibility depend partly on an arbitrary
+    hash-bucket assignment rather than the risk the serving model actually
+    computed, and would disagree with `predict.py`'s
+    `predictions_above_threshold_total` Prometheus counter, which already
+    uses each row's own served threshold. The `contact_capacity`/
+    `campaign_budget` cut downstream is still one pool shared by both
+    cohorts — see `ANALYSIS.md` §9, item 14 for the capacity-interference
+    limitation that remains.
+    """
+    cfg: DictConfig = request.app.state.cfg
+    max_size = int(cfg.serving.batch.max_size)
+    if len(payload) > max_size:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"batch of {len(payload)} rows exceeds batch.max_size="
+                f"{max_size}; use pipelines/batch_predict.py (Phase 10) for "
+                "a full population sweep"
+            ),
+        )
+
+    request_id = _request_id(request)
+    validated: dict[int, BatchPredictItem] = {}
+    errors: list[BatchPredictionError] = []
+    for idx, raw in enumerate(payload):
+        try:
+            validated[idx] = BatchPredictItem.model_validate(raw)
+        except ValidationError as exc:
+            errors.append(
+                BatchPredictionError(
+                    index=idx,
+                    customerid=(
+                        raw.get("customerid") if isinstance(raw, dict) else None
+                    ),
+                    reason="validation_error",
+                    detail=customer_lookup.format_validation_error(exc),
+                )
+            )
+
+    lookup_ids = sorted(
+        {
+            item.customerid
+            for item in validated.values()
+            if item.customerid is not None and not customer_lookup.is_complete(item)
+        }
+    )
+    looked_up = (
+        await customer_lookup.lookup_customers(lookup_ids, get_async_engine())
+        if lookup_ids
+        else {}
+    )
+    rows, row_indices, row_customer_ids, resolution_errors = (
+        customer_lookup.resolve_batch_rows(validated, looked_up)
+    )
+    errors.extend(resolution_errors)
+
+    # Champion's own persisted cost scenario, used to rank every row
+    # regardless of which model served it — including challenger-scored
+    # canary rows, whose own persisted scenario is never consulted or
+    # compared. See ANALYSIS.md §9, item 16.
+    bundle = runtime.champion
+    scenario = bundle.scenarios[bundle.base_scenario_name]
+    costs_cfg = load_costs_config()
+
+    scored: predict.ScoredBatch | None = None
+    served_proba = np.array([], dtype=float)
+    served_threshold = np.array([], dtype=float)
+    if rows:
+        scored = predict.predict_batch(
+            pd.DataFrame(rows), pd.Series(row_customer_ids), runtime, cfg
+        )
+        served_proba = scored.served_proba
+        served_threshold = scored.served_threshold
+
+    contact_decision = select_contacts(
+        served_proba,
+        scenario,
+        served_threshold,
+        int(costs_cfg.contact_capacity),
+        float(costs_cfg.campaign_budget),
+    )
+
+    results: list[BatchPredictionResult] = []
+    if scored is not None:
+        for i in range(len(rows)):
+            results.append(
+                BatchPredictionResult(
+                    index=row_indices[i],
+                    customerid=row_customer_ids[i],
+                    probability=float(scored.served_proba[i]),
+                    threshold=float(scored.served_threshold[i]),
+                    decision_threshold=float(scored.served_threshold[i]),
+                    decision=bool(contact_decision.decision[i]),
+                    contact=bool(contact_decision.contact[i]),
+                    model_version=scored.served_model_version[i],
+                    served_source=scored.served_source[i],
+                )
+            )
+            logger.info(
+                "prediction_served",
+                request_id=request_id,
+                customerid=row_customer_ids[i],
+                features=rows[i],
+                probability=float(scored.served_proba[i]),
+                threshold=float(scored.served_threshold[i]),
+                decision=bool(contact_decision.decision[i]),
+                model_version=scored.served_model_version[i],
+                served_source=scored.served_source[i],
+            )
+
+    results.sort(key=lambda r: r.index)
+    errors.sort(key=lambda e: e.index)
+    return BatchPredictResponse(
+        capacity_limit=contact_decision.capacity_limit,
+        results=results,
+        errors=errors,
+    )
+
+
+@app.get(
+    "/customer/{customerid}",
+    response_model=CustomerFeatures,
+    dependencies=[Depends(require_api_key)],
+)
+async def get_customer(customerid: str) -> CustomerFeatures:
+    """Read-only lookup of an existing customer's raw feature values.
+
+    churn is deliberately excluded even though the column exists in
+    customers_raw — it's the historical outcome the frozen snapshot
+    recorded, not a live-monitored result, and surfacing it next to a
+    freshly computed probability invites reading it as live validation.
+    """
+    found = await customer_lookup.lookup_customers([customerid], get_async_engine())
+    row = found.get(customerid)
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"customerid '{customerid}' not found"
+        )
+    return CustomerFeatures.model_validate(row)
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    """Liveness only — no dependency checks. A Postgres/MLflow outage must
+    never restart-loop a process that was never actually broken."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready(request: Request) -> dict[str, str]:
+    """Readiness — 503 until the champion has loaded at least once.
+
+    Scoped to the model-load check alone, deliberately not Postgres: POST
+    /predict never touches Postgres at all, so gating readiness on it would
+    pull the whole API out of rotation over a dependency /predict doesn't
+    even need.
+    """
+    if not getattr(request.app.state, "ready", False):
+        raise HTTPException(status_code=503, detail="not ready")
+    bundle = request.app.state.runtime.champion
+    return {
+        "status": "ready",
+        "model_version": bundle.model_version,
+        "run_id": bundle.run_id,
+    }

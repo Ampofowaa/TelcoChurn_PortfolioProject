@@ -16,7 +16,12 @@ import pandas as pd
 import shap
 from numpy.typing import NDArray
 
-__all__ = ["compute_shap_values", "unwrap_calibrated_pipeline"]
+__all__ = [
+    "build_tree_explainer",
+    "compute_shap_values",
+    "explain_with_explainer",
+    "unwrap_calibrated_pipeline",
+]
 
 
 def unwrap_calibrated_pipeline(model: Any) -> tuple[Any, Any]:
@@ -33,10 +38,21 @@ def unwrap_calibrated_pipeline(model: Any) -> tuple[Any, Any]:
     return preprocessor, booster
 
 
-def compute_shap_values(
-    preprocessor: Any, booster: Any, X: pd.DataFrame
+def build_tree_explainer(booster: Any) -> Any:
+    """Build a shap.TreeExplainer for `booster`, cacheable across many calls.
+
+    Split out of compute_shap_values so serving/predict.py can build this
+    once per loaded champion (an expensive tree-structure parse) and reuse it
+    across many per-request explanations, rather than rebuilding it on every
+    call the way compute_shap_values' one-shot batch usage does.
+    """
+    return shap.TreeExplainer(booster)
+
+
+def explain_with_explainer(
+    explainer: Any, preprocessor: Any, X: pd.DataFrame
 ) -> tuple[NDArray[np.float64], list[str], float, NDArray[np.float64]]:
-    """TreeExplainer SHAP values for `X` against the champion's base LightGBM step.
+    """SHAP values for `X` against an already-built `explainer`.
 
     Returns (shap_values, feature_names, base_value, Xt); Xt (the transformed
     model input matrix) is returned too because explain.py's
@@ -52,7 +68,6 @@ def compute_shap_values(
     Xt = preprocessor.transform(X)
     feature_names = list(preprocessor.get_feature_names_out())
 
-    explainer = shap.TreeExplainer(booster)
     shap_values = explainer(Xt).values
     if shap_values.ndim == 3:
         shap_values = shap_values[..., 1]
@@ -69,3 +84,15 @@ def compute_shap_values(
         base_value,
         np.asarray(Xt),
     )
+
+
+def compute_shap_values(
+    preprocessor: Any, booster: Any, X: pd.DataFrame
+) -> tuple[NDArray[np.float64], list[str], float, NDArray[np.float64]]:
+    """TreeExplainer SHAP values for `X` against the champion's base LightGBM step.
+
+    One-shot batch usage (build the explainer and use it exactly once) — see
+    build_tree_explainer/explain_with_explainer for the cacheable-explainer
+    split serving/predict.py needs instead.
+    """
+    return explain_with_explainer(build_tree_explainer(booster), preprocessor, X)

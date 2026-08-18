@@ -24,16 +24,13 @@ champion_history) as an ordered, append-only record.
 from __future__ import annotations
 
 import json
-import re
 import time
 from datetime import UTC, datetime
-from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
 import mlflow
 import mlflow.artifacts
-import mlflow.pyfunc
 import mlflow.sklearn
 import mlflow.tracking
 import numpy as np
@@ -53,6 +50,10 @@ from telco_churn.models.artifacts import (
 from telco_churn.models.dev_features import load_dev_features
 from telco_churn.models.diagnostics import FAIRNESS_AXES, ROBUSTNESS_AXES
 from telco_churn.models.drift_reference import build_reference
+from telco_churn.models.environment_parity import (
+    EnvironmentMismatchError,
+    diff_environment,
+)
 from telco_churn.models.gate import check_threshold_screen_passed
 from telco_churn.utils.hashing import content_hash
 from telco_churn.utils.logging import get_logger
@@ -108,18 +109,6 @@ _REGISTRY_DESCRIPTION = (
 _PENDING_VERSION_DESCRIPTION = "Awaiting sealed-test evaluation and promotion review."
 
 
-class EnvironmentMismatchError(RuntimeError):
-    """The checking environment disagrees with the one the model was logged under.
-
-    Distinct from a smoke-check failure: this means the *verification*
-    cannot be trusted, not that the *model* is broken. Callers must not tag
-    promotion_status on this exception — the version stays exactly where it
-    was (pending, if this fires during the initial smoke check), on the same
-    "no verdict was reached, so don't fabricate one" logic that makes
-    pending the crash-safe mint-time default in the first place.
-    """
-
-
 def check_environment_parity(model_uri: str, packages: list[str]) -> dict[str, str]:
     """Compare installed `packages` against the registered model's own logged pip requirements.
 
@@ -129,41 +118,18 @@ def check_environment_parity(model_uri: str, packages: list[str]) -> dict[str, s
     floating-point output in the same 1e-7-1e-9 range as that tolerance,
     with no actual bug present. Raises EnvironmentMismatchError naming every
     disagreeing package; returns the matched versions on success.
+
+    Thin wrapper around environment_parity.py::diff_environment (the shared
+    comparison core, reused unraised by serving/predict.py's hot-reload
+    guard) — this module owns the raise-on-mismatch behavior appropriate to
+    a promotion gate; predict.py owns a log-and-refuse behavior appropriate
+    to a long-lived process that must not crash on a stale environment.
     """
-    requirements_path = mlflow.pyfunc.get_model_dependencies(model_uri, format="pip")
-    with open(requirements_path, encoding="utf-8") as f:
-        requirements_text = f.read()
-
-    matched: dict[str, str] = {}
-    mismatches: dict[str, tuple[str, str]] = {}
-    for package in packages:
-        match = re.search(
-            rf"^{re.escape(package)}==([^\s;]+)",
-            requirements_text,
-            re.MULTILINE | re.IGNORECASE,
-        )
-        if match is None:
-            logger.warning(
-                "environment_parity_pin_not_found",
-                package=package,
-                hint=(
-                    "no exact `package==version` pin found in the registered "
-                    "model's logged requirements — this package was not "
-                    "checked for environment drift."
-                ),
-            )
-            continue
-        pinned = match.group(1)
-        installed = importlib_metadata.version(package)
-        if pinned == installed:
-            matched[package] = installed
-        else:
-            mismatches[package] = (pinned, installed)
-
-    if mismatches:
+    diff = diff_environment(model_uri, packages)
+    if diff.mismatches:
         detail = ", ".join(
             f"{pkg} (logged={pinned}, installed={installed})"
-            for pkg, (pinned, installed) in mismatches.items()
+            for pkg, (pinned, installed) in diff.mismatches.items()
         )
         raise EnvironmentMismatchError(
             "Environment mismatch against the registered model's logged "
@@ -171,7 +137,7 @@ def check_environment_parity(model_uri: str, packages: list[str]) -> dict[str, s
             "meaningful under a matching environment — fix the environment "
             "and re-run rather than trusting this check."
         )
-    return matched
+    return diff.matched
 
 
 def promote_to_alias(
@@ -700,13 +666,7 @@ def _summarize_for_stakeholders(
         f"cancel. Of the customers it recommends contacting "
         f"({contact_rate:.0%} of the customer base), {precision:.0%} "
         "actually do churn — the remainder are contacted as a "
-        "precautionary cost, not a false alarm to be eliminated. Under the "
-        f"base cost scenario, following its recommendations is projected "
-        f"to net ${ev:,.0f} more than contacting no one, at a campaign "
-        f"cost of ${campaign_cost:,.0f}. See business_case.expected_impact "
-        "for the conservative and aggressive scenarios, and "
-        "risks_and_limitations before treating these figures as "
-        "guaranteed."
+        "precautionary cost, not a false alarm to be eliminated."
     )
 
 
@@ -884,9 +844,9 @@ def _build_business_case_section(
             "See ANALYSIS.md §0 for the full problem framing."
         ),
         "why_this_exists": (
-            "Rank-order and score existing telecom customers by "
-            "probability of churn, to prioritize retention outreach "
-            "within a fixed campaign budget."
+            "Rank-order and score telecom customers by probability of "
+            "churn, to prioritize retention outreach within a fixed "
+            "campaign budget."
         ),
         "promotion_rationale": _summarize_promotion_context(
             decision, metrics.get("champion_version")
@@ -1000,19 +960,15 @@ def _build_risks_and_limitations_section(
                 "deployment), because there is no live customer feed "
                 "for this project to do that with."
             ),
-            "see_also": (
-                "Two more limitations worth knowing: this model predicts "
-                "who will cancel, not who would actually respond to a "
-                "retention offer — the expected-value figures above "
-                "assume a benchmark response rate rather than a "
-                "measured one. And they also assume enough capacity to "
-                "contact everyone the model flags; if the retention "
-                "team can't act on that many customers, the real "
-                "expected value is lower. This card covers the "
-                "limitations most relevant to day-to-day use of the "
-                "model's recommendations — the project's full technical "
-                "documentation (ANALYSIS.md §9) covers additional, more "
-                "technical limitations for a reviewer with access to it."
+            "response_rate_and_capacity_are_assumed": (
+                "This model predicts who will cancel — it does not "
+                "predict who would actually respond to a retention "
+                "offer. The expected-value figures above apply one "
+                "flat, assumed response rate to every contacted "
+                "customer, not a rate specific to each person. They "
+                "also assume enough capacity to contact everyone the "
+                "model flags; if the retention team can't act on that "
+                "many customers, the real expected value is lower."
             ),
         },
     }

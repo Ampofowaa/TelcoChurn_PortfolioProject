@@ -1,0 +1,33 @@
+# Serving configuration — see serving/predict.py and serving/app.py.
+
+# TTL between hot-reload checks: how often resolve_serving_model() re-polls
+# the champion/challenger aliases for a moved pointer.
+poll_interval_seconds: 30
+
+# Cold-start retry: exponential backoff (capped) while MLflow is unreachable
+# at boot. /ready stays 503 until the first successful load.
+initial_load:
+  backoff_base_seconds: 1.0
+  backoff_max_seconds: 30.0
+
+# Shadow: challenger scores every request for comparison but never serves
+# one. Canary: a consistent-hash slice of traffic (by customerid) is
+# actually routed to the challenger. Independent toggles — see
+# serving/predict.py's module docstring for why they solve different
+# problems. Both off by default.
+shadow:
+  enabled: false
+canary:
+  enabled: false
+  fraction: 0.0
+
+# local_explanations' top_k for POST /predict's include_explanation output.
+explanation:
+  top_k: 5
+
+# Task 4 (serving/app.py) reads these — defined here now so this file's full
+# surface lands in one place rather than being edited twice across tasks.
+auth:
+  enabled: false
+batch:
+  max_size: 500
