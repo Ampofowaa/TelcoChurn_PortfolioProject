@@ -1,4 +1,4 @@
-.PHONY: help lint format pre-commit test test-data test-features test-models test-integration data db-up db-down mlflow-ui repro dag metrics params calibrate threshold evaluate error-analysis review register-challenger register clean
+.PHONY: help setup lint format pre-commit test test-data test-features test-models test-serving test-integration data db-up db-down serve-up serve-down smoke-test-serving mlflow-ui repro dag metrics params calibrate threshold evaluate error-analysis review register-challenger register clean
 
 .DEFAULT_GOAL := help
 
@@ -10,6 +10,10 @@ RUN := uv run
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+
+setup: ## Install all dependencies (incl. serving/ui extras) and pre-commit hooks
+	uv sync --all-extras
+	uv run pre-commit install
 
 # ---------------------------------------------------------------------------
 # Code quality
@@ -48,6 +52,11 @@ test-models: ## Run models package tests with scoped coverage
 		--override-ini="addopts=" \
 		--cov=src/telco_churn/models --cov-report=term-missing
 
+test-serving: ## Run serving package tests with scoped coverage
+	$(RUN) pytest tests/unit/test_predict.py tests/unit/test_contact_policy.py tests/unit/test_schemas.py \
+		--override-ini="addopts=" \
+		--cov=src/telco_churn/serving --cov-report=term-missing
+
 test-integration: ## Run integration tests (requires Docker; run `make db-up` first)
 	$(RUN) pytest -m integration --run-integration
 
@@ -62,11 +71,21 @@ data: ## Download the raw dataset via Kaggle CLI (skips if already present)
 		$(RUN) kaggle datasets download -d blastchar/telco-customer-churn -p datasets/raw/ --unzip; \
 	fi
 
-db-up: ## Start Postgres + MLflow in Docker (infra profile)
-	docker compose --profile infra up -d
+db-up: ## Start Postgres + MLflow in Docker (infra services only, no api/ui build)
+	docker compose up -d postgres mlflow
 
 db-down: ## Stop and remove the infra containers
-	docker compose --profile infra down
+	docker compose stop postgres mlflow
+	docker compose rm -f postgres mlflow
+
+serve-up: ## Start the full local stack — postgres, mlflow, fastapi, streamlit (Phase 9+)
+	docker compose up -d
+
+serve-down: ## Stop and remove the full stack, including postgres/mlflow
+	docker compose down
+
+smoke-test-serving: ## docker compose up -d --build, then curl /ready, /predict, /customer/<id> (Phase 9 §8)
+	./scripts/smoke_test_serving.sh
 
 mlflow-ui: ## Open the MLflow tracking UI at localhost:5000
 	$(RUN) mlflow ui

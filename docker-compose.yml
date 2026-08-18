@@ -1,7 +1,6 @@
 services:
   postgres:
     image: postgres:16
-    profiles: [infra]
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-telco}
@@ -22,7 +21,6 @@ services:
     build:
       context: .
       dockerfile: docker/mlflow/Dockerfile
-    profiles: [infra]
     restart: unless-stopped
     depends_on:
       postgres:
@@ -31,6 +29,16 @@ services:
       - "${MLFLOW_PORT:-5000}:5000"
     volumes:
       - ./mlruns:/mlruns/artifacts
+    environment:
+      # MLflow 3.14's server-side DNS-rebinding guard only allowlists
+      # 'localhost' and private-IP literals by default — the Compose DNS
+      # name 'mlflow' that fastapi/streamlit reach this service through
+      # doesn't match either pattern and gets a 403 ("Invalid Host header")
+      # without this. is_allowed_host_header() does an exact string match
+      # unless the entry itself contains '*', and the actual Host header is
+      # 'mlflow:5000' (hostname:port) — so the bare 'mlflow' entry alone
+      # never matches; the 'mlflow:*' wildcard is what actually clears it.
+      MLFLOW_SERVER_ALLOWED_HOSTS: "mlflow:*,mlflow,localhost:*,localhost"
     command: >
       mlflow server
       --host 0.0.0.0
@@ -40,6 +48,58 @@ services:
       --serve-artifacts
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      POSTGRES_URL: postgresql://${POSTGRES_USER:-telco}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-telco_churn}
+      API_KEY: ${API_KEY:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: docker/ui/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      fastapi:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    environment:
+      # Compose gives every service a DNS name equal to its service key on
+      # the shared network — fastapi is reachable at this hostname with no
+      # extra wiring. streamlit_app.py falls back to http://localhost:8000
+      # for a bare `streamlit run` outside Compose.
+      API_BASE_URL: http://fastapi:8000
+      # Host-facing counterpart to API_BASE_URL, display-only (see
+      # streamlit_app.py's API_DISPLAY_URL comment) — fastapi's internal
+      # DNS name above isn't reachable from the browser rendering this
+      # page, but its published port mapping (ports:, above) is.
+      API_DISPLAY_URL: http://localhost:${API_PORT:-8000}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=5)"]
       interval: 10s
       timeout: 5s
       retries: 6
