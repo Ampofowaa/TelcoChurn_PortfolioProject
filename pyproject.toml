@@ -169,12 +169,15 @@ filterwarnings = [
     "ignore:VIF is inf for one or more features:UserWarning",
     # MLflow's SqlAlchemyStore (the sqlite:///... tracking URI ~20 test files
     # use) doesn't expose an explicit close for its underlying sqlite3
-    # connection; it's released via garbage collection. pytest's own
-    # unraisableexception plugin wraps that into
-    # pytest.PytestUnraisableExceptionWarning (not a bare ResourceWarning),
-    # so the category below matches what's actually emitted. Not a leak in
-    # this project's own code.
+    # connection; it's released via garbage collection. Locally this surfaces
+    # wrapped as pytest.PytestUnraisableExceptionWarning (pytest's own
+    # unraisableexception plugin); under CI's Linux + pytest-xdist workers,
+    # GC finalization timing differs enough that the identical leak instead
+    # comes through the standard warnings path as a bare ResourceWarning —
+    # same root cause, two categories, so both are ignored. Not a leak in
+    # this project's own code either way.
     "ignore:unclosed database in <sqlite3.Connection:pytest.PytestUnraisableExceptionWarning",
+    "ignore:unclosed database in <sqlite3.Connection:ResourceWarning",
 ]
 
 [tool.coverage.run]

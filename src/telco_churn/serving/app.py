@@ -93,8 +93,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     shutdown event fires, uvicorn has typically already stopped accepting
     new connections, which is too late for '/ready' to have warned the
     platform to stop routing here in the first place. Falls back to a no-op
-    where add_signal_handler isn't available (Windows dev boxes) — the
-    container runtime (Linux) this matters for supports it.
+    where add_signal_handler isn't available — Windows dev boxes (the
+    container runtime this matters for is Linux, which supports it), and
+    any test harness that runs this lifespan off the main thread (Starlette's
+    TestClient does, via a background anyio portal); real uvicorn always
+    runs lifespan on the main thread, so production is unaffected.
     """
     load_dotenv()
     configure_logging()
@@ -117,8 +120,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     try:
         asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, _flip_not_ready)
-    except (NotImplementedError, AttributeError):
-        logger.warning("sigterm_handler_unavailable_on_this_platform")
+    except (NotImplementedError, AttributeError, RuntimeError):
+        # NotImplementedError/AttributeError: platform can't do this at all
+        # (Windows dev boxes). RuntimeError: the platform can, but this
+        # process/thread can't right now — add_signal_handler calls
+        # signal.set_wakeup_fd() under the hood, which only works on the
+        # main thread of the main interpreter. Starlette's TestClient runs
+        # the app's lifespan inside a background anyio portal thread, not
+        # the main thread, so every TestClient-driven test hits this path
+        # even on Linux; real uvicorn always runs lifespan on the main
+        # thread, so production is unaffected either way.
+        logger.warning("sigterm_handler_unavailable_in_this_context")
 
     async def _load_and_poll_loop() -> None:
         interval = float(cfg.serving.poll_interval_seconds)
