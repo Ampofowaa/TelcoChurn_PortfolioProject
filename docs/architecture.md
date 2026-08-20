@@ -245,6 +245,25 @@ The routing/logging/metrics *mechanism* documented here is real and tested;
 a live production shadow/canary result is not, and must never be implied
 as one.
 
+## Live Customer Lookup — `customers_crm` (Phase 9)
+
+`GET /customer/{id}` and `/predict/batch`'s ID-resolution path need a "live customer" source. The obvious wrong answer is to query `customers_raw` — the exact table the model trained on — which would make a Streamlit "Fetch customer" click silently present frozen training data as if it were current. `customers_crm` is the fix: a second table, generated from `customers_raw` but never read by anything upstream of serving.
+
+```mermaid
+flowchart TD
+    A["Raw CSV\ndatasets/raw/ — read-only,\nsource of truth"] -->|"ingest.py\n(once)"| B[("Postgres\ncustomers_raw\nfrozen training snapshot")]
+    B -->|"crm_data.py::generate_crm_rows\nseeded (random_state: 42), deterministic:\ntenure +1-6mo, contract upgrade-only,\ntotalcharges accrues, else unchanged"| C[("Postgres\ncustomers_crm\nsimulated current state")]
+    C -->|"customer_lookup.py::lookup_customers"| D["GET /customer/{id}\nPOST /predict/batch ID resolution"]
+    D -->|"CustomerLookupResponse\n{features, crm_snapshot_at}"| E["Streamlit UI\nScore a Customer tab"]
+    B -.->|"never read at serving time"| D
+```
+
+**Why a derived table rather than reusing `customers_raw` or a hand-authored fixture.** `customers_raw` is read-only and DVC-hashed (`CLAUDE.md` § Data Handling) — mutating it to look "current" would invalidate the whole `ingest → ... → error_analysis` chain for a UI transparency fix, and would still be dishonest (it's the same rows the model was evaluated against, not new data). A hand-authored fixture would be an unrelated, disconnected dataset — the customerids a Batch Prediction or Score a Customer demo resolves would stop being the same customers the model card and evaluation report discuss. `customers_crm` keeps the same 7,043 customers and nudges them forward in time by a plausible amount instead, so a served prediction is still about a customer the reader can trace back to the training data, just at a later, simulated point in their account lifecycle.
+
+**What is, and isn't, recorded.** `crm_snapshot_at` (stamped fresh at generation time) travels with every `GET /customer/{id}` response, so a caller can tell how stale the "live" row is. What doesn't exist yet is a durable, queryable record of *which* `customers_crm` row a given `/predict` or `/predict/batch` call actually scored — the response is the only trace, and it's ephemeral. `prediction_log` (`prediction_logging_plan.md` Part B, Phase 10 scope) is the planned fix: every prediction gets a durable row, `feature_snapshot` included, so this gap closes without `customers_crm` itself changing shape.
+
+**Regeneration.** `make crm-data`, run after `db-up` + ingest (the table starts empty on a fresh Postgres volume — its DDL auto-creates via `docker-entrypoint-initdb.d`, but nothing populates it until this runs). Safe to re-run: the fixed seed reproduces the same nudges every time, so it's a truncate-and-reload, not an upsert — the same idempotency `data/ingest.py` already has for `customers_raw`.
+
 ## Emergency Rollback — `register.py::rollback_champion`
 
 Two independent triggers write to the same append-only `promotion_log` tag on the registered model, so "what was champion before this one" is always a direct index into one history, never a tag-scan-and-`max()` reconstruction.
