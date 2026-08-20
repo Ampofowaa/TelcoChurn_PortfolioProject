@@ -22,6 +22,12 @@ from testcontainers.postgres import PostgresContainer
 
 from telco_churn.data.ingest import ingest
 from telco_churn.features.preprocessing import build_preprocessor
+from telco_churn.serving.crm_data import (
+    CrmGenerationParams,
+    generate_crm_rows,
+    load_crm,
+    setup_crm_schema,
+)
 from telco_churn.utils.paths import compose_config, reset_active_config
 
 # fastapi.testclient.TestClient imports the third-party `httpx` module by
@@ -93,10 +99,24 @@ def _serving_csv_text() -> str:
     return "".join(rows)
 
 
+_CRM_PARAMS = CrmGenerationParams(
+    random_state=42,
+    tenure_advance_min_months=1,
+    tenure_advance_max_months=6,
+    contract_upgrade_probability=0.08,
+    totalcharges_noise_scale=0.02,
+)
+
+
 @pytest.fixture(scope="module")
 def serving_postgres_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
-    """Ephemeral Postgres, seeded with SERVING_CUSTOMERS, exposed as a bare
-    (driverless) connection URL.
+    """Ephemeral Postgres, seeded with SERVING_CUSTOMERS in both
+    customers_raw and customers_crm, exposed as a bare (driverless)
+    connection URL.
+
+    customer_lookup.py reads customers_crm, not customers_raw — seeding both
+    keeps GET /customer/{id} and /predict/batch's ID-resolution path exercised
+    against the same table serving/app.py actually queries in production.
 
     Bare 'postgresql://' rather than testcontainers' default
     '+psycopg2'-qualified URL: utils/db.py::get_engine() (used here to seed
@@ -111,6 +131,10 @@ def serving_postgres_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[s
         csv_path = tmp_path_factory.mktemp("serving_csv") / "serving_customers.csv"
         csv_path.write_text(_serving_csv_text(), encoding="utf-8")
         ingest(csv_path, engine)
+        raw_df = pd.read_sql_table("customers_raw", engine)
+        crm_rows = generate_crm_rows(raw_df, _CRM_PARAMS)
+        setup_crm_schema(engine)
+        load_crm(crm_rows, engine)
         engine.dispose()
         yield url
 

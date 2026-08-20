@@ -12,6 +12,7 @@ from telco_churn.serving.schemas import (
     BatchPredictItem,
     BatchPredictResponse,
     CustomerFeatures,
+    CustomerLookupResponse,
     Explanation,
     FeatureContribution,
     PredictRequest,
@@ -94,6 +95,21 @@ def test_customer_features_round_trips_into_predict_request() -> None:
     request = PredictRequest.model_validate(looked_up.model_dump())
     assert request.customerid == "A-0001"
     assert request.include_explanation is True
+
+
+def test_customer_lookup_response_wraps_features_and_snapshot() -> None:
+    """GET /customer/{id}'s response carries the looked-up features plus a
+    provenance timestamp, not bare CustomerFeatures — crm_snapshot_at isn't
+    a model feature, so it stays off CustomerFeatures itself.
+    """
+    features = CustomerFeatures.model_validate(
+        {**_FULL_FEATURE_ROW, "customerid": "A-0001"}
+    )
+    response = CustomerLookupResponse(
+        features=features, crm_snapshot_at="2026-08-15T00:00:00+00:00"
+    )
+    assert response.features.customerid == "A-0001"
+    assert response.crm_snapshot_at.year == 2026
 
 
 def test_customer_features_field_set_matches_feature_schema_raw_columns() -> None:
