@@ -51,6 +51,21 @@ services:
       interval: 10s
       timeout: 5s
       retries: 6
+      # start_period: MLflow's uvicorn workers observably die and respawn once
+      # on a cold start (a transient race, not a real failure — confirmed via
+      # `docker logs`: the first worker exits within ~6s, then a full,
+      # healthy startup completes ~60-70s later) before "Application startup
+      # complete" actually lands. Without this, interval(10s) x retries(6) =
+      # ~60s gives the healthcheck no margin against that observed worst
+      # case, so `docker compose up --build` intermittently gave up with
+      # "dependency mlflow failed to start" moments before mlflow would have
+      # reported healthy on its own — confirmed by re-running plain `docker
+      # compose up -d fastapi streamlit` immediately after, with no rebuild,
+      # which always succeeded once mlflow had caught up. Failing checks
+      # during start_period don't count against retries or mark the
+      # container unhealthy, so this removes the race without masking a
+      # genuine failure — retries still apply in full once start_period ends.
+      start_period: 90s
 
   fastapi:
     build:

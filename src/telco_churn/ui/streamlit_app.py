@@ -38,7 +38,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import altair as alt
@@ -503,6 +503,19 @@ def _run_single_prediction(payload: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _format_crm_snapshot(iso_timestamp: str) -> str:
+    """Render crm_snapshot_at as 'YYYY-MM-DD HH:MM:SS UTC' — the same format
+    utils/logging.py's structlog TimeStamper stamps every ingest/crm_data
+    log line with, so a timestamp reads the same whether it came from a
+    terminal or this UI. Falls back to the raw ISO string on a parse
+    failure; a display nicety is never worth breaking the page over.
+    """
+    try:
+        return datetime.fromisoformat(iso_timestamp).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except ValueError:
+        return iso_timestamp
+
+
 def _render_lookup_tab() -> None:
     """One form, two ways in: fetch a real customer by ID to prefill it, or
     fill it in yourself. Manual entry stays legitimate for a real account
@@ -517,11 +530,10 @@ def _render_lookup_tab() -> None:
     # Customer" — restating it would just push the actual instruction
     # further down the page for no added clarity.
     st.caption(
-        "Enter a Customer ID and click Fetch to load a real account — or "
-        "skip that and fill in the form yourself. Edit any field to test "
-        "a what-if scenario, then click Predict for a churn risk score "
-        "and explanation. Nothing here writes back to a customer's "
-        "record."
+        "Enter a Customer ID and click Fetch to load their current record, "
+        "or fill in the form yourself. Click Predict for a churn risk "
+        "score and explanation. This never changes the customer's "
+        "account details."
     )
     # `key` incorporates a reset counter, bumped on both Clear and a
     # successful Fetch. Deleting a widget's session-state entry (or simply
@@ -582,9 +594,14 @@ def _render_lookup_tab() -> None:
             else:
                 st.error(f"API error {resp.status_code}: {resp.text}")
 
-    prefill = st.session_state.get("lookup_prefill")
-    if prefill:
-        st.success(f"Loaded customer {prefill.get('customerid')}")
+    lookup_response = st.session_state.get("lookup_prefill")
+    prefill = lookup_response.get("features") if lookup_response else None
+    if lookup_response is not None and prefill:
+        st.success(
+            f"Loaded customer {prefill.get('customerid')} "
+            f"(CRM snapshot as of "
+            f"{_format_crm_snapshot(lookup_response.get('crm_snapshot_at'))})"
+        )
 
     form_values = render_customer_form(form_key_prefix, prefill=prefill)
 
@@ -653,7 +670,8 @@ def _drill_into_prediction(
     if customerid:
         resp = _api_request("GET", f"/customer/{customerid}")
         if resp is not None and resp.ok:
-            payload = {**resp.json(), "include_explanation": True}
+            features = resp.json().get("features", {})
+            payload = {**features, "include_explanation": True}
             _run_single_prediction(payload)
             return
     payload = {**submitted_row, "customerid": customerid, "include_explanation": True}
@@ -735,10 +753,13 @@ def _bulk_drill_options(
 def _render_bulk_tab() -> None:
     st.subheader("Bulk CSV upload")
     st.caption(
-        "Upload a CSV of customers to score in one call — an ID-only "
-        "'customerid' column, full inline feature rows, or a mix of both "
-        "(the same three item shapes POST /predict/batch accepts). Capped "
-        "at the API's configured batch size."
+        "Upload a CSV of customers to score in one call. Each row can be: "
+        "just a `customerid` (their current details are looked up "
+        "automatically), a fully filled-in profile (no `customerid` "
+        "needed), or a `customerid` plus a few fields to override — useful "
+        "for testing what happens if a specific real customer's plan "
+        "changed. Rows of different types can be mixed in the same file. "
+        "Capped at the API's configured batch size."
     )
     uploaded = st.file_uploader("CSV file", type=["csv"], key="bulk_csv")
     if uploaded is None:
@@ -934,8 +955,7 @@ def _render_about_model_tab() -> None:
     requested = st.session_state.get("about_model_requested", False)
     if not requested:
         st.caption(
-            "Loads governance details from MLflow on demand, not on every "
-            "page render."
+            "Loads governance details from MLflow on demand, not on every page render."
         )
         if st.button("Load model details", key="about_model_load"):
             st.session_state["about_model_requested"] = True
@@ -989,7 +1009,7 @@ def _render_about_model_tab() -> None:
     # operationally useful fact in it (customer-level, not household;
     # scored on a recurring cycle) survives as its own light-touch note.
     st.caption(
-        "One score per customer per scoring cycle, not per household or " "account."
+        "One score per customer per scoring cycle, not per household or account."
     )
 
     st.markdown("#### Console Users")
