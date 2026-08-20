@@ -1,4 +1,4 @@
-.PHONY: help setup lint format pre-commit test test-data test-features test-models test-serving test-integration data db-up db-down serve-up serve-down smoke-test-serving mlflow-ui repro dag metrics params calibrate threshold evaluate error-analysis review register-challenger register clean
+.PHONY: help setup lint format pre-commit test test-data test-features test-models test-serving test-integration data db-up db-down crm-data serve-up serve-down smoke-test-serving mlflow-ui repro dag metrics params calibrate threshold evaluate error-analysis review register-challenger register clean
 
 .DEFAULT_GOAL := help
 
@@ -77,6 +77,9 @@ db-up: ## Start Postgres + MLflow in Docker (infra services only, no api/ui buil
 db-down: ## Stop and remove the infra containers
 	docker compose stop postgres mlflow
 	docker compose rm -f postgres mlflow
+
+crm-data: ## Populate customers_crm from customers_raw (run after db-up + ingest; safe to re-run)
+	$(RUN) python -m telco_churn.serving.crm_data
 
 serve-up: ## Start the full local stack — postgres, mlflow, fastapi, streamlit (Phase 9+)
 	docker compose up -d

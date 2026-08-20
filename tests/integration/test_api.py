@@ -92,15 +92,22 @@ def test_predict_without_explanation_omits_it(
     assert response.json()["explanation"] is None
 
 
-def test_customer_lookup_returns_raw_fields(api_client: TestClient) -> None:
+def test_customer_lookup_returns_crm_snapshot(api_client: TestClient) -> None:
+    """Response is CustomerLookupResponse{features, crm_snapshot_at}, sourced
+    from customers_crm — tenure/monthlycharges carry the seeded CRM nudge, so
+    this asserts plausible bounds rather than the exact training-time value
+    (see prediction_logging_plan.md Part A / conftest.py::serving_postgres_url).
+    """
     response = api_client.get("/customer/serve-0001")
 
     assert response.status_code == 200
     body = response.json()
-    assert body["customerid"] == "serve-0001"
-    assert body["tenure"] == 5
-    assert body["monthlycharges"] == pytest.approx(30.0)
-    assert "churn" not in body
+    features = body["features"]
+    assert features["customerid"] == "serve-0001"
+    assert 5 + 1 <= features["tenure"] <= 5 + 6
+    assert features["monthlycharges"] == pytest.approx(30.0)
+    assert "churn" not in features
+    assert body["crm_snapshot_at"] is not None
 
 
 def test_customer_lookup_404_for_unknown_id(api_client: TestClient) -> None:

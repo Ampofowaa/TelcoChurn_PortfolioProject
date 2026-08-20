@@ -12,6 +12,25 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ---
 
+## [0.9.1] - 2026-08-20 — Phase 9 sub-step: `customers_crm` live-lookup source
+
+*Gives `GET /customer/{customerid}` and `/predict/batch`'s ID-resolution path a source genuinely distinct from the frozen training snapshot — the Score a Customer tab's "Fetch customer" no longer silently reuses `customers_raw` and presents it as current. See `prediction_logging_plan.md` Part A.*
+
+### Added
+- **`sql/schema/003_create_customers_crm.sql`**, **`src/telco_churn/serving/crm_data.py`** — new `customers_crm` table: a seeded "current state" derivation of `customers_raw` (`generate_crm_rows`), never touching the read-only raw table. Tenure advances +1–6 months, contract only upgrades (never downgrades), `totalcharges` carries forward plus accrued charge and seeded noise; everything else held fixed. `setup_crm_schema`/`load_crm` mirror `data/ingest.py`'s idempotent truncate-and-reload pattern. `make crm-data` runs it (after `db-up`/ingest).
+- **`serving/schemas.py::CustomerLookupResponse`** — wraps `CustomerFeatures` with a `crm_snapshot_at` provenance timestamp; `crm_snapshot_at` stays off `CustomerFeatures` itself since it isn't a model feature.
+- Test suite: `tests/unit/test_crm_data.py` (pure generator — determinism, bounds, contract-never-downgrades), `tests/integration/test_crm_data_postgres.py` (schema/load round-trip + the required `__main__` subprocess test).
+
+### Changed
+- **`serving/customer_lookup.py::lookup_customers`** — reads `customers_crm`, not `customers_raw`.
+- **`serving/app.py::get_customer`** — `GET /customer/{customerid}` now returns `CustomerLookupResponse{features, crm_snapshot_at}` instead of bare `CustomerFeatures`.
+- **`ui/streamlit_app.py::_render_lookup_tab`** — unwraps the new response shape; the success message is now genuinely dynamic (*"Loaded customer X (CRM snapshot as of ...)"*) instead of a static caption on a query that was actually hitting the training table.
+- **`tests/integration/conftest.py::serving_postgres_url`** — also seeds `customers_crm` from the ingested `customers_raw`, since serving now resolves lookups against the CRM table.
+- **`tests/integration/test_serving_parity.py`** — the ID-only golden-parity test asserted served probabilities matched `golden_predictions.json` at `atol=1e-9`; since ID-only resolution now goes through `customers_crm`'s seeded tenure nudge, bit-exact parity against the frozen training values is no longer the right invariant. Replaced with a self-consistency check: an ID-only `/predict/batch` request must match an inline `/predict` request built from that same customer's current `GET /customer/{id}` row.
+- **`examples/sample_batch_predictions.csv`** — regenerated from `customers_crm` (47 dev-partition ID-only rows, up from 5, still keeping the one inline-prospect and two partial-override demo rows) so the Batch Prediction tab exercises real scale, not just the three item shapes. Now reproducible via **`scripts/generate_sample_batch_predictions.py`** — deterministic (`dev_ids() ∩ customers_crm`, sorted, first 47), also prints the 5 customer IDs referenced below for the Score a Customer tab's "Fetch customer" demo. **`README.md`** — Quick Start's `curl` example and the Score a Customer tab's "Fetch customer" walkthrough both point at customer IDs that actually resolve against the current data.
+
+---
+
 ## [0.9.0] - 2026-08-18 — Phase 9: Serving + Streamlit UI
 
 *Stands up the champion-serving path end to end: FastAPI (`/predict`, `/predict/batch`, `/customer/{id}`, `/health`, `/ready`, `/metrics`) with hot-reload and a capacity-constrained contact policy, plus a config-gated shadow/canary mechanism that continuously dual-scores traffic against a `challenger` whenever one exists. Streamlit UI and both Docker images complete a locally-runnable full stack (`docker compose up`). The champion alias still flips on an offline gate alone — shadow/canary is real routing/logging/metrics machinery, not a live-traffic validation gate, since this dataset has no live traffic to validate against (`ANALYSIS.md` §9 item 13).*

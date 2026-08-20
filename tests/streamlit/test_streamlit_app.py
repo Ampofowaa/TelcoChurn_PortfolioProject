@@ -54,6 +54,19 @@ _CUSTOMER_ROW: dict[str, Any] = {
     "totalcharges": 29.85,
 }
 
+_CRM_SNAPSHOT_AT = "2026-08-15T00:00:00+00:00"
+# The UI reformats this to match utils/logging.py's structlog timestamp
+# style ("YYYY-MM-DD HH:MM:SS UTC") — see streamlit_app.py::_format_crm_snapshot.
+_CRM_SNAPSHOT_AT_DISPLAY = "2026-08-15 00:00:00 UTC"
+# GET /customer/{id}'s actual response shape: CustomerLookupResponse{features,
+# crm_snapshot_at} — never the bare CustomerFeatures dict _CUSTOMER_ROW is,
+# since customers_crm (prediction_logging_plan.md Part A) always carries a
+# provenance timestamp alongside the feature values.
+_CUSTOMER_LOOKUP_RESPONSE: dict[str, Any] = {
+    "features": _CUSTOMER_ROW,
+    "crm_snapshot_at": _CRM_SNAPSHOT_AT,
+}
+
 
 class _FakeResponse:
     """Minimal requests.Response stand-in — only the surface streamlit_app.py reads."""
@@ -93,7 +106,7 @@ def test_lookup_tab_prefills_from_mocked_customer_response(
     def fake_request(method: str, url: str, **kwargs: Any) -> _FakeResponse:
         assert method == "GET"
         assert url.endswith(f"/customer/{_CUSTOMER_ROW['customerid']}")
-        return _FakeResponse(200, _CUSTOMER_ROW)
+        return _FakeResponse(200, _CUSTOMER_LOOKUP_RESPONSE)
 
     monkeypatch.setattr("requests.request", fake_request)
 
@@ -103,7 +116,10 @@ def test_lookup_tab_prefills_from_mocked_customer_response(
     at.button(key="lookup_fetch").click().run(timeout=_RUN_TIMEOUT_SECONDS)
 
     assert not at.exception
-    assert at.success[0].value == f"Loaded customer {_CUSTOMER_ROW['customerid']}"
+    assert at.success[0].value == (
+        f"Loaded customer {_CUSTOMER_ROW['customerid']} "
+        f"(CRM snapshot as of {_CRM_SNAPSHOT_AT_DISPLAY})"
+    )
     # A successful fetch bumps the form's key-rotation nonce (see
     # _render_lookup_tab's comment on why: a same-key widget can survive a
     # programmatic overwrite in a real browser even though the state-level
@@ -143,7 +159,7 @@ def test_lookup_tab_fetch_works_without_a_prior_commit_run(
     """
 
     def fake_request(method: str, url: str, **kwargs: Any) -> _FakeResponse:
-        return _FakeResponse(200, _CUSTOMER_ROW)
+        return _FakeResponse(200, _CUSTOMER_LOOKUP_RESPONSE)
 
     monkeypatch.setattr("requests.request", fake_request)
 
@@ -153,7 +169,10 @@ def test_lookup_tab_fetch_works_without_a_prior_commit_run(
     at.button(key="lookup_fetch").click().run(timeout=_RUN_TIMEOUT_SECONDS)
 
     assert not at.exception
-    assert at.success[0].value == f"Loaded customer {_CUSTOMER_ROW['customerid']}"
+    assert at.success[0].value == (
+        f"Loaded customer {_CUSTOMER_ROW['customerid']} "
+        f"(CRM snapshot as of {_CRM_SNAPSHOT_AT_DISPLAY})"
+    )
 
 
 def test_lookup_tab_fetch_with_blank_customerid_warns_instead_of_erroring() -> None:
@@ -176,7 +195,7 @@ def test_lookup_tab_clear_resets_the_customerid_box(
     """
 
     def fake_request(method: str, url: str, **kwargs: Any) -> _FakeResponse:
-        return _FakeResponse(200, _CUSTOMER_ROW)
+        return _FakeResponse(200, _CUSTOMER_LOOKUP_RESPONSE)
 
     monkeypatch.setattr("requests.request", fake_request)
 
@@ -268,3 +287,80 @@ def test_score_tab_renders_every_raw_field() -> None:
     assert at.toggle(key="lookup_seniorcitizen") is not None
     for field in ("tenure", "monthlycharges", "totalcharges"):
         assert at.number_input(key=f"lookup_{field}") is not None, field
+
+
+def test_bulk_drill_into_customer_sends_a_flat_predict_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: _drill_into_prediction's GET /customer/{id} call
+    returns CustomerLookupResponse{features, crm_snapshot_at} (Part A), not
+    bare CustomerFeatures — the payload it builds for POST /predict must
+    unwrap ["features"] first. Previously it spread the whole response in
+    (`{**resp.json(), "include_explanation": True}`), producing
+    `{"features": {...}, "crm_snapshot_at": ..., "include_explanation": true}`
+    — a shape PredictRequest rejects with 422 "field required" on every real
+    field, since none of them exist at the top level.
+    """
+    predict_payloads: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        customerid = _CUSTOMER_ROW["customerid"]
+        if method == "POST" and url.endswith("/predict/batch"):
+            return _FakeResponse(
+                200,
+                {
+                    "capacity_limit": 10,
+                    "results": [
+                        {
+                            "index": 0,
+                            "customerid": customerid,
+                            "probability": 0.3,
+                            "threshold": 0.4,
+                            "decision_threshold": 0.4,
+                            "decision": False,
+                            "contact": False,
+                            "model_version": "1",
+                            "served_source": "champion",
+                        }
+                    ],
+                    "errors": [],
+                },
+            )
+        if method == "GET" and url.endswith(f"/customer/{customerid}"):
+            return _FakeResponse(200, _CUSTOMER_LOOKUP_RESPONSE)
+        if method == "POST" and url.endswith("/predict"):
+            payload = kwargs.get("json", {})
+            predict_payloads.append(payload)
+            return _FakeResponse(
+                200,
+                {
+                    "customerid": payload.get("customerid"),
+                    "probability": 0.3,
+                    "threshold": 0.4,
+                    "decision": False,
+                    "model_version": "1",
+                    "explanation": None,
+                },
+            )
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    csv_bytes = f"customerid\n{_CUSTOMER_ROW['customerid']}\n".encode()
+    at.file_uploader(key="bulk_csv").set_value(("customers.csv", csv_bytes, "text/csv"))
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    at.button(key="bulk_score").click().run(timeout=_RUN_TIMEOUT_SECONDS)
+    assert not at.exception
+
+    at.button(key="bulk_drill_button").click().run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    assert len(predict_payloads) == 1
+    sent = predict_payloads[0]
+    assert "features" not in sent, f"payload must be flattened, not wrapped: {sent}"
+    assert sent["gender"] == _CUSTOMER_ROW["gender"]
+    assert sent["tenure"] == _CUSTOMER_ROW["tenure"]
