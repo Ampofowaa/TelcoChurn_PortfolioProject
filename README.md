@@ -167,7 +167,7 @@ The champion (`telco-churn-pipeline@champion` in the MLflow registry) is served 
 | **FastAPI** (`serving/app.py`, `serving/predict.py`) | Loads the champion at startup and hot-reloads it on a TTL poll — a promotion is just an MLflow alias flip, so a new champion goes live without a redeploy. Exposes `POST /predict`, `POST /predict/batch`, `GET /customer/{id}`, `GET /health`/`GET /ready` (liveness vs. readiness), and `GET /metrics` (Prometheus). Runs on `uvicorn` inside `docker/api/Dockerfile`, a multi-stage build from the project's own `uv.lock`. |
 | **Contact policy** | `POST /predict/batch` doesn't just score every row — it ranks them by expected value and caps who gets contacted at a configurable `contact_capacity`/`campaign_budget`, so the response reflects an operationally realistic campaign, not an unlimited-budget fantasy. |
 | **Shadow/canary rollout** | Config-gated, off by default: whenever a `challenger` model exists in the registry, it can be dual-scored against every request for comparison (**shadow**, zero routing risk) or actually serve a consistent-hash slice of live traffic (**canary**). Mechanism, Prometheus metrics, and a real evidence log → [docs/architecture.md § Shadow/Canary Serving](docs/architecture.md#shadowcanary-serving--servingpredictpy-phase-9). |
-| **Streamlit UI** (`ui/streamlit_app.py`) | Look up a real customer, run a what-if scenario, bulk-score a CSV, or read the champion's model card — all driven through the same FastAPI endpoints a real client would call. [`examples/sample_batch_predictions.csv`](examples/sample_batch_predictions.csv) demonstrates all three `/predict/batch` item shapes in one upload (ID-only, full inline, ID-plus-override). Runs from `docker/ui/Dockerfile`, same build pattern as the API image. |
+| **Streamlit UI** (`ui/streamlit_app.py`) | **Score a Customer** tab: look up a real customer from `customers_crm` (a seeded "current state" derivation of the training data, never the frozen snapshot itself) or manually enter one for a what-if scenario. Mechanism, rationale, and what's/isn't durably recorded → [docs/architecture.md § Live Customer Lookup](docs/architecture.md#live-customer-lookup--customers_crm-phase-9). **Batch Prediction** tab: score a CSV upload — [`examples/sample_batch_predictions.csv`](examples/sample_batch_predictions.csv) demonstrates all three `/predict/batch` item shapes in one upload (ID-only, full inline, ID-plus-override). **Model Info** tab: read the champion's model card. All three drive the same FastAPI endpoints a real client would call. Runs from `docker/ui/Dockerfile`, same build pattern as the API image. |
 | **Docker Compose** | `docker-compose.yml` wires four services — `postgres`, `mlflow`, `fastapi`, `streamlit` — so `docker compose up -d --build` brings up the entire stack in one command, with `fastapi`/`streamlit` waiting on `postgres`/`mlflow` via `depends_on`. |
 
 Run it yourself → [Quick Start step 9](#quick-start).
@@ -288,10 +288,10 @@ Once `/ready` returns `200` (`curl http://localhost:8000/ready`), open [http://l
 ```bash
 curl -X POST http://localhost:8000/predict/batch \
   -H "Content-Type: application/json" \
-  -d '[{"customerid":"2446-BEGGB"},{"customerid":"8766-PAFNE"}]'
+  -d '[{"customerid":"0002-ORFBO"},{"customerid":"0003-MKNFE"}]'
 ```
 
-Try the Bulk CSV tab with [`examples/sample_batch_predictions.csv`](examples/sample_batch_predictions.csv) — see [Serving](#serving) for what it demonstrates. `make smoke-test-serving` runs the same checks as a script; `docker compose down` tears the stack back down.
+Try the Batch Prediction tab with [`examples/sample_batch_predictions.csv`](examples/sample_batch_predictions.csv) (50 real customers, resolved live from `customers_crm`, regenerated deterministically by [`scripts/generate_sample_batch_predictions.py`](scripts/generate_sample_batch_predictions.py)) — see [Serving](#serving) for what it demonstrates. In the Score a Customer tab, hit "Fetch customer" with any of `0094-OIFMO`, `0096-BXERS`, `0096-FCPUF`, `0098-BOWSO`, `0100-DUVFC`. `make smoke-test-serving` runs the same checks as a script; `docker compose down` tears the stack back down.
 
 ---
 
@@ -313,7 +313,7 @@ src/telco_churn/
     predict.py, app.py           # hot-reloading model bundle, /predict endpoints
     contact_policy.py, customer_lookup.py, schemas.py  # contact ranking, Postgres lookup, request/response models
   ui/                            # Streamlit demo app
-    streamlit_app.py             # Lookup, Manual/what-if, Bulk CSV, About-this-model tabs
+    streamlit_app.py             # Score a Customer, Batch Prediction, Model Info tabs
   utils/                         # paths, logging, db, mlflow, stats, hashing helpers
 configs/                 # Hydra YAML — training/, tuning/, calibration/, threshold/, evaluate/, error_analysis/, review/, register/, serving/, costs.yaml, model_promotion.yaml
 sql/                     # Postgres schema + feature SQL views
@@ -323,7 +323,8 @@ tests/streamlit/         # headless Streamlit `AppTest` smoke suite (Phase 9)
 pipelines/               # Prefect flows (retrain, drift check, batch predict) — Phase 10
 monitoring/              # Prometheus config + Grafana dashboard JSON — Phase 13
 docker/api/, docker/ui/  # multi-stage Dockerfiles (FastAPI, Streamlit), built from uv.lock (Phase 9)
-examples/                # sample_batch_predictions.csv — real dev-partition customer IDs for /predict/batch and the Bulk CSV tab
+examples/                # sample_batch_predictions.csv — real dev-partition customer IDs for /predict/batch and the Batch Prediction tab
+                         #   regenerate: uv run python scripts/generate_sample_batch_predictions.py
 dvc.yaml, .dvc/, .dvcignore  # DVC pipeline — 9 stages, ingest through error_analysis (Phase 8)
 datasets/raw/             # committed to git — the source CSV DVC hashes as a stage dep, never modified
 datasets/processed/, datasets/interim/  # gitignored; DVC-cached stage outputs
