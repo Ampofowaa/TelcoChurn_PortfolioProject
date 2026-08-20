@@ -22,6 +22,7 @@ _CategoricalFieldValidators rather than duplicated.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
@@ -30,6 +31,7 @@ from telco_churn.data.schema import YES_NO, YES_NO_NO_INTERNET, YES_NO_NO_PHONE
 
 __all__ = [
     "CustomerFeatures",
+    "CustomerLookupResponse",
     "PredictRequest",
     "FeatureContribution",
     "Explanation",
@@ -136,6 +138,21 @@ class CustomerFeatures(_CategoricalFieldValidators, BaseModel):
     paymentmethod: _PAYMENT_METHOD
     monthlycharges: float = Field(ge=0.0)
     totalcharges: float | None = Field(default=None, ge=0.0)
+
+
+class CustomerLookupResponse(BaseModel):
+    """GET /customer/{customerid}'s response: the looked-up feature set plus
+    provenance, not bare CustomerFeatures.
+
+    crm_snapshot_at stays off CustomerFeatures itself — that schema is the
+    model's actual feature contract, and a provenance timestamp isn't a
+    feature. Wrapping it here instead is what lets the Streamlit Lookup tab
+    say something genuinely true ("CRM snapshot as of ...") about a row that
+    now comes from customers_crm, not the frozen training snapshot.
+    """
+
+    features: CustomerFeatures
+    crm_snapshot_at: datetime
 
 
 class PredictRequest(CustomerFeatures):
