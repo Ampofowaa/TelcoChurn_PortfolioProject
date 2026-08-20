@@ -64,16 +64,22 @@ def format_validation_error(exc: ValidationError) -> str:
 async def lookup_customers(
     customerids: list[str], engine: AsyncEngine
 ) -> dict[str, dict[str, Any]]:
-    """Batch-resolve customerids against customers_raw in one round trip.
+    """Batch-resolve customerids against customers_crm in one round trip.
 
     Backs both GET /customer/{customerid} (a length-1 list) and
     /predict/batch's ID-resolution path — the same query either way, so a
-    caller never pays N round trips for an N-row batch.
+    caller never pays N round trips for an N-row batch. customers_crm, not
+    customers_raw: a live lookup must hit a source distinct from the frozen
+    training snapshot (prediction_logging_plan.md Part A). Each returned row
+    carries crm_snapshot_at alongside the feature columns — resolve_batch_rows
+    ignores it (CustomerFeatures has no such field and Pydantic drops unknown
+    keys by default); GET /customer/{customerid} surfaces it explicitly via
+    CustomerLookupResponse.
     """
     if not customerids:
         return {}
-    columns = ", ".join(["customerid", *LOOKUP_COLUMNS])
-    stmt = text(f"SELECT {columns} FROM customers_raw WHERE customerid = ANY(:ids)")
+    columns = ", ".join(["customerid", *LOOKUP_COLUMNS, "crm_snapshot_at"])
+    stmt = text(f"SELECT {columns} FROM customers_crm WHERE customerid = ANY(:ids)")
     async with engine.connect() as conn:
         result = await conn.execute(stmt, {"ids": customerids})
         rows = result.mappings().all()

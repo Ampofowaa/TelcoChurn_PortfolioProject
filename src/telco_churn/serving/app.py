@@ -51,6 +51,7 @@ from telco_churn.serving.schemas import (
     BatchPredictItem,
     BatchPredictResponse,
     CustomerFeatures,
+    CustomerLookupResponse,
     PredictRequest,
     PredictResponse,
 )
@@ -361,16 +362,18 @@ async def predict_batch_endpoint(
 
 @app.get(
     "/customer/{customerid}",
-    response_model=CustomerFeatures,
+    response_model=CustomerLookupResponse,
     dependencies=[Depends(require_api_key)],
 )
-async def get_customer(customerid: str) -> CustomerFeatures:
-    """Read-only lookup of an existing customer's raw feature values.
+async def get_customer(customerid: str) -> CustomerLookupResponse:
+    """Read-only lookup of an existing customer's simulated-current state.
 
-    churn is deliberately excluded even though the column exists in
-    customers_raw — it's the historical outcome the frozen snapshot
-    recorded, not a live-monitored result, and surfacing it next to a
-    freshly computed probability invites reading it as live validation.
+    Reads customers_crm, not customers_raw — a live lookup must hit a
+    source distinct from the frozen training snapshot (see
+    serving/customer_lookup.py). churn is deliberately excluded even though
+    the raw column exists — it's the historical training-time outcome, not
+    a live-monitored result, and surfacing it next to a freshly computed
+    probability invites reading it as live validation.
     """
     found = await customer_lookup.lookup_customers([customerid], get_async_engine())
     row = found.get(customerid)
@@ -378,7 +381,9 @@ async def get_customer(customerid: str) -> CustomerFeatures:
         raise HTTPException(
             status_code=404, detail=f"customerid '{customerid}' not found"
         )
-    return CustomerFeatures.model_validate(row)
+    crm_snapshot_at = row["crm_snapshot_at"]
+    features = CustomerFeatures.model_validate(row)
+    return CustomerLookupResponse(features=features, crm_snapshot_at=crm_snapshot_at)
 
 
 @app.get("/health")
