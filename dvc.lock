@@ -3,26 +3,35 @@ stages:
   ingest:
     cmd: uv run python -m telco_churn.data.ingest
     deps:
+    - path: alembic.ini
+      hash: md5
+      md5: 6ec84051317ca123277e9910eb6c6011
+      size: 5238
+    - path: alembic/
+      hash: md5
+      md5: 1f52ffa02ac7b28d6bf0d6543888faec.dir
+      size: 16052
+      nfiles: 7
     - path: datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv
       hash: md5
       md5: 0f9de68e012bd3aed5fa7cdc9fc421af
       size: 977501
-    - path: sql/schema/001_create_raw.sql
-      hash: md5
-      md5: 1c49e25ff2043ae9cf577a58bd6f5f23
-      size: 1471
     - path: src/telco_churn/data/checks.py
       hash: md5
       md5: 186f1de8539950453914718113dc752c
       size: 11217
     - path: src/telco_churn/data/ingest.py
       hash: md5
-      md5: 59b6ed467fe2e5d601f9d160b640d291
-      size: 10287
+      md5: 508c6a9a305475bcaca493b6058222ab
+      size: 10292
     - path: src/telco_churn/data/schema.py
       hash: md5
-      md5: cd642ff5867e761c4eadc50192b417b7
-      size: 4915
+      md5: 0dfc0f80b2ad4736e541bb59451c1bd6
+      size: 4943
+    - path: src/telco_churn/data/tables.py
+      hash: md5
+      md5: b7252cf2bb60b0f04144ac17129c00e2
+      size: 6432
     - path: src/telco_churn/data/validate.py
       hash: md5
       md5: 17b9bd36c2152305faf72ef132a3525b
@@ -49,8 +58,8 @@ stages:
       size: 11217
     - path: src/telco_churn/data/schema.py
       hash: md5
-      md5: cd642ff5867e761c4eadc50192b417b7
-      size: 4915
+      md5: 0dfc0f80b2ad4736e541bb59451c1bd6
+      size: 4943
     - path: src/telco_churn/data/validate.py
       hash: md5
       md5: 17b9bd36c2152305faf72ef132a3525b
@@ -62,14 +71,14 @@ stages:
     outs:
     - path: reports/validation_receipt.json
       hash: md5
-      md5: 3c95557db0c12d724cf28d652d69577b
+      md5: b46555e67c755d4a1d0c1825ce91aadb
       size: 3348
   split:
     cmd: uv run python -m telco_churn.data.split
     deps:
     - path: reports/validation_receipt.json
       hash: md5
-      md5: 3c95557db0c12d724cf28d652d69577b
+      md5: b46555e67c755d4a1d0c1825ce91aadb
       size: 3348
     - path: src/telco_churn/data/split.py
       hash: md5
@@ -89,7 +98,7 @@ stages:
     deps:
     - path: reports/validation_receipt.json
       hash: md5
-      md5: 3c95557db0c12d724cf28d652d69577b
+      md5: b46555e67c755d4a1d0c1825ce91aadb
       size: 3348
     - path: sql/features/
       hash: md5
@@ -98,8 +107,8 @@ stages:
       nfiles: 2
     - path: src/telco_churn/data/schema.py
       hash: md5
-      md5: cd642ff5867e761c4eadc50192b417b7
-      size: 4915
+      md5: 0dfc0f80b2ad4736e541bb59451c1bd6
+      size: 4943
     - path: src/telco_churn/features/accessor.py
       hash: md5
       md5: 8746d51975f3fdb0a635ab65d1f6acc0
@@ -134,8 +143,8 @@ stages:
       size: 209928
     - path: src/telco_churn/data/schema.py
       hash: md5
-      md5: cd642ff5867e761c4eadc50192b417b7
-      size: 4915
+      md5: 0dfc0f80b2ad4736e541bb59451c1bd6
+      size: 4943
     - path: src/telco_churn/data/split.py
       hash: md5
       md5: 836576a3344d19ae5ccd91cebdf337a3
@@ -170,8 +179,8 @@ stages:
       size: 23202
     - path: src/telco_churn/models/train/
       hash: md5
-      md5: 74c25a5553d0eb5d502e4743021c124e.dir
-      size: 137307
+      md5: fccbc33382684e22924b0d277a4a13ed.dir
+      size: 137553
       nfiles: 9
     - path: src/telco_churn/utils/stats.py
       hash: md5
@@ -285,7 +294,7 @@ stages:
     outs:
     - path: reports/train_receipt.json
       hash: md5
-      md5: 40b3e280663c5f2bc1d05a68b38a60b2
+      md5: ace160b60acf5f27b88066766cc6aeae
       size: 171
   calibrate:
     cmd: uv run python -m telco_churn.models.calibrate
@@ -300,12 +309,12 @@ stages:
       size: 209928
     - path: reports/train_receipt.json
       hash: md5
-      md5: 40b3e280663c5f2bc1d05a68b38a60b2
+      md5: ace160b60acf5f27b88066766cc6aeae
       size: 171
     - path: src/telco_churn/data/schema.py
       hash: md5
-      md5: cd642ff5867e761c4eadc50192b417b7
-      size: 4915
+      md5: 0dfc0f80b2ad4736e541bb59451c1bd6
+      size: 4943
     - path: src/telco_churn/data/split.py
       hash: md5
       md5: 836576a3344d19ae5ccd91cebdf337a3
@@ -320,8 +329,8 @@ stages:
       size: 8010
     - path: src/telco_churn/models/artifacts.py
       hash: md5
-      md5: 773cef59d7d36da1ef158e04b370fc07
-      size: 7133
+      md5: a57f885db880a1192eeafa3546b8053f
+      size: 8022
     - path: src/telco_churn/models/calibrate.py
       hash: md5
       md5: 6f7fd663a4a557c3ba0d613236a48212
@@ -340,8 +349,8 @@ stages:
       size: 15286
     - path: src/telco_churn/models/shap_values.py
       hash: md5
-      md5: 518c91c025bd8919e3060cb6fb08dbb6
-      size: 2719
+      md5: 14bdf685a6fdd35d041d4983d24f37db
+      size: 3725
     - path: src/telco_churn/utils/stats.py
       hash: md5
       md5: 8c6b20e44f3c8c52b859354acb5a072b
@@ -365,7 +374,7 @@ stages:
     outs:
     - path: reports/calibrate_receipt.json
       hash: md5
-      md5: 1fbd1155581ab22801b187180b827954
+      md5: 62bfa3038e1b77a0468628e68994415f
       size: 171
   threshold:
     cmd: uv run python -m telco_churn.models.threshold
@@ -380,12 +389,12 @@ stages:
       size: 209928
     - path: reports/calibrate_receipt.json
       hash: md5
-      md5: 1fbd1155581ab22801b187180b827954
+      md5: 62bfa3038e1b77a0468628e68994415f
       size: 171
     - path: src/telco_churn/data/schema.py
       hash: md5
-      md5: cd642ff5867e761c4eadc50192b417b7
-      size: 4915
+      md5: 0dfc0f80b2ad4736e541bb59451c1bd6
+      size: 4943
     - path: src/telco_churn/data/split.py
       hash: md5
       md5: 836576a3344d19ae5ccd91cebdf337a3
@@ -404,8 +413,8 @@ stages:
       size: 8010
     - path: src/telco_churn/models/artifacts.py
       hash: md5
-      md5: 773cef59d7d36da1ef158e04b370fc07
-      size: 7133
+      md5: a57f885db880a1192eeafa3546b8053f
+      size: 8022
     - path: src/telco_churn/models/calibration_metrics.py
       hash: md5
       md5: 11c58c24f23ed52f90a8edecd13ba048
@@ -428,8 +437,8 @@ stages:
       size: 20430
     - path: src/telco_churn/models/policy_config.py
       hash: md5
-      md5: 677036663faf2f2c76b7fe8a7e150265
-      size: 6377
+      md5: 937897793e099fdbcf0a2d744b1ed2b5
+      size: 8625
     - path: src/telco_churn/models/threshold.py
       hash: md5
       md5: 44d0ad49396eca99545e05d4130ea834
@@ -501,7 +510,7 @@ stages:
       size: 209928
     - path: reports/calibrate_receipt.json
       hash: md5
-      md5: 1fbd1155581ab22801b187180b827954
+      md5: 62bfa3038e1b77a0468628e68994415f
       size: 171
     - path: reports/policy/threshold.yaml
       hash: md5
@@ -509,8 +518,8 @@ stages:
       size: 864
     - path: src/telco_churn/data/schema.py
       hash: md5
-      md5: cd642ff5867e761c4eadc50192b417b7
-      size: 4915
+      md5: 0dfc0f80b2ad4736e541bb59451c1bd6
+      size: 4943
     - path: src/telco_churn/data/split.py
       hash: md5
       md5: 836576a3344d19ae5ccd91cebdf337a3
@@ -529,8 +538,8 @@ stages:
       size: 8010
     - path: src/telco_churn/models/artifacts.py
       hash: md5
-      md5: 773cef59d7d36da1ef158e04b370fc07
-      size: 7133
+      md5: a57f885db880a1192eeafa3546b8053f
+      size: 8022
     - path: src/telco_churn/models/calibration_metrics.py
       hash: md5
       md5: 11c58c24f23ed52f90a8edecd13ba048
@@ -557,8 +566,8 @@ stages:
       size: 8691
     - path: src/telco_churn/models/policy_config.py
       hash: md5
-      md5: 677036663faf2f2c76b7fe8a7e150265
-      size: 6377
+      md5: 937897793e099fdbcf0a2d744b1ed2b5
+      size: 8625
     - path: src/telco_churn/utils/hashing.py
       hash: md5
       md5: 20635fdad0856a0f572a66ddb7fa3ae4
@@ -626,11 +635,11 @@ stages:
     outs:
     - path: reports/eval_receipt.json
       hash: md5
-      md5: d26a704b1e81e81b30c6da5f77a8ef99
+      md5: f5c4a7ec47fe0d6feabdb43b7856302b
       size: 80
     - path: reports/metrics_summary.json
       hash: md5
-      md5: 1e58d8ca110eb8510e15ca87d07fd195
+      md5: 6e9274d102b840bf7be06c4e610bf4e9
       size: 925
     - path: reports/plots/decile_lift.csv
       hash: md5
@@ -638,11 +647,11 @@ stages:
       size: 1285
     - path: reports/promotion_decision.json
       hash: md5
-      md5: 555cb5892183a5b1f26bce3bc0c7e4fb
+      md5: 990eccdd4beffc9c49c8c26a9e5680c2
       size: 869
     - path: reports/test_predictions.parquet
       hash: md5
-      md5: e1a4cd163a2b44a78a76a13de3a8377e
+      md5: 8e470395aa2e6f9a69f41fc047a48ba0
       size: 33584
   error_analysis:
     cmd: uv run python -m telco_churn.models.error_analysis
@@ -653,7 +662,7 @@ stages:
       size: 209928
     - path: reports/calibrate_receipt.json
       hash: md5
-      md5: 1fbd1155581ab22801b187180b827954
+      md5: 62bfa3038e1b77a0468628e68994415f
       size: 171
     - path: reports/policy/threshold.yaml
       hash: md5
@@ -661,12 +670,12 @@ stages:
       size: 864
     - path: reports/test_predictions.parquet
       hash: md5
-      md5: e1a4cd163a2b44a78a76a13de3a8377e
+      md5: 8e470395aa2e6f9a69f41fc047a48ba0
       size: 33584
     - path: src/telco_churn/data/schema.py
       hash: md5
-      md5: cd642ff5867e761c4eadc50192b417b7
-      size: 4915
+      md5: 0dfc0f80b2ad4736e541bb59451c1bd6
+      size: 4943
     - path: src/telco_churn/features/accessor.py
       hash: md5
       md5: 8746d51975f3fdb0a635ab65d1f6acc0
@@ -677,8 +686,8 @@ stages:
       size: 8010
     - path: src/telco_churn/models/artifacts.py
       hash: md5
-      md5: 773cef59d7d36da1ef158e04b370fc07
-      size: 7133
+      md5: a57f885db880a1192eeafa3546b8053f
+      size: 8022
     - path: src/telco_churn/models/error_analysis.py
       hash: md5
       md5: 6594403d97f52581ac01b4d179597a95
@@ -693,12 +702,12 @@ stages:
       size: 20430
     - path: src/telco_churn/models/policy_config.py
       hash: md5
-      md5: 677036663faf2f2c76b7fe8a7e150265
-      size: 6377
+      md5: 937897793e099fdbcf0a2d744b1ed2b5
+      size: 8625
     - path: src/telco_churn/models/shap_values.py
       hash: md5
-      md5: 518c91c025bd8919e3060cb6fb08dbb6
-      size: 2719
+      md5: 14bdf685a6fdd35d041d4983d24f37db
+      size: 3725
     params:
       configs/config.yaml:
         mlflow.registered_model_name: telco-churn-pipeline
@@ -716,5 +725,5 @@ stages:
     outs:
     - path: reports/error_analysis_receipt.json
       hash: md5
-      md5: 28f35f012ed889c4ef1c7ea83b85c0c1
+      md5: c637baa25a68d399fae1d203bc55cc2f
       size: 90
