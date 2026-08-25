@@ -6,9 +6,10 @@ so GET /customer/{customerid} and /predict/batch's ID-resolution path have a
 source genuinely distinct from the frozen training snapshot — see
 prediction_logging_plan.md Part A for the full rationale.
 
-Pure generation (generate_crm_rows) is separated from I/O (setup_crm_schema/
-load_crm), the same split drift_reference.py's pure builder / register.py's
-I/O already uses.
+Pure generation (generate_crm_rows) is separated from I/O (load_crm), the
+same split drift_reference.py's pure builder / register.py's I/O already
+uses. Schema creation is Alembic's job (utils/db.py::apply_migrations), not
+this module's — load_crm expects customers_crm to already exist.
 """
 
 from __future__ import annotations
@@ -23,12 +24,10 @@ from sqlalchemy.engine import Engine
 
 from telco_churn.serving.customer_lookup import LOOKUP_COLUMNS
 from telco_churn.utils.logging import get_logger
-from telco_churn.utils.paths import get_project_root
 
 __all__ = [
     "CrmGenerationParams",
     "generate_crm_rows",
-    "setup_crm_schema",
     "load_crm",
 ]
 
@@ -36,7 +35,6 @@ logger = get_logger(__name__)
 
 _RAW_TABLE = "customers_raw"
 _CRM_TABLE = "customers_crm"
-_SQL_SCHEMA = get_project_root() / "sql" / "schema" / "003_create_customers_crm.sql"
 
 # Real customers don't downgrade a contract term without churning outright —
 # only the plausible upgrade direction is ever rolled.
@@ -108,17 +106,6 @@ def generate_crm_rows(df: pd.DataFrame, params: CrmGenerationParams) -> pd.DataF
     return out
 
 
-def setup_crm_schema(engine: Engine) -> None:
-    """Create the customers_crm table if it does not exist.
-
-    Executes 003_create_customers_crm.sql — CREATE TABLE IF NOT EXISTS, same
-    convention data/ingest.py::setup_schema already uses for customers_raw.
-    """
-    ddl = _SQL_SCHEMA.read_text()
-    with engine.begin() as conn:
-        conn.execute(text(ddl))
-
-
 def load_crm(df: pd.DataFrame, engine: Engine) -> int:
     """Truncate-and-reload customers_crm from a generated DataFrame.
 
@@ -126,6 +113,11 @@ def load_crm(df: pd.DataFrame, engine: Engine) -> int:
     deterministic under a fixed seed, so a re-run yields the same nudges
     every time — the same idempotent, safe-to-re-run property
     data/ingest.py already has for customers_raw.
+
+    Does not create customers_crm itself — the table is expected to already
+    exist (utils/db.py::apply_migrations, run once at CLI start, or a test
+    fixture's own equivalent call), the same convention data/ingest.py::ingest
+    now follows for customers_raw.
     """
     with engine.begin() as conn:
         conn.execute(text(f"TRUNCATE TABLE {_CRM_TABLE}"))
@@ -145,7 +137,7 @@ if __name__ == "__main__":
 
     from dotenv import load_dotenv
 
-    from telco_churn.utils.db import get_engine
+    from telco_churn.utils.db import apply_migrations, get_engine
     from telco_churn.utils.logging import configure_logging
     from telco_churn.utils.paths import activate_config, compose_config
 
@@ -156,6 +148,10 @@ if __name__ == "__main__":
     activate_config(cfg)
 
     try:
+        # Belt-and-braces schema creation for a Postgres instance that never saw
+        # docker-compose.yml's docker-entrypoint-initdb.d mount — CI's
+        # testcontainers, Phase 12's RDS. A no-op once already at head.
+        apply_migrations()
         engine = get_engine()
         raw = pd.read_sql_table(_RAW_TABLE, engine)
         params = CrmGenerationParams(
@@ -168,7 +164,6 @@ if __name__ == "__main__":
             totalcharges_noise_scale=float(cfg.serving.crm.totalcharges_noise_scale),
         )
         crm_rows = generate_crm_rows(raw, params)
-        setup_crm_schema(engine)
         n = load_crm(crm_rows, engine)
         logger.info("customers_crm_loaded", rows_loaded=n)
     except Exception as e:

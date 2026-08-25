@@ -295,12 +295,15 @@ def _build_optuna_storage() -> optuna.storages.RDBStorage:
     more reconstructing it from MLflow-logged trial params just to run fANOVA
     importance. Isolated in its own 'optuna' schema (not 'public') so Optuna's
     own tables (studies, trials, ...) can't collide with application tables —
-    the schema's DDL lives in sql/schema/002_create_optuna_schema.sql, the
-    same convention customers_raw's table follows, not an inline string here;
-    this executes it explicitly (mirroring ingest.py::setup_schema) since
-    docker-compose.yml's docker-entrypoint-initdb.d mount only fires against a
-    fresh Postgres data volume. Builds its own engine rather than reusing
-    utils.db.get_engine()'s shared singleton: that one stays strict (raises
+    the schema's DDL lives in sql/schema/002_create_optuna_schema.sql, not an
+    inline string here; this executes it explicitly (the same belt-and-braces
+    role utils.db.py::apply_migrations plays for the Alembic-managed tables)
+    since docker-compose.yml's docker-entrypoint-initdb.d mount only fires
+    against a fresh Postgres data volume — 002_create_optuna_schema.sql stays
+    outside this project's Alembic instance permanently (PROJECT_PLAN.md's
+    Phase 10a-i scope-boundary note), so it keeps this direct-execution
+    pattern rather than moving into a migration. Builds its own engine rather
+    than reusing utils.db.get_engine()'s shared singleton: that one stays strict (raises
     with no POSTGRES_URL) for ingest.py/sql_features.py, whose SQL is
     Postgres-only and must never silently run against a SQLite fallback.
 

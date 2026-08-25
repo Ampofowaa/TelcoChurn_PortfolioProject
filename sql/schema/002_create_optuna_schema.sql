@@ -5,7 +5,9 @@
 -- docker-entrypoint-initdb.d mount (fresh containers only — that mount never
 -- fires against an already-initialized data volume), and again explicitly by
 -- tuning.py::_build_optuna_storage at call time, the same belt-and-braces
--- pattern 001_create_raw.sql's setup_schema() uses for customers_raw, so a
+-- role utils/db.py::apply_migrations plays for the Alembic-managed tables, so a
 -- pre-existing Postgres instance (CI's testcontainers, Phase 12's RDS, a
 -- developer's already-initialized local container) still gets the schema.
+-- This file stays outside this project's Alembic instance permanently
+-- (PROJECT_PLAN.md's Phase 10a-i scope-boundary note).
 CREATE SCHEMA IF NOT EXISTS optuna;

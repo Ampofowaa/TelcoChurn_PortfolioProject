@@ -12,14 +12,13 @@ from sqlalchemy.engine import Engine
 from telco_churn.data.checks import MAX_NULL_RATE, MIN_ROWS, frame_checksum
 from telco_churn.data.schema import RawSchema
 from telco_churn.data.validate import ValidationError, validate_raw
-from telco_churn.utils.db import get_engine
+from telco_churn.utils.db import apply_migrations, get_engine
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.paths import get_project_root
 
 __all__ = [
     "IngestReceipt",
     "load_raw_csv",
-    "setup_schema",
     "ingest",
 ]
 
@@ -40,9 +39,6 @@ class IngestReceipt:
 
 
 logger = get_logger(__name__)
-
-# Path to the authoritative DDL — column types and PRIMARY KEY live here only.
-_SQL_SCHEMA = get_project_root() / "sql" / "schema" / "001_create_raw.sql"
 
 # Derived from RawSchema via the public Pandera API so inheritance and metaclass
 # processing are respected — frozenset(__annotations__) misses inherited fields.
@@ -76,18 +72,6 @@ def load_raw_csv(path: Path) -> pd.DataFrame:
     df["totalcharges"] = pd.to_numeric(df["totalcharges"], errors="coerce")
     df["churn"] = (df["churn"] == "Yes").astype(int)
     return df
-
-
-def setup_schema(engine: Engine) -> None:
-    """Create the customers_raw table if it does not exist.
-
-    Executes 001_create_raw.sql which uses CREATE TABLE IF NOT EXISTS and
-    declares customerid as PRIMARY KEY. Unlike to_sql(if_exists='replace'),
-    this never drops the table, so the PK constraint is never silently lost.
-    """
-    ddl = _SQL_SCHEMA.read_text()
-    with engine.begin() as conn:
-        conn.execute(text(ddl))
 
 
 def _load_staging(df: pd.DataFrame, engine: Engine) -> None:
@@ -175,12 +159,17 @@ def ingest(
     point below overrides both from config: validation.min_rows /
     validation.max_null_rate, so an operator-tunable value in configs/config.yaml
     actually reaches the ingest path, not just validate.py's own CLI.
+
+    Does not create customers_raw itself — the table is expected to already
+    exist (utils/db.py::apply_migrations, run once at CLI start, or a test
+    fixture's own equivalent call). A direct caller against a database that
+    was never migrated gets Postgres's own "relation does not exist" error
+    from _load_staging/_merge_from_staging, not a silent auto-create.
     """
     if engine is None:
         engine = get_engine()
     df = load_raw_csv(path)
     validate_raw(df, strict=True, min_rows=min_rows, max_null_rate=max_null_rate)
-    setup_schema(engine)
     update_cols = [c for c in df.columns if c != "customerid"]
     csv_rows = len(df)
     _load_staging(df, engine)
@@ -224,6 +213,10 @@ if __name__ == "__main__":
     csv_path = get_project_root() / cfg.paths.raw_data
 
     try:
+        # Belt-and-braces schema creation for a Postgres instance that never saw
+        # docker-compose.yml's docker-entrypoint-initdb.d mount — CI's
+        # testcontainers, Phase 12's RDS. A no-op once already at head.
+        apply_migrations()
         receipt = ingest(
             path=csv_path,
             min_rows=int(cfg.validation.min_rows),

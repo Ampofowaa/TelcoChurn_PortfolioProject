@@ -6,7 +6,9 @@ stages:
       - src/telco_churn/data/schema.py
       - src/telco_churn/data/checks.py
       - src/telco_churn/data/validate.py
-      - sql/schema/001_create_raw.sql
+      - src/telco_churn/data/tables.py
+      - alembic/
+      - alembic.ini
       - datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv
     params:
       - configs/config.yaml:

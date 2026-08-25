@@ -14,6 +14,7 @@ from testcontainers.postgres import PostgresContainer
 
 from telco_churn.data.ingest import ingest
 from telco_churn.data.validate import ValidationError
+from telco_churn.utils.db import apply_migrations
 from telco_churn.utils.paths import get_project_root
 
 _PROJECT_ROOT = get_project_root()
@@ -38,8 +39,10 @@ zero-tenure,Female,0,No,No,0,No,No phone service,DSL,No,No,No,No,No,No,Month-to-
 
 @pytest.fixture(scope="module")
 def pg_engine() -> Iterator[Engine]:
-    """Spin up an ephemeral Postgres 16 container for the test module."""
+    """Spin up an ephemeral Postgres 16 container for the test module,
+    migrated to head — ingest() no longer creates customers_raw itself."""
     with PostgresContainer("postgres:16") as pg:
+        apply_migrations(pg.get_connection_url(driver=None))
         engine = create_engine(pg.get_connection_url())
         yield engine
         engine.dispose()
