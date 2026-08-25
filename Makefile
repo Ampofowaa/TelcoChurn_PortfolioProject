@@ -1,4 +1,4 @@
-.PHONY: help setup lint format pre-commit test test-data test-features test-models test-serving test-integration data db-up db-down crm-data serve-up serve-down smoke-test-serving mlflow-ui repro dag metrics params calibrate threshold evaluate error-analysis review register-challenger register clean
+.PHONY: help setup lint format pre-commit test test-data test-features test-models test-serving test-integration data db-up db-down alembic-upgrade crm-data record-outcome serve-up serve-down smoke-test-serving mlflow-ui repro dag metrics params calibrate threshold evaluate error-analysis review register-challenger register clean
 
 .DEFAULT_GOAL := help
 
@@ -78,8 +78,19 @@ db-down: ## Stop and remove the infra containers
 	docker compose stop postgres mlflow
 	docker compose rm -f postgres mlflow
 
+alembic-upgrade: ## Apply Alembic migrations to head (belt-and-braces schema creation; safe to re-run)
+	$(RUN) alembic upgrade head
+
 crm-data: ## Populate customers_crm from customers_raw (run after db-up + ingest; safe to re-run)
 	$(RUN) python -m telco_churn.serving.crm_data
+
+record-outcome: ## Record a matured churn outcome (CUSTOMERID=... CHURNED=true|false OBSERVED_AT=<ISO8601> required; optional SOURCE=manual|crm_sync|synthetic_seed, default manual)
+	@if [ -z "$(CUSTOMERID)" ] || [ -z "$(CHURNED)" ] || [ -z "$(OBSERVED_AT)" ]; then \
+		echo 'Error: CUSTOMERID, CHURNED, and OBSERVED_AT are all required.'; \
+		echo 'Usage: make record-outcome CUSTOMERID=serve-0001 CHURNED=true OBSERVED_AT=2026-08-22T00:00:00+00:00'; \
+		exit 1; \
+	fi
+	$(RUN) python -m telco_churn.serving.outcomes outcomes.customerid=$(CUSTOMERID) outcomes.churned=$(CHURNED) outcomes.observed_at=$(OBSERVED_AT) $(if $(SOURCE),outcomes.source=$(SOURCE),)
 
 serve-up: ## Start the full local stack — postgres, mlflow, fastapi, streamlit (Phase 9+)
 	docker compose up -d

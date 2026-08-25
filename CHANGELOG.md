@@ -12,6 +12,25 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ---
 
+## [0.10.0] - 2026-08-22 — Phase 10a-i: Data Infrastructure — Alembic + Prediction Tables
+
+*Adopts Alembic as this project's schema-migration tool (`prediction_outcomes` is the first table that can't be regenerated from the CSV) and lands the durable capture path for production inference: `prediction_log` (every `/predict`/`/predict/batch` call) and `prediction_outcomes` (matured churn labels). Full design in `prediction_logging_plan.md` Part B/C.*
+
+### Added
+- **`alembic/`, `alembic.ini`, `src/telco_churn/data/tables.py`** — four linear migrations (`customers_raw` → `customers_crm` → `prediction_log` → `prediction_outcomes`), each with a real `downgrade()`. `utils/db.py::apply_migrations()` is the belt-and-braces call `data/ingest.py`, `serving/crm_data.py`, and `serving/outcomes.py` now run at CLI start instead of executing raw DDL.
+- **`src/telco_churn/serving/prediction_log.py`** — `build_log_rows()` (pure) + `write_log_rows()` (async I/O boundary): one `prediction_log` row per scored customer, capturing `feature_snapshot`, the serving model's identity, `dual_score_mode`/challenger/champion probabilities whenever a challenger was evaluated, and `resolution_kind`. Wired into `serving/app.py`'s `POST /predict`/`POST /predict/batch` via `BackgroundTasks` — fires after the response is sent, fail-open (log-and-swallow plus a new `prediction_log_write_failures_total` Prometheus counter). Config-gated (`configs/serving/api.yaml: prediction_log.enabled`).
+- **`src/telco_churn/serving/outcomes.py`** — `build_outcome_row()` (pure) + `write_outcomes()` (`INSERT ... ON CONFLICT (customerid, observed_at, source) DO NOTHING`); `__main__` CLI (`python -m telco_churn.serving.outcomes`, `make record-outcome`) for manually recording a matured churn label. Raises normally on failure — no live request path to protect.
+- **`serving/schemas.py::PredictRequest.resolution_kind`**, **`customer_lookup.py::resolve_batch_rows`**'s fifth return value — client-/server-declared provenance (`id_only` / `full_inline` / `partial_override`) for how a scored row was actually built, threaded through to `prediction_log`. `ui/streamlit_app.py`'s Score a Customer tab sets it from whether a Fetch preceded the Predict click.
+- **`Makefile`** — `alembic-upgrade`, `record-outcome` targets.
+- Test suite: `tests/unit/test_prediction_log.py` (6), `test_outcomes.py` (3); `tests/integration/test_alembic_migrations.py` (up/down/up roundtrip), `test_outcomes_subprocess.py` (success, `ON CONFLICT` dedup, exit-1); three new `prediction_log`-focused tests in `test_api.py` plus a `compose_config_with_prediction_log_disabled` fixture.
+
+### Changed
+- **`serving/predict.py::predict_single`** — now returns `(PredictResponse, ScoredBatch)` instead of just the response, so `/predict`'s background prediction-log write doesn't re-score the row a second time.
+- **`sql/schema/001_create_raw.sql`, `sql/schema/003_create_customers_crm.sql`** — deleted, not archived (superseded by Alembic migrations 001–002; leaving them would race Alembic on every fresh Docker volume via the `docker-entrypoint-initdb.d` mount). `000_create_mlflow_db.sql`/`002_create_optuna_schema.sql` stay outside Alembic's scope — MLflow and Optuna self-manage those schemas.
+- Local Docker Postgres reinitialized (`docker compose down -v`) and the full training cycle re-run end-to-end (`dvc repro --force` through `register.py`) to mint champion version 1 against the fresh Alembic-managed schema.
+
+---
+
 ## [0.9.1] - 2026-08-20 — Phase 9 sub-step: `customers_crm` live-lookup source
 
 *Gives `GET /customer/{customerid}` and `/predict/batch`'s ID-resolution path a source genuinely distinct from the frozen training snapshot — the Score a Customer tab's "Fetch customer" no longer silently reuses `customers_raw` and presents it as current. See `prediction_logging_plan.md` Part A.*
