@@ -17,10 +17,13 @@ instead of a module-level global.
 **`serving/predict.py` (Task 3) already owns hot-reload, shadow/canary
 routing, and five of the module's Prometheus metrics; `serving/customer_lookup.py`
 owns Postgres ID-resolution — this module is a thin HTTP skin over both, not
-a second implementation of either.** `GET /metrics` needs no per-metric code
-of its own: `prometheus_fastapi_instrumentator`'s `Instrumentator().expose(app)`
+a second implementation of either.** `GET /metrics` needs no extra wiring for
+any of it: `prometheus_fastapi_instrumentator`'s `Instrumentator().expose(app)`
 serves the entire default `prometheus_client` registry, which already
-contains every metric `predict.py` registered at import time.
+contains every metric `predict.py` registered at import time, plus this
+module's own `prediction_log_write_failures_total` — owned here rather than
+`serving/prediction_log.py` because this module is what swallows the write
+failure that increments it (see `_log_prediction_background` below).
 """
 
 from __future__ import annotations
@@ -32,18 +35,19 @@ import secrets
 import signal
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from omegaconf import DictConfig
+from prometheus_client import Counter
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import ValidationError
 
 from telco_churn.models.policy_config import load_costs_config
-from telco_churn.serving import customer_lookup, predict
+from telco_churn.serving import customer_lookup, predict, prediction_log
 from telco_churn.serving.contact_policy import select_contacts
 from telco_churn.serving.schemas import (
     BatchPredictionError,
@@ -62,6 +66,18 @@ from telco_churn.utils.paths import activate_config, compose_config
 __all__ = ["app", "lifespan", "require_api_key", "get_runtime"]
 
 logger = get_logger(__name__)
+
+# Owned here, not serving/prediction_log.py: this module is what swallows a
+# write failure (see _log_prediction_background below), and a metric belongs
+# to whichever module actually increments it — the same rule predict.py's
+# own module-level metrics follow. No model_version label: a write failure
+# is a Postgres-availability signal, not a per-model one.
+_PREDICTION_LOG_WRITE_FAILURES_TOTAL = Counter(
+    "prediction_log_write_failures",
+    "Predictions whose prediction_log write failed and was swallowed — the "
+    "response itself was still served; this counts only the logging side effect.",
+    labelnames=("route",),
+)
 
 
 @contextlib.asynccontextmanager
@@ -190,12 +206,46 @@ def _request_id(request: Request) -> str:
     return request.headers.get("x-request-id") or str(uuid.uuid4())
 
 
+async def _log_prediction_background(
+    feature_rows: list[dict[str, Any]],
+    scored: predict.ScoredBatch,
+    runtime: predict.ServingRuntime,
+    contact: list[bool] | None,
+    route: Literal["single", "batch", "nightly_batch"],
+    request_id: str,
+    resolution_kinds: list[
+        Literal["id_only", "full_inline", "partial_override"] | None
+    ],
+) -> None:
+    """BackgroundTasks target for both /predict and /predict/batch — fires
+    after the response is already sent, so a Postgres hiccup here degrades
+    to "this call wasn't captured," never to a failed prediction
+    (prediction_logging_plan.md Part B §B4). Log-and-swallow, plus the
+    prediction_log_write_failures_total counter so a sustained outage is
+    discoverable rather than only ever silent.
+    """
+    try:
+        rows = prediction_log.build_log_rows(
+            feature_rows, scored, runtime, contact, route, request_id, resolution_kinds
+        )
+        await prediction_log.write_log_rows(rows, get_async_engine())
+    except Exception:
+        _PREDICTION_LOG_WRITE_FAILURES_TOTAL.labels(route=route).inc()
+        logger.warning(
+            "prediction_log_write_failed",
+            request_id=request_id,
+            route=route,
+            exc_info=True,
+        )
+
+
 @app.post(
     "/predict", response_model=PredictResponse, dependencies=[Depends(require_api_key)]
 )
 async def predict_endpoint(
     payload: PredictRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     runtime: predict.ServingRuntime = Depends(get_runtime),
 ) -> PredictResponse:
     """Single-customer prediction — probability/threshold/decision, plus an
@@ -205,17 +255,32 @@ async def predict_endpoint(
     /predict/batch alone, below).
     """
     cfg: DictConfig = request.app.state.cfg
-    response = predict.predict_single(payload, runtime, cfg)
+    request_id = _request_id(request)
+    response, scored = predict.predict_single(payload, runtime, cfg)
     logger.info(
         "prediction_served",
-        request_id=_request_id(request),
+        request_id=request_id,
         customerid=response.customerid,
-        features=payload.model_dump(exclude={"include_explanation"}),
+        features=payload.model_dump(exclude={"include_explanation", "resolution_kind"}),
         probability=response.probability,
         threshold=response.threshold,
         decision=response.decision,
         model_version=response.model_version,
     )
+    if bool(cfg.serving.prediction_log.enabled):
+        row = payload.model_dump(
+            exclude={"customerid", "include_explanation", "resolution_kind"}
+        )
+        background_tasks.add_task(
+            _log_prediction_background,
+            [row],
+            scored,
+            runtime,
+            None,
+            "single",
+            request_id,
+            [payload.resolution_kind],
+        )
     return response
 
 
@@ -227,6 +292,7 @@ async def predict_endpoint(
 async def predict_batch_endpoint(
     payload: list[dict[str, Any]],
     request: Request,
+    background_tasks: BackgroundTasks,
     runtime: predict.ServingRuntime = Depends(get_runtime),
 ) -> BatchPredictResponse:
     """Batch scoring with partial success and capacity-constrained contact ranking.
@@ -292,7 +358,7 @@ async def predict_batch_endpoint(
         if lookup_ids
         else {}
     )
-    rows, row_indices, row_customer_ids, resolution_errors = (
+    rows, row_indices, row_customer_ids, resolution_errors, resolution_kinds = (
         customer_lookup.resolve_batch_rows(validated, looked_up)
     )
     errors.extend(resolution_errors)
@@ -349,6 +415,18 @@ async def predict_batch_endpoint(
                 decision=bool(contact_decision.decision[i]),
                 model_version=scored.served_model_version[i],
                 served_source=scored.served_source[i],
+            )
+
+        if bool(cfg.serving.prediction_log.enabled):
+            background_tasks.add_task(
+                _log_prediction_background,
+                rows,
+                scored,
+                runtime,
+                contact_decision.contact.tolist(),
+                "batch",
+                request_id,
+                resolution_kinds,
             )
 
     results.sort(key=lambda r: r.index)

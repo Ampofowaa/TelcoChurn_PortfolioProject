@@ -616,15 +616,22 @@ def _bundle_for_source(runtime: ServingRuntime, source: str) -> ModelBundle:
 
 def predict_single(
     request: PredictRequest, runtime: ServingRuntime, cfg: DictConfig
-) -> PredictResponse:
+) -> tuple[PredictResponse, ScoredBatch]:
     """Score one customer, optionally with a local SHAP explanation.
 
     Never carries `contact`/`capacity_limit` — a single customer in
     isolation has no population to be capacity-ranked against; that policy
     is `serving/contact_policy.py::select_contacts`, wired into
     `predict_batch`'s caller instead.
+
+    Also returns the underlying `ScoredBatch` — `serving/app.py`'s
+    `POST /predict` handler needs it to build a `prediction_log` row
+    (`serving/prediction_log.py::build_log_rows`), and re-deriving it with a
+    second `score_request` call would score the same row twice.
     """
-    row = request.model_dump(exclude={"customerid", "include_explanation"})
+    row = request.model_dump(
+        exclude={"customerid", "include_explanation", "resolution_kind"}
+    )
     X = pd.DataFrame([row])
     customer_ids = pd.Series([request.customerid])
 
@@ -660,7 +667,7 @@ def predict_single(
             ],
         )
 
-    return PredictResponse(
+    response = PredictResponse(
         customerid=request.customerid,
         probability=proba,
         threshold=threshold,
@@ -668,6 +675,7 @@ def predict_single(
         model_version=model_version,
         explanation=explanation,
     )
+    return response, scored
 
 
 def predict_batch(

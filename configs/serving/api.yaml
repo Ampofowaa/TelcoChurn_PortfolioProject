@@ -32,6 +32,12 @@ auth:
 batch:
   max_size: 500
 
+# Off-switch so the FastAPI TestClient suite doesn't need a live Postgres
+# just to exercise /predict — flip false per-test the same way auth.enabled/
+# shadow.enabled already are (prediction_logging_plan.md §B5).
+prediction_log:
+  enabled: true
+
 # customers_crm generation (serving/crm_data.py) — seeded "current state"
 # nudges applied to customers_raw. random_state is a plain literal (never
 # ${random_seed}): this generator is a serving-side script, not a DVC stage,

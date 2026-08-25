@@ -1,0 +1,21 @@
+# Manual outcome-recording CLI configuration — see serving/outcomes.py.
+# In a real deployment this table is written by a CRM webhook or a nightly
+# reconciliation job; here it is invoked by hand, one label at a time.
+
+# customerid whose real-world label matured — required, e.g.
+# `outcomes.customerid=serve-0001`.
+customerid: null
+
+# Whether this customer churned — required, e.g. `outcomes.churned=true`.
+churned: null
+
+# When the outcome became known in the real world (ISO 8601, e.g.
+# 2026-08-22T00:00:00+00:00) — required. Kept distinct from recorded_at
+# (when this row was *written*, stamped server-side at insert time).
+observed_at: null
+
+# "crm_sync" | "manual" | "synthetic_seed" — distinguishes a real
+# integration from the manual/synthetic seeding this project actually
+# exercises. Defaults to "manual", the common case for this CLI's own
+# invocation.
+source: manual

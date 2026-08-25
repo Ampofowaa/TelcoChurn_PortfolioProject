@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
 
 from telco_churn.serving.app import app
 
@@ -164,6 +165,130 @@ def test_metrics_exposes_prediction_counters_after_traffic(
     assert "predictions_total" in body
     assert "predicted_probability" in body
     assert "predictions_above_threshold_total" in body
+
+
+# ---------------------------------------------------------------------------
+# prediction_log — serving/prediction_log.py's BackgroundTasks write,
+# exercised through the real HTTP path rather than a standalone subprocess
+# test (prediction_log.py has no __main__; see prediction_logging_plan.md
+# Part B §B6). TestClient runs a request's background tasks synchronously as
+# part of the request/response cycle, so the row is already committed by the
+# time these assertions run.
+# ---------------------------------------------------------------------------
+
+
+def test_predict_writes_a_row_to_prediction_log(
+    api_client: TestClient,
+    serving_env: dict[str, Any],
+    serving_customer_payload: Any,
+) -> None:
+    payload = serving_customer_payload("pl-single-0001", tenure=5, monthlycharges=30.0)
+    payload["resolution_kind"] = "full_inline"
+
+    response = api_client.post("/predict", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+
+    engine = create_engine(serving_env["postgres_url"])
+    try:
+        with engine.begin() as conn:
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT route, feature_snapshot, model_version, probability, "
+                        "threshold, decision, contact, dual_score_mode, resolution_kind "
+                        "FROM prediction_log WHERE customerid = :customerid"
+                    ),
+                    {"customerid": "pl-single-0001"},
+                )
+                .mappings()
+                .one()
+            )
+    finally:
+        engine.dispose()
+
+    assert row["route"] == "single"
+    assert row["model_version"] == body["model_version"]
+    assert row["probability"] == pytest.approx(body["probability"])
+    assert row["threshold"] == pytest.approx(body["threshold"])
+    assert row["decision"] == body["decision"]
+    assert row["contact"] is None
+    assert row["dual_score_mode"] is None
+    assert row["resolution_kind"] == "full_inline"
+    assert "customerid" not in row["feature_snapshot"]
+    assert "resolution_kind" not in row["feature_snapshot"]
+    assert "include_explanation" not in row["feature_snapshot"]
+    assert row["feature_snapshot"]["tenure"] == 5
+
+
+def test_predict_batch_writes_rows_to_prediction_log(
+    api_client: TestClient,
+    serving_env: dict[str, Any],
+    serving_customer_payload: Any,
+) -> None:
+    """Full-inline batch items (no lookup) rather than ID-only, so this test
+    doesn't depend on — or interfere with — the shared, module-scoped
+    customers_crm seed data other tests in this file already query against.
+    """
+    payload = [
+        serving_customer_payload("pl-batch-0001", tenure=5, monthlycharges=30.0),
+        serving_customer_payload("pl-batch-0002", tenure=40, monthlycharges=75.0),
+    ]
+
+    response = api_client.post("/predict/batch", json=payload)
+    assert response.status_code == 200
+
+    engine = create_engine(serving_env["postgres_url"])
+    try:
+        with engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT customerid, route, contact, resolution_kind "
+                        "FROM prediction_log WHERE customerid = ANY(:ids)"
+                    ),
+                    {"ids": ["pl-batch-0001", "pl-batch-0002"]},
+                )
+                .mappings()
+                .all()
+            )
+    finally:
+        engine.dispose()
+
+    assert len(rows) == 2
+    for row in rows:
+        assert row["route"] == "batch"
+        assert row["resolution_kind"] == "full_inline"
+        assert isinstance(row["contact"], bool)
+
+
+def test_prediction_log_disabled_skips_the_write(
+    api_client: TestClient,
+    serving_env: dict[str, Any],
+    compose_config_with_prediction_log_disabled: None,
+    serving_customer_payload: Any,
+) -> None:
+    payload = serving_customer_payload(
+        "pl-disabled-0001", tenure=5, monthlycharges=30.0
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/predict", json=payload)
+    assert response.status_code == 200
+
+    engine = create_engine(serving_env["postgres_url"])
+    try:
+        with engine.begin() as conn:
+            count = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM prediction_log WHERE customerid = :customerid"
+                ),
+                {"customerid": "pl-disabled-0001"},
+            ).scalar()
+    finally:
+        engine.dispose()
+
+    assert count == 0
 
 
 # ---------------------------------------------------------------------------

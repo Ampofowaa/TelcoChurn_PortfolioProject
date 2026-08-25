@@ -748,12 +748,14 @@ def test_predict_single_probability_matches_direct_model_call(
     golden_predictions.json check (Task 4, through the HTTP layer) extends.
     """
     request = _predict_request()
-    response = predict.predict_single(
+    response, _scored = predict.predict_single(
         request, champion_only_runtime_raw_fields, predict_cfg
     )
 
     bundle = champion_only_runtime_raw_fields.champion
-    row = request.model_dump(exclude={"customerid", "include_explanation"})
+    row = request.model_dump(
+        exclude={"customerid", "include_explanation", "resolution_kind"}
+    )
     X = predict._assemble_model_input(pd.DataFrame([row]), bundle.committed_features)
     expected = float(bundle.model.predict_proba(X)[:, 1][0])
 
@@ -769,7 +771,7 @@ def test_predict_single_with_explanation(
     request = _predict_request()
     request.include_explanation = True
 
-    response = predict.predict_single(
+    response, _scored = predict.predict_single(
         request, champion_only_runtime_raw_fields, predict_cfg
     )
 
@@ -780,7 +782,7 @@ def test_predict_single_with_explanation(
 def test_predict_single_without_explanation_omits_it(
     predict_cfg: DictConfig, champion_only_runtime_raw_fields: predict.ServingRuntime
 ) -> None:
-    response = predict.predict_single(
+    response, _scored = predict.predict_single(
         _predict_request(), champion_only_runtime_raw_fields, predict_cfg
     )
     assert response.explanation is None
@@ -870,7 +872,7 @@ def test_predict_single_matches_golden_predictions_json(
     )
 
     for request, expected in zip(golden_requests, golden["p_hat"], strict=True):
-        response = predict.predict_single(request, runtime, predict_cfg)
+        response, _scored = predict.predict_single(request, runtime, predict_cfg)
         assert response.probability == pytest.approx(expected, abs=1e-9)
 
 

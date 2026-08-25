@@ -14,7 +14,7 @@ customerid (PROJECT_PLAN.md's Phase 9 note).
 
 from __future__ import annotations
 
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from pydantic import ValidationError
 from sqlalchemy import text
@@ -86,21 +86,42 @@ async def lookup_customers(
     return {str(row["customerid"]): dict(row) for row in rows}
 
 
+_ResolutionKind = Literal["id_only", "full_inline", "partial_override"]
+
+
 def resolve_batch_rows(
     validated: dict[int, BatchPredictItem],
     looked_up: dict[str, dict[str, Any]],
 ) -> tuple[
-    list[dict[str, Any]], list[int], list[str | None], list[BatchPredictionError]
+    list[dict[str, Any]],
+    list[int],
+    list[str | None],
+    list[BatchPredictionError],
+    list[_ResolutionKind | None],
 ]:
-    """Turn each validated batch item into an engineered-feature-ready row, or an error."""
+    """Turn each validated batch item into an engineered-feature-ready row, or an error.
+
+    The fifth return value, resolution_kinds, is this function's own
+    classification of how each row was actually built — free, since
+    is_complete(item) and the override dict's emptiness are already computed
+    below to resolve the row itself, not derived separately
+    (prediction_logging_plan.md §B1/§B4). Zipped 1:1 with rows/row_indices/
+    row_customer_ids (a row that errors out contributes to none of the five).
+    Typed `| None` to match `serving/prediction_log.py::build_log_rows`'s
+    parameter shape exactly (list is invariant) — every row this function
+    actually resolves gets a concrete classification, never `None`.
+    """
     rows: list[dict[str, Any]] = []
     row_indices: list[int] = []
     row_customer_ids: list[str | None] = []
     errors: list[BatchPredictionError] = []
+    resolution_kinds: list[_ResolutionKind | None] = []
     for idx, item in validated.items():
+        resolution_kind: _ResolutionKind
         if is_complete(item):
             resolved = item.model_dump(exclude={"customerid"})
             customerid = item.customerid
+            resolution_kind = "full_inline"
         else:
             if item.customerid is None:
                 errors.append(
@@ -136,7 +157,9 @@ def resolve_batch_rows(
             }
             resolved = {**base_features, **override}
             customerid = item.customerid
+            resolution_kind = "partial_override" if override else "id_only"
         rows.append(resolved)
         row_indices.append(idx)
         row_customer_ids.append(customerid)
-    return rows, row_indices, row_customer_ids, errors
+        resolution_kinds.append(resolution_kind)
+    return rows, row_indices, row_customer_ids, errors, resolution_kinds
