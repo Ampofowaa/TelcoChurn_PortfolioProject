@@ -12,9 +12,33 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ---
 
+## [0.10.1] - 2026-08-26 — Phase 10a-ii: Training Pipeline Refactor for Retraining
+
+*Resolves every open ML/pipeline-policy question `training_cycle.py` (Phase 10b) needs answered before it can be written, and delivers the per-stage code changes those decisions require — the reserve partition, a two-gate promotion split, and bundle overrides that let every training-cycle stage run against either the dev-only cold-start population or a dev ∪ matured-reserve retrain population, with zero behavior change on the cold-start path.*
+
+### Added
+- **`data/split.py`** — `reserve_ids()`/`make_reserve()` (seeded 6-month cohort carve-out from `test`, its own independent random-state stream) and `sealed_test_ids()` (`test_ids()` minus reserved ids). New `reserve_manifest.parquet` DVC output.
+- **`data/tables.py`, alembic migration `6658a9eeadb6`** — new `training_pool` table (every `customers_raw` column + `churn` + nullable `reserve_month`), seeded once by `ingest.py::seed_training_pool` and grown by `data/training_pool.py::build_training_pool_cohort`/`write_training_pool_cohort` (joins `prediction_log ⋈ prediction_outcomes`, flattens `feature_snapshot`). `sql/features/*.sql`/`features/build.py::build_feature_query` repointed at `training_pool`, filterable by `reserve_months`.
+- **`models/train/common.py::load_training_pool_bundle`** — the 4-field `(X_train, y_train, customer_ids, raw_partition)` assembly every training-cycle stage now accepts as an optional override (`calibrate.py`, `threshold.py`, `error_analysis.py`'s `raw_partition_override`), all-or-none, `None` by default so the cold-start path is unchanged. `train/tuning.py` gained a `pinned_params` mode and `warm_start_params` (Optuna `enqueue_trial`) for the reserve-driven cycles.
+- **`pipelines/performance_check.py::run_performance_check`** — new binding promotion gate for the two routine, reserve-driven retrain cycles: scores the candidate against the sealed test set (non-binding diagnostic) and, separately, against the reserve comparison window using each customer's already-served `prediction_log` score as the incumbent — the binding decision. `evaluate.py`'s sealed-test comparative gate stays binding only for a rare/cold-start cycle.
+- **`models/sealed_test.py`** — extracted from `evaluate.py` (dataset-agnostic scoring/gate functions) so `performance_check.py` can reuse them without violating the no-cross-`__main__`-import rule; `evaluate.py` is now a thin `__main__` wrapper over it.
+- **`threshold.py::run_threshold_rerun_step`, `register.py::tag_threshold_rerun`** — a `costs.yaml`-only change re-derives `t*` against an already-promoted champion's existing dev-OOF probabilities and logs to a fresh, small MLflow run, tagged onto the version as `threshold_run_id` — no new model version minted. `serving/policy_config.py::load_threshold_payload` resolves through that tag when present. New `threshold.rerun_model_version`/`register.threshold_rerun_version` CLI keys.
+- **`register.py`** — `tuned_hyperparameters`, `gate_source`/`gate_pr_auc_delta`, and `threshold_run_id` model-version tags; a third `_tag_rejected` dispatch mode for a pre-seal screen failure (`tag_pre_seal_screen_rejected`).
+- Test suite: ~200 new/updated tests across `test_split.py`, `test_train_common.py`/`test_train_tuning.py`, `test_calibrate.py`, `test_threshold.py`, `test_sealed_test.py` (new), `test_error_analysis.py`, `test_register.py`, `test_mlflow.py`, `test_policy_config.py`, `test_predict.py`; `tests/integration/test_training_pool_postgres.py` (new), `test_performance_check_postgres.py`/`test_performance_check.py` (new), plus extensions to `test_alembic_migrations.py`, `test_split_postgres.py`, `test_sql_features_postgres.py`, `test_threshold_subprocess.py`, `test_register_subprocess.py`.
+
+### Changed
+- **`data/split.py`, `models/train/*.py`** — `X_dev`/`y_dev` renamed to `X_train`/`y_train` across the training-cycle stage functions (cold-start call sites unaffected).
+- **`threshold.py`, `configs/threshold/default.yaml`** — `v3_direction_sanity` renamed to `direction_sanity` (criterion string, function, and config keys), now alongside a new third binding pre-seal veto, `within_ci`.
+- **`register.py`** — `run_registration_step`'s mint/evaluate/register chain is now documented as gated by the caller (`training_cycle.py`, Phase 10b) on whether `calibrate_receipt.json`'s `run_id` moved, not by `register.py` itself.
+
+### Fixed
+- Three pre-existing integration-test gaps found while extending this phase's fixtures, all predating Phase 10a-ii: `test_ingest_postgres.py`, `test_split_postgres.py`, `test_sql_features_postgres.py` never called `apply_migrations()` in their `pg_engine` fixture, so `ingest()` failed with `UndefinedTable` before any of this phase's own changes were exercised.
+
+---
+
 ## [0.10.0] - 2026-08-22 — Phase 10a-i: Data Infrastructure — Alembic + Prediction Tables
 
-*Adopts Alembic as this project's schema-migration tool (`prediction_outcomes` is the first table that can't be regenerated from the CSV) and lands the durable capture path for production inference: `prediction_log` (every `/predict`/`/predict/batch` call) and `prediction_outcomes` (matured churn labels). Full design in `prediction_logging_plan.md` Part B/C.*
+*Adopts Alembic as this project's schema-migration tool (`prediction_outcomes` is the first table that can't be regenerated from the CSV) and lands the durable capture path for production inference: `prediction_log` (every `/predict`/`/predict/batch` call) and `prediction_outcomes` (matured churn labels).*
 
 ### Added
 - **`alembic/`, `alembic.ini`, `src/telco_churn/data/tables.py`** — four linear migrations (`customers_raw` → `customers_crm` → `prediction_log` → `prediction_outcomes`), each with a real `downgrade()`. `utils/db.py::apply_migrations()` is the belt-and-braces call `data/ingest.py`, `serving/crm_data.py`, and `serving/outcomes.py` now run at CLI start instead of executing raw DDL.
@@ -33,7 +57,7 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ## [0.9.1] - 2026-08-20 — Phase 9 sub-step: `customers_crm` live-lookup source
 
-*Gives `GET /customer/{customerid}` and `/predict/batch`'s ID-resolution path a source genuinely distinct from the frozen training snapshot — the Score a Customer tab's "Fetch customer" no longer silently reuses `customers_raw` and presents it as current. See `prediction_logging_plan.md` Part A.*
+*Gives `GET /customer/{customerid}` and `/predict/batch`'s ID-resolution path a source genuinely distinct from the frozen training snapshot — the Score a Customer tab's "Fetch customer" no longer silently reuses `customers_raw` and presents it as current.*
 
 ### Added
 - **`sql/schema/003_create_customers_crm.sql`**, **`src/telco_churn/serving/crm_data.py`** — new `customers_crm` table: a seeded "current state" derivation of `customers_raw` (`generate_crm_rows`), never touching the read-only raw table. Tenure advances +1–6 months, contract only upgrades (never downgrades), `totalcharges` carries forward plus accrued charge and seeded noise; everything else held fixed. `setup_crm_schema`/`load_crm` mirror `data/ingest.py`'s idempotent truncate-and-reload pattern. `make crm-data` runs it (after `db-up`/ingest).

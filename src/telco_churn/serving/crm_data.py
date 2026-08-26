@@ -3,8 +3,7 @@ derived from customers_raw, never touching the read-only raw table itself.
 
 customer_lookup.py::lookup_customers reads customers_crm, not customers_raw,
 so GET /customer/{customerid} and /predict/batch's ID-resolution path have a
-source genuinely distinct from the frozen training snapshot — see
-prediction_logging_plan.md Part A for the full rationale.
+source genuinely distinct from the frozen training snapshot.
 
 Pure generation (generate_crm_rows) is separated from I/O (load_crm), the
 same split drift_reference.py's pure builder / register.py's I/O already

@@ -70,8 +70,8 @@ async def lookup_customers(
     /predict/batch's ID-resolution path — the same query either way, so a
     caller never pays N round trips for an N-row batch. customers_crm, not
     customers_raw: a live lookup must hit a source distinct from the frozen
-    training snapshot (prediction_logging_plan.md Part A). Each returned row
-    carries crm_snapshot_at alongside the feature columns — resolve_batch_rows
+    training snapshot. Each returned row carries crm_snapshot_at alongside
+    the feature columns — resolve_batch_rows
     ignores it (CustomerFeatures has no such field and Pydantic drops unknown
     keys by default); GET /customer/{customerid} surfaces it explicitly via
     CustomerLookupResponse.
@@ -104,9 +104,9 @@ def resolve_batch_rows(
     The fifth return value, resolution_kinds, is this function's own
     classification of how each row was actually built — free, since
     is_complete(item) and the override dict's emptiness are already computed
-    below to resolve the row itself, not derived separately
-    (prediction_logging_plan.md §B1/§B4). Zipped 1:1 with rows/row_indices/
-    row_customer_ids (a row that errors out contributes to none of the five).
+    below to resolve the row itself, not derived separately. Zipped 1:1 with
+    rows/row_indices/row_customer_ids (a row that errors out contributes to
+    none of the five).
     Typed `| None` to match `serving/prediction_log.py::build_log_rows`'s
     parameter shape exactly (list is invariant) — every row this function
     actually resolves gets a concrete classification, never `None`.

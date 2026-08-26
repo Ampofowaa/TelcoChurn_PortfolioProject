@@ -219,9 +219,9 @@ async def _log_prediction_background(
 ) -> None:
     """BackgroundTasks target for both /predict and /predict/batch — fires
     after the response is already sent, so a Postgres hiccup here degrades
-    to "this call wasn't captured," never to a failed prediction
-    (prediction_logging_plan.md Part B §B4). Log-and-swallow, plus the
-    prediction_log_write_failures_total counter so a sustained outage is
+    to "this call wasn't captured," never to a failed prediction.
+    Log-and-swallow, plus the prediction_log_write_failures_total counter
+    so a sustained outage is
     discoverable rather than only ever silent.
     """
     try:

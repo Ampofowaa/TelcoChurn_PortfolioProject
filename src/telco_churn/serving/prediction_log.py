@@ -6,7 +6,7 @@ before scoring ever runs (its own module docstring says as much), so by the
 time this function runs, both call sites (`POST /predict`, `POST
 /predict/batch`) already hold the same shape of input — a list of feature
 dicts, a `ScoredBatch`, and a `resolution_kind` per row — length 1 for a
-single call, length N for a batch (`prediction_logging_plan.md` §B4).
+single call, length N for a batch.
 
 `write_log_rows` is the async I/O boundary: one bulk `INSERT` via
 `data/tables.py`'s `prediction_log` Table. It raises normally on failure —

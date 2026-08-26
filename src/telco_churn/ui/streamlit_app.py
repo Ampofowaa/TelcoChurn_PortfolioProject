@@ -628,9 +628,9 @@ def _render_lookup_tab() -> None:
             # id_only whenever a Fetch preceded this submission — regardless
             # of whether the fetched fields were then edited — full_inline
             # for manual entry with no prior Fetch. No "partial_override"
-            # here: Score a Customer never detects "fetched, then edited"
-            # (prediction_logging_plan.md §B1/§B4); the edited values are
-            # still fully captured in feature_snapshot either way.
+            # here: Score a Customer never detects "fetched, then edited";
+            # the edited values are still fully captured in
+            # feature_snapshot either way.
             "resolution_kind": (
                 "id_only" if lookup_response is not None else "full_inline"
             ),
