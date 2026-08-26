@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pandas as pd
 import pandera as pa
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
 
 from telco_churn.features.schema import (
     COMMITTED_FEATURES,
@@ -24,6 +26,8 @@ __all__ = [
     "FeatureSchema",
     "TARGET_COL",
     "SQL_FEATURE_COLS",
+    "build_feature_query",
+    "load_customer_features",
     "build_feature_df",
 ]
 
@@ -38,6 +42,50 @@ SQL_FEATURE_COLS: list[str] = (
     + list(FEATURE_SCHEMA.numeric)
     + [TARGET_COL]
 )
+
+
+def build_feature_query(reserve_months: list[int] | None = None) -> str:
+    """Build the customer_features SELECT, scoped to the given reserve months.
+
+    `customer_features` is sourced from `training_pool`, which holds both the
+    original CSV-seeded population (`reserve_month IS NULL`) and every
+    past/future reserve cohort
+    (`reserve_month` 1..6). Every training query includes the seeded
+    population; `reserve_months=None` (the default v1/cold-start path) selects
+    *only* that population — today's exact customers_raw-derived behavior,
+    unaffected by any reserve cohort that has since matured. A non-empty list
+    additionally folds in those matured cohorts (the fold-forward training
+    query, §D1/§D4) — this is what Phase 10b's training_cycle.py will call for
+    a routine retrain cycle; nothing in this repo calls it with a non-None
+    argument yet.
+
+    reserve_months values are cast through int() before interpolation — they
+    come from this project's own fold-forward bookkeeping (reserve_manifest.parquet
+    cohort numbers 1..6), never request/user input, and the cast both
+    documents that and rejects a non-numeric value loudly rather than
+    building an unintended query string.
+    """
+    cols = ", ".join(SQL_FEATURE_COLS)
+    if not reserve_months:
+        return f"SELECT {cols} FROM customer_features WHERE reserve_month IS NULL"
+    months = ", ".join(str(int(m)) for m in reserve_months)
+    return (
+        f"SELECT {cols} FROM customer_features "
+        f"WHERE reserve_month IS NULL OR reserve_month IN ({months})"
+    )
+
+
+def load_customer_features(
+    engine: Engine, reserve_months: list[int] | None = None
+) -> pd.DataFrame:
+    """Read customer_features from Postgres, scoped to build_feature_query's filter.
+
+    Returns exactly SQL_FEATURE_COLS — training_pool_id/reserve_month (the
+    join key and the fold-forward filter column) never leave this function,
+    since build_feature_df's schemas describe the customerid+feature+churn
+    shape only.
+    """
+    return pd.read_sql_query(text(build_feature_query(reserve_months)), engine)
 
 
 @pa.check_input(CustomerFeaturesSchema)  # type: ignore[untyped-decorator]
@@ -101,9 +149,7 @@ if __name__ == "__main__":
         engine = get_engine()
         build_sql_features(engine, sql_dir=sql_dir)
 
-        df_raw = pd.read_sql_table(
-            "customer_features", engine, columns=SQL_FEATURE_COLS
-        )
+        df_raw = load_customer_features(engine)
         df_out = build_feature_df(df_raw)
         _reject_if_empty(df_out)
 

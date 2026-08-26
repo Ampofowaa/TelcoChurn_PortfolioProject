@@ -420,13 +420,29 @@ def _sanitize_metric_name(name: str) -> str:
     return _METRIC_NAME_DISALLOWED_CHARS_RE.sub("_", name)
 
 
-def _features_by_customer_id(customer_ids: pd.Series) -> pd.DataFrame:
+def _features_by_customer_id(
+    customer_ids: pd.Series,
+    raw_partition_override: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Full raw feature rows for exactly `customer_ids`, via the unsplit
     feature table — never telco_churn's data/split.py. `customer_ids` already
     carries whatever partition membership an upstream artifact (evaluate.py's
     test_predictions.parquet, calibrate.py's dev-OOF vector) sealed; this only
     joins raw columns onto that already-fixed identity set, it does not
     re-derive a split.
+
+    `raw_partition_override` defaults to `load_features()` (the static,
+    customers_raw-only processed-features parquet). Pass
+    `models/train/common.py::load_training_pool_bundle`'s own `raw_partition`
+    return once the dev-OOF vector includes matured reserve cohorts — a
+    reserve customerid is found in
+    `load_features()` too (same physical customer), so the missing-id check
+    below never fires, but the row returned would be that customer's
+    *original, frozen* customers_raw snapshot rather than the nudged values
+    (via training_pool) the model actually trained and was evaluated on —
+    quietly wrong SHAP feature values next to a customer's explanation, not a
+    raised error. Sealed-test lookups never pass this override: test
+    customers are never part of the reserve mechanism.
 
     Checks for a missing lookup by id membership, not by scanning the joined
     frame for any NaN: 11 zero-tenure customers carry a legitimate NaN
@@ -435,12 +451,17 @@ def _features_by_customer_id(customer_ids: pd.Series) -> pd.DataFrame:
     load_features()), and one of them routinely lands in the sealed test
     set. An any-NaN check would treat that expected value as a broken join.
     """
-    df = load_features().set_index("customerid")
+    source = (
+        raw_partition_override
+        if raw_partition_override is not None
+        else load_features()
+    )
+    df = source.set_index("customerid")
     missing_ids = set(customer_ids) - set(df.index)
     assert not missing_ids, (
-        f"load_features() is missing {len(missing_ids)} of the requested "
-        "customerids — it no longer matches the prediction artifact this "
-        "customer id set came from."
+        f"{'raw_partition_override' if raw_partition_override is not None else 'load_features()'} "
+        f"is missing {len(missing_ids)} of the requested customerids — it no "
+        "longer matches the prediction artifact this customer id set came from."
     )
     return df.reindex(customer_ids).reset_index()
 
@@ -1009,7 +1030,11 @@ def _save_value_weighted_plot(rows: list[dict[str, Any]], path: Path) -> None:
 
 
 def _load_error_analysis_inputs(
-    run_id: str, model_version: str, model_uri: str, cfg: DictConfig
+    run_id: str,
+    model_version: str,
+    model_uri: str,
+    cfg: DictConfig,
+    raw_partition_override: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Check threshold provenance/screen status, load test/dev-OOF predictions, and join raw feature values.
 
@@ -1017,6 +1042,10 @@ def _load_error_analysis_inputs(
     (threshold.py's dev-OOF screen, fetched by run_id from calibrate.py's
     logged artifact) — the only route this module reaches evaluation data
     through.
+
+    `raw_partition_override` is threaded only to the dev-OOF feature lookup,
+    never the sealed-test one — see
+    `_features_by_customer_id`'s own docstring for why.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
 
@@ -1043,7 +1072,9 @@ def _load_error_analysis_inputs(
     dev_oof_predictions = load_dev_oof_predictions(run_id, cfg)
 
     test_features_df = _features_by_customer_id(test_predictions["customerid"])
-    dev_features_df = _features_by_customer_id(dev_oof_predictions["customerid"])
+    dev_features_df = _features_by_customer_id(
+        dev_oof_predictions["customerid"], raw_partition_override
+    )
 
     policy = load_policy_thresholds(cfg)
     base_threshold = resolve_policy_thresholds_by_scenario(policy)["base"]
@@ -1694,9 +1725,21 @@ def _write_error_analysis_reports(
 
 
 def run_error_analysis_step(
-    run_id: str, model_version: str, model_uri: str, cfg: DictConfig
+    run_id: str,
+    model_version: str,
+    model_uri: str,
+    cfg: DictConfig,
+    raw_partition_override: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Run the full error-diagnosis pass and write reports/error_analysis.json.
+
+    `raw_partition_override` is `None` by default so the rare/cold-start path
+    is unaffected; a routine reserve-
+    driven cycle passes `models/train/common.py::load_training_pool_bundle`'s
+    own `raw_partition` so the dev-OOF SHAP lookup sources matured reserve
+    customers' engineered feature values from `training_pool`, not their
+    frozen `customers_raw` snapshot — see `_features_by_customer_id`'s own
+    docstring.
 
     Takes `run_id`/`model_version`/`model_uri` already resolved by the
     caller (utils.mlflow.resolve_model_identifier — an explicit override,
@@ -1731,7 +1774,9 @@ def run_error_analysis_step(
     so a stale cutoff would otherwise silently narrow or widen a chart's
     feature set with nothing to flag it.
     """
-    loaded = _load_error_analysis_inputs(run_id, model_version, model_uri, cfg)
+    loaded = _load_error_analysis_inputs(
+        run_id, model_version, model_uri, cfg, raw_partition_override
+    )
     run_id = loaded["run_id"]
     base_threshold = loaded["base_threshold"]
     y_test, proba_test = loaded["y_test"], loaded["proba_test"]

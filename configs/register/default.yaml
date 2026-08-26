@@ -16,6 +16,17 @@
 # than one).
 refresh_reference_version: null
 
+# telco-churn-pipeline version whose threshold_run_id tag should be pointed
+# at a costs.yaml-only re-run's fresh MLflow run, e.g.
+# `register.threshold_rerun_version=3`. Run
+# `python -m telco_churn.models.threshold threshold.rerun_model_version=<this
+# version>` first — that produces the fresh run and writes
+# reports/threshold_rerun_receipt.json, which this reads. Does not run the
+# gate and does not move champion/challenger, same as
+# refresh_reference_version above; mutually exclusive with it and with
+# model_version/run_id below.
+threshold_rerun_version: null
+
 # telco-churn-pipeline version to promote/reject, e.g. `register.model_version=2`
 # — the already-registered challenger evaluate.py's promotion_decision.json
 # was computed against. Never inferred from the challenger alias.

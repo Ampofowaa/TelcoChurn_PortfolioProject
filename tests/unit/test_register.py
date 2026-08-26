@@ -18,6 +18,7 @@ them by name).
 
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 from pathlib import Path
@@ -38,7 +39,11 @@ from sklearn.linear_model import LogisticRegression
 
 import telco_churn.models.register as register
 from telco_churn.utils.hashing import content_hash
-from telco_churn.utils.mlflow import write_error_analysis_receipt, write_eval_receipt
+from telco_churn.utils.mlflow import (
+    write_error_analysis_receipt,
+    write_eval_receipt,
+    write_threshold_rerun_receipt,
+)
 
 _COMMITTED_FEATURES = ["tenure", "monthlycharges"]
 
@@ -409,6 +414,13 @@ def test_register_challenger_mints_pending_and_points_challenger_alias(
             },
             "calibration/golden_predictions.json",
         )
+        # register_challenger reads tuning_summary.selected_hyperparameters
+        # off this to tag tuned_hyperparameters at mint time (§E9) — the
+        # same artifact log_model.py's real _build_training_manifest logs.
+        mlflow.log_dict(
+            {"tuning_summary": {"selected_hyperparameters": {"num_leaves": 31}}},
+            "training_manifest.json",
+        )
 
     version = register.register_challenger(
         register_cfg, run_id, model_info.model_uri, model_info.model_id
@@ -419,6 +431,7 @@ def test_register_challenger_mints_pending_and_points_challenger_alias(
     assert tags["promotion_status"] == "pending"
     assert tags["logged_model_id"] == model_info.model_id
     assert tags["training_data_scope"] == "dev"
+    assert json.loads(tags["tuned_hyperparameters"]) == {"num_leaves": 31}
     challenger = client.get_model_version_by_alias(registered_name, "challenger")
     assert str(challenger.version) == version
 
@@ -451,6 +464,10 @@ def test_register_challenger_leaves_pending_and_no_alias_on_parity_failure(
                 "p_hat": np.zeros(len(X_golden)).tolist(),
             },
             "calibration/golden_predictions.json",
+        )
+        mlflow.log_dict(
+            {"tuning_summary": {"selected_hyperparameters": {"num_leaves": 31}}},
+            "training_manifest.json",
         )
 
     with pytest.raises(AssertionError, match="Golden-parity check failed"):
@@ -677,6 +694,10 @@ def test_register_resolves_eval_and_error_analysis_run_id_from_receipts_on_first
     assert tags["error_analysis_run_id"] == error_analysis_run_id
     assert tags["test_pr_auc"] == "0.65"
     assert tags["test_recall"] == "0.7"
+    # cold_start regime, run_name="evaluation" (this fixture's defaults) —
+    # gate_source resolves to v1_cold_start, never plain "evaluate" (§E9).
+    assert tags["gate_source"] == "v1_cold_start"
+    assert "gate_pr_auc_delta" not in tags
 
 
 def test_register_receipt_for_different_model_version_raises(
@@ -1103,6 +1124,82 @@ def test_build_drift_reference_inputs_row_count_equals_sum_of_both_halves(
     )
 
     assert len(oos_proba) == len(dev_oof) + len(test_predictions)
+
+
+# ---------------------------------------------------------------------------
+# _tag_gate_source / tag_pre_seal_screen_rejected
+# ---------------------------------------------------------------------------
+
+
+def test_tag_gate_source_evaluate_comparative_regime(
+    register_cfg: DictConfig, fitted_model: LogisticRegression, X_golden: pd.DataFrame
+) -> None:
+    """A comparative-regime decision logged on an 'evaluation' run (the rare
+    trigger path, not cold start) tags gate_source=evaluate, never
+    performance_check or v1_cold_start."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+    with mlflow.start_run(run_name="evaluation") as run:
+        eval_run_id = run.info.run_id
+    decision = {"regime": "comparative", "criteria": {}}
+
+    client = mlflow.tracking.MlflowClient()
+    register._tag_gate_source(client, registered_name, version, eval_run_id, decision)
+
+    tags = client.get_model_version(registered_name, version).tags
+    assert tags["gate_source"] == "evaluate"
+    assert "gate_pr_auc_delta" not in tags
+
+
+def test_tag_gate_source_performance_check_tags_pr_auc_delta(
+    register_cfg: DictConfig, fitted_model: LogisticRegression, X_golden: pd.DataFrame
+) -> None:
+    """A decision logged on a 'performance_check' run tags
+    gate_source=performance_check and gate_pr_auc_delta — the one scalar
+    that is literally decide_promotion's admitting criterion on a routine
+    cycle, currently untagged anywhere else."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+    with mlflow.start_run(run_name="performance_check") as run:
+        eval_run_id = run.info.run_id
+    decision = {
+        "regime": "comparative",
+        "criteria": {"pr_auc": {"delta_obs": 0.021}},
+    }
+
+    client = mlflow.tracking.MlflowClient()
+    register._tag_gate_source(client, registered_name, version, eval_run_id, decision)
+
+    tags = client.get_model_version(registered_name, version).tags
+    assert tags["gate_source"] == "performance_check"
+    assert tags["gate_pr_auc_delta"] == "0.021"
+
+
+def test_tag_pre_seal_screen_rejected_tags_rejected_with_reason(
+    register_cfg: DictConfig, fitted_model: LogisticRegression, X_golden: pd.DataFrame
+) -> None:
+    """The third _tag_rejected dispatch mode: no promotion_decision.json
+    exists yet (neither evaluate.py nor performance_check.py has run this
+    cycle), so this bypasses that read entirely and tags rejected directly —
+    training_cycle.py's (Phase 10b) response to a caught threshold.py
+    RuntimeError."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+
+    register.tag_pre_seal_screen_rejected(
+        version, "pre_seal_screen_failed: within_ci", register_cfg
+    )
+
+    client = mlflow.tracking.MlflowClient()
+    tag_data = client.get_model_version(registered_name, version)
+    assert tag_data.tags["promotion_status"] == "rejected"
+    assert "within_ci" in tag_data.description
 
 
 # ---------------------------------------------------------------------------
@@ -1764,3 +1861,94 @@ def test_refresh_champion_reference_rejects_stale_metrics_content_hash(
 
     with pytest.raises(ValueError, match="metrics_content_hash"):
         register.refresh_champion_reference(version, register_cfg)
+
+
+# ---------------------------------------------------------------------------
+# tag_threshold_rerun
+# ---------------------------------------------------------------------------
+
+
+def test_tag_threshold_rerun_tags_from_receipt(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """The common, first-ever-rerun path: no threshold_run_id tag exists
+    yet, so this resolves from models.threshold's own receipt and tags it."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="promoted"
+    )
+    write_threshold_rerun_receipt(version, "a_threshold_run_id", register_cfg)
+
+    result = register.tag_threshold_rerun(version, register_cfg)
+
+    assert result == {
+        "model_version": version,
+        "threshold_run_id": "a_threshold_run_id",
+        "previous_threshold_run_id": None,
+    }
+    client = mlflow.tracking.MlflowClient()
+    tags = client.get_model_version(registered_name, version).tags
+    assert tags["threshold_run_id"] == "a_threshold_run_id"
+
+
+def test_tag_threshold_rerun_overwrites_a_prior_tag(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """A second costs.yaml edit during the same version's tenure supersedes
+    the first re-run's tag — unlike eval_run_id/error_analysis_run_id, this
+    tag is never trusted forever once set."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="promoted"
+    )
+    write_threshold_rerun_receipt(version, "first_threshold_run_id", register_cfg)
+    register.tag_threshold_rerun(version, register_cfg)
+    write_threshold_rerun_receipt(version, "second_threshold_run_id", register_cfg)
+
+    result = register.tag_threshold_rerun(version, register_cfg)
+
+    assert result == {
+        "model_version": version,
+        "threshold_run_id": "second_threshold_run_id",
+        "previous_threshold_run_id": "first_threshold_run_id",
+    }
+    client = mlflow.tracking.MlflowClient()
+    tags = client.get_model_version(registered_name, version).tags
+    assert tags["threshold_run_id"] == "second_threshold_run_id"
+
+
+def test_tag_threshold_rerun_rejects_non_promoted_version(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """A pending or rejected version was never serving traffic, so it has no
+    shipped threshold for a costs.yaml change to update."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="pending"
+    )
+
+    with pytest.raises(RuntimeError, match="not 'promoted'"):
+        register.tag_threshold_rerun(version, register_cfg)
+
+
+def test_tag_threshold_rerun_receipt_for_different_model_version_raises(
+    register_cfg: DictConfig,
+    fitted_model: LogisticRegression,
+    X_golden: pd.DataFrame,
+) -> None:
+    """A stale reports/threshold_rerun_receipt.json left over from a
+    different cycle on this machine must not be silently trusted."""
+    registered_name = str(register_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_version(
+        registered_name, fitted_model, X_golden, promotion_status="promoted"
+    )
+    write_threshold_rerun_receipt("999", "a_threshold_run_id", register_cfg)
+
+    with pytest.raises(RuntimeError, match="threshold_rerun_receipt"):
+        register.tag_threshold_rerun(version, register_cfg)

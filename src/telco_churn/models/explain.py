@@ -255,8 +255,8 @@ def direction_sanity_check(
     established sign (+1/-1); a feature matching no key has no established
     relationship to contradict and is recorded as checked=False rather than
     silently counted as a pass. threshold.py's pre-seal screen calls this on
-    the champion's own dev-SHAP top-k as a binding veto
-    (`v3_direction_sanity`); error_analysis.py calls it again on the sealed-
+    the champion's own dev-SHAP top-k as a binding veto (`direction_sanity`,
+    ANALYSIS.md's V3); error_analysis.py calls it again on the sealed-
     test SHAP ranking as a reported-only re-audit
     (`direction_sanity_check_test`) — a sign flip on a feature this
     influential means the model is fitting an artifact, and no aggregate
@@ -307,7 +307,7 @@ def check_top_k_elbow(
 ) -> dict[str, Any]:
     """Verify the plateau-then-elbow shape that justified `configured_k` still holds.
 
-    `v3_top_k_features` (threshold.py), `top_k_dependence_features`,
+    `direction_sanity_top_k_features` (threshold.py), `top_k_dependence_features`,
     `top_k_cohort_gap_features`, and `top_k_cohort_gap_features_fp_tn`
     (error_analysis.py) were each hand-derived once from the sorted deltas of
     exactly this kind of ranking (see their config comments), and nothing

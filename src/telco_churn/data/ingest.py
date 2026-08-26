@@ -19,6 +19,7 @@ from telco_churn.utils.paths import get_project_root
 __all__ = [
     "IngestReceipt",
     "load_raw_csv",
+    "seed_training_pool",
     "ingest",
 ]
 
@@ -36,6 +37,7 @@ class IngestReceipt:
     csv_rows: int
     null_counts: dict[str, int]
     frame_checksum: str
+    training_pool_rows_seeded: int
 
 
 logger = get_logger(__name__)
@@ -136,6 +138,43 @@ def _merge_from_staging(update_cols: list[str], engine: Engine) -> int:
     return int(result.rowcount)
 
 
+def seed_training_pool(df: pd.DataFrame, engine: Engine) -> int:
+    """Seed training_pool from the just-ingested customers_raw dataframe.
+
+    Write path 1 of two — the one-time, DVC-tracked seed, sharing this DVC
+    `ingest` stage rather than a stage of
+    its own, since it's a deterministic function of customers_raw, which is
+    itself a deterministic function of the static raw CSV. reserve_month is
+    left NULL for every row here: NULL means "the original CSV-seeded
+    population," not "not yet reserved" — a customerid legitimately gets a
+    second row later, with a non-null reserve_month, once its reserve cohort
+    matures and the out-of-DVC cyclical reshape function (Phase 10b's
+    training_cycle.py) appends it. That second row is untouched here.
+
+    Idempotent the same way customers_crm's load_crm() is: delete-and-reload,
+    scoped to just the reserve_month IS NULL rows this function owns (a plain
+    customerid upsert doesn't apply — customerid is not unique in
+    training_pool by design, so there is no ON CONFLICT target). A rerun
+    never duplicates the seed and never touches rows write path 2 already
+    appended.
+
+    Returns the number of rows (re)seeded.
+    """
+    seed_columns = [c for c in df.columns if c != "reserve_month"]
+    seed = df[seed_columns]
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM training_pool WHERE reserve_month IS NULL"))
+        seed.to_sql(
+            "training_pool",
+            conn,
+            if_exists="append",
+            index=False,
+            method="multi",
+            chunksize=1000,
+        )
+    return len(seed)
+
+
 def ingest(
     path: Path,
     engine: Engine | None = None,
@@ -151,7 +190,9 @@ def ingest(
 
     This mirrors the dbt incremental model pattern used in production warehouses
     (Snowflake / BigQuery MERGE). The main table's PRIMARY KEY is never dropped;
-    the merge is fully atomic. Returns an IngestReceipt describing the load.
+    the merge is fully atomic. Also seeds training_pool from the same validated
+    dataframe (seed_training_pool, write path 1) once the customers_raw merge
+    succeeds. Returns an IngestReceipt describing the load.
 
     min_rows/max_null_rate feed validate_raw's gate-5 thresholds and default to
     the same checks.py constants validate_raw itself falls back to, so a direct
@@ -187,11 +228,14 @@ def ingest(
             "not per-row constraint violations."
         )
     logger.info("merge_complete", db_rows=n, csv_rows=csv_rows, table="customers_raw")
+    n_seeded = seed_training_pool(df, engine)
+    logger.info("training_pool_seeded", rows_seeded=n_seeded)
     return IngestReceipt(
         rows_loaded=n,
         csv_rows=csv_rows,
         null_counts={col: int(df[col].isna().sum()) for col in df.columns},
         frame_checksum=frame_checksum(df),
+        training_pool_rows_seeded=n_seeded,
     )
 
 

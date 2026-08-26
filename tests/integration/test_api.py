@@ -97,7 +97,7 @@ def test_customer_lookup_returns_crm_snapshot(api_client: TestClient) -> None:
     """Response is CustomerLookupResponse{features, crm_snapshot_at}, sourced
     from customers_crm — tenure/monthlycharges carry the seeded CRM nudge, so
     this asserts plausible bounds rather than the exact training-time value
-    (see prediction_logging_plan.md Part A / conftest.py::serving_postgres_url).
+    (see conftest.py::serving_postgres_url).
     """
     response = api_client.get("/customer/serve-0001")
 
@@ -170,8 +170,8 @@ def test_metrics_exposes_prediction_counters_after_traffic(
 # ---------------------------------------------------------------------------
 # prediction_log — serving/prediction_log.py's BackgroundTasks write,
 # exercised through the real HTTP path rather than a standalone subprocess
-# test (prediction_log.py has no __main__; see prediction_logging_plan.md
-# Part B §B6). TestClient runs a request's background tasks synchronously as
+# test (prediction_log.py has no __main__). TestClient runs a request's
+# background tasks synchronously as
 # part of the request/response cycle, so the row is already committed by the
 # time these assertions run.
 # ---------------------------------------------------------------------------

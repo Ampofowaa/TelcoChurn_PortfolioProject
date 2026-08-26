@@ -1,8 +1,9 @@
 """Integration test: the Alembic migration chain's up/down/up roundtrip
-against a real testcontainers Postgres — the actual proof the four
+against a real testcontainers Postgres — the actual proof the five
 migrations (customers_raw, customers_crm, prediction_log,
-prediction_outcomes) are reversible, not just that `alembic upgrade head`
-produces the right schema (PROJECT_PLAN.md's Phase 10a-i Verification).
+prediction_outcomes, training_pool) are reversible, not just that
+`alembic upgrade head` produces the right schema (PROJECT_PLAN.md's Phase
+10a-i Verification, extended to training_pool by Phase 10a-ii §E1).
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ _MIGRATED_TABLES = {
     "customers_crm",
     "prediction_log",
     "prediction_outcomes",
+    "training_pool",
 }
 
 
@@ -43,7 +45,7 @@ def pg_url() -> Iterator[str]:
         yield pg.get_connection_url(driver=None)
 
 
-def test_upgrade_head_creates_all_four_tables_with_expected_shape(
+def test_upgrade_head_creates_all_five_tables_with_expected_shape(
     pg_url: str,
 ) -> None:
     apply_migrations(pg_url)
@@ -67,6 +69,18 @@ def test_upgrade_head_creates_all_four_tables_with_expected_shape(
             set(uc["column_names"]) == {"customerid", "observed_at", "source"}
             for uc in outcome_unique_constraints
         )
+
+        training_pool_columns = {
+            col["name"]: col for col in inspector.get_columns("training_pool")
+        }
+        assert training_pool_columns["reserve_month"]["nullable"] is True
+        assert training_pool_columns["churn"]["nullable"] is False
+        training_pool_index_columns = {
+            column
+            for idx in inspector.get_indexes("training_pool")
+            for column in idx["column_names"]
+        }
+        assert "reserve_month" in training_pool_index_columns
     finally:
         engine.dispose()
 

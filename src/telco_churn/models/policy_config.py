@@ -129,8 +129,10 @@ def load_policy_thresholds(cfg: DictConfig) -> DictConfig:
     return loaded
 
 
-def load_threshold_payload(run_id: str, cfg: DictConfig) -> DictConfig:
-    """Load threshold/threshold.json off the model's own MLflow run.
+def load_threshold_payload(
+    run_id: str, cfg: DictConfig, threshold_run_id: str | None = None
+) -> DictConfig:
+    """Load threshold/threshold.json off the model's own MLflow run, or a costs.yaml-only re-run's fresh one.
 
     The model-run-scoped counterpart to load_policy_thresholds' local-file
     read: reports/policy/threshold.yaml is model-independent by construction
@@ -142,6 +144,14 @@ def load_threshold_payload(run_id: str, cfg: DictConfig) -> DictConfig:
     does — a rollback to a different champion must not leave the API serving
     a threshold derived for a version it no longer runs.
 
+    threshold_run_id, given, is that model version's own threshold_run_id
+    tag (register.py's tag_threshold_rerun) — the fresh, small run a
+    costs.yaml-only change re-derived t* onto, superseding the training
+    run's original threshold.json without minting a new model version. None
+    (the common case: no costs.yaml change since promotion) falls back to
+    run_id, the training run threshold.py originally logged
+    threshold/threshold.json onto.
+
     threshold.py's threshold_payload["scenarios"] is the raw per-scenario
     results dict — each entry already carries .threshold and
     .costs.{arpu,ltv,c,r}, the exact shape resolve_policy_scenarios/
@@ -150,7 +160,10 @@ def load_threshold_payload(run_id: str, cfg: DictConfig) -> DictConfig:
     both of those, no separate reconstruction needed.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    payload = mlflow.artifacts.load_dict(f"runs:/{run_id}/threshold/threshold.json")
+    effective_run_id = threshold_run_id if threshold_run_id else run_id
+    payload = mlflow.artifacts.load_dict(
+        f"runs:/{effective_run_id}/threshold/threshold.json"
+    )
     loaded = OmegaConf.create(payload)
     assert isinstance(loaded, DictConfig)
     return loaded

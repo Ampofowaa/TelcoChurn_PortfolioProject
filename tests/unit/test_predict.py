@@ -212,6 +212,37 @@ def test_resolve_champion_model_cold_start_loads_the_aliased_version(
     assert bundle.explainer is not None
 
 
+def test_build_model_bundle_resolves_threshold_through_threshold_run_id_tag(
+    predict_cfg: DictConfig,
+) -> None:
+    """A costs.yaml-only re-run's threshold_run_id tag (register.py's
+    tag_threshold_rerun) supersedes the training run's own threshold.json,
+    without a new model version."""
+    name = str(predict_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_model(name, seed=1, threshold=0.4)
+    with mlflow.start_run() as rerun_run:
+        mlflow.log_dict(
+            {
+                "threshold": 0.55,
+                "scenario": "base",
+                "scenarios": {
+                    "base": {
+                        "threshold": 0.55,
+                        "costs": {"c": 60.0, "r": 0.3, "ltv": 500.0, "arpu": 70.0},
+                    },
+                },
+            },
+            "threshold/threshold.json",
+        )
+        rerun_run_id = rerun_run.info.run_id
+    client = mlflow.tracking.MlflowClient()
+    client.set_model_version_tag(name, version, "threshold_run_id", rerun_run_id)
+
+    bundle = predict.build_model_bundle(version, predict_cfg)
+
+    assert bundle.thresholds["base"] == pytest.approx(0.55)
+
+
 def test_resolve_champion_model_refresh_is_a_noop_on_unchanged_alias(
     predict_cfg: DictConfig,
 ) -> None:

@@ -262,6 +262,35 @@ def test_load_threshold_payload_is_a_drop_in_for_resolve_policy_helpers(
     assert thresholds["base"] == pytest.approx(0.39)
 
 
+def test_load_threshold_payload_resolves_through_threshold_run_id_when_given(
+    mlflow_test_experiment: Callable[[str], str],
+) -> None:
+    """threshold_run_id, given, overrides run_id — a costs.yaml-only re-run's
+    fresh run supersedes the training run's original threshold.json without
+    minting a new model version."""
+    tracking_uri = mlflow_test_experiment("test-load-threshold-payload-rerun-tag")
+    with mlflow.start_run() as training_run:
+        mlflow.log_dict(
+            {"threshold": 0.39, "scenarios": {}}, "threshold/threshold.json"
+        )
+        training_run_id = training_run.info.run_id
+    with mlflow.start_run() as rerun_run:
+        mlflow.log_dict(
+            {"threshold": 0.44, "scenarios": {}}, "threshold/threshold.json"
+        )
+        rerun_run_id = rerun_run.info.run_id
+
+    cfg = OmegaConf.create({"mlflow": {"tracking_uri": tracking_uri}})
+
+    fallback_payload = load_threshold_payload(training_run_id, cfg)
+    overridden_payload = load_threshold_payload(
+        training_run_id, cfg, threshold_run_id=rerun_run_id
+    )
+
+    assert fallback_payload.threshold == pytest.approx(0.39)
+    assert overridden_payload.threshold == pytest.approx(0.44)
+
+
 # ---------------------------------------------------------------------------
 # load_model_promotion_bars
 # ---------------------------------------------------------------------------

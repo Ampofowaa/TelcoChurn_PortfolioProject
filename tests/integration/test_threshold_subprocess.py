@@ -13,6 +13,7 @@ without ever touching the real configs/costs.yaml.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -354,6 +355,54 @@ def test_threshold_main_cli_ships_policy_regardless_of_dev_oof_screen_verdict(
     # of pass/fail.
     assert (reports_dir / "dev_oof_predictions.parquet").exists()
     assert (reports_dir / "dev_oof_diagnostics.json").exists()
+
+
+def test_threshold_main_cli_rerun_mode_produces_a_fresh_run_and_receipt(
+    registered_threshold_model: tuple[str, str, str, Path],
+    tmp_path: Path,
+) -> None:
+    """threshold.rerun_model_version selects run_threshold_rerun_step instead
+    of the normal derive-and-ship path — no threshold.model_version override
+    given, and the CLI still exits 0 without ever needing the dev-OOF
+    screen's own verdict (the rerun mode doesn't run it)."""
+    tracking_uri, registered_model_name, model_version, data_dir = (
+        registered_threshold_model
+    )
+    figures_dir = tmp_path / "figures"
+    policy_dir = tmp_path / "policy"
+    reports_dir = tmp_path / "reports"
+
+    result = _run_threshold_cli(
+        None,
+        tracking_uri,
+        registered_model_name,
+        data_dir,
+        figures_dir,
+        policy_dir,
+        reports_dir,
+        extra_overrides=[f"threshold.rerun_model_version={model_version}"],
+    )
+
+    assert result.returncode == 0, (
+        f"threshold CLI (rerun mode) exited non-zero:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "threshold_rerun_step_done" in result.stdout
+
+    receipt = json.loads(
+        (reports_dir / "threshold_rerun_receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["model_version"] == model_version
+    assert receipt["threshold_run_id"]
+
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+    rerun = client.get_run(receipt["threshold_run_id"])
+    assert rerun.data.tags["source_model_version"] == model_version
+    assert rerun.data.tags["recall_guardrail_result"] in {"pass", "fail"}
+
+    assert (policy_dir / "threshold.yaml").exists()
+    written = OmegaConf.load(policy_dir / "threshold.yaml")
+    assert 0.0 < float(written.threshold) < 1.0
 
 
 def test_threshold_main_cli_exits_one_when_model_version_missing(

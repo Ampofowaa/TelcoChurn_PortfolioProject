@@ -33,9 +33,13 @@ _INTEGRATION = get_project_root() / "tests" / "integration"
 _ROOT = get_project_root()
 _DVC_YAML = _ROOT / "dvc.yaml"
 
-# The one module permitted to bind the sealed test partition (CLAUDE.md,
-# "Modelling Invariants": test set touched once).
-_TEST_PARTITION_OWNER = "models/evaluate.py"
+# The modules permitted to bind the sealed test partition (CLAUDE.md,
+# "Modelling Invariants": test set touched once). models/sealed_test.py
+# (Phase 10a-ii) holds the dataset-agnostic scoring/gate primitives
+# extracted out of evaluate.py's own __main__-bearing module; evaluate.py's
+# __main__ CLI is now a thin wrapper calling into it for the rare/cold-start
+# path.
+_TEST_PARTITION_OWNERS = {"models/evaluate.py", "models/sealed_test.py"}
 
 
 def _src_modules() -> list[Path]:
@@ -95,17 +99,18 @@ def _code_strings(tree: ast.Module) -> list[tuple[int, str]]:
 
 
 def test_only_evaluate_binds_the_test_partition() -> None:
-    """Every `partition()` call outside evaluate.py must discard the test half.
+    """Every `partition()` call outside evaluate.py/sealed_test.py must discard the test half.
 
     `partition(df)` returns (dev_df, test_df). Today artifacts.py, train/common,
-    and evaluate.py call it — and only evaluate.py may keep the second element.
-    Checking the *binding* rather than the import is what makes this precise:
-    the other two legitimately import data.split for the dev half, so an
-    import-level rule would either fail on them or be too weak to mean anything.
+    evaluate.py, and models/sealed_test.py call it — and only evaluate.py/
+    models/sealed_test.py may keep the second element. Checking the *binding*
+    rather than the import is what makes this precise: the other two
+    legitimately import data.split for the dev half, so an import-level rule
+    would either fail on them or be too weak to mean anything.
     """
     offenders: list[str] = []
     for path in _src_modules():
-        if _rel(path) == _TEST_PARTITION_OWNER:
+        if _rel(path) in _TEST_PARTITION_OWNERS:
             continue
         for node in ast.walk(_parse(path)):
             if not isinstance(node, ast.Assign):
@@ -123,21 +128,31 @@ def test_only_evaluate_binds_the_test_partition() -> None:
                         offenders.append(f"{_rel(path)}:{node.lineno}")
 
     assert offenders == [], (
-        "Only models/evaluate.py may bind the test half of partition(); these "
-        f"call sites keep it: {offenders}"
+        "Only models/evaluate.py/models/sealed_test.py may bind the test half "
+        f"of partition(); these call sites keep it: {offenders}"
     )
 
 
+# data/split.py's own sealed_test_ids() (Phase 10a-ii) legitimately calls
+# test_ids() — it's the customerid-set bookkeeping that keeps "who's in the
+# sealed test set" defined in exactly one place, not a bind of the test
+# partition's actual feature/label values. models/sealed_test.py does not
+# call test_ids() directly — it joins down to sealed_test_ids() instead,
+# the same one-choke-point discipline every other partition consumer
+# follows — so it needs no entry here despite legitimately touching the test
+# partition (see _TEST_PARTITION_OWNERS above for that permission instead).
+_TEST_IDS_ALLOWED_CALLERS = {*_TEST_PARTITION_OWNERS, "data/split.py"}
+
+
 def test_test_ids_is_never_called_outside_evaluate() -> None:
-    """`test_ids()` — the direct route to the sealed partition — has no caller but evaluate.py.
+    """`test_ids()` — the direct route to the sealed partition — has no caller but
+    evaluate.py and split.py's own sealed_test_ids() accessor.
 
     split.py defines it and data/__init__.py re-exports it; neither is a call.
-    Today the call count across src/ is zero, which is stronger than the rule
-    requires — this test pins that so a first caller has to be a deliberate act.
     """
     callers: list[str] = []
     for path in _src_modules():
-        if _rel(path) == _TEST_PARTITION_OWNER:
+        if _rel(path) in _TEST_IDS_ALLOWED_CALLERS:
             continue
         for node in ast.walk(_parse(path)):
             if (
@@ -147,7 +162,7 @@ def test_test_ids_is_never_called_outside_evaluate() -> None:
             ):
                 callers.append(f"{_rel(path)}:{node.lineno}")
 
-    assert callers == [], f"test_ids() called outside evaluate.py: {callers}"
+    assert callers == [], f"test_ids() called outside evaluate.py/split.py: {callers}"
 
 
 # --------------------------------------------------------------------------
@@ -416,17 +431,25 @@ def test_every_main_module_has_a_subprocess_test(module_path: Path) -> None:
 # cross-import at all now that register.py's mint step (register_challenger)
 # runs as its own CLI, resolving what it needs from an explicit override or
 # calibrate.py's reports/calibrate_receipt.json rather than an in-process
-# import.
+# import. models/sealed_test.py (§E6) is a plain, non-__main__-bearing module
+# that imports data.split.partition()/sealed_test_ids() and
+# features.build.TARGET_COL for its own dataset-agnostic sealed-test scoring
+# primitives — evaluate.py no longer imports data.split at all now that
+# extraction moved _load_sealed_test_partition() out of it, so
+# "models/evaluate.py" moves off data/split.py's row onto sealed_test.py's;
+# evaluate.py still imports TARGET_COL directly, so it stays on
+# features/build.py's row alongside sealed_test.py.
 _MAIN_MODULE_IMPORT_ALLOWANCES: dict[str, set[str]] = {
     "data/split.py": {
         "models/dev_features.py",
-        "models/evaluate.py",
+        "models/sealed_test.py",
         "models/train/common.py",
     },
     "features/build.py": {
         "models/dev_features.py",
         "models/error_analysis.py",
         "models/evaluate.py",
+        "models/sealed_test.py",
         "models/train/candidates.py",
         "models/train/common.py",
         "models/train/feature_audit.py",
@@ -1054,6 +1077,7 @@ _PATHS_KEY_DVC_LITERALS: dict[str, list[str]] = {
     "raw_data": ["datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv"],
     "processed_data": [
         "datasets/processed/split_manifest.parquet",
+        "datasets/processed/reserve_manifest.parquet",
         "datasets/processed/telco_churn_features.parquet",
     ],
     "policy": ["reports/policy/threshold.yaml"],

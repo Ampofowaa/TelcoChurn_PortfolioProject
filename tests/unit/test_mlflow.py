@@ -19,6 +19,7 @@ import telco_churn.utils.mlflow as tc_mlflow
 from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
     read_calibrate_receipt,
+    read_threshold_rerun_receipt,
     read_train_receipt,
     resolve_calibrated_run,
     resolve_logged_model_id,
@@ -30,6 +31,7 @@ from telco_churn.utils.mlflow import (
     set_registered_model_description,
     set_run_description,
     write_calibrate_receipt,
+    write_threshold_rerun_receipt,
     write_train_receipt,
 )
 from telco_churn.utils.paths import get_project_root
@@ -452,6 +454,37 @@ def test_write_and_read_calibrate_receipt_round_trips(reports_cfg: DictConfig) -
 def test_read_calibrate_receipt_raises_when_absent(reports_cfg: DictConfig) -> None:
     with pytest.raises(FileNotFoundError, match="run_id/model_version"):
         read_calibrate_receipt(reports_cfg)
+
+
+def test_write_and_read_threshold_rerun_receipt_round_trips(
+    reports_cfg: DictConfig,
+) -> None:
+    write_threshold_rerun_receipt("3", "a_threshold_run_id", reports_cfg)
+
+    receipt = read_threshold_rerun_receipt(reports_cfg)
+
+    assert receipt == {"model_version": "3", "threshold_run_id": "a_threshold_run_id"}
+
+
+def test_write_threshold_rerun_receipt_overwrites_on_rerun(
+    reports_cfg: DictConfig,
+) -> None:
+    """Unlike eval/error_analysis receipts, this one is expected to be
+    rewritten across repeated re-runs of the same model version — see
+    register.py::tag_threshold_rerun's docstring."""
+    write_threshold_rerun_receipt("3", "first_run_id", reports_cfg)
+    write_threshold_rerun_receipt("3", "second_run_id", reports_cfg)
+
+    receipt = read_threshold_rerun_receipt(reports_cfg)
+
+    assert receipt["threshold_run_id"] == "second_run_id"
+
+
+def test_read_threshold_rerun_receipt_raises_when_absent(
+    reports_cfg: DictConfig,
+) -> None:
+    with pytest.raises(FileNotFoundError, match="rerun_model_version"):
+        read_threshold_rerun_receipt(reports_cfg)
 
 
 # ---------------------------------------------------------------------------

@@ -10,17 +10,24 @@ import pytest
 
 from telco_churn.data.split import (
     DEV,
+    RESERVE_COL,
     SPLIT_COL,
     TEST,
     dev_ids,
+    load_reserve,
     load_split,
+    make_reserve,
     make_split,
     partition,
+    sealed_test_ids,
+    write_reserve,
     write_split,
 )
+from telco_churn.data.split import reserve_ids as get_reserve_ids  # avoid collection
 from telco_churn.data.split import test_ids as get_test_ids  # avoid pytest collection
 
 _N = 200  # enough rows to stratify comfortably at 20% test size
+_N_RESERVE = 300  # enough test-partition rows for 6 statistically-usable cohorts
 
 
 @pytest.fixture
@@ -198,6 +205,188 @@ def test_partition_unmatched_customerid_raises(manifest: pd.DataFrame) -> None:
     )
     with pytest.raises(ValueError, match="did not match the split manifest"):
         partition(df, manifest)
+
+
+# ---------------------------------------------------------------------------
+# make_reserve / reserve_ids / sealed_test_ids — Phase 10a-ii reserve
+# partition
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def test_ids_labels() -> tuple[pd.Series, pd.Series]:
+    """Synthetic test-partition (customerid, churn) pair — ~30% churn, 300 rows."""
+    rng = np.random.default_rng(1)
+    ids = pd.Series(
+        [f"test-cust-{i:04d}" for i in range(_N_RESERVE)], name="customerid"
+    )
+    labels = pd.Series(rng.choice([0, 1], size=_N_RESERVE, p=[0.7, 0.3]), name="churn")
+    return ids, labels
+
+
+@pytest.fixture
+def reserve_manifest(test_ids_labels: tuple[pd.Series, pd.Series]) -> pd.DataFrame:
+    """A manifest produced by make_reserve, reused by the accessor-helper tests."""
+    ids, labels = test_ids_labels
+    return make_reserve(ids, labels, n_months=6, fraction=0.4, random_state=42)
+
+
+def test_make_reserve_deterministic(
+    test_ids_labels: tuple[pd.Series, pd.Series],
+) -> None:
+    """Same seed produces a byte-identical reserve manifest across repeated calls."""
+    ids, labels = test_ids_labels
+    a = make_reserve(ids, labels, n_months=6, fraction=0.4, random_state=42)
+    b = make_reserve(ids, labels, n_months=6, fraction=0.4, random_state=42)
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_make_reserve_full_coverage(
+    test_ids_labels: tuple[pd.Series, pd.Series],
+) -> None:
+    """Every input customerid appears exactly once in the reserve manifest."""
+    ids, labels = test_ids_labels
+    result = make_reserve(ids, labels, n_months=6, fraction=0.4, random_state=42)
+    assert set(result["customerid"]) == set(ids)
+    assert result["customerid"].is_unique
+
+
+def test_make_reserve_cohorts_are_disjoint_and_within_range(
+    reserve_manifest: pd.DataFrame,
+) -> None:
+    """Every reserved row gets exactly one cohort in [1, n_months]; no overlap is
+    possible by construction (a customerid appears once, with one reserve_month
+    value), but the value range is worth asserting directly."""
+    reserved = reserve_manifest[RESERVE_COL].dropna()
+    assert reserved.between(1, 6).all()
+    assert reserve_manifest["customerid"].is_unique
+
+
+def test_make_reserve_cohort_sizes_are_roughly_balanced(
+    reserve_manifest: pd.DataFrame,
+) -> None:
+    """6 monthly cohorts split the reserved ~40% roughly evenly — the sizing
+    rationale behind choosing 6 months over a larger count (§D1: a longer split
+    would leave too few churners per cohort to be statistically usable)."""
+    cohort_sizes = reserve_manifest[RESERVE_COL].dropna().value_counts()
+    assert set(cohort_sizes.index) == {1, 2, 3, 4, 5, 6}
+    expected_reserved = _N_RESERVE * 0.4
+    expected_per_cohort = expected_reserved / 6
+    for size in cohort_sizes:
+        assert size == pytest.approx(expected_per_cohort, abs=3)
+
+
+def test_make_reserve_preserves_churn_prevalence_per_cohort(
+    test_ids_labels: tuple[pd.Series, pd.Series],
+) -> None:
+    """Each monthly cohort's churn rate stays close to the overall prevalence —
+    the round-robin-per-label assignment is what keeps every cohort
+    'statistically usable' despite the dataset's ~27% real-world churn rate."""
+    ids, labels = test_ids_labels
+    result = make_reserve(ids, labels, n_months=6, fraction=0.4, random_state=42)
+    label_by_id = dict(zip(ids, labels, strict=True))
+    overall_rate = labels.mean()
+    for month in range(1, 7):
+        cohort_ids = result.loc[result[RESERVE_COL] == month, "customerid"]
+        cohort_rate = cohort_ids.map(label_by_id).mean()
+        assert cohort_rate == pytest.approx(overall_rate, abs=0.15)
+
+
+def test_make_reserve_single_class_raises() -> None:
+    """A single-class label column fails the stratification guard loudly."""
+    ids = pd.Series([f"cust-{i:04d}" for i in range(10)])
+    labels = pd.Series([0] * 10)
+    with pytest.raises(ValueError, match="at least 2 classes"):
+        make_reserve(ids, labels, n_months=6, fraction=0.4, random_state=42)
+
+
+def test_make_reserve_invalid_n_months_raises(
+    test_ids_labels: tuple[pd.Series, pd.Series],
+) -> None:
+    """n_months < 1 fails loudly rather than silently producing an empty reserve."""
+    ids, labels = test_ids_labels
+    with pytest.raises(ValueError, match="n_months >= 1"):
+        make_reserve(ids, labels, n_months=0, fraction=0.4, random_state=42)
+
+
+def test_make_reserve_invalid_fraction_raises(
+    test_ids_labels: tuple[pd.Series, pd.Series],
+) -> None:
+    """A fraction outside (0, 1) fails loudly."""
+    ids, labels = test_ids_labels
+    with pytest.raises(ValueError, match="0 < fraction < 1"):
+        make_reserve(ids, labels, n_months=6, fraction=1.5, random_state=42)
+
+
+def test_make_reserve_independent_of_split_random_state(
+    test_ids_labels: tuple[pd.Series, pd.Series],
+) -> None:
+    """make_reserve's own random_state draws are independent of make_split's —
+    changing dev/test's random_seed must never redraw the reserve assignment,
+    and vice versa (§D4's safeguard against a shared random-state stream)."""
+    ids, labels = test_ids_labels
+    reserve_a = make_reserve(ids, labels, n_months=6, fraction=0.4, random_state=42)
+
+    # A completely different (dev, test) split, same reserve random_state — the
+    # reserve manifest must be identical, since it never reads dev/test's stream.
+    unrelated_split = make_split(ids, labels, test_size=0.2, random_state=999)
+    assert unrelated_split is not None  # exercised only for its side effect: none
+    reserve_b = make_reserve(ids, labels, n_months=6, fraction=0.4, random_state=42)
+    pd.testing.assert_frame_equal(reserve_a, reserve_b)
+
+
+def test_write_load_reserve_round_trip(
+    reserve_manifest: pd.DataFrame, tmp_path: Path
+) -> None:
+    """A written reserve manifest loads back identically (content + dtypes)."""
+    path = tmp_path / "reserve_manifest.parquet"
+    write_reserve(reserve_manifest, path)
+    loaded = load_reserve(path)
+    pd.testing.assert_frame_equal(loaded, reserve_manifest)
+
+
+def test_load_reserve_missing_raises(tmp_path: Path) -> None:
+    """Loading a nonexistent reserve manifest fails loudly rather than returning empty."""
+    with pytest.raises(FileNotFoundError, match="Run `dvc repro split` first"):
+        load_reserve(tmp_path / "does_not_exist.parquet")
+
+
+def test_reserve_ids_returns_the_manifest(reserve_manifest: pd.DataFrame) -> None:
+    """reserve_ids() is a thin accessor over the passed-in manifest."""
+    result = get_reserve_ids(reserve_manifest)
+    pd.testing.assert_frame_equal(result, reserve_manifest.reset_index(drop=True))
+
+
+def test_sealed_test_ids_is_a_strict_subset_of_test_ids(
+    test_ids_labels: tuple[pd.Series, pd.Series],
+    reserve_manifest: pd.DataFrame,
+) -> None:
+    """sealed_test_ids() ⊆ test_ids(), and strictly smaller once any reserve exists."""
+    ids, _labels = test_ids_labels
+    split_manifest = pd.DataFrame({"customerid": ids, SPLIT_COL: TEST})
+    full_test = get_test_ids(split_manifest)
+    sealed = sealed_test_ids(split_manifest, reserve_manifest)
+
+    assert set(sealed) <= set(full_test)
+    assert len(sealed) < len(full_test)
+    reserved_ids = set(
+        reserve_manifest.loc[reserve_manifest[RESERVE_COL].notna(), "customerid"]
+    )
+    assert set(sealed).isdisjoint(reserved_ids)
+
+
+def test_sealed_test_ids_no_op_reserve_trips_the_assertion(
+    test_ids_labels: tuple[pd.Series, pd.Series],
+) -> None:
+    """A reserve manifest with every reserve_month NULL (a silent no-op) must
+    trip the defensive assertion, not silently return the full test set."""
+    ids, _labels = test_ids_labels
+    split_manifest = pd.DataFrame({"customerid": ids, SPLIT_COL: TEST})
+    broken_reserve = pd.DataFrame(
+        {"customerid": ids, RESERVE_COL: pd.array([pd.NA] * len(ids), dtype="Int16")}
+    )
+    with pytest.raises(AssertionError):
+        sealed_test_ids(split_manifest, broken_reserve)
 
 
 # ---------------------------------------------------------------------------

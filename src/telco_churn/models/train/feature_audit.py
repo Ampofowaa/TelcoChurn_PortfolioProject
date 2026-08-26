@@ -43,9 +43,9 @@ _RUN_DESCRIPTION = (
 
 
 def _mint_and_audit(
-    X_dev: pd.DataFrame, y_dev: pd.Series, cfg: DictConfig
+    X_train: pd.DataFrame, y_train: pd.Series, cfg: DictConfig
 ) -> dict[str, Any]:
-    """Fit the all-dev permutation-importance selector and the SHAP audit against the full candidate space."""
+    """Fit the all-training-population permutation-importance selector and the SHAP audit against the full candidate space."""
     random_state = int(cfg.random_seed)
     sel = cfg.selection
     estimator_params = lgbm_default_params(cfg, random_state)
@@ -57,8 +57,8 @@ def _mint_and_audit(
     committed_features = list(COMMITTED_FEATURES)
 
     committed_selector = mint_committed_list(
-        X_dev,
-        y_dev,
+        X_train,
+        y_train,
         binary,
         multi_cat,
         numeric,
@@ -71,7 +71,13 @@ def _mint_and_audit(
     )
 
     shap_audit = compute_shap_audit(
-        X_dev, y_dev, committed_features, binary, multi_cat, numeric, estimator_params
+        X_train,
+        y_train,
+        committed_features,
+        binary,
+        multi_cat,
+        numeric,
+        estimator_params,
     )
     high_shap_dropouts = flag_high_shap_dropouts(shap_audit)
 
@@ -84,8 +90,8 @@ def _mint_and_audit(
 
 
 def _log_selection_run(
-    X_dev: pd.DataFrame,
-    y_dev: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
     audits: dict[str, Any],
     cfg: DictConfig,
 ) -> None:
@@ -106,7 +112,7 @@ def _log_selection_run(
                 "data_content_hash": features_sha256(),
             }
         )
-        _log_dev_input(X_dev, y_dev, context="training")
+        _log_dev_input(X_train, y_train, context="training")
         mlflow.log_params(
             {
                 "n_repeats": int(cfg.selection.n_repeats),
@@ -152,11 +158,17 @@ def _log_selection_run(
 
 
 def run_feature_audit_step(
-    X_dev: pd.DataFrame,
-    y_dev: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
     cfg: DictConfig,
 ) -> dict[str, Any]:
     """Audit the already-frozen committed feature set; log the permutation-importance/SHAP diagnostic.
+
+    X_train/y_train is dev-only at cold start (train/__main__.py's call
+    site), dev ∪ matured reserve on a retrain cycle
+    (models/train/common.py::load_training_pool_bundle, §D5) — this step
+    runs every cycle either way, so its diagnostics always describe the
+    population the model actually fit on, not a fixed dev-only snapshot.
 
     The committed feature set is read from features/schema.py::COMMITTED_FEATURES
     (alongside its sibling COMMITTED_FEATURES_DECISION/
@@ -195,8 +207,8 @@ def run_feature_audit_step(
     Returns {"committed_features": [...], "permutation_importance_table": [...],
     "shap_audit": [...], "high_shap_dropouts": [...]}.
     """
-    audits = _mint_and_audit(X_dev, y_dev, cfg)
-    _log_selection_run(X_dev, y_dev, audits, cfg)
+    audits = _mint_and_audit(X_train, y_train, cfg)
+    _log_selection_run(X_train, y_train, audits, cfg)
 
     committed_features = audits["committed_features"]
     high_shap_dropouts = audits["high_shap_dropouts"]

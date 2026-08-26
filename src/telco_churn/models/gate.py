@@ -433,9 +433,9 @@ def check_threshold_screen_passed(validation_payload: dict[str, Any]) -> None:
     """Raise RuntimeError if threshold.py's dev-OOF pre-seal screen failed.
 
     validation_payload["failures"] is the model-dependent half of
-    threshold.py's dev-OOF pre-seal screen (calibration_slope +
-    v3_direction_sanity; V1/V2/V2b are reported-only and never appear here)
-    — this is an independent re-check at every downstream reader
+    threshold.py's dev-OOF pre-seal screen (calibration_slope,
+    direction_sanity, and within_ci; V1/V2/V2b are reported-only and never
+    appear here) — this is an independent re-check at every downstream reader
     (evaluate.py, error_analysis.py, register.py), not a replacement for the
     RuntimeError run_threshold_step itself already raises when the screen
     fails. No override flag: a failed screen means the artifact is not

@@ -13,8 +13,7 @@ sql/schema/003_create_customers_crm.sql exactly — those two files are
 deleted once the Alembic migrations that reproduce them land (see
 PROJECT_PLAN.md's Phase 10a-i). prediction_log/prediction_outcomes have no
 prior CREATE TABLE IF NOT EXISTS file; their column shapes come from
-prediction_logging_plan.md §B1 and PROJECT_PLAN.md's Phase 10a-i deliverable
-list.
+PROJECT_PLAN.md's Phase 10a-i deliverable list.
 """
 
 from __future__ import annotations
@@ -46,6 +45,7 @@ __all__ = [
     "customers_crm",
     "prediction_log",
     "prediction_outcomes",
+    "training_pool",
 ]
 
 metadata = MetaData()
@@ -177,4 +177,26 @@ prediction_outcomes = Table(
         "source",
         name="uq_prediction_outcomes_customer_observed_source",
     ),
+)
+
+# Surrogate BIGINT identity PK, not customerid — same reasoning as
+# prediction_log: a customerid legitimately recurs (once from the one-time
+# CSV seed with reserve_month NULL, once more per matured reserve cohort the
+# cyclical reshape appends), so customerid alone can't be unique here.
+# reserve_month is indexed since it's the fold-forward training query's
+# primary filter predicate.
+training_pool = Table(
+    "training_pool",
+    metadata,
+    Column("training_pool_id", BigInteger, Identity(), primary_key=True),
+    Column("customerid", String(20), nullable=False),
+    *_customer_columns(),
+    Column(
+        "churn",
+        SmallInteger,
+        CheckConstraint("churn IN (0, 1)", name="ck_training_pool_churn_binary"),
+        nullable=False,
+    ),
+    Column("reserve_month", SmallInteger, nullable=True),
+    Index("ix_training_pool_reserve_month", "reserve_month"),
 )

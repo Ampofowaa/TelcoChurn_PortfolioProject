@@ -654,23 +654,63 @@ def _check_trial_count_gate(
         )
 
 
+def _validate_bundle_override(
+    X_train: pd.DataFrame | None,
+    y_train: pd.Series | None,
+    customer_ids: pd.Series | None,
+) -> None:
+    """Raise ValueError if X_train/y_train/customer_ids is a partial override.
+
+    All three or none — a partial override risks silently pairing an
+    overridden X_train with the dev-only customer_ids load_dev_customer_ids()
+    would otherwise supply, misaligning the two by row order.
+    """
+    given = [X_train is not None, y_train is not None, customer_ids is not None]
+    if any(given) and not all(given):
+        raise ValueError(
+            "X_train, y_train, and customer_ids must be given together or not "
+            "at all — a partial override risks silently mixing a dev-only "
+            "customer_ids with an overridden X_train/y_train."
+        )
+
+
 def _load_calibration_inputs(
-    manifest: dict[str, Any], cfg: DictConfig
+    manifest: dict[str, Any],
+    cfg: DictConfig,
+    X_train: pd.DataFrame | None = None,
+    y_train: pd.Series | None = None,
+    customer_ids: pd.Series | None = None,
 ) -> dict[str, Any]:
-    """Load the unfitted committed pipeline and the dev-partition feature/target split."""
+    """Load the unfitted committed pipeline and the fitting population's feature/target/customerid triple.
+
+    X_train/y_train/customer_ids, given together, override the dev-only
+    default with the retrain-cycle bundle (models/train/common.py::
+    load_training_pool_bundle — dev ∪ matured reserve); train/__main__.py's
+    cold-start path never passes them, so `None` still loads dev-only internally, exactly as
+    before this override existed. An overridden X_train is restricted to
+    committed_features here, the same way log_model.py's X_committed already
+    is — the bundle itself carries the full FEATURE_SCHEMA space, not the
+    frozen selection.
+    """
+    _validate_bundle_override(X_train, y_train, customer_ids)
     committed_features = committed_features_from_manifest(manifest)
     pipeline = unfitted_pipeline_from_manifest(manifest)
-    X_dev, y_dev = load_dev_features(committed_features)
+    if X_train is None:
+        X_train, y_train = load_dev_features(committed_features)
+        customer_ids = load_dev_customer_ids()
+    else:
+        X_train = X_train[committed_features]
     return {
         "committed_features": committed_features,
         "pipeline": pipeline,
-        "X_dev": X_dev,
-        "y_dev": y_dev,
+        "X_train": X_train,
+        "y_train": y_train,
+        "customer_ids": customer_ids,
     }
 
 
 def _select_and_render_calibration(
-    pipeline: Pipeline, X_dev: pd.DataFrame, y_dev: pd.Series, cfg: DictConfig
+    pipeline: Pipeline, X_train: pd.DataFrame, y_train: pd.Series, cfg: DictConfig
 ) -> dict[str, Any]:
     """Select the calibration method and render the pre/post-calibration reliability diagram.
 
@@ -679,16 +719,16 @@ def _select_and_render_calibration(
     decided the winning method — not a recomputation, so the picture matches
     the numbers in calibration_summary.json.
     """
-    selection = select_calibration_method(pipeline, X_dev, y_dev, cfg)
+    selection = select_calibration_method(pipeline, X_train, y_train, cfg)
     method = str(selection["method"])
 
     n_bins = int(cfg.calibration.ece_n_bins)
     strategy = str(cfg.calibration.ece_strategy)
     uncalibrated_bins = reliability_diagram_bins(
-        selection["uncalibrated_proba"], y_dev.to_numpy(), n_bins, strategy
+        selection["uncalibrated_proba"], y_train.to_numpy(), n_bins, strategy
     )
     calibrated_bins = reliability_diagram_bins(
-        selection["calibrated_proba"], y_dev.to_numpy(), n_bins, strategy
+        selection["calibrated_proba"], y_train.to_numpy(), n_bins, strategy
     )
     figure_path = (
         get_project_root() / str(cfg.paths.figures) / "reliability_diagram.png"
@@ -709,10 +749,19 @@ def _fit_and_build_golden_fixture(
     pipeline: Pipeline,
     method: str,
     cfg: DictConfig,
-    X_dev: pd.DataFrame,
-    y_dev: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    customer_ids: pd.Series,
 ) -> dict[str, Any]:
     """Fit the calibrated pipeline and build register.py's serving-parity reference.
+
+    customer_ids is the caller's already-resolved id Series — dev-only at
+    cold start, dev ∪ matured reserve on a retrain cycle — row-order-aligned
+    with X_train/y_train by construction (both come from the same
+    _load_calibration_inputs call),
+    so this function no longer independently loads it via
+    load_dev_customer_ids(), which would silently reintroduce a dev-only id
+    set under X_train/y_train's expanded population.
 
     in_memory_preds is the reference for register.py's serving-parity smoke
     check, captured here — while `fitted` is still the live in-memory object
@@ -725,20 +774,19 @@ def _fit_and_build_golden_fixture(
     the round trip was. Rows are stored in full (not just scores), pinned by
     customerid, at the model's committed input schema, so the fixture is
     self-contained and Phase 9/11 can replay it without touching the
-    dataset. Every golden row is a development-partition row the model
-    trained on — in-sample, and therefore reproducibility evidence only,
-    never performance evidence; the "purpose" key travels that caveat with
-    the artifact rather than leaving it to live only in a plan document.
+    dataset. Every golden row is a row the model trained on — in-sample, and
+    therefore reproducibility evidence only, never performance evidence; the
+    "purpose" key travels that caveat with the artifact rather than leaving
+    it to live only in a plan document.
     """
     fitted = build_calibrated_pipeline(pipeline, method, cfg)
-    fitted.fit(X_dev, y_dev)
+    fitted.fit(X_train, y_train)
 
-    dev_customer_ids = load_dev_customer_ids()
     input_example, golden_customer_ids = select_golden_rows(
-        X_dev, dev_customer_ids, int(cfg.calibration.golden_n_rows)
+        X_train, customer_ids, int(cfg.calibration.golden_n_rows)
     )
     in_memory_preds = fitted.predict_proba(input_example)
-    signature = infer_signature(X_dev, fitted.predict_proba(X_dev))
+    signature = infer_signature(X_train, fitted.predict_proba(X_train))
 
     golden_fixture = {
         "purpose": (
@@ -752,7 +800,7 @@ def _fit_and_build_golden_fixture(
 
     return {
         "fitted": fitted,
-        "dev_customer_ids": dev_customer_ids,
+        "customer_ids": customer_ids,
         "input_example": input_example,
         "in_memory_preds": in_memory_preds,
         "signature": signature,
@@ -761,22 +809,24 @@ def _fit_and_build_golden_fixture(
 
 
 def _compute_dev_shap(
-    fitted: CalibratedClassifierCV, X_dev: pd.DataFrame
+    fitted: CalibratedClassifierCV, X_train: pd.DataFrame
 ) -> dict[str, Any]:
     """Compute dev-SHAP values once and rank every transformed feature's (mean_abs_shap, direction).
 
-    This is the evidence threshold.py's V3 pre-seal screen
-    (`v3_direction_sanity`) binds on — computed on the champion's own
-    dev-partition rows, the same ones it trained on, never the sealed test
-    set: V3 is a pre-seal veto and must never require the test partition to
-    evaluate. `configs/threshold/default.yaml`'s `v3_top_k_features`/
-    `v3_min_direction_magnitude` are hand-derived, once, off a real run's
+    This is the evidence threshold.py's pre-seal direction-sanity screen
+    (formerly `v3_direction_sanity`) binds on — computed on the champion's
+    own fitting-population rows (dev-only at cold start, dev ∪ matured
+    reserve on a retrain cycle), the same ones it trained on, never the
+    sealed test set: this is a pre-seal veto
+    and must never require the test partition to evaluate.
+    `configs/threshold/default.yaml`'s `direction_sanity_top_k_features`/
+    `direction_sanity_min_magnitude` are hand-derived, once, off a real run's
     `dev_shap_summary.json` output — this function only produces the
     evidence, it does not itself decide a cutoff.
     """
     preprocessor, booster = unwrap_calibrated_pipeline(fitted)
     shap_values, feature_names, base_value, Xt = compute_shap_values(
-        preprocessor, booster, X_dev
+        preprocessor, booster, X_train
     )
     importance_rows = global_importance(shap_values, feature_names)
     directions = feature_directions(Xt, shap_values, feature_names)
@@ -792,24 +842,25 @@ def _compute_dev_shap(
 
 
 def _compute_calibration_slopes_and_summary(
-    y_dev: pd.Series,
-    dev_customer_ids: pd.Series,
+    y_train: pd.Series,
+    customer_ids: pd.Series,
     selection: dict[str, Any],
     method: str,
     cfg: DictConfig,
 ) -> dict[str, Any]:
     """Compute the calibrated/uncalibrated slopes and assemble calibration_summary.json.
 
-    calibration_summary.json carries calibration_slope (the dev-OOF Cox
-    slope, with a bootstrap CI), uncalibrated_calibration_slope (the same
-    statistic on the pre-calibration OOF vector, paired for comparison — a
-    reliability diagram's bin-level scatter can't by itself distinguish
-    genuine miscalibration from sampling noise, and this pairing is what
-    turns that visual ambiguity into two comparable numbers), and
-    calibration_spec (method/inner_cv_folds/random_state/ensemble — the four
-    fields a future Phase 10 recalibration flow, not yet designed, would
-    need to rebuild an identical CalibratedClassifierCV without re-deriving
-    it).
+    calibration_summary.json carries calibration_slope (the fitting-
+    population OOF Cox slope, with a bootstrap CI — dev-only at cold start,
+    dev ∪ matured reserve on a retrain cycle), uncalibrated_calibration_slope
+    (the same statistic on the
+    pre-calibration OOF vector, paired for comparison — a reliability
+    diagram's bin-level scatter can't by itself distinguish genuine
+    miscalibration from sampling noise, and this pairing is what turns that
+    visual ambiguity into two comparable numbers), and calibration_spec
+    (method/inner_cv_folds/random_state/ensemble — the four fields a future
+    Phase 10 recalibration flow, not yet designed, would need to rebuild an
+    identical CalibratedClassifierCV without re-deriving it).
 
     dev_oof_predictions.parquet is the vector that selected `method`,
     produced its BSS, and will validate t* — computed already as
@@ -819,19 +870,24 @@ def _compute_calibration_slopes_and_summary(
     seeded, and silently diverges from the vector this cycle's decisions
     actually rested on once either isn't true (Phase 10's retraining).
     Segment/protected columns are joined later, by Phase 7's evaluate.py,
-    where the dev-partition feature columns are in hand — this is the
-    minimal vector.
+    where the fitting-population's feature columns are in hand — this is
+    the minimal vector. Keeps the artifact's own on-disk filename
+    (`dev_oof_predictions.parquet`) unchanged even on a retrain cycle where
+    the population is dev ∪ matured reserve — every downstream reader
+    (threshold.py, evaluate.py, drift_reference.py) resolves it by this
+    fixed name via the model's own run_id, so renaming it would be a
+    breaking artifact-contract change for no benefit.
     """
     dev_oof_predictions = pd.DataFrame(
         {
-            "customerid": dev_customer_ids,
-            "y_true": y_dev.reset_index(drop=True),
+            "customerid": customer_ids,
+            "y_true": y_train.reset_index(drop=True),
             "p_hat": selection["calibrated_proba"],
         }
     )
 
     slope = calibration_slope(
-        y_dev,
+        y_train,
         selection["calibrated_proba"],
         n_bootstrap=int(cfg.calibration.slope_bootstrap_n_samples),
         random_state=int(cfg.calibration.random_state),
@@ -847,7 +903,7 @@ def _compute_calibration_slopes_and_summary(
     # bidirectional scatter shows up as a slope near 1 — confirming the
     # visual story instead of merely asserting it.
     uncalibrated_slope = calibration_slope(
-        y_dev,
+        y_train,
         selection["uncalibrated_proba"],
         n_bootstrap=int(cfg.calibration.slope_bootstrap_n_samples),
         random_state=int(cfg.calibration.random_state),
@@ -869,7 +925,7 @@ def _compute_calibration_slopes_and_summary(
         # (CLAUDE.md § Persist the evidence, not just the conclusion).
         "mean_p_hat_calibrated": float(np.mean(selection["calibrated_proba"])),
         "mean_p_hat_uncalibrated": float(np.mean(selection["uncalibrated_proba"])),
-        "observed_churn_rate": float(y_dev.mean()),
+        "observed_churn_rate": float(y_train.mean()),
         # The four fields that reconstruct the fitted CalibratedClassifierCV
         # from this run alone — a future Phase 10 recalibration flow (not yet
         # designed) would rebuild the identical estimator from this block
@@ -981,7 +1037,7 @@ def _log_calibration_run(
             shap_df = pd.DataFrame(
                 dev_shap["shap_values"], columns=dev_shap["feature_names"]
             )
-            shap_df.insert(0, "customerid", golden["dev_customer_ids"].to_numpy())
+            shap_df.insert(0, "customerid", golden["customer_ids"].to_numpy())
             shap_df["base_value"] = dev_shap["base_value"]
             shap_df.to_parquet(shap_path, index=False)
             mlflow.log_artifact(str(shap_path), artifact_path="calibration")
@@ -1010,7 +1066,13 @@ def _log_calibration_run(
     return model_info
 
 
-def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
+def run_calibration_step(
+    run_id: str,
+    cfg: DictConfig,
+    X_train: pd.DataFrame | None = None,
+    y_train: pd.Series | None = None,
+    customer_ids: pd.Series | None = None,
+) -> dict[str, Any]:
     """Calibrate, select a method, and log the fitted pipeline — no registry write.
 
     Fits and logs a pure, deterministic file transform — the calibrated
@@ -1019,6 +1081,16 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     reload parity, and pointing `challenger` is register.py's job
     (register_challenger), run as a separate CLI step after this one — never
     called from this process (see this module's own docstring for why).
+
+    X_train/y_train/customer_ids, given together, override the dev-only
+    default with a caller-resolved fitting population — the retrain-cycle
+    bundle (models/train/common.py::load_training_pool_bundle, dev ∪
+    matured reserve). All three or none; train/__main__.py's cold-start path
+    never passes them, so `None` still
+    loads dev-only internally, exactly as before this override existed.
+    Named to match the bundle's own output-field names, not `X_dev`/`y_dev`
+    — so the value passes through unchanged in both name and meaning from
+    assembly to consumption, with nothing to mislabel on a retrain cycle.
 
     reports/figures/reliability_diagram.png is overwritten on every call —
     it reflects whichever run executed this function most recently on this
@@ -1047,24 +1119,28 @@ def run_calibration_step(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     manifest = load_training_manifest(run_id, cfg)
     _check_trial_count_gate(manifest, run_id, cfg)
 
-    loaded = _load_calibration_inputs(manifest, cfg)
-    X_dev, y_dev = loaded["X_dev"], loaded["y_dev"]
+    loaded = _load_calibration_inputs(manifest, cfg, X_train, y_train, customer_ids)
+    X_train, y_train, customer_ids = (
+        loaded["X_train"],
+        loaded["y_train"],
+        loaded["customer_ids"],
+    )
 
     selection_result = _select_and_render_calibration(
-        loaded["pipeline"], X_dev, y_dev, cfg
+        loaded["pipeline"], X_train, y_train, cfg
     )
     method = selection_result["method"]
 
     golden = _fit_and_build_golden_fixture(
-        loaded["pipeline"], method, cfg, X_dev, y_dev
+        loaded["pipeline"], method, cfg, X_train, y_train, customer_ids
     )
 
     slopes_and_summary = _compute_calibration_slopes_and_summary(
-        y_dev, golden["dev_customer_ids"], selection_result["selection"], method, cfg
+        y_train, golden["customer_ids"], selection_result["selection"], method, cfg
     )
     calibration_summary = slopes_and_summary["calibration_summary"]
 
-    dev_shap = _compute_dev_shap(golden["fitted"], X_dev)
+    dev_shap = _compute_dev_shap(golden["fitted"], X_train)
 
     model_info = _log_calibration_run(
         run_id,

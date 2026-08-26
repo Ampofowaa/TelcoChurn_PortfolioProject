@@ -12,9 +12,9 @@ predict_proba).
 POST /predict/batch's ID-only path no longer resolves against
 calibrate.py's frozen golden_predictions.json values — customer_lookup.py
 resolves against customers_crm, a seeded "current state" derivation that
-deliberately diverges from the training-time snapshot
-(prediction_logging_plan.md Part A), so a customerid-only request and the
-literal golden feature values are no longer expected to agree bit-for-bit.
+deliberately diverges from the training-time snapshot, so a customerid-only
+request and the literal golden feature values are no longer expected to
+agree bit-for-bit.
 What the HTTP/Postgres path must still guarantee is self-consistency: an
 ID-only batch request and an inline request built from that same
 customer's current GET /customer/{id} row must score identically — anything

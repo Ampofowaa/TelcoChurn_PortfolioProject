@@ -260,7 +260,9 @@ def build_model_bundle(version: str, cfg: DictConfig) -> ModelBundle:
     manifest = load_training_manifest(run_id, cfg)
     committed_features = committed_features_from_manifest(manifest)
 
-    policy = load_threshold_payload(run_id, cfg)
+    policy = load_threshold_payload(
+        run_id, cfg, model_version_info.tags.get("threshold_run_id")
+    )
     scenarios = resolve_policy_scenarios(policy)
     thresholds = resolve_policy_thresholds_by_scenario(policy)
 

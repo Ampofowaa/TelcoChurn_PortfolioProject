@@ -8,7 +8,7 @@ Durable capture of every prediction served (or backtested) through
 serving/app.py's /predict and /predict/batch, plus pipelines/batch_predict.py's
 nightly sweep (route='nightly_batch') — the single foundation drift_check.py,
 performance_check.py, and retraining read from. Schema per
-prediction_logging_plan.md §B1 and PROJECT_PLAN.md's Phase 10a-i deliverable.
+PROJECT_PLAN.md's Phase 10a-i deliverable.
 
 prediction_id is a surrogate BIGINT identity, not customerid: the same
 customer is expected to recur across rows (repeat scoring, later cycles),

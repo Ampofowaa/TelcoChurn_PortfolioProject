@@ -34,6 +34,7 @@ from telco_churn.models.train.candidates import run_candidate_step  # noqa: E402
 from telco_churn.models.train.common import (  # noqa: E402
     cv_score_candidate,
     lgbm_default_params,
+    load_training_pool_bundle,
 )
 from telco_churn.models.train.comparison import (  # noqa: E402
     bootstrap_comparison,
@@ -59,6 +60,7 @@ __all__ = [
     "run_candidate_step",
     "run_comparison_step",
     "run_diagnostics_step",
+    "load_training_pool_bundle",
     "run_feature_audit_step",
     "run_feature_selection_step",
     "run_model_logging_step",

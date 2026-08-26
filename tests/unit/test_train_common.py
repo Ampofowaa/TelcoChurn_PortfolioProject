@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from typing import Any
 from unittest.mock import Mock
 
 import mlflow
@@ -152,6 +153,87 @@ def test_load_dev_features_never_touches_test_partition(
     monkeypatch.setattr(common, "partition", lambda df: (dev_df, _PoisonFrame()))
 
     common._load_dev_features()  # raises AssertionError if test_df is touched
+
+
+# ---------------------------------------------------------------------------
+# load_training_pool_bundle (E4) — the retrain-cycle equivalent of
+# _load_dev_features: sourced from training_pool via features/build.py's
+# customer_features query rather than the static processed-features parquet.
+# feature_df already matches SQL_FEATURE_COLS's shape (customerid + every
+# FEATURE_SCHEMA column + churn), so it stands in for load_customer_features's
+# real Postgres read.
+# ---------------------------------------------------------------------------
+
+
+def test_load_training_pool_bundle_returns_expected_shapes(
+    monkeypatch: pytest.MonkeyPatch, feature_df: pd.DataFrame
+) -> None:
+    """X_train/y_train match _load_dev_features's own shape; customer_ids and
+    raw_partition are row-order-aligned with them.
+    """
+    monkeypatch.setattr(
+        common,
+        "load_customer_features",
+        lambda engine, reserve_months=None: feature_df,
+    )
+
+    X_train, y_train, customer_ids, raw_partition = common.load_training_pool_bundle(
+        Mock(), reserve_months=[1, 2]
+    )
+
+    assert set(X_train.columns) == set(common._FEATURE_COLS)
+    assert "customerid" not in X_train.columns
+    assert "churn" not in X_train.columns
+    assert len(X_train) == len(y_train) == len(customer_ids) == len(feature_df)
+    assert y_train.tolist() == raw_partition[TARGET_COL].tolist()
+    assert customer_ids.tolist() == raw_partition["customerid"].tolist()
+    assert set(raw_partition.columns) == set(feature_df.columns)
+
+
+def test_load_training_pool_bundle_passes_engine_and_reserve_months_through(
+    monkeypatch: pytest.MonkeyPatch, feature_df: pd.DataFrame
+) -> None:
+    """engine and reserve_months (the fold-forward filter) reach
+    load_customer_features unchanged — this function adds no filtering logic
+    of its own.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_load(
+        engine: Any, reserve_months: list[int] | None = None
+    ) -> pd.DataFrame:
+        captured["engine"] = engine
+        captured["reserve_months"] = reserve_months
+        return feature_df
+
+    monkeypatch.setattr(common, "load_customer_features", _fake_load)
+    sentinel_engine = Mock()
+
+    common.load_training_pool_bundle(sentinel_engine, reserve_months=[1, 2, 3])
+
+    assert captured["engine"] is sentinel_engine
+    assert captured["reserve_months"] == [1, 2, 3]
+
+
+def test_load_training_pool_bundle_defaults_reserve_months_to_none(
+    monkeypatch: pytest.MonkeyPatch, feature_df: pd.DataFrame
+) -> None:
+    """Omitting reserve_months selects only the seeded population (reserve_month
+    IS NULL) — the same rows _load_dev_features() reads for cold start.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_load(
+        engine: Any, reserve_months: list[int] | None = None
+    ) -> pd.DataFrame:
+        captured["reserve_months"] = reserve_months
+        return feature_df
+
+    monkeypatch.setattr(common, "load_customer_features", _fake_load)
+
+    common.load_training_pool_bundle(Mock())
+
+    assert captured["reserve_months"] is None
 
 
 # ---------------------------------------------------------------------------

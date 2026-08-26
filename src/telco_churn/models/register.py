@@ -61,6 +61,7 @@ from telco_churn.utils.mlflow import (
     ensure_experiment_metadata,
     read_error_analysis_receipt,
     read_eval_receipt,
+    read_threshold_rerun_receipt,
     resolve_calibrated_run,
     set_registered_model_description,
 )
@@ -75,6 +76,8 @@ __all__ = [
     "register_challenger",
     "rollback_champion",
     "run_registration_step",
+    "tag_pre_seal_screen_rejected",
+    "tag_threshold_rerun",
 ]
 
 logger = get_logger(__name__)
@@ -223,6 +226,21 @@ def register_challenger(
     client.set_model_version_tag(
         registered_model_name, version, "logged_model_id", logged_model_id
     )
+    # Resolution source for both hyperparameter pinning and Optuna
+    # warm-starting on a routine reserve-driven cycle —
+    # training_cycle.py (Phase 10b) reads this tag off the
+    # current champion rather than reaching into training_manifest.json's
+    # schema directly, the same one-hop-via-tag indirection logged_model_id
+    # above already establishes. Set at mint time — it needs only
+    # training_manifest.json, available as soon as calibrate.py has run, with
+    # no dependency on a gate outcome that hasn't happened yet.
+    tuning_summary = load_training_manifest(run_id, cfg)["tuning_summary"]
+    client.set_model_version_tag(
+        registered_model_name,
+        version,
+        "tuned_hyperparameters",
+        json.dumps(tuning_summary["selected_hyperparameters"]),
+    )
     # Mint-time default, set before anything downstream can fail: a crash in
     # the parity check below, evaluate.py, error_analysis.py, or the rest of
     # this module leaves this version with no verdict recorded, rather than
@@ -286,23 +304,34 @@ def _describe_criterion(key: str, criterion: dict[str, Any]) -> str:
 
 
 def _rejection_description(
-    decision: dict[str, Any],
+    decision: dict[str, Any] | None,
     reason: str,
     review_entry: dict[str, Any] | None = None,
 ) -> str:
     """One-line human-readable summary for a rejected model version's description field.
 
-    `reason` distinguishes the four rejection paths in run_registration_step
+    `reason` distinguishes the five rejection paths in run_registration_step
     — a human veto, a gate failure, a post-registration smoke-check failure,
-    or a post-alias-flip parity failure — because they mean operationally
-    different things (a reviewer's judgment vs. a metrics problem vs. a
-    serving-artifact problem vs. a rollback that already happened) and must
-    not collapse into one indistinguishable "rejected" string the way the
-    promotion_status tag alone does. `review_entry` is required for
+    a post-alias-flip parity failure, or a pre-seal screen failure caught
+    before any gate ran — because they mean operationally different things
+    (a reviewer's judgment vs. a metrics problem vs. a serving-artifact
+    problem vs. a rollback that already happened vs. a dev-OOF screen veto)
+    and must not collapse into one indistinguishable "rejected" string the
+    way the promotion_status tag alone does. `review_entry` is required for
     "human_rejected" only — the promotion_review.json entry naming who
-    rejected it, when, and why.
+    rejected it, when, and why. `decision` is `None` only for
+    "pre_seal_screen_failed" — no promotion_decision.json exists yet on that
+    path.
     """
     today = datetime.now(UTC).strftime("%Y-%m-%d")
+    if reason.startswith("pre_seal_screen_failed"):
+        return (
+            f"Rejected {today} — the dev-OOF pre-seal screen "
+            "(calibration_slope/direction_sanity/within_ci) failed before "
+            f"either evaluate.py or performance_check.py ever ran this "
+            f"cycle: {reason}."
+        )
+    assert decision is not None, f"decision is required for reason={reason!r}"
     if reason == "human_rejected":
         assert review_entry is not None
         return (
@@ -448,6 +477,13 @@ def rollback_champion(
     in particular — it would leave `champion` pointing at the very
     candidate that just failed its own serving check, which is exactly
     what a rollback exists to prevent.
+
+    ⚠ **Flagged gap, not fixed here:** this function is hardcoded to the
+    `champion` alias throughout (the
+    `promotion_status=promoted` query, the alias read/delete/set calls)
+    despite `promote_to_alias` above already being alias-generic. Phase
+    10b's shadow-staging sequence needs an alias-generic rollback; the fix
+    itself is scoped to that design pass, not re-derived here.
     """
     client = mlflow.tracking.MlflowClient()
     versions = client.search_model_versions(f"name='{registered_model_name}'")
@@ -1328,6 +1364,51 @@ def _tag_gate_criteria(
     )
 
 
+def _tag_gate_source(
+    client: Any,
+    registered_model_name: str,
+    model_version: str,
+    eval_run_id: str,
+    decision: dict[str, Any],
+) -> None:
+    """Tag which module's run produced the binding decision, and — only on a
+    routine cycle — the one scalar that actually gated it.
+
+    Closes a tag-legibility gap: the four `_tag_gate_criteria` tags above are
+    always the **sealed-test**
+    numbers, but on a routine `performance_check.py` cycle those are a
+    same-cycle diagnostic, not what decided promotion — the reserve-cohort
+    comparative delta is. `gate_source` states outright which is which,
+    without requiring a reviewer to open the run and read `promotion_decision
+    .json`'s `regime`/`reserve_month` fields to find out.
+
+    Derived from information already on hand rather than threaded in from a
+    caller — `training_cycle.py` (Phase 10b) doesn't exist yet, so this
+    can't depend on it supplying the value: `performance_check.py` and
+    `evaluate.py` log to differently-named runs (`performance_check` vs
+    `evaluation`), and `evaluate.py`'s own two regimes (`cold_start` vs
+    `comparative`) are already recorded in `decision["regime"]`.
+    """
+    run_name = mlflow.get_run(eval_run_id).info.run_name
+    if run_name == "performance_check":
+        gate_source = "performance_check"
+    elif decision["regime"] == "cold_start":
+        gate_source = "v1_cold_start"
+    else:
+        gate_source = "evaluate"
+
+    client.set_model_version_tag(
+        registered_model_name, model_version, "gate_source", gate_source
+    )
+    if gate_source == "performance_check":
+        client.set_model_version_tag(
+            registered_model_name,
+            model_version,
+            "gate_pr_auc_delta",
+            str(decision["criteria"]["pr_auc"]["delta_obs"]),
+        )
+
+
 def _load_and_verify_evaluation_artifacts(
     client: Any,
     cfg: DictConfig,
@@ -1336,12 +1417,19 @@ def _load_and_verify_evaluation_artifacts(
     model_version: str,
 ) -> dict[str, Any]:
     """Resolve eval_run_id (tagging it if this is the first pass), tag the
-    four gate criteria, and load+verify promotion_decision.json/metrics.json.
+    four gate criteria plus gate_source/gate_pr_auc_delta, and load+verify
+    promotion_decision.json/metrics.json.
 
     Beyond the receipt's one-time bootstrap role, never a local reports/
     path — a fixed path would reflect whichever run last executed
     evaluate.py on this machine, not necessarily this model_version's own
     cycle.
+
+    Confirmed: no `eval_run_id`/`decision_run_id` split is needed here —
+    exactly one evaluation run exists per cycle regardless of which module
+    produced it (`evaluate.py` on a rare cycle, `pipelines/performance_check.py`
+    on a routine one, per the two-gate split), so this function's single
+    `eval_run_id` resolution already covers both sources unchanged.
     """
     eval_run_id = _resolve_and_tag_eval_run_id(
         client, cfg, current_version, registered_model_name, model_version
@@ -1372,6 +1460,9 @@ def _load_and_verify_evaluation_artifacts(
         )
 
     _tag_gate_criteria(client, registered_model_name, model_version, metrics)
+    _tag_gate_source(
+        client, registered_model_name, model_version, eval_run_id, decision
+    )
 
     return {"eval_run_id": eval_run_id, "decision": decision, "metrics": metrics}
 
@@ -1506,6 +1597,71 @@ def refresh_champion_reference(model_version: str, cfg: DictConfig) -> dict[str,
     }
 
 
+def tag_threshold_rerun(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+    """Point `threshold_run_id` at a costs.yaml-only re-run's fresh MLflow run.
+
+    Unlike eval_run_id/error_analysis_run_id above (a one-time decision per
+    model version, trusted from its own tag forever after), threshold_run_id
+    is a pointer expected to move: a costs.yaml change during an
+    already-promoted version's tenure produces a new "current" shipped
+    threshold that supersedes the previous one, rather than a fixed
+    historical fact worth protecting from re-computation. So this always
+    re-resolves from reports/threshold_rerun_receipt.json —
+    models.threshold's run_threshold_rerun_step's own bootstrap pointer,
+    rewritten fresh on every re-run — rather than trusting an existing tag:
+    the receipt is what's current, the tag is what's remembered until the
+    next one.
+
+    Scoped to an already-promoted version, the same restriction
+    refresh_champion_reference enforces above and for the same reason: a
+    pending or rejected version was never serving traffic, so it has no
+    shipped threshold for a costs.yaml change to update. Does not touch the
+    champion/challenger alias, does not run the gate, and does not require
+    human review — a costs.yaml edit is a policy event, not a model event.
+    """
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+    client = mlflow.tracking.MlflowClient()
+    current_version = client.get_model_version(registered_model_name, model_version)
+
+    current_status = current_version.tags.get("promotion_status")
+    if current_status != "promoted":
+        raise RuntimeError(
+            f"Model version {model_version!r} carries promotion_status="
+            f"{current_status!r}, not 'promoted' — only an already-promoted "
+            "version is serving traffic under a shipped threshold a "
+            "costs.yaml change could update."
+        )
+
+    receipt = read_threshold_rerun_receipt(cfg)
+    receipt_model_version = str(receipt["model_version"])
+    if receipt_model_version != str(model_version):
+        raise RuntimeError(
+            "reports/threshold_rerun_receipt.json was written for "
+            f"model_version={receipt_model_version!r}, not "
+            f"{model_version!r} — models.threshold's re-run mode was not "
+            "the last thing run for this model version on this machine. "
+            "Re-run `python -m telco_churn.models.threshold "
+            f"threshold.rerun_model_version={model_version}` first."
+        )
+    threshold_run_id = str(receipt["threshold_run_id"])
+    previous_threshold_run_id = current_version.tags.get("threshold_run_id")
+    client.set_model_version_tag(
+        registered_model_name, model_version, "threshold_run_id", threshold_run_id
+    )
+
+    logger.info(
+        "threshold_rerun_tagged",
+        model_version=model_version,
+        threshold_run_id=threshold_run_id,
+        previous_threshold_run_id=previous_threshold_run_id,
+    )
+    return {
+        "model_version": model_version,
+        "threshold_run_id": threshold_run_id,
+        "previous_threshold_run_id": previous_threshold_run_id,
+    }
+
+
 def _resolve_review_verdict(eval_run_id: str) -> dict[str, Any] | None:
     """Fetch promotion_review.json's latest entry from the eval run, if any exist.
 
@@ -1528,21 +1684,26 @@ def _tag_rejected(
     client: Any,
     registered_model_name: str,
     model_version: str,
-    decision: dict[str, Any],
+    decision: dict[str, Any] | None,
     reason: str,
     review_entry: dict[str, Any] | None = None,
 ) -> None:
     """Tag, describe, and log a rejection — the caller still decides return vs. raise.
 
-    Shared by all four reject sites (human_rejected, gate_fail,
-    smoke_check_failed, post_flip_parity_failed), which differ in control
-    flow: human_rejected and gate_fail return normally, the other two raise
-    from inside an except block. This helper only ever tags/logs — unifying
-    the return-vs-raise decision here too would either swallow a traceback
-    or return instead of propagating. A human veto is a rejection like the
-    other three and must land here too — left at `pending`, it would be
-    indistinguishable from a crash artifact (CLAUDE.md § MLflow Model
-    Registry), the exact ambiguity `promotion_status` exists to prevent.
+    Shared by all five reject sites (human_rejected, gate_fail,
+    smoke_check_failed, post_flip_parity_failed, pre_seal_screen_failed),
+    which differ in control flow: human_rejected and gate_fail return
+    normally, the other three raise from inside an except block (or, for
+    pre_seal_screen_failed, are called by training_cycle.py after catching
+    threshold.py's own RuntimeError — see tag_pre_seal_screen_rejected).
+    This helper only ever tags/logs — unifying the return-vs-raise decision
+    here too would either swallow a traceback or return instead of
+    propagating. A human veto is a rejection like the others and must land
+    here too — left at `pending`, it would be indistinguishable from a crash
+    artifact (CLAUDE.md § MLflow Model Registry), the exact ambiguity
+    `promotion_status` exists to prevent. `decision` is `None` only for
+    pre_seal_screen_failed — no promotion_decision.json exists yet on that
+    path.
     """
     client.set_model_version_tag(
         registered_model_name, model_version, "promotion_status", "rejected"
@@ -1555,9 +1716,42 @@ def _tag_rejected(
     logger.info(
         "model_rejected",
         model_version=model_version,
-        regime=decision["regime"],
+        regime=decision["regime"] if decision is not None else None,
         reason=reason,
     )
+
+
+def tag_pre_seal_screen_rejected(
+    model_version: str, reason: str, cfg: DictConfig
+) -> None:
+    """Tag `model_version` `rejected` immediately for a pre-seal dev-OOF
+    screen failure — the third `_tag_rejected` dispatch mode.
+
+    `register_challenger` mints a version and tags it `pending` using only
+    `calibrate.py`'s receipt, entirely before `threshold.py` ever runs. If
+    `run_threshold_step` then raises (the `calibration_slope`/
+    `direction_sanity`/`within_ci` pre-seal screen failed), that version has
+    no `promotion_decision.json`/`promotion_review.json` to read yet —
+    neither `evaluate.py` nor `performance_check.py` has run this cycle — so
+    the normal `run_registration_step` reject path can't fire. Left alone,
+    the version would sit at `pending`, indistinguishable from a genuine
+    crash artifact, until the stale-`pending` reaper eventually swept it up
+    — the exact version-list ambiguity CLAUDE.md's rollback-legibility
+    reasoning warns against, for a failure the pipeline actually observed
+    and can name.
+
+    Called by `training_cycle.py` (Phase 10b) after it catches
+    `run_threshold_step`'s `RuntimeError`, with `reason` naming the failed
+    criterion (e.g. `"pre_seal_screen_failed: within_ci"`). `register.py`
+    stays the sole registry-tag writer — this only adds a legitimate third
+    way to reach the same `_tag_rejected` helper `gate_fail`/`human_rejected`
+    already use, bypassing the `promotion_decision.json`/`promotion_review
+    .json` read those two paths depend on and that this one has nothing to
+    read yet.
+    """
+    registered_model_name = str(cfg.mlflow.registered_model_name)
+    client = mlflow.tracking.MlflowClient()
+    _tag_rejected(client, registered_model_name, model_version, None, reason)
 
 
 def _resolve_and_tag_error_analysis_run_id(
@@ -1721,6 +1915,13 @@ def _flip_and_confirm(
     Rolls the alias back, tags rejected, and re-raises on a post-flip parity
     failure — the alias must never point at a model that failed its own
     serving check.
+
+    ⚠ The rollback call below is hardcoded to `champion` regardless of
+    `alias` — harmless today (this function is only ever called with
+    `alias="champion"`), but the same flagged, not-fixed-here gap
+    `rollback_champion`'s own docstring names: a future `alias="challenger"`
+    call site (Phase 10b's shadow-staging sequence) would roll back the
+    wrong alias.
     """
     promote_to_alias(registered_model_name, model_version, alias)
     reloaded = mlflow.sklearn.load_model(f"models:/{registered_model_name}@{alias}")
@@ -1941,7 +2142,7 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
            "rejected" tags rejected (human_rejected) and returns; anything
            other than "approved"/"rejected" raises; no entry at all raises.
         5. Independent re-check of threshold.py's dev-OOF pre-seal screen
-           (calibration_slope + v3_direction_sanity) via
+           (calibration_slope + direction_sanity + within_ci) via
            check_threshold_screen_passed — the out-of-band manual
            `evaluate` -> `register` path's backstop: evaluate.py already
            enforces this before promotion_decision.json can exist, but this
@@ -1971,6 +2172,18 @@ def run_registration_step(model_version: str, cfg: DictConfig) -> dict[str, Any]
     leave promotion_status untouched. A genuine smoke-check failure or a
     human rejection tags "rejected" and returns (the smoke-check failure
     also re-raises).
+
+    Does not itself gate on whether this is a "no-op month" — a cycle
+    bit-identical to the current champion (same `data_content_hash`, same
+    resumed Optuna study/selected trial), which resolves to a predictable
+    `rejected`-by-construction outcome. That decision belongs to the
+    *caller* (`training_cycle.py`, Phase 10b):
+    skip calling `register_challenger`/`run_registration_step` at all for a
+    cycle whose `calibrate_receipt.json` `run_id` didn't move — cheaper than
+    minting a version this function would just reject, and avoids
+    unbounded, zero-information growth in the rejected-version audit trail.
+    Hypothetical for this project's own two reserve-driven cycles (neither
+    is a no-op by fold-forward construction); becomes live only beyond them.
     """
     ensure_experiment_metadata(cfg)
     registered_model_name = str(cfg.mlflow.registered_model_name)
@@ -2115,7 +2328,8 @@ if __name__ == "__main__":
     configure_logging()
 
     def _dispatch_mode(cfg: DictConfig) -> str:
-        """Return "refresh", "promote", or "mint" from register.{refresh_reference_version,model_version,run_id}.
+        """Return "refresh", "tag_threshold_rerun", "promote", or "mint" from
+        register.{refresh_reference_version,threshold_rerun_version,model_version,run_id}.
 
         Mutually exclusive, mirroring the run_id/model_version
         disambiguation rule every other stage CLI already follows.
@@ -2124,13 +2338,17 @@ if __name__ == "__main__":
         cold-start re-evaluation (refresh_champion_reference) — see that
         function's docstring for when this is the right operation, distinct
         from both promotion paths below since no gate runs and no alias
-        moves. model_version identifies an already-registered version — the
-        promote/reject path (run_registration_step) — and can only ever
-        mean that, since minting a version *creates* one; passing an
-        existing version to register_challenger would not be a valid
-        request. run_id identifies a calibration run to mint as a new
-        challenger version (register_challenger); giving none of the three
-        also mints, defaulting run_id from calibrate.py's own receipt via
+        moves. threshold_rerun_version identifies an already-promoted
+        version whose threshold_run_id tag needs pointing at
+        models.threshold's own costs.yaml-only re-run (tag_threshold_rerun)
+        — also no gate, no alias move, no human review. model_version
+        identifies an already-registered version — the promote/reject path
+        (run_registration_step) — and can only ever mean that, since minting
+        a version *creates* one; passing an existing version to
+        register_challenger would not be a valid request. run_id identifies
+        a calibration run to mint as a new challenger version
+        (register_challenger); giving none of the four also mints,
+        defaulting run_id from calibrate.py's own receipt via
         resolve_calibrated_run — the same convenience-default shape every
         other stage's __main__ uses.
         """
@@ -2138,6 +2356,7 @@ if __name__ == "__main__":
             name
             for name, value in (
                 ("refresh_reference_version", cfg.register.refresh_reference_version),
+                ("threshold_rerun_version", cfg.register.threshold_rerun_version),
                 ("model_version", cfg.register.model_version),
                 ("run_id", cfg.register.run_id),
             )
@@ -2147,14 +2366,18 @@ if __name__ == "__main__":
             raise ValueError(
                 f"More than one of register.{{{', '.join(given)}}} was given "
                 "— ambiguous: refresh_reference_version re-points an "
-                "already-promoted version's own reference tags, model_version "
-                "selects the promote/reject path for an already-registered "
-                "version, run_id selects the mint path for a not-yet-"
-                "registered calibration run. Pass exactly one, or none to "
-                "mint the most recent calibration run."
+                "already-promoted version's own reference tags, "
+                "threshold_rerun_version points that version's "
+                "threshold_run_id tag at a costs.yaml-only re-run, "
+                "model_version selects the promote/reject path for an "
+                "already-registered version, run_id selects the mint path "
+                "for a not-yet-registered calibration run. Pass exactly "
+                "one, or none to mint the most recent calibration run."
             )
         if cfg.register.refresh_reference_version is not None:
             return "refresh"
+        if cfg.register.threshold_rerun_version is not None:
+            return "tag_threshold_rerun"
         return "promote" if cfg.register.model_version is not None else "mint"
 
     try:
@@ -2166,6 +2389,9 @@ if __name__ == "__main__":
                 str(cfg.register.refresh_reference_version), cfg
             )
             logger.info("reference_refresh_done", **result)
+        elif mode == "tag_threshold_rerun":
+            result = tag_threshold_rerun(str(cfg.register.threshold_rerun_version), cfg)
+            logger.info("threshold_rerun_tag_done", **result)
         elif mode == "promote":
             result = run_registration_step(str(cfg.register.model_version), cfg)
             logger.info("registration_step_done", **result)

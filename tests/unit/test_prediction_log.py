@@ -140,8 +140,8 @@ def test_batch_row_missing_customerid_becomes_none() -> None:
 
 
 def test_shadow_row_serves_champion_but_logs_both_scores() -> None:
-    """prediction_logging_plan.md §B2's shadow.enabled=true, canary.enabled=false
-    worked example: served_source stays "champion" — shadow never routes."""
+    """shadow.enabled=true, canary.enabled=false worked example:
+    served_source stays "champion" — shadow never routes."""
     champion = _bundle("1", "run-champ1")
     challenger = _bundle("2", "run-chal2")
     runtime = predict.ServingRuntime(champion=champion, challenger=challenger)
@@ -177,8 +177,8 @@ def test_shadow_row_serves_champion_but_logs_both_scores() -> None:
 
 
 def test_canary_row_serves_challenger_and_preserves_champion_score() -> None:
-    """prediction_logging_plan.md §B2's canary-routed worked example:
-    model_version/probability flip to the challenger's, but champion_probability
+    """Canary-routed worked example: model_version/probability flip to the
+    challenger's, but champion_probability
     still preserves what the champion alone would have said."""
     champion = _bundle("1", "run-champ1")
     challenger = _bundle("2", "run-chal2")

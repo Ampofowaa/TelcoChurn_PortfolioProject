@@ -43,6 +43,8 @@ _LAZY_SOURCES: dict[str, str] = {
     "TARGET_COL": "telco_churn.features.build",
     "FeatureSchema": "telco_churn.features.build",
     "build_feature_df": "telco_churn.features.build",
+    "build_feature_query": "telco_churn.features.build",
+    "load_customer_features": "telco_churn.features.build",
     "build_sql_features": "telco_churn.features.sql_features",
 }
 
@@ -109,6 +111,8 @@ __all__ = [
     "subgroup_recall",
     "write_provenance",
     "build_feature_df",
+    "build_feature_query",
+    "load_customer_features",
     "TENURE_COHORT_EDGES",
     "build_linear_preprocessor",
     "build_preprocessor",

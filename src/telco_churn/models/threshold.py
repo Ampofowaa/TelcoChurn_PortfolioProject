@@ -11,20 +11,25 @@ estimator import. `run_threshold_step` only reads models.calibrate's
 already-computed OOF arrays and telco_churn.data.split's segment/protected
 columns — never the test partition.
 
-Also runs Phase 7's pre-seal dev-OOF screen as its last step. Two *binding*
-checks, both computed here, before the sealed test set is ever touched:
-re-screens calibrate.py's logged aggregate calibration slope against
-ANALYSIS.md §0's band, and V3 — ranks calibrate.py's logged dev-SHAP summary
-(dev_shap_summary.json), cuts at `v3_top_k_features`, and checks each
-surviving feature's direction against explain.EXPECTED_EDA_DIRECTIONS (no
-shap import here; calibrate.py already computed the SHAP values). Also
-computes V1 (segment collapse), V2 (fairness disparity), and V2b (per-group
-calibration collapse) on the same dev-OOF surface — reported-only, never
-gating (CLAUDE.md's three-guardrail rule) — writing
-reports/dev_oof_predictions.parquet and reports/dev_oof_diagnostics.json for
-evaluate.py, error_analysis.py, register.py, and drift_reference.py to read
-back. Raises RuntimeError, after logging, if the calibration slope or V3
-fails.
+Also runs Phase 7's pre-seal dev-OOF screen as its last step. Three
+*binding* checks, all computed here, before the sealed test set is ever
+touched: re-screens calibrate.py's logged aggregate calibration slope
+against ANALYSIS.md §0's band; direction_sanity (formerly `v3_direction_sanity`,
+still cross-referenced as V3 in ANALYSIS.md's guardrail taxonomy) — ranks
+calibrate.py's logged dev-SHAP summary (dev_shap_summary.json), cuts at
+`direction_sanity_top_k_features`, and checks each surviving feature's
+direction against explain.EXPECTED_EDA_DIRECTIONS (no shap import here;
+calibrate.py already computed the SHAP values); and within_ci — whether the
+closed-form t* falls inside the base scenario's empirical argmax-EV
+bootstrap CI, added to catch a retrain cycle where the inherited operating
+point no longer agrees with
+where expected value is empirically maximised. Also computes V1 (segment
+collapse), V2 (fairness disparity), and V2b (per-group calibration collapse)
+on the same dev-OOF surface — reported-only, never gating (CLAUDE.md's
+three-guardrail rule) — writing reports/dev_oof_predictions.parquet and
+reports/dev_oof_diagnostics.json for evaluate.py, error_analysis.py,
+register.py, and drift_reference.py to read back. Raises RuntimeError, after
+logging, if any of the three binding checks fails.
 """
 
 from __future__ import annotations
@@ -83,10 +88,13 @@ from telco_churn.models.policy_config import (
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (
     TRAINING_CYCLE_RUN_DESCRIPTION,
+    ensure_experiment_metadata,
     resolve_logged_model_id,
     resolve_model_identifier,
+    resolve_model_run_id,
     resolve_tracking_uri,
     set_run_description,
+    write_threshold_rerun_receipt,
 )
 from telco_churn.utils.paths import get_project_root
 
@@ -106,6 +114,7 @@ __all__ = [
     "build_dev_oof_screen_frame",
     "compute_dev_oof_diagnostics",
     "run_threshold_step",
+    "run_threshold_rerun_step",
 ]
 
 logger = get_logger(__name__)
@@ -368,15 +377,25 @@ def load_dev_shap_summary(run_id: str, cfg: DictConfig) -> list[dict[str, Any]]:
 
 
 def build_dev_oof_screen_frame(
-    customerid: pd.Series, y_true: NDArray[np.int_], p_hat: NDArray[np.float64]
+    customerid: pd.Series,
+    y_true: NDArray[np.int_],
+    p_hat: NDArray[np.float64],
+    raw_partition: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Join the already-aligned dev-OOF vector to the dev partition's segment/protected columns.
+    """Join the already-aligned dev-OOF vector to the fitting population's segment/protected columns.
 
     Takes `run_threshold_step`'s own aligned (customerid, y_true, p_hat)
     rather than re-fetching dev_oof_predictions.parquet from MLflow a second
     time — this runs in the same process, right after that alignment.
+
+    raw_partition, given, overrides the dev-only default with the caller-
+    resolved fitting-population raw frame — the retrain-cycle bundle's own
+    fourth field (models/train/common.py::load_training_pool_bundle).
+    `None` (train/__main__.py's cold-start path) loads dev-only via
+    load_dev_partition(), unchanged from today.
     """
-    dev_df = load_dev_partition().set_index("customerid").reindex(customerid)
+    source = raw_partition if raw_partition is not None else load_dev_partition()
+    dev_df = source.set_index("customerid").reindex(customerid)
     segment_lookup = build_segment_lookup(dev_df)
     frame = pd.DataFrame(
         {"customerid": customerid.to_numpy(), "y_true": y_true, "p_hat": p_hat}
@@ -535,15 +554,61 @@ def _save_scenario_ev_curve_plot(
     plt.close(fig)
 
 
-def _load_and_align_dev_oof(run_id: str, cfg: DictConfig) -> dict[str, Any]:
-    """Load the model's dev-OOF probabilities and align them to the dev partition.
+def _validate_bundle_override(
+    X_train: pd.DataFrame | None,
+    y_train: pd.Series | None,
+    customer_ids: pd.Series | None,
+    raw_partition: pd.DataFrame | None,
+) -> None:
+    """Raise ValueError if the four-field training-pool bundle override is partial.
+
+    All four or none — a partial override risks silently pairing an
+    overridden X_train/y_train with the dev-only customer_ids/raw_partition
+    the dev-only default would otherwise supply, misaligning the two by row
+    order.
+    """
+    given = [
+        X_train is not None,
+        y_train is not None,
+        customer_ids is not None,
+        raw_partition is not None,
+    ]
+    if any(given) and not all(given):
+        raise ValueError(
+            "X_train, y_train, customer_ids, and raw_partition must be given "
+            "together or not at all — a partial override risks silently "
+            "mixing a dev-only population with an overridden one."
+        )
+
+
+def _load_and_align_dev_oof(
+    run_id: str,
+    cfg: DictConfig,
+    X_train: pd.DataFrame | None = None,
+    y_train: pd.Series | None = None,
+    customer_ids: pd.Series | None = None,
+) -> dict[str, Any]:
+    """Load the model's OOF probabilities and align them to the fitting population.
 
     Loads calibrate.py's persisted dev_oof_predictions.parquet (for the
     method recorded in calibration_summary.json) rather than recomputing —
     this module never sees a fitted estimator or the raw data split. Aligned
-    by customerid rather than trusted positionally: dev_oof and X_dev/y_dev
-    are two independent loads, and a silent misalignment between them would
-    otherwise never surface.
+    by customerid rather than trusted positionally: dev_oof and
+    X_train/y_train are two independent loads, and a silent misalignment
+    between them would otherwise never surface.
+
+    X_train/y_train/customer_ids, given together, override the dev-only
+    default with the caller-resolved fitting population — the retrain-cycle
+    bundle's first three fields (models/train/common.py::
+    load_training_pool_bundle). An overridden X_train is restricted to
+    committed_features here, the same
+    way calibrate.py's own override is. `None` (train/__main__.py's
+    cold-start path) loads dev-only, unchanged from today — and this also
+    fixes a real bug the override closes: without it, `.reindex(customerid)`
+    silently discards every reserve-cohort row calibrate.py's
+    dev_oof_predictions.parquet logged on a retrain cycle, since reindexing
+    to a subset always finds matches and the `notna().all()` assertion below
+    can't catch it.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
 
@@ -552,53 +617,57 @@ def _load_and_align_dev_oof(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     method = str(calibration_summary["method"])
 
     committed_features = committed_features_from_manifest(manifest)
-    X_dev, y_dev = load_dev_features(committed_features)
+    if X_train is None:
+        X_train, y_train = load_dev_features(committed_features)
+        customer_ids = load_dev_customer_ids()
+    else:
+        assert y_train is not None  # _validate_bundle_override already enforced this
+        X_train = X_train[committed_features]
 
-    customerid = load_dev_customer_ids()
     dev_oof = load_dev_oof_predictions(run_id, cfg).set_index("customerid")
-    aligned = dev_oof.reindex(customerid)
+    aligned = dev_oof.reindex(customer_ids)
     assert aligned["p_hat"].notna().all(), (
         "dev_oof_predictions.parquet is missing rows for one or more "
-        "dev-partition customerids — it no longer matches the current "
-        "features.parquet (was it logged against a different dev partition?)."
+        "fitting-population customerids — it no longer matches the current "
+        "features (was it logged against a different fitting population?)."
     )
     oof_proba = aligned["p_hat"].to_numpy()
-    y_dev_arr = y_dev.to_numpy()
-    assert np.array_equal(aligned["y_true"].to_numpy(dtype=int), y_dev_arr), (
+    y_train_arr = y_train.to_numpy()
+    assert np.array_equal(aligned["y_true"].to_numpy(dtype=int), y_train_arr), (
         "dev_oof_predictions.parquet's y_true does not match the current "
-        "y_dev — the persisted OOF artifact is stale relative to the "
-        "current dev partition."
+        "y_train — the persisted OOF artifact is stale relative to the "
+        "current fitting population."
     )
 
     return {
         "run_id": run_id,
         "calibration_summary": calibration_summary,
         "method": method,
-        "X_dev": X_dev,
-        "y_dev": y_dev,
-        "customerid": customerid,
+        "X_train": X_train,
+        "y_train": y_train,
+        "customer_ids": customer_ids,
         "oof_proba": oof_proba,
-        "y_dev_arr": y_dev_arr,
+        "y_train_arr": y_train_arr,
     }
 
 
 def _derive_scenario_thresholds(
-    X_dev: pd.DataFrame,
-    y_dev: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
     oof_proba: NDArray[np.float64],
-    y_dev_arr: NDArray[np.int_],
+    y_train_arr: NDArray[np.int_],
     cfg: DictConfig,
 ) -> dict[str, Any]:
     """Derive every scenario's threshold and the base scenario's retention-rate sensitivity sweep."""
     costs_cfg = load_costs_config(get_project_root() / str(cfg.paths.costs_config))
-    scenarios = resolve_all_scenarios(X_dev["monthlycharges"], y_dev, costs_cfg)
+    scenarios = resolve_all_scenarios(X_train["monthlycharges"], y_train, costs_cfg)
 
     n_bootstrap = int(costs_cfg.argmax_ev_bootstrap_n_samples)
     random_state = int(cfg.threshold.random_state)
 
     results = {
         name: derive_threshold(
-            oof_proba, y_dev_arr, scenario, n_bootstrap, random_state
+            oof_proba, y_train_arr, scenario, n_bootstrap, random_state
         )
         for name, scenario in scenarios.items()
     }
@@ -641,7 +710,7 @@ def _derive_scenario_thresholds(
 def _render_threshold_figures(
     derived: dict[str, Any],
     oof_proba: NDArray[np.float64],
-    y_dev_arr: NDArray[np.int_],
+    y_train_arr: NDArray[np.int_],
     cfg: DictConfig,
 ) -> dict[str, Any]:
     """Render the three threshold figures and the EV-curve series they (and the persisted artifact) share.
@@ -671,7 +740,7 @@ def _render_threshold_figures(
     _save_scenario_threshold_plot(results, scenario_threshold_path)
 
     ev_curves = {
-        name: expected_value_curve(oof_proba, y_dev_arr, scenario)
+        name: expected_value_curve(oof_proba, y_train_arr, scenario)
         for name, scenario in scenarios.items()
     }
 
@@ -688,29 +757,29 @@ def _render_threshold_figures(
     }
 
 
-def _run_v3_direction_sanity(run_id: str, cfg: DictConfig) -> dict[str, Any]:
-    """V3 pre-seal veto: rank calibrate.py's dev-SHAP summary, cut at
-    `v3_top_k_features`, and check each surviving feature's direction
-    against `explain.EXPECTED_EDA_DIRECTIONS`.
+def _run_direction_sanity_check(run_id: str, cfg: DictConfig) -> dict[str, Any]:
+    """Pre-seal direction-sanity veto (ANALYSIS.md's V3): rank calibrate.py's
+    dev-SHAP summary, cut at `direction_sanity_top_k_features`, and check
+    each surviving feature's direction against `explain.EXPECTED_EDA_DIRECTIONS`.
 
     No shap import here — calibrate.py already computed the SHAP values and
     logged the ranking (`dev_shap_summary.json`); this module only ranks,
     cuts, and checks the already-persisted summary. A top-k feature whose
-    `|direction|` falls below `v3_min_direction_magnitude` is excluded from
-    the checked set (`weak_count`) rather than risking a veto on a sign too
-    unstable/noise-prone to trust.
+    `|direction|` falls below `direction_sanity_min_magnitude` is excluded
+    from the checked set (`weak_count`) rather than risking a veto on a sign
+    too unstable/noise-prone to trust.
     """
     summary = load_dev_shap_summary(run_id, cfg)
-    v3_top_k = int(cfg.threshold.v3_top_k_features)
-    min_direction_magnitude = float(cfg.threshold.v3_min_direction_magnitude)
+    direction_sanity_top_k = int(cfg.threshold.direction_sanity_top_k_features)
+    min_direction_magnitude = float(cfg.threshold.direction_sanity_min_magnitude)
 
     elbow = check_top_k_elbow(
-        [float(row["mean_abs_shap"]) for row in summary], v3_top_k
+        [float(row["mean_abs_shap"]) for row in summary], direction_sanity_top_k
     )
     if not elbow["valid"]:
-        logger.warning("v3_top_k_features_elbow_drifted", **elbow)
+        logger.warning("direction_sanity_top_k_features_elbow_drifted", **elbow)
 
-    top_rows = summary[:v3_top_k]
+    top_rows = summary[:direction_sanity_top_k]
     directions = {str(row["feature"]): float(row["direction"]) for row in top_rows}
     strong_features = [
         str(row["feature"])
@@ -719,14 +788,16 @@ def _run_v3_direction_sanity(run_id: str, cfg: DictConfig) -> dict[str, Any]:
     ]
     weak_count = len(top_rows) - len(strong_features)
 
-    v3_result = direction_sanity_check(
+    direction_sanity_result = direction_sanity_check(
         strong_features, directions, EXPECTED_EDA_DIRECTIONS
     )
-    checked_count = sum(1 for row in v3_result["checked_features"] if row["checked"])
+    checked_count = sum(
+        1 for row in direction_sanity_result["checked_features"] if row["checked"]
+    )
 
     return {
-        "v3_result": v3_result,
-        "v3_top_k_features": v3_top_k,
+        "direction_sanity_result": direction_sanity_result,
+        "direction_sanity_top_k_features": direction_sanity_top_k,
         "top_k_feature_names": [str(row["feature"]) for row in top_rows],
         "checked_count": checked_count,
         "weak_count": weak_count,
@@ -736,31 +807,48 @@ def _run_v3_direction_sanity(run_id: str, cfg: DictConfig) -> dict[str, Any]:
 
 def _run_dev_oof_screen(
     loaded: dict[str, Any],
-    base_threshold: float,
+    base: dict[str, Any],
     cfg: DictConfig,
     random_state: int,
+    raw_partition: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
-    """Screen calibrate.py's logged calibration slope and this module's own
-    V3 direction-sanity veto against ANALYSIS.md §0's bars.
+    """Screen calibrate.py's logged calibration slope, this module's own
+    direction-sanity veto, and the base scenario's within_ci agreement
+    against ANALYSIS.md §0's bars.
 
     Reuses the aligned dev-OOF vector `_load_and_align_dev_oof` already
-    built, never re-fetching dev_oof_predictions.parquet. Returns `failures`
-    (a list of `{criterion, detail, remediation}` dicts, empty iff the
-    screen passes) rather than raising: the caller logs and mirrors the
-    audit trail first, and raises only afterward, so a failing screen is
-    recorded rather than silently vanishing. Exactly two possible entries —
-    `calibration_slope` and `v3_direction_sanity` — never V1/V2/V2b, which
-    stay reported-only per CLAUDE.md's three-guardrail rule. A V3 veto with
-    zero checked features (nothing in the top-k both matched an EDA key and
-    cleared the magnitude floor) is itself a failure: a veto that never fired
-    validated nothing. The V3 top-k elbow-validity check
+    built, never re-fetching dev_oof_predictions.parquet. `base` is
+    `_derive_scenario_thresholds`'s already-computed base-scenario result
+    (threshold, within_ci, argmax_ev_bootstrap_ci, ...) — reused, not
+    re-derived, per the "no new number invented" discipline. `raw_partition`,
+    given, overrides the dev-only default `build_dev_oof_screen_frame` would
+    otherwise load — see that function's own docstring.
+
+    Returns `failures` (a list of `{criterion, detail, remediation}` dicts,
+    empty iff the screen passes) rather than raising: the caller logs and
+    mirrors the audit trail first, and raises only afterward, so a failing
+    screen is recorded rather than silently vanishing. Exactly three
+    possible entries — `calibration_slope`, `direction_sanity`, and
+    `within_ci` — never V1/V2/V2b, which stay reported-only per CLAUDE.md's
+    three-guardrail rule. A direction-sanity veto with zero checked features
+    (nothing in the top-k both matched an EDA key and cleared the magnitude
+    floor) is itself a failure: a veto that never fired validated nothing.
+    The direction-sanity top-k elbow-validity check
     (`explain.check_top_k_elbow`) is recorded into `dev_oof_diagnostics`
     under `direction_sanity_elbow_check` — reported-only like V1/V2/V2b, not
-    a third failure entry, since it only flags that `v3_top_k_features` may
-    need re-deriving by hand, never that the veto itself is untrustworthy.
+    a fourth failure entry, since it only flags that
+    `direction_sanity_top_k_features` may need re-deriving by hand, never
+    that the veto itself is untrustworthy. `within_ci` is a veto only —
+    never auto-re-derives t*, which stays the inherited, already-shipped
+    operating point regardless of this screen's verdict (CLAUDE.md's
+    "guardrails may veto; they may never promote" rule).
     """
+    base_threshold = float(base["threshold"])
     dev_oof_screen_frame = build_dev_oof_screen_frame(
-        loaded["customerid"], loaded["y_dev_arr"], loaded["oof_proba"]
+        loaded["customer_ids"],
+        loaded["y_train_arr"],
+        loaded["oof_proba"],
+        raw_partition,
     )
     slope = loaded["calibration_summary"]["calibration_slope"]
     calibration_slope_band = load_model_promotion_bars(cfg).calibration_slope_band
@@ -768,7 +856,7 @@ def _run_dev_oof_screen(
         slope["slope_ci_lower"], slope["slope_ci_upper"], calibration_slope_band
     )
 
-    v3 = _run_v3_direction_sanity(loaded["run_id"], cfg)
+    direction_sanity = _run_direction_sanity_check(loaded["run_id"], cfg)
 
     failures: list[dict[str, Any]] = []
     if not slope_ok:
@@ -786,30 +874,63 @@ def _run_dev_oof_screen(
                 ),
             }
         )
-    v3_ok = v3["v3_result"]["passed"] and v3["checked_count"] > 0
-    if not v3_ok:
-        if v3["checked_count"] == 0:
+    direction_sanity_ok = (
+        direction_sanity["direction_sanity_result"]["passed"]
+        and direction_sanity["checked_count"] > 0
+    )
+    if not direction_sanity_ok:
+        top_k = direction_sanity["direction_sanity_top_k_features"]
+        if direction_sanity["checked_count"] == 0:
             detail = (
-                f"zero of the dev-SHAP top-{v3['v3_top_k_features']} "
-                "features could be checked against an established EDA "
-                "direction — the veto cannot validate anything this cycle."
+                f"zero of the dev-SHAP top-{top_k} features could be "
+                "checked against an established EDA direction — the veto "
+                "cannot validate anything this cycle."
             )
         else:
-            violation_names = [row["feature"] for row in v3["v3_result"]["violations"]]
+            violation_names = [
+                row["feature"]
+                for row in direction_sanity["direction_sanity_result"]["violations"]
+            ]
             detail = (
-                f"{len(v3['v3_result']['violations'])} of "
-                f"{v3['checked_count']} checked dev-SHAP top-"
-                f"{v3['v3_top_k_features']} features contradict their "
-                f"established EDA direction: {violation_names}"
+                f"{len(direction_sanity['direction_sanity_result']['violations'])} "
+                f"of {direction_sanity['checked_count']} checked dev-SHAP "
+                f"top-{top_k} features contradict their established EDA "
+                f"direction: {violation_names}"
             )
         failures.append(
             {
-                "criterion": "v3_direction_sanity",
+                "criterion": "direction_sanity",
                 "detail": detail,
                 "remediation": (
                     "Investigate whether the model is fitting a "
                     "training-data artifact before evaluating on the "
                     "sealed test set."
+                ),
+            }
+        )
+    if not bool(base["within_ci"]):
+        ci_lower, ci_upper = base["argmax_ev_bootstrap_ci"]
+        failures.append(
+            {
+                "criterion": "within_ci",
+                "detail": (
+                    f"inherited closed-form t*={base_threshold:.4f} falls "
+                    f"outside the base scenario's empirical argmax-EV "
+                    f"bootstrap CI [{ci_lower:.4f}, {ci_upper:.4f}] — the "
+                    "inherited operating point no longer agrees with where "
+                    "expected value is empirically maximised on this "
+                    "cycle's dev-OOF surface."
+                ),
+                "remediation": (
+                    "Check whether this is sampling noise on a small "
+                    "dev-OOF sample first; then re-examine the other "
+                    "calibration method's OOF vector for a local "
+                    "disagreement near t*; if the disagreement is real and "
+                    "persistent across cycles, check the logged "
+                    "costs.arpu in threshold_payload across recent cycles "
+                    "before revisiting configs/costs.yaml's r/LTV/cost "
+                    "inputs deliberately (a reviewed edit, never "
+                    "automatic) — this screen never auto-re-derives t*."
                 ),
             }
         )
@@ -822,11 +943,15 @@ def _run_dev_oof_screen(
         int(cfg.threshold.n_bootstrap),
         random_state,
     )
-    dev_oof_diagnostics["direction_sanity_result"] = v3["v3_result"]
-    dev_oof_diagnostics["direction_check_feature_names"] = v3["top_k_feature_names"]
-    dev_oof_diagnostics["direction_checked_count"] = v3["checked_count"]
-    dev_oof_diagnostics["direction_weak_signal_count"] = v3["weak_count"]
-    dev_oof_diagnostics["direction_sanity_elbow_check"] = v3["elbow"]
+    dev_oof_diagnostics["direction_sanity_result"] = direction_sanity[
+        "direction_sanity_result"
+    ]
+    dev_oof_diagnostics["direction_check_feature_names"] = direction_sanity[
+        "top_k_feature_names"
+    ]
+    dev_oof_diagnostics["direction_checked_count"] = direction_sanity["checked_count"]
+    dev_oof_diagnostics["direction_weak_signal_count"] = direction_sanity["weak_count"]
+    dev_oof_diagnostics["direction_sanity_elbow_check"] = direction_sanity["elbow"]
 
     return {
         "dev_oof_screen_frame": dev_oof_screen_frame,
@@ -1028,6 +1153,22 @@ def _log_threshold_run(
         )
 
 
+def _write_policy_yaml(policy_payload: dict[str, Any], cfg: DictConfig) -> None:
+    """Write reports/policy/threshold.yaml — the model-independent shipped-policy mirror.
+
+    Like reports/figures/reliability_diagram.png, overwritten on every call —
+    the copy on disk reflects the most recent local run, not a specific
+    run_id. Shared by run_threshold_step and run_threshold_rerun_step: a
+    costs.yaml-only re-run genuinely changes the shipped policy this file
+    describes, even though it mints no new model version.
+    """
+    policy_path = get_project_root() / str(cfg.paths.policy) / "threshold.yaml"
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    policy_path.write_text(
+        OmegaConf.to_yaml(OmegaConf.create(policy_payload)), newline="\n"
+    )
+
+
 def _write_threshold_reports(
     loaded: dict[str, Any],
     policy_payload: dict[str, Any],
@@ -1036,24 +1177,18 @@ def _write_threshold_reports(
 ) -> None:
     """Write reports/policy/threshold.yaml and the reports/ dev-OOF mirror.
 
-    Like reports/figures/reliability_diagram.png, these are overwritten on
-    every call — the copy on disk reflects the most recent local run, not a
-    specific run_id. threshold_validation.json is self-describing
-    (model_run_id, model_version), so that is the right place to confirm
-    provenance, not these files' mtimes.
+    threshold_validation.json is self-describing (model_run_id,
+    model_version), so that is the right place to confirm provenance, not
+    these files' mtimes.
     """
-    policy_path = get_project_root() / str(cfg.paths.policy) / "threshold.yaml"
-    policy_path.parent.mkdir(parents=True, exist_ok=True)
-    policy_path.write_text(
-        OmegaConf.to_yaml(OmegaConf.create(policy_payload)), newline="\n"
-    )
+    _write_policy_yaml(policy_payload, cfg)
 
     reports_dir = get_project_root() / str(cfg.paths.reports)
     reports_dir.mkdir(parents=True, exist_ok=True)
     dev_oof_predictions = pd.DataFrame(
         {
-            "customerid": loaded["customerid"].to_numpy(),
-            "y_true": loaded["y_dev_arr"],
+            "customerid": loaded["customer_ids"].to_numpy(),
+            "y_true": loaded["y_train_arr"],
             "p_hat": loaded["oof_proba"],
         }
     )
@@ -1068,7 +1203,13 @@ def _write_threshold_reports(
 
 
 def run_threshold_step(
-    run_id: str, model_version: str, cfg: DictConfig
+    run_id: str,
+    model_version: str,
+    cfg: DictConfig,
+    X_train: pd.DataFrame | None = None,
+    y_train: pd.Series | None = None,
+    customer_ids: pd.Series | None = None,
+    raw_partition: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Derive and ship the cost-sensitive threshold for a registered calibrated model.
 
@@ -1078,24 +1219,39 @@ def run_threshold_step(
     invalidates a previously-derived threshold, and an alias is a moving
     pointer that could later point at a different version.
 
+    X_train/y_train/customer_ids/raw_partition, given together, override the
+    dev-only default with the retrain-cycle bundle (models/train/common.py::
+    load_training_pool_bundle, dev ∪ matured reserve). All four or none;
+    train/__main__.py's cold-start path never passes them, so `None` still derives everything
+    dev-only, unchanged from today. Named to match the bundle's own
+    output-field names — the same naming discipline calibrate.py's own
+    override already follows — so nothing is mislabeled on a retrain cycle.
+
     Finally runs the dev-OOF screen: screens calibrate.py's logged
-    calibration slope against ANALYSIS.md §0's band and computes V1/V2/V2b on
+    calibration slope and this module's own direction-sanity veto against
+    ANALYSIS.md §0's bars, screens the base scenario's within_ci agreement
+    (§D9 — never auto-re-derives t*, only vetoes), and computes V1/V2/V2b on
     the same aligned dev-OOF vector already built for the threshold
     derivation above (no second fetch), writing
     reports/dev_oof_predictions.parquet and reports/dev_oof_diagnostics.json.
-    Raises RuntimeError, after logging, if the calibration slope or the V3
-    direction-sanity veto fails.
+    Raises RuntimeError, after logging, if any of the three binding checks
+    fails.
     """
-    loaded = _load_and_align_dev_oof(run_id, cfg)
+    _validate_bundle_override(X_train, y_train, customer_ids, raw_partition)
+    loaded = _load_and_align_dev_oof(run_id, cfg, X_train, y_train, customer_ids)
     derived = _derive_scenario_thresholds(
-        loaded["X_dev"], loaded["y_dev"], loaded["oof_proba"], loaded["y_dev_arr"], cfg
+        loaded["X_train"],
+        loaded["y_train"],
+        loaded["oof_proba"],
+        loaded["y_train_arr"],
+        cfg,
     )
     figures = _render_threshold_figures(
-        derived, loaded["oof_proba"], loaded["y_dev_arr"], cfg
+        derived, loaded["oof_proba"], loaded["y_train_arr"], cfg
     )
     random_state = int(cfg.threshold.random_state)
     screen = _run_dev_oof_screen(
-        loaded, float(derived["base"]["threshold"]), cfg, random_state
+        loaded, derived["base"], cfg, random_state, raw_partition
     )
     payloads = _assemble_threshold_payloads(
         loaded, derived, model_version, screen["failures"], cfg
@@ -1139,6 +1295,133 @@ def run_threshold_step(
     return result
 
 
+def _recheck_recall_guardrail(
+    oof_proba: NDArray[np.float64],
+    y_train_arr: NDArray[np.int_],
+    t_star: float,
+    recall_bar: float,
+) -> dict[str, Any]:
+    """Recall of "contact iff proba >= t_star" on the dev-OOF vector, checked against ANALYSIS.md §0's recall bar.
+
+    Dev-OOF, never the sealed test set — this module is leak-free by
+    construction and never binds the test partition (CLAUDE.md's
+    test-set-touched-once rule reserves that to evaluate.py). A costs.yaml-
+    only change mints no new model version, so there is nothing for
+    evaluate.py's own sealed-test recall check to run against; this is the
+    leak-free dev-OOF proxy run_threshold_rerun_step checks instead.
+    """
+    predicted = oof_proba >= t_star
+    actual_positive = y_train_arr == 1
+    tp = int(np.sum(predicted & actual_positive))
+    fn = int(np.sum(~predicted & actual_positive))
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    return {"recall": recall, "recall_bar": recall_bar, "passed": recall >= recall_bar}
+
+
+def run_threshold_rerun_step(model_version: str, cfg: DictConfig) -> dict[str, Any]:
+    """Re-derive t* against a costs.yaml-only change, without minting a new model version.
+
+    A costs.yaml edit changes t* = c/(r x LTV) but not the calibrated
+    pipeline itself, so this never fits, calibrates, mints, promotes, or
+    rejects anything — it only re-derives every scenario's threshold from
+    an already-promoted version's own dev-OOF probabilities (the same
+    _load_and_align_dev_oof/_derive_scenario_thresholds machinery
+    run_threshold_step uses, called here with no bundle override — the
+    population is whatever the champion was originally trained on — against
+    whatever configs/costs.yaml currently holds on disk) and rechecks the
+    recall guardrail at the new base-scenario t*.
+
+    Logs to a fresh, small MLflow run rather than model_version's own
+    training run: that run stays a description of the training cycle that
+    produced it, not of every policy edit made afterward. Writes
+    reports/threshold_rerun_receipt.json (this cycle's bootstrap pointer,
+    rewritten fresh on every re-run) so register.py's tag_threshold_rerun
+    can point a threshold_run_id tag at this run without an explicit
+    run_id argument; serving/policy_config.py::load_threshold_payload then
+    resolves through that tag when present, falling back to the training
+    run when it isn't.
+
+    No figures are rendered and reports/dev_oof_predictions.parquet/
+    reports/dev_oof_diagnostics.json are not rewritten — the dev-OOF screen
+    itself did not re-run, only the threshold derived from its
+    already-persisted output. reports/policy/threshold.yaml (the
+    model-independent shipped-policy mirror) is refreshed, since the
+    shipped policy genuinely changed.
+
+    If the recall guardrail fails at the new t*, this does not raise and
+    does not silently ship it either — there is no promotion happening for
+    CLAUDE.md's "guardrails may veto; they may never promote" rule to apply
+    to. Failure is instead a stop-and-look alarm: logged at error level and
+    recorded in both the returned result and the fresh run's validation
+    payload for a human to act on deliberately — the same alarm-on-ambiguity
+    pattern the dummy-floor and within_ci guardrails already use elsewhere
+    in this project, never an automatic retrain trigger by itself.
+    """
+    run_id = resolve_model_run_id(model_version, cfg)
+    loaded = _load_and_align_dev_oof(run_id, cfg)
+    derived = _derive_scenario_thresholds(
+        loaded["X_train"],
+        loaded["y_train"],
+        loaded["oof_proba"],
+        loaded["y_train_arr"],
+        cfg,
+    )
+    base = derived["base"]
+    recall_bar = load_model_promotion_bars(cfg).recall_bar
+    guardrail = _recheck_recall_guardrail(
+        loaded["oof_proba"], loaded["y_train_arr"], float(base["threshold"]), recall_bar
+    )
+
+    payloads = _assemble_threshold_payloads(loaded, derived, model_version, [], cfg)
+    payloads["validation_payload"]["recall_guardrail"] = guardrail
+
+    ensure_experiment_metadata(cfg)
+    with mlflow.start_run(run_name="threshold_rerun") as run:
+        set_run_description(
+            "costs.yaml-only threshold re-run — recomputes t* for an "
+            "already-promoted model version against the current "
+            "configs/costs.yaml, with no new training and no new registry "
+            "version. See threshold/threshold_validation.json's "
+            "recall_guardrail field for whether the new operating point "
+            "still clears ANALYSIS.md §0's recall bar."
+        )
+        mlflow.set_tag("source_run_id", run_id)
+        mlflow.set_tag("source_model_version", model_version)
+        mlflow.log_dict(payloads["threshold_payload"], "threshold/threshold.json")
+        mlflow.log_dict(
+            payloads["validation_payload"], "threshold/threshold_validation.json"
+        )
+        mlflow.set_tag(
+            "costs_config_hash", payloads["policy_payload"]["costs_config_hash"]
+        )
+        mlflow.set_tag(
+            "recall_guardrail_result", "pass" if guardrail["passed"] else "fail"
+        )
+        threshold_run_id = run.info.run_id
+
+    _write_policy_yaml(payloads["policy_payload"], cfg)
+    write_threshold_rerun_receipt(model_version, threshold_run_id, cfg)
+
+    log_fn = logger.info if guardrail["passed"] else logger.error
+    log_fn(
+        "threshold_rerun_done",
+        model_version=model_version,
+        threshold_run_id=threshold_run_id,
+        threshold=base["threshold"],
+        recall_guardrail_passed=guardrail["passed"],
+        recall=guardrail["recall"],
+        recall_bar=guardrail["recall_bar"],
+    )
+
+    return {
+        "model_version": model_version,
+        "threshold_run_id": threshold_run_id,
+        "threshold_payload": payloads["threshold_payload"],
+        "validation_payload": payloads["validation_payload"],
+        "recall_guardrail_passed": guardrail["passed"],
+    }
+
+
 if __name__ == "__main__":
     import sys
 
@@ -1154,15 +1437,26 @@ if __name__ == "__main__":
     try:
         cfg = compose_config(overrides=sys.argv[1:] or None)
         activate_config(cfg)
-        cli_run_id, cli_model_version, _cli_model_uri = resolve_model_identifier(
-            cfg.threshold.run_id, cfg.threshold.model_version, cfg
-        )
-        result = run_threshold_step(cli_run_id, cli_model_version, cfg)
-        logger.info(
-            "threshold_step_done",
-            threshold=result["threshold_payload"]["threshold"],
-            model_version=cli_model_version,
-        )
+        if cfg.threshold.rerun_model_version is not None:
+            rerun_result = run_threshold_rerun_step(
+                str(cfg.threshold.rerun_model_version), cfg
+            )
+            logger.info(
+                "threshold_rerun_step_done",
+                threshold_run_id=rerun_result["threshold_run_id"],
+                model_version=rerun_result["model_version"],
+                recall_guardrail_passed=rerun_result["recall_guardrail_passed"],
+            )
+        else:
+            cli_run_id, cli_model_version, _cli_model_uri = resolve_model_identifier(
+                cfg.threshold.run_id, cfg.threshold.model_version, cfg
+            )
+            result = run_threshold_step(cli_run_id, cli_model_version, cfg)
+            logger.info(
+                "threshold_step_done",
+                threshold=result["threshold_payload"]["threshold"],
+                model_version=cli_model_version,
+            )
     except FileNotFoundError as e:
         logger.error("threshold_data_not_found", error=str(e), exc_info=True)
         sys.exit(1)

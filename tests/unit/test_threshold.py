@@ -19,6 +19,7 @@ import inspect
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import mlflow
 import mlflow.artifacts
@@ -38,6 +39,7 @@ import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
 from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
 from telco_churn.features.preprocessing import build_preprocessor
+from telco_churn.models.gate import GateBars
 from telco_churn.models.policy_config import CostScenario
 from telco_churn.models.train.common import _FEATURE_COLS
 
@@ -491,9 +493,9 @@ def full_cfg(
     needed by the dev-OOF screen folded into run_threshold_step: the screen
     writes reports/dev_oof_predictions.parquet + reports/dev_oof_diagnostics.json
     and checks the aggregate slope against configs/model_promotion.yaml's band.
-    threshold.v3_top_k_features=2 (not the production 8) keeps the V3
-    direction-sanity veto small enough to reason about against this file's
-    synthetic feature set.
+    threshold.direction_sanity_top_k_features=2 (not the production 8) keeps
+    the direction-sanity veto small enough to reason about against this
+    file's synthetic feature set.
 
     Module-scoped, sharing one tmp_path across every test in this file that
     consumes full_cfg/registered_model_version — see registered_model_version's
@@ -538,8 +540,8 @@ def full_cfg(
                 "model_version": None,
                 "random_state": 42,
                 "n_bootstrap": 200,
-                "v3_top_k_features": 2,
-                "v3_min_direction_magnitude": 0.3,
+                "direction_sanity_top_k_features": 2,
+                "direction_sanity_min_magnitude": 0.3,
             },
             "register": {"golden_atol": 1.0e-9},
             "mlflow": {
@@ -693,15 +695,16 @@ def registered_model_version(
     lines up rather than reindexing to all-NaN.
 
     threshold.load_dev_shap_summary is sandboxed to a fixed, EDA-consistent
-    two-feature summary (matching full_cfg's threshold.v3_top_k_features=2) —
+    two-feature summary (matching full_cfg's threshold.direction_sanity_top_k_features=2) —
     _module_feature_df's `churn` column is uniform random noise
     (rng.integers(0, 2)), so the real fitted model's dev-SHAP directions on it
     are themselves noise with no reason to agree with
-    explain.EXPECTED_EDA_DIRECTIONS; without this, the V3 pre-seal veto this
-    module now binds on would non-deterministically fail every consumer of
-    this fixture on a signal this fixture was never designed to carry. V3's
-    own pass/fail mechanics are covered directly, against controlled inputs,
-    in test_run_v3_direction_sanity_* below — not by this shared fixture.
+    explain.EXPECTED_EDA_DIRECTIONS; without this, the direction-sanity
+    pre-seal veto this module now binds on would non-deterministically fail
+    every consumer of this fixture on a signal this fixture was never
+    designed to carry. Its own pass/fail mechanics are covered directly,
+    against controlled inputs, in test_run_direction_sanity_check_* below —
+    not by this shared fixture.
 
     Module-scoped: every consuming test calls run_threshold_step itself (this
     fixture only builds the registered version it's called against), so the
@@ -732,8 +735,8 @@ def registered_model_version(
         )
 
     def _fake_load_dev_shap_summary(run_id: str, cfg: object) -> list[dict]:
-        # >= v3_top_k_features + 1 rows: explain.check_top_k_elbow indexes
-        # deltas[configured_k - 1], which needs len(values) >= configured_k + 1.
+        # >= direction_sanity_top_k_features + 1 rows: explain.check_top_k_elbow
+        # indexes deltas[configured_k - 1], which needs len(values) >= configured_k + 1.
         return [
             {"feature": "numeric__tenure", "mean_abs_shap": 0.5, "direction": -0.9},
             {
@@ -1194,23 +1197,26 @@ def test_run_threshold_step_raises_on_bad_slope_read_from_calibration_summary(
 
 
 # ---------------------------------------------------------------------------
-# _run_v3_direction_sanity — the V3 pre-seal veto's own mechanics, against
-# controlled inputs rather than a real (signal-free) fit.
+# _run_direction_sanity_check — the pre-seal direction-sanity veto's own
+# mechanics (ANALYSIS.md's V3), against controlled inputs rather than a
+# real (signal-free) fit.
 # ---------------------------------------------------------------------------
 
 
-def _v3_cfg(top_k: int, min_direction_magnitude: float = 0.3) -> OmegaConf:
+def _direction_sanity_cfg(
+    top_k: int, min_direction_magnitude: float = 0.3
+) -> OmegaConf:
     return OmegaConf.create(
         {
             "threshold": {
-                "v3_top_k_features": top_k,
-                "v3_min_direction_magnitude": min_direction_magnitude,
+                "direction_sanity_top_k_features": top_k,
+                "direction_sanity_min_magnitude": min_direction_magnitude,
             }
         }
     )
 
 
-def test_run_v3_direction_sanity_passes_on_correctly_signed_top_features(
+def test_run_direction_sanity_check_passes_on_correctly_signed_top_features(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every top-k feature matches an EDA key with the expected sign -> passes."""
@@ -1231,13 +1237,15 @@ def test_run_v3_direction_sanity_passes_on_correctly_signed_top_features(
         ]
 
     monkeypatch.setattr(threshold, "load_dev_shap_summary", _summary)
-    result = threshold._run_v3_direction_sanity("fake-run", _v3_cfg(top_k=2))
-    assert result["v3_result"]["passed"] is True
+    result = threshold._run_direction_sanity_check(
+        "fake-run", _direction_sanity_cfg(top_k=2)
+    )
+    assert result["direction_sanity_result"]["passed"] is True
     assert result["checked_count"] == 2
     assert result["weak_count"] == 0
 
 
-def test_run_v3_direction_sanity_fails_on_contradicting_direction(
+def test_run_direction_sanity_check_fails_on_contradicting_direction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A top-k feature whose direction contradicts EXPECTED_EDA_DIRECTIONS fails."""
@@ -1250,16 +1258,21 @@ def test_run_v3_direction_sanity_fails_on_contradicting_direction(
         ]
 
     monkeypatch.setattr(threshold, "load_dev_shap_summary", _summary)
-    result = threshold._run_v3_direction_sanity("fake-run", _v3_cfg(top_k=1))
-    assert result["v3_result"]["passed"] is False
+    result = threshold._run_direction_sanity_check(
+        "fake-run", _direction_sanity_cfg(top_k=1)
+    )
+    assert result["direction_sanity_result"]["passed"] is False
     assert result["checked_count"] == 1
-    assert result["v3_result"]["violations"][0]["feature"] == "numeric__tenure"
+    assert (
+        result["direction_sanity_result"]["violations"][0]["feature"]
+        == "numeric__tenure"
+    )
 
 
-def test_run_v3_direction_sanity_excludes_weak_direction_from_checked_set(
+def test_run_direction_sanity_check_excludes_weak_direction_from_checked_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A top-k feature whose |direction| falls below v3_min_direction_magnitude
+    """A top-k feature whose |direction| falls below direction_sanity_min_magnitude
     is excluded from the checked set — even though its (unstable) sign here
     would otherwise contradict the established EDA direction."""
 
@@ -1271,13 +1284,15 @@ def test_run_v3_direction_sanity_excludes_weak_direction_from_checked_set(
         ]
 
     monkeypatch.setattr(threshold, "load_dev_shap_summary", _summary)
-    result = threshold._run_v3_direction_sanity("fake-run", _v3_cfg(top_k=1))
+    result = threshold._run_direction_sanity_check(
+        "fake-run", _direction_sanity_cfg(top_k=1)
+    )
     assert result["checked_count"] == 0
     assert result["weak_count"] == 1
-    assert result["v3_result"]["passed"] is True
+    assert result["direction_sanity_result"]["passed"] is True
 
 
-def test_run_v3_direction_sanity_zero_checked_when_no_eda_match(
+def test_run_direction_sanity_check_zero_checked_when_no_eda_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A top-k feature matching no EXPECTED_EDA_DIRECTIONS key is unchecked —
@@ -1294,14 +1309,26 @@ def test_run_v3_direction_sanity_zero_checked_when_no_eda_match(
         ]
 
     monkeypatch.setattr(threshold, "load_dev_shap_summary", _summary)
-    result = threshold._run_v3_direction_sanity("fake-run", _v3_cfg(top_k=1))
+    result = threshold._run_direction_sanity_check(
+        "fake-run", _direction_sanity_cfg(top_k=1)
+    )
     assert result["checked_count"] == 0
-    assert result["v3_result"]["passed"] is True
+    assert result["direction_sanity_result"]["passed"] is True
 
 
 # ---------------------------------------------------------------------------
-# _run_dev_oof_screen — pinning the veto set (calibration_slope + V3 only)
+# _run_dev_oof_screen — pinning the veto set (calibration_slope,
+# direction_sanity, within_ci — never V1/V2/V2b)
 # ---------------------------------------------------------------------------
+
+
+def _passing_base(threshold_value: float = 0.5) -> dict[str, Any]:
+    """A base-scenario derive_threshold()-shaped result whose within_ci passes."""
+    return {
+        "threshold": threshold_value,
+        "within_ci": True,
+        "argmax_ev_bootstrap_ci": [threshold_value - 0.05, threshold_value + 0.05],
+    }
 
 
 def test_run_dev_oof_screen_ignores_v1_v2_v2b_flags_in_failures(
@@ -1310,13 +1337,13 @@ def test_run_dev_oof_screen_ignores_v1_v2_v2b_flags_in_failures(
 ) -> None:
     """V1/V2/V2b are reported-only (CLAUDE.md's three-guardrail rule): even
     with compute_dev_oof_diagnostics reporting every one of them flagged,
-    `failures` stays empty as long as the calibration slope and V3 both
-    pass — exactly two possible criteria ever enter `failures`, and V1/V2/V2b
-    are not among them.
+    `failures` stays empty as long as calibration_slope, direction_sanity,
+    and within_ci all pass — exactly three possible criteria ever enter
+    `failures`, and V1/V2/V2b are not among them.
     """
     n = 10
     customerid = pd.Series([f"cust-{i:04d}" for i in range(n)], name="customerid")
-    y_dev_arr = np.array([1, 0] * (n // 2))
+    y_train_arr = np.array([1, 0] * (n // 2))
     oof_proba = np.linspace(0.1, 0.9, n)
     # build_dev_oof_screen_frame's build_segment_lookup call needs these
     # columns regardless of compute_dev_oof_diagnostics being mocked below.
@@ -1372,15 +1399,15 @@ def test_run_dev_oof_screen_ignores_v1_v2_v2b_flags_in_failures(
         {
             "threshold": {
                 "n_bootstrap": 10,
-                "v3_top_k_features": 2,
-                "v3_min_direction_magnitude": 0.3,
+                "direction_sanity_top_k_features": 2,
+                "direction_sanity_min_magnitude": 0.3,
             },
             "paths": {"model_promotion_config": str(model_promotion_config_path)},
         }
     )
     loaded = {
-        "customerid": customerid,
-        "y_dev_arr": y_dev_arr,
+        "customer_ids": customerid,
+        "y_train_arr": y_train_arr,
         "oof_proba": oof_proba,
         "calibration_summary": {
             "calibration_slope": {
@@ -1394,7 +1421,7 @@ def test_run_dev_oof_screen_ignores_v1_v2_v2b_flags_in_failures(
     }
 
     screen = threshold._run_dev_oof_screen(
-        loaded, base_threshold=0.5, cfg=cfg, random_state=42
+        loaded, _passing_base(), cfg=cfg, random_state=42
     )
 
     assert screen["failures"] == []
@@ -1402,3 +1429,466 @@ def test_run_dev_oof_screen_ignores_v1_v2_v2b_flags_in_failures(
         "contract_type"
     ]
     assert screen["dev_oof_diagnostics"]["direction_checked_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# _run_dev_oof_screen — within_ci, the third binding pre-seal veto (E5, §D9).
+# Never auto-re-derives t* — only vetoes; the inherited threshold stays
+# whatever base["threshold"] already is regardless of this check's verdict.
+# ---------------------------------------------------------------------------
+
+
+def _passing_dev_oof_diagnostics(*args: object, **kwargs: object) -> dict[str, Any]:
+    """A compute_dev_oof_diagnostics stand-in — the within_ci tests below
+    exercise only the within_ci criterion, so V1/V2/V2b's real
+    cfg.calibration-dependent computation is mocked out, the same way
+    test_run_dev_oof_screen_ignores_v1_v2_v2b_flags_in_failures already does.
+    """
+    return {
+        "segment_pr_auc": {},
+        "segment_collapse_flagged": [],
+        "segment_decision_rates": {},
+        "equal_opportunity_gap_by_axis": {},
+        "demographic_parity_gap_by_axis": {},
+        "equal_opportunity_gap_flagged": {},
+        "demographic_parity_gap_flagged": {},
+        "segment_calibration": {},
+        "calibration_collapse_flagged": [],
+    }
+
+
+def _passing_direction_sanity_shap_summary(run_id: str, cfg: object) -> list[dict]:
+    return [
+        {"feature": "numeric__tenure", "mean_abs_shap": 0.5, "direction": -0.9},
+        {
+            "feature": "numeric__monthlycharges",
+            "mean_abs_shap": 0.3,
+            "direction": 0.9,
+        },
+        {
+            "feature": "numeric__totalcharges",
+            "mean_abs_shap": 0.1,
+            "direction": -0.6,
+        },
+    ]
+
+
+def _within_ci_test_loaded(
+    model_promotion_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[dict, OmegaConf]:
+    n = 10
+    customerid = pd.Series([f"cust-{i:04d}" for i in range(n)], name="customerid")
+    y_train_arr = np.array([1, 0] * (n // 2))
+    oof_proba = np.linspace(0.1, 0.9, n)
+    feature_df = pd.DataFrame(
+        {
+            "customerid": customerid,
+            "tenure": list(range(n)),
+            "contract_type": ["Month-to-month"] * n,
+            "internetservice": ["Fiber optic"] * n,
+            "gender": ["Male"] * n,
+            "seniorcitizen": [0] * n,
+            "has_partner": ["No"] * n,
+            "dependents": ["No"] * n,
+        }
+    )
+    monkeypatch.setattr(threshold, "load_dev_partition", lambda: feature_df)
+    cfg = OmegaConf.create(
+        {
+            "threshold": {
+                "n_bootstrap": 10,
+                "direction_sanity_top_k_features": 2,
+                "direction_sanity_min_magnitude": 0.3,
+            },
+            "paths": {"model_promotion_config": str(model_promotion_config_path)},
+        }
+    )
+    loaded = {
+        "customer_ids": customerid,
+        "y_train_arr": y_train_arr,
+        "oof_proba": oof_proba,
+        "calibration_summary": {
+            "calibration_slope": {
+                "slope": 1.0,
+                "intercept": 0.0,
+                "slope_ci_lower": 0.95,
+                "slope_ci_upper": 1.05,
+            }
+        },
+        "run_id": "fake-run-id",
+    }
+    return loaded, cfg
+
+
+def test_run_dev_oof_screen_within_ci_pass_does_not_add_a_failure(
+    model_promotion_config_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """base["within_ci"]=True contributes no entry to `failures` — the
+    inherited t* agrees with the empirical argmax-EV CI, nothing to veto."""
+    monkeypatch.setattr(
+        threshold, "compute_dev_oof_diagnostics", _passing_dev_oof_diagnostics
+    )
+    monkeypatch.setattr(
+        threshold, "load_dev_shap_summary", _passing_direction_sanity_shap_summary
+    )
+    loaded, cfg = _within_ci_test_loaded(model_promotion_config_path, monkeypatch)
+
+    screen = threshold._run_dev_oof_screen(
+        loaded, _passing_base(), cfg=cfg, random_state=42
+    )
+
+    assert screen["failures"] == []
+
+
+def test_run_dev_oof_screen_within_ci_trip_adds_a_failure_and_never_reshifts_threshold(
+    model_promotion_config_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """base["within_ci"]=False adds exactly one `within_ci` failure entry —
+    the inherited t* no longer agrees with where EV is empirically
+    maximised. The failure detail cites the same threshold/CI base already
+    carries; nothing here recomputes or re-ships a different t* (CLAUDE.md's
+    "guardrails may veto; they may never promote" rule) — the veto only
+    ever blocks the promotion pipeline downstream, it never mutates
+    base["threshold"] itself.
+    """
+    monkeypatch.setattr(
+        threshold, "compute_dev_oof_diagnostics", _passing_dev_oof_diagnostics
+    )
+    monkeypatch.setattr(
+        threshold, "load_dev_shap_summary", _passing_direction_sanity_shap_summary
+    )
+    loaded, cfg = _within_ci_test_loaded(model_promotion_config_path, monkeypatch)
+    tripped_base = {
+        "threshold": 0.5,
+        "within_ci": False,
+        "argmax_ev_bootstrap_ci": [0.6, 0.8],
+    }
+
+    screen = threshold._run_dev_oof_screen(
+        loaded, tripped_base, cfg=cfg, random_state=42
+    )
+
+    within_ci_failures = [
+        f for f in screen["failures"] if f["criterion"] == "within_ci"
+    ]
+    assert len(within_ci_failures) == 1
+    detail = within_ci_failures[0]["detail"]
+    assert "0.5000" in detail
+    assert "0.6000" in detail
+    assert "0.8000" in detail
+    # The veto never mutates the inherited threshold — tripped_base's own
+    # "threshold" value is untouched by _run_dev_oof_screen.
+    assert tripped_base["threshold"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# _recheck_recall_guardrail — pure
+# ---------------------------------------------------------------------------
+
+
+def test_recheck_recall_guardrail_passes_when_recall_clears_bar() -> None:
+    oof_proba = np.array([0.9, 0.8, 0.3, 0.2])
+    y_train_arr = np.array([1, 1, 0, 0])
+
+    result = threshold._recheck_recall_guardrail(
+        oof_proba, y_train_arr, t_star=0.5, recall_bar=0.65
+    )
+
+    assert result == {"recall": 1.0, "recall_bar": 0.65, "passed": True}
+
+
+def test_recheck_recall_guardrail_fails_below_bar() -> None:
+    """tp=1, fn=1 -> recall=0.5, below the 0.65 bar."""
+    oof_proba = np.array([0.9, 0.4, 0.3, 0.2])
+    y_train_arr = np.array([1, 1, 0, 0])
+
+    result = threshold._recheck_recall_guardrail(
+        oof_proba, y_train_arr, t_star=0.5, recall_bar=0.65
+    )
+
+    assert result["recall"] == pytest.approx(0.5)
+    assert result["passed"] is False
+
+
+def test_recheck_recall_guardrail_zero_positives_is_zero_recall_not_a_crash() -> None:
+    oof_proba = np.array([0.9, 0.8])
+    y_train_arr = np.array([0, 0])
+
+    result = threshold._recheck_recall_guardrail(
+        oof_proba, y_train_arr, t_star=0.5, recall_bar=0.65
+    )
+
+    assert result["recall"] == 0.0
+    assert result["passed"] is False
+
+
+# ---------------------------------------------------------------------------
+# run_threshold_rerun_step — the costs.yaml-only re-run mode (§D9/§E10),
+# reusing full_cfg/registered_model_run_id/registered_model_version.
+# ---------------------------------------------------------------------------
+
+
+def test_run_threshold_rerun_step_recomputes_against_current_costs_yaml(
+    full_cfg: OmegaConf,
+    registered_model_run_id: str,
+    registered_model_version: str,
+    costs_cfg: OmegaConf,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Logs to a fresh run distinct from the training run, never mutating the
+    training run's own threshold/threshold.json, and writes the bootstrap
+    receipt register.py's tag_threshold_rerun reads."""
+    monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
+
+    result = threshold.run_threshold_rerun_step(registered_model_version, full_cfg)
+
+    assert result["model_version"] == registered_model_version
+    assert result["threshold_run_id"] != registered_model_run_id
+    assert result["threshold_payload"]["model_run_id"] == registered_model_run_id
+    assert "recall_guardrail" in result["validation_payload"]
+
+    client = mlflow.tracking.MlflowClient()
+    run = client.get_run(result["threshold_run_id"])
+    assert run.data.tags["source_run_id"] == registered_model_run_id
+    assert run.data.tags["source_model_version"] == registered_model_version
+    assert run.data.tags["recall_guardrail_result"] in {"pass", "fail"}
+    assert run.data.tags["costs_config_hash"]
+
+    artifact_paths = {a.path for a in client.list_artifacts(result["threshold_run_id"])}
+    assert "threshold/threshold.json" in {
+        a.path for a in client.list_artifacts(result["threshold_run_id"], "threshold")
+    }
+    assert not any(p.startswith("threshold/figures") for p in artifact_paths)
+
+    receipt = json.loads(
+        (Path(str(full_cfg.paths.reports)) / "threshold_rerun_receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt == {
+        "model_version": registered_model_version,
+        "threshold_run_id": result["threshold_run_id"],
+    }
+
+
+def test_run_threshold_rerun_step_never_mints_a_new_registered_version(
+    full_cfg: OmegaConf,
+    registered_model_version: str,
+    costs_cfg: OmegaConf,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
+    client = mlflow.tracking.MlflowClient()
+    registered_name = str(full_cfg.mlflow.registered_model_name)
+    versions_before = {
+        v.version for v in client.search_model_versions(f"name='{registered_name}'")
+    }
+
+    threshold.run_threshold_rerun_step(registered_model_version, full_cfg)
+
+    versions_after = {
+        v.version for v in client.search_model_versions(f"name='{registered_name}'")
+    }
+    assert versions_after == versions_before
+
+
+def test_run_threshold_rerun_step_alarms_without_raising_when_recall_guardrail_fails(
+    full_cfg: OmegaConf,
+    registered_model_version: str,
+    costs_cfg: OmegaConf,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An impossible recall_bar fails the guardrail — this must not raise
+    (there is no promotion for CLAUDE.md's veto-only rule to apply to), only
+    alarm: logged at error level and recorded in the result and the fresh
+    run's own tag, a stop-and-look signal, never an automatic consequence."""
+    monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
+    monkeypatch.setattr(
+        threshold,
+        "load_model_promotion_bars",
+        lambda cfg: GateBars(
+            pr_auc_bar=0.0,
+            recall_bar=1.1,
+            calibration_slope_band=(0.0, 10.0),
+            pr_auc_materiality_threshold=0.0,
+            brier_non_inferiority_margin=1.0,
+            recall_non_inferiority_margin=1.0,
+        ),
+    )
+
+    result = threshold.run_threshold_rerun_step(registered_model_version, full_cfg)
+
+    assert result["recall_guardrail_passed"] is False
+    client = mlflow.tracking.MlflowClient()
+    run = client.get_run(result["threshold_run_id"])
+    assert run.data.tags["recall_guardrail_result"] == "fail"
+
+
+def test_run_threshold_rerun_step_passes_when_recall_bar_is_trivially_cleared(
+    full_cfg: OmegaConf,
+    registered_model_version: str,
+    costs_cfg: OmegaConf,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
+    monkeypatch.setattr(
+        threshold,
+        "load_model_promotion_bars",
+        lambda cfg: GateBars(
+            pr_auc_bar=0.0,
+            recall_bar=0.0,
+            calibration_slope_band=(0.0, 10.0),
+            pr_auc_materiality_threshold=0.0,
+            brier_non_inferiority_margin=1.0,
+            recall_non_inferiority_margin=1.0,
+        ),
+    )
+
+    result = threshold.run_threshold_rerun_step(registered_model_version, full_cfg)
+
+    assert result["recall_guardrail_passed"] is True
+    client = mlflow.tracking.MlflowClient()
+    run = client.get_run(result["threshold_run_id"])
+    assert run.data.tags["recall_guardrail_result"] == "pass"
+
+
+# ---------------------------------------------------------------------------
+# run_threshold_step's X_train/y_train/customer_ids/raw_partition bundle
+# override (E5) — the retrain-cycle path (dev ∪ matured reserve), exercised
+# end to end against a synthetic reserve-shaped fixture chained through the
+# real train -> calibrate ->
+# register -> threshold sequence, mirroring test_calibrate.py's own
+# reserve_shaped_bundle fixture.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_bundle_override_rejects_partial_override() -> None:
+    """Any subset of the four given without the rest raises — a partial
+    override risks silently mixing a dev-only population with an
+    overridden one."""
+    X = pd.DataFrame({"a": [1, 2]})
+    y = pd.Series([0, 1])
+    ids = pd.Series(["c1", "c2"])
+    raw = pd.DataFrame({"customerid": ["c1", "c2"]})
+
+    with pytest.raises(ValueError, match="given together or not at all"):
+        threshold._validate_bundle_override(X, None, None, None)
+    with pytest.raises(ValueError, match="given together or not at all"):
+        threshold._validate_bundle_override(X, y, ids, None)
+    with pytest.raises(ValueError, match="given together or not at all"):
+        threshold._validate_bundle_override(None, None, None, raw)
+
+
+def test_validate_bundle_override_accepts_all_or_none() -> None:
+    """All four together, or all four absent, are both valid — neither raises."""
+    X = pd.DataFrame({"a": [1, 2]})
+    y = pd.Series([0, 1])
+    ids = pd.Series(["c1", "c2"])
+    raw = pd.DataFrame({"customerid": ["c1", "c2"]})
+
+    threshold._validate_bundle_override(None, None, None, None)
+    threshold._validate_bundle_override(X, y, ids, raw)
+
+
+@pytest.fixture
+def reserve_shaped_bundle(
+    _module_dev_split: tuple[pd.DataFrame, pd.Series],
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
+    """dev ∪ matured-reserve synthetic population, mirroring
+    test_calibrate.py's own fixture of the same name — _module_dev_split's
+    rows plus 10 extra all-churner rows under a disjoint customerid range.
+    raw_partition is X_train itself with a customerid column inserted:
+    _module_dev_split's X already carries every FAIRNESS_AXES/
+    ROBUSTNESS_AXES raw column (gender, seniorcitizen, has_partner,
+    dependents, contract_type, internetservice, tenure) build_segment_lookup
+    needs.
+    """
+    X_dev, y_dev = _module_dev_split
+    n_reserve = 10
+    reserve_X = X_dev.sample(n=n_reserve, random_state=1).reset_index(drop=True)
+    reserve_y = pd.Series([1] * n_reserve)
+
+    X_train = pd.concat([X_dev, reserve_X], ignore_index=True)
+    y_train = pd.concat([y_dev, reserve_y], ignore_index=True)
+    customer_ids = pd.Series(
+        [f"cust-{i:04d}" for i in range(len(y_dev))]
+        + [f"reserve-{i:03d}" for i in range(n_reserve)]
+    )
+    raw_partition = X_train.copy()
+    raw_partition.insert(0, "customerid", customer_ids.to_numpy())
+    return X_train, y_train, customer_ids, raw_partition
+
+
+def test_run_threshold_step_override_reaches_every_consumer(
+    full_cfg: OmegaConf,
+    reserve_shaped_bundle: tuple[pd.DataFrame, pd.Series, pd.Series, pd.DataFrame],
+    tuning_result: dict,
+    costs_cfg: OmegaConf,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X_train/y_train/customer_ids/raw_partition, given together, are used
+    end to end in place of the dev-only default across a real train ->
+    calibrate -> register -> threshold chain. calibrate.py is called with
+    the identical override, so dev_oof_predictions.parquet already covers
+    every customer_ids row threshold.py's own override introduces — proving
+    the two modules' overrides compose correctly, and exercising the real
+    bug §D5/§E5 calls out: without threshold.py's own override,
+    .reindex(customer_ids) against a dev_oof_predictions.parquet built from
+    a *smaller* dev-only population would silently discard every
+    reserve-cohort row instead of raising, since reindexing to a subset
+    always finds matches.
+
+    load_dev_shap_summary is stubbed to a fixed, EDA-consistent summary
+    (the same pattern registered_model_version uses) so direction_sanity
+    passes deterministically; calibration_slope/within_ci are left to
+    whatever the real fit on this synthetic, noise-labeled population
+    produces — the assertions below hold regardless of that outcome, since
+    they verify the override's population plumbing, not the gate verdict.
+    """
+    X_train, y_train, customer_ids, raw_partition = reserve_shaped_bundle
+    monkeypatch.setattr(threshold, "load_costs_config", lambda path=None: costs_cfg)
+
+    monkeypatch.setattr(
+        threshold, "load_dev_shap_summary", _passing_direction_sanity_shap_summary
+    )
+    monkeypatch.setattr(log_model, "features_sha256", lambda path=None: "deadbeef" * 8)
+
+    with mlflow.start_run(run_name="tuning_study") as run:
+        seeded_tuning_result = {**tuning_result, "parent_run_id": run.info.run_id}
+    log_result = log_model.run_model_logging_step(
+        X_train, y_train, seeded_tuning_result, full_cfg
+    )
+    cal_result = calibrate.run_calibration_step(
+        log_result["run_id"], full_cfg, X_train, y_train, customer_ids
+    )
+    model_version = register.register_challenger(
+        full_cfg,
+        str(cal_result["run_id"]),
+        str(cal_result["model_uri"]),
+        str(cal_result["logged_model_id"]),
+    )
+
+    try:
+        threshold_result = threshold.run_threshold_step(
+            cal_result["run_id"],
+            model_version,
+            full_cfg,
+            X_train,
+            y_train,
+            customer_ids,
+            raw_partition,
+        )
+    except RuntimeError:
+        # calibration_slope/within_ci may legitimately fail on this
+        # synthetic, noise-labeled population — either resting state proves
+        # the override's population plumbing worked (no length-mismatch
+        # AssertionError from _load_and_align_dev_oof), which is what this
+        # test actually verifies.
+        run = mlflow.tracking.MlflowClient().get_run(cal_result["run_id"])
+        assert run.data.tags["dev_oof_screen_result"] == "fail"
+        return
+
+    assert threshold_result["threshold_payload"]["model_run_id"] == cal_result["run_id"]

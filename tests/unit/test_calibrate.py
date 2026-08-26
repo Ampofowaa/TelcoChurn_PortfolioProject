@@ -1311,3 +1311,132 @@ def test_run_calibration_step_override_trial_count_gate(
 
     client = mlflow.tracking.MlflowClient()
     assert client.search_registered_models() == []
+
+
+# ---------------------------------------------------------------------------
+# run_calibration_step's X_train/y_train/customer_ids bundle override (E5) —
+# the retrain-cycle path (dev ∪ matured reserve), exercised against a
+# synthetic reserve-shaped fixture: dev_split's 120 rows plus 10 extra rows simulating
+# a matured reserve cohort, with a deliberately different customerid range
+# and churn rate so every downstream number traces back to the override, not
+# a hidden fallback to dev_split alone.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_bundle_override_rejects_partial_override() -> None:
+    """Any one or two of the three given without the rest raises — a partial
+    override risks silently mixing a dev-only customer_ids with an
+    overridden X_train/y_train."""
+    X = pd.DataFrame({"a": [1, 2]})
+    y = pd.Series([0, 1])
+    ids = pd.Series(["c1", "c2"])
+
+    with pytest.raises(ValueError, match="given together or not at all"):
+        calibrate._validate_bundle_override(X, None, None)
+    with pytest.raises(ValueError, match="given together or not at all"):
+        calibrate._validate_bundle_override(X, y, None)
+    with pytest.raises(ValueError, match="given together or not at all"):
+        calibrate._validate_bundle_override(None, None, ids)
+
+
+def test_validate_bundle_override_accepts_all_or_none() -> None:
+    """All three together, or all three absent, are both valid — neither raises."""
+    X = pd.DataFrame({"a": [1, 2]})
+    y = pd.Series([0, 1])
+    ids = pd.Series(["c1", "c2"])
+
+    calibrate._validate_bundle_override(None, None, None)
+    calibrate._validate_bundle_override(X, y, ids)
+
+
+@pytest.fixture
+def reserve_shaped_bundle(
+    dev_split: tuple[pd.DataFrame, pd.Series],
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """A synthetic dev ∪ matured-reserve population: dev_split's 120 rows plus
+    10 extra all-churner rows under a disjoint customerid range — large
+    enough and different enough in composition that observed_churn_rate and
+    row counts downstream can only match if the override actually reached
+    every consumer, not a coincidental match against dev_split alone.
+    """
+    X_dev, y_dev = dev_split
+    n_reserve = 10
+    reserve_X = X_dev.sample(n=n_reserve, random_state=1).reset_index(drop=True)
+    reserve_y = pd.Series([1] * n_reserve)
+
+    X_train = pd.concat([X_dev, reserve_X], ignore_index=True)
+    y_train = pd.concat([y_dev, reserve_y], ignore_index=True)
+    customer_ids = pd.Series(
+        [f"cust-{i:04d}" for i in range(len(y_dev))]
+        + [f"reserve-{i:03d}" for i in range(n_reserve)]
+    )
+    return X_train, y_train, customer_ids
+
+
+def test_run_calibration_step_override_reaches_every_consumer(
+    registration_cfg: DictConfig,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_result: dict[str, Any],
+    reserve_shaped_bundle: tuple[pd.DataFrame, pd.Series, pd.Series],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X_train/y_train/customer_ids, given together, are used end to end in
+    place of the dev-only default — calibration_summary's
+    observed_churn_rate, dev_oof_predictions.parquet's row count, and
+    dev_shap_values.parquet's row count all reflect the overridden
+    (larger, higher-churn) population. load_dev_features/
+    load_dev_customer_ids are stubbed to raise, proving the override path
+    ran instead of silently falling back to a dev-only load.
+    """
+    X_train, y_train, customer_ids = reserve_shaped_bundle
+
+    def _raise_if_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dev-only loader called despite a full bundle override")
+
+    monkeypatch.setattr(calibrate, "load_dev_features", _raise_if_called)
+    monkeypatch.setattr(calibrate, "load_dev_customer_ids", _raise_if_called)
+    monkeypatch.setattr(log_model, "features_sha256", lambda path=None: "deadbeef" * 8)
+
+    run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
+
+    result = calibrate.run_calibration_step(
+        run_id, registration_cfg, X_train, y_train, customer_ids
+    )
+
+    assert result["calibration_summary"]["observed_churn_rate"] == pytest.approx(
+        float(y_train.mean())
+    )
+
+    mlflow.set_tracking_uri(str(registration_cfg.mlflow.tracking_uri))
+    oof_local_path = mlflow.artifacts.download_artifacts(
+        run_id=run_id, artifact_path="calibration/dev_oof_predictions.parquet"
+    )
+    oof = pd.read_parquet(oof_local_path)
+    assert len(oof) == len(y_train)
+    assert set(oof["customerid"]) == set(customer_ids)
+
+    shap_local_path = mlflow.artifacts.download_artifacts(
+        run_id=run_id, artifact_path="calibration/dev_shap_values.parquet"
+    )
+    shap_df = pd.read_parquet(shap_local_path)
+    assert len(shap_df) == len(y_train)
+
+
+def test_run_calibration_step_no_override_still_loads_dev_only(
+    registration_cfg: DictConfig,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_result: dict[str, Any],
+    sandboxed_dev_features: None,
+) -> None:
+    """Omitting X_train/y_train/customer_ids (train/__main__.py's cold-start
+    call shape) still resolves the dev-only population internally — the
+    override is additive, not a breaking change to the existing call sites.
+    """
+    _, y_dev = dev_split
+    run_id = _log_parent_run(dev_split, tuning_result, registration_cfg)
+
+    result = calibrate.run_calibration_step(run_id, registration_cfg)
+
+    assert result["calibration_summary"]["observed_churn_rate"] == pytest.approx(
+        float(y_dev.mean())
+    )
