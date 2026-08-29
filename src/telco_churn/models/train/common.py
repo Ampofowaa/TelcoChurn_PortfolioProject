@@ -56,7 +56,7 @@ logger = get_logger(__name__)
 # ANALYSIS.md §4a. LightGBM wins on the evidence (paired-bootstrap Δ = 0.007,
 # CI [0.002, 0.012], p = 0.0020, run `c405f6fe31454c3a9899423680644411`) and on
 # build-specific rationale (SHAP speed, calibration continuity, training
-# speed for Optuna/weekly retrain). Edit this constant — never hand-fit a
+# speed for Optuna/monthly retrain). Edit this constant — never hand-fit a
 # LogReg pipeline into Steps 3-5 — if a re-run of 03a's on-demand review
 # concludes a different family should ship; same "explicit code changes,
 # never accidental side-effects" discipline features/schema.py's

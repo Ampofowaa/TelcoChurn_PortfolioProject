@@ -175,7 +175,7 @@ _ALIAS_URI = re.compile(r"models:/[^\"'\s]*@")
 def test_evaluate_never_resolves_a_model_by_alias() -> None:
     """evaluate.py must not build a `models:/<name>@<alias>` URI.
 
-    An alias is a moving pointer: under Phase 10's weekly retrain `challenger`
+    An alias is a moving pointer: under Phase 10's monthly retrain `challenger`
     advances every cycle, so resolving through it can evaluate a different model
     than the caller meant. Matching the URI shape rather than the bare word
     'champion' avoids flagging legitimate uses — evaluate.py takes a champion

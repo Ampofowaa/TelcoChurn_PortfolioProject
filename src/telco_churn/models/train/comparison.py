@@ -88,7 +88,7 @@ def bootstrap_comparison(
       tie        — otherwise; LGBM is still adopted. LGBM is the pre-committed family
                    for this build regardless of this comparison (fast exact TreeSHAP
                    for the explainability work, training speed for Optuna and the
-                   weekly retrain cadence, clean class_weight-based imbalance
+                   monthly retrain cadence, clean class_weight-based imbalance
                    handling) — a statistical tie has no grounds to override that
                    up-front choice, so it does not flip the decision to LogReg.
 
