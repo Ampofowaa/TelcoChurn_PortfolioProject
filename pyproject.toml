@@ -81,6 +81,12 @@ ignore = ["E501", "TRY003", "PTH123"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["ANN"]
 
+[tool.ruff.lint.isort]
+# The repo-root alembic/ migrations directory makes isort's first-party
+# heuristic misclassify the `alembic` library, splitting `from alembic import
+# command` from `from alembic.config import Config` into separate groups.
+known-third-party = ["alembic"]
+
 [tool.ruff.lint.flake8-bugbear]
 # FastAPI's own idiom is `param: T = Depends(...)` in a route signature —
 # the call is evaluated once at route-registration time, not per-request,
