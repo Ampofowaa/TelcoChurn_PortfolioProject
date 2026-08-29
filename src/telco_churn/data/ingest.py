@@ -12,14 +12,14 @@ from sqlalchemy.engine import Engine
 from telco_churn.data.checks import MAX_NULL_RATE, MIN_ROWS, frame_checksum
 from telco_churn.data.schema import RawSchema
 from telco_churn.data.validate import ValidationError, validate_raw
-from telco_churn.utils.db import get_engine
+from telco_churn.utils.db import apply_migrations, get_engine
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.paths import get_project_root
 
 __all__ = [
     "IngestReceipt",
     "load_raw_csv",
-    "setup_schema",
+    "seed_training_pool",
     "ingest",
 ]
 
@@ -37,12 +37,10 @@ class IngestReceipt:
     csv_rows: int
     null_counts: dict[str, int]
     frame_checksum: str
+    training_pool_rows_seeded: int
 
 
 logger = get_logger(__name__)
-
-# Path to the authoritative DDL — column types and PRIMARY KEY live here only.
-_SQL_SCHEMA = get_project_root() / "sql" / "schema" / "001_create_raw.sql"
 
 # Derived from RawSchema via the public Pandera API so inheritance and metaclass
 # processing are respected — frozenset(__annotations__) misses inherited fields.
@@ -76,18 +74,6 @@ def load_raw_csv(path: Path) -> pd.DataFrame:
     df["totalcharges"] = pd.to_numeric(df["totalcharges"], errors="coerce")
     df["churn"] = (df["churn"] == "Yes").astype(int)
     return df
-
-
-def setup_schema(engine: Engine) -> None:
-    """Create the customers_raw table if it does not exist.
-
-    Executes 001_create_raw.sql which uses CREATE TABLE IF NOT EXISTS and
-    declares customerid as PRIMARY KEY. Unlike to_sql(if_exists='replace'),
-    this never drops the table, so the PK constraint is never silently lost.
-    """
-    ddl = _SQL_SCHEMA.read_text()
-    with engine.begin() as conn:
-        conn.execute(text(ddl))
 
 
 def _load_staging(df: pd.DataFrame, engine: Engine) -> None:
@@ -152,6 +138,43 @@ def _merge_from_staging(update_cols: list[str], engine: Engine) -> int:
     return int(result.rowcount)
 
 
+def seed_training_pool(df: pd.DataFrame, engine: Engine) -> int:
+    """Seed training_pool from the just-ingested customers_raw dataframe.
+
+    Write path 1 of two — the one-time, DVC-tracked seed, sharing this DVC
+    `ingest` stage rather than a stage of
+    its own, since it's a deterministic function of customers_raw, which is
+    itself a deterministic function of the static raw CSV. reserve_month is
+    left NULL for every row here: NULL means "the original CSV-seeded
+    population," not "not yet reserved" — a customerid legitimately gets a
+    second row later, with a non-null reserve_month, once its reserve cohort
+    matures and the out-of-DVC cyclical reshape function (Phase 10b's
+    training_cycle.py) appends it. That second row is untouched here.
+
+    Idempotent the same way customers_crm's load_crm() is: delete-and-reload,
+    scoped to just the reserve_month IS NULL rows this function owns (a plain
+    customerid upsert doesn't apply — customerid is not unique in
+    training_pool by design, so there is no ON CONFLICT target). A rerun
+    never duplicates the seed and never touches rows write path 2 already
+    appended.
+
+    Returns the number of rows (re)seeded.
+    """
+    seed_columns = [c for c in df.columns if c != "reserve_month"]
+    seed = df[seed_columns]
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM training_pool WHERE reserve_month IS NULL"))
+        seed.to_sql(
+            "training_pool",
+            conn,
+            if_exists="append",
+            index=False,
+            method="multi",
+            chunksize=1000,
+        )
+    return len(seed)
+
+
 def ingest(
     path: Path,
     engine: Engine | None = None,
@@ -167,7 +190,9 @@ def ingest(
 
     This mirrors the dbt incremental model pattern used in production warehouses
     (Snowflake / BigQuery MERGE). The main table's PRIMARY KEY is never dropped;
-    the merge is fully atomic. Returns an IngestReceipt describing the load.
+    the merge is fully atomic. Also seeds training_pool from the same validated
+    dataframe (seed_training_pool, write path 1) once the customers_raw merge
+    succeeds. Returns an IngestReceipt describing the load.
 
     min_rows/max_null_rate feed validate_raw's gate-5 thresholds and default to
     the same checks.py constants validate_raw itself falls back to, so a direct
@@ -175,12 +200,17 @@ def ingest(
     point below overrides both from config: validation.min_rows /
     validation.max_null_rate, so an operator-tunable value in configs/config.yaml
     actually reaches the ingest path, not just validate.py's own CLI.
+
+    Does not create customers_raw itself — the table is expected to already
+    exist (utils/db.py::apply_migrations, run once at CLI start, or a test
+    fixture's own equivalent call). A direct caller against a database that
+    was never migrated gets Postgres's own "relation does not exist" error
+    from _load_staging/_merge_from_staging, not a silent auto-create.
     """
     if engine is None:
         engine = get_engine()
     df = load_raw_csv(path)
     validate_raw(df, strict=True, min_rows=min_rows, max_null_rate=max_null_rate)
-    setup_schema(engine)
     update_cols = [c for c in df.columns if c != "customerid"]
     csv_rows = len(df)
     _load_staging(df, engine)
@@ -198,11 +228,14 @@ def ingest(
             "not per-row constraint violations."
         )
     logger.info("merge_complete", db_rows=n, csv_rows=csv_rows, table="customers_raw")
+    n_seeded = seed_training_pool(df, engine)
+    logger.info("training_pool_seeded", rows_seeded=n_seeded)
     return IngestReceipt(
         rows_loaded=n,
         csv_rows=csv_rows,
         null_counts={col: int(df[col].isna().sum()) for col in df.columns},
         frame_checksum=frame_checksum(df),
+        training_pool_rows_seeded=n_seeded,
     )
 
 
@@ -224,6 +257,10 @@ if __name__ == "__main__":
     csv_path = get_project_root() / cfg.paths.raw_data
 
     try:
+        # Belt-and-braces schema creation for a Postgres instance that never saw
+        # docker-compose.yml's docker-entrypoint-initdb.d mount — CI's
+        # testcontainers, Phase 12's RDS. A no-op once already at head.
+        apply_migrations()
         receipt = ingest(
             path=csv_path,
             min_rows=int(cfg.validation.min_rows),

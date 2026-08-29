@@ -295,12 +295,15 @@ def _build_optuna_storage() -> optuna.storages.RDBStorage:
     more reconstructing it from MLflow-logged trial params just to run fANOVA
     importance. Isolated in its own 'optuna' schema (not 'public') so Optuna's
     own tables (studies, trials, ...) can't collide with application tables —
-    the schema's DDL lives in sql/schema/002_create_optuna_schema.sql, the
-    same convention customers_raw's table follows, not an inline string here;
-    this executes it explicitly (mirroring ingest.py::setup_schema) since
-    docker-compose.yml's docker-entrypoint-initdb.d mount only fires against a
-    fresh Postgres data volume. Builds its own engine rather than reusing
-    utils.db.get_engine()'s shared singleton: that one stays strict (raises
+    the schema's DDL lives in sql/schema/002_create_optuna_schema.sql, not an
+    inline string here; this executes it explicitly (the same belt-and-braces
+    role utils.db.py::apply_migrations plays for the Alembic-managed tables)
+    since docker-compose.yml's docker-entrypoint-initdb.d mount only fires
+    against a fresh Postgres data volume — 002_create_optuna_schema.sql stays
+    outside this project's Alembic instance permanently (PROJECT_PLAN.md's
+    Phase 10a-i scope-boundary note), so it keeps this direct-execution
+    pattern rather than moving into a migration. Builds its own engine rather
+    than reusing utils.db.get_engine()'s shared singleton: that one stays strict (raises
     with no POSTGRES_URL) for ingest.py/sql_features.py, whose SQL is
     Postgres-only and must never silently run against a SQLite fallback.
 
@@ -403,11 +406,12 @@ def _discard_incomplete_study_unless_resuming(
 
 
 def _build_optuna_study(
-    X_dev: pd.DataFrame,
-    y_dev: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
     committed_features: list[str],
     cfg: DictConfig,
     storage: optuna.storages.BaseStorage | None,
+    warm_start_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build (or resume) the Optuna study, its pruner/sampler, and the CV splits trials will use.
 
@@ -418,6 +422,15 @@ def _build_optuna_study(
     unless `tuning.resume` is true (see `_discard_incomplete_study_unless_resuming`)
     — `load_if_exists=True` below then either finds nothing (fresh study) or
     finds a study eligible to be reused (complete, or resume explicitly requested).
+
+    warm_start_params, when given, takes precedence over
+    `cfg.tuning.warm_start_params` as the trial enqueued before the search
+    starts — from Phase 10b on, the caller resolves this dynamically from
+    the current champion's own `tuned_hyperparameters` model-version tag
+    rather than this project's one-time, hand-set config prior. Falling
+    back to the config
+    value when the caller passes nothing keeps today's Phase 5 cold-start
+    behavior unchanged.
     """
     tuning_cfg = cfg.tuning
     random_state = int(tuning_cfg.random_state)
@@ -437,7 +450,7 @@ def _build_optuna_study(
     skf = StratifiedKFold(
         n_splits=int(tuning_cfg.cv_folds), shuffle=True, random_state=random_state
     )
-    cv_splits = list(skf.split(X_dev, y_dev))
+    cv_splits = list(skf.split(X_train, y_train))
 
     pruning_enabled = str(tuning_cfg.pruner) == "median"
     pruner: optuna.pruners.BasePruner = (
@@ -468,10 +481,14 @@ def _build_optuna_study(
         pruner=pruner,
     )
 
-    raw_warm_start = tuning_cfg.get("warm_start_params", None)
-    if raw_warm_start is not None:
-        warm_start_params = {str(k): v for k, v in raw_warm_start.items()}
-        study.enqueue_trial(warm_start_params, skip_if_exists=True)
+    resolved_warm_start = (
+        warm_start_params
+        if warm_start_params is not None
+        else tuning_cfg.get("warm_start_params", None)
+    )
+    if resolved_warm_start is not None:
+        enqueue_params = {str(k): v for k, v in resolved_warm_start.items()}
+        study.enqueue_trial(enqueue_params, skip_if_exists=True)
 
     return {
         "tuning_cfg": tuning_cfg,
@@ -490,7 +507,7 @@ def _build_optuna_study(
 
 
 def _run_study_trials(
-    setup: dict[str, Any], X_dev: pd.DataFrame, y_dev: pd.Series
+    setup: dict[str, Any], X_train: pd.DataFrame, y_train: pd.Series
 ) -> dict[str, Any]:
     """Run the study's remaining trials — call only from inside an active MLflow run.
 
@@ -510,8 +527,8 @@ def _run_study_trials(
 
     objective = partial(
         _tuning_objective,
-        X=X_dev,
-        y=y_dev,
+        X=X_train,
+        y=y_train,
         cv_splits=setup["cv_splits"],
         binary=setup["binary"],
         multi_cat=setup["multi_cat"],
@@ -757,14 +774,148 @@ def _log_tuning_artifacts(
         plt.close(fig_importance)
 
 
+def _run_pinned_tuning_step(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    committed_features: list[str],
+    cfg: DictConfig,
+    pinned_params: dict[str, Any],
+) -> dict[str, Any]:
+    """Skip the Optuna search entirely; ship the champion's own tuned hyperparameters unchanged.
+
+    pinned_params is the `tuned_hyperparameters` model-version tag's payload
+    (register.py, §E9) — training_manifest.json's own
+    `tuning_summary.selected_hyperparameters` from the cycle that minted the
+    current champion, so it already carries an "n_estimators" key (the
+    champion's own final, already-scaled tree count). That key is popped out
+    and returned as `best_n_estimators_median`, treated exactly like a
+    search-path trial's early-stopped median: log_model.py's
+    `_scale_n_estimators` still rescales it against *this* cycle's (larger)
+    X_train/y_train before shipping, since the population genuinely grows
+    cycle to cycle even when the hyperparameters themselves don't search.
+    `best_params` below therefore excludes "n_estimators" — the same shape a
+    search-path trial's own `best_params` always has (Optuna never searches
+    tree count; early stopping resolves it) — so nothing here needs a special
+    case to avoid the two colliding.
+
+    Returns a result shaped identically to `run_tuning_step`'s search branch
+    — same top-level keys, same nested `tuning_summary` shape
+    (`mode="pinned"` instead of `"search"`, every trial-count/CV field zeroed
+    or null) — so `run_model_logging_step` needs no changes at all: it
+    consumes `best_params`/`best_n_estimators_median` either way and cannot
+    tell the two paths apart.
+
+    Still opens and tags a `tuning_study` MLflow run — log_model.py reopens
+    this run's id to log the model onto it, on either path — but logs no
+    nested trial runs and no CV metrics, since none were computed.
+    """
+    if "n_estimators" not in pinned_params:
+        raise ValueError(
+            "pinned_params must include 'n_estimators' — it is expected to be "
+            "the tuned_hyperparameters model-version tag payload "
+            "(training_manifest.json's tuning_summary.selected_hyperparameters), "
+            "which always carries the champion's shipped tree count."
+        )
+    best_n_estimators_median = int(pinned_params["n_estimators"])
+    best_params = {k: v for k, v in pinned_params.items() if k != "n_estimators"}
+
+    tuning_cfg = cfg.tuning
+    search_space_dict = {
+        str(name): {"low": spec.low, "high": spec.high}
+        for name, spec in tuning_cfg.search_space.items()
+    }
+    boundary_hits = boundary_hit_check(best_params, search_space_dict)
+    hit_params = [name for name, hit in boundary_hits.items() if hit]
+    if hit_params:
+        logger.warning(
+            "tuning_boundary_hit",
+            hit_params=hit_params,
+            selected_params=best_params,
+            hint=(
+                "pinned params (inherited unchanged from the champion) sit on "
+                "a searched range's edge — investigate before shipping another "
+                "cycle unchanged"
+            ),
+        )
+
+    ensure_experiment_metadata(cfg)
+
+    with mlflow.start_run(run_name="tuning_study") as parent_run:
+        mlflow.set_tags(
+            {
+                "stage": "tuning",
+                "git_sha": _git_sha(),
+                "data_content_hash": features_sha256(),
+            }
+        )
+        _log_dev_input(X_train, y_train, context="training")
+        mlflow.log_params(
+            {
+                "mode": "pinned",
+                "n_committed_features": len(committed_features),
+                **{f"pinned_{k}": v for k, v in pinned_params.items()},
+            }
+        )
+        mlflow.log_dict(boundary_hits, "tuning/boundary_hits.json")
+        parent_run_id = parent_run.info.run_id
+
+    logger.info(
+        "tuning_step_done",
+        mode="pinned",
+        best_n_estimators_median=best_n_estimators_median,
+        boundary_hits=boundary_hits,
+    )
+
+    return {
+        "best_params": best_params,
+        "best_n_estimators_median": best_n_estimators_median,
+        "best_cv_pr_auc_mean": None,
+        "boundary_hits": boundary_hits,
+        "n_completed_trials": 0,
+        "parent_run_id": parent_run_id,
+        "committed_features": committed_features,
+        "tuning_summary": {
+            "mode": "pinned",
+            "n_trials_requested": 0,
+            "n_completed_trials": 0,
+            "n_pruned_trials": 0,
+            "n_failed_trials": 0,
+            "n_trials_reused": 0,
+            "n_trials_run_this_invocation": 0,
+            "min_completed_trials": None,
+            "trial_count_below_threshold": False,
+            "selection_rule": None,
+            "selected_trial_number": None,
+            "selected_cv_pr_auc": None,
+            "raw_best_trial_number": None,
+            "raw_best_cv_pr_auc": None,
+            "se": None,
+            "band_floor": None,
+            "boundary_hits": boundary_hits,
+        },
+    }
+
+
 def run_tuning_step(
-    X_dev: pd.DataFrame,
-    y_dev: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
     committed_features: list[str],
     cfg: DictConfig,
     storage: optuna.storages.BaseStorage | None = None,
+    pinned_params: dict[str, Any] | None = None,
+    warm_start_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Optuna tuning of LightGBM on the frozen feature set.
+
+    pinned_params, when given, skips the search entirely — see
+    `_run_pinned_tuning_step`. Reserved for the two reserve-driven routine
+    retrain cycles: a scheduled retrain
+    is supposed to answer "did new data help?", and a fresh search changes
+    the data *and* the hyperparameters at once, making a challenger's
+    win/loss unattributable. `train/__main__.py`'s cold-start path never
+    passes it, so v1 always takes the search branch below, unchanged.
+    `warm_start_params` is ignored when `pinned_params` is given — pinning
+    skips study construction altogether, so there is no study to seed.
 
     Must run after feature selection freezes the input space — rerunning
     selection afterward invalidates the study. Uses single stratified CV
@@ -807,7 +958,14 @@ def run_tuning_step(
     notebook narrating the decision read the same numbers select_best_trial
     actually used, not a client-side reconstruction.
     """
-    setup = _build_optuna_study(X_dev, y_dev, committed_features, cfg, storage)
+    if pinned_params is not None:
+        return _run_pinned_tuning_step(
+            X_train, y_train, committed_features, cfg, pinned_params
+        )
+
+    setup = _build_optuna_study(
+        X_train, y_train, committed_features, cfg, storage, warm_start_params
+    )
     tuning_cfg = setup["tuning_cfg"]
 
     ensure_experiment_metadata(cfg)
@@ -823,9 +981,10 @@ def run_tuning_step(
         # Also covers log_model.py's "model" and calibrate.py's "calibrated_model"
         # LoggedModels for free — both reuse this run's run_id, and log_input
         # attaches to the run, not to any one LoggedModel logged onto it.
-        _log_dev_input(X_dev, y_dev, context="training")
+        _log_dev_input(X_train, y_train, context="training")
         mlflow.log_params(
             {
+                "mode": "search",
                 "optuna_study_name": setup["study_name"],
                 "n_trials": int(tuning_cfg.n_trials),
                 "resume": bool(tuning_cfg.resume),
@@ -844,7 +1003,7 @@ def run_tuning_step(
             }
         )
 
-        trial_result = _run_study_trials(setup, X_dev, y_dev)
+        trial_result = _run_study_trials(setup, X_train, y_train)
         summary = _summarize_completed_trials(setup, trial_result)
         fig_hist = _plot_optimization_history(summary["trial_summaries"])
         importance = _compute_hyperparameter_importance(
@@ -882,6 +1041,7 @@ def run_tuning_step(
         "parent_run_id": parent_run_id,
         "committed_features": committed_features,
         "tuning_summary": {
+            "mode": "search",
             "n_trials_requested": int(tuning_cfg.n_trials),
             "n_completed_trials": len(trial_summaries),
             "n_pruned_trials": trial_result["n_pruned_trials"],

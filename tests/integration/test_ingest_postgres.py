@@ -14,6 +14,7 @@ from testcontainers.postgres import PostgresContainer
 
 from telco_churn.data.ingest import ingest
 from telco_churn.data.validate import ValidationError
+from telco_churn.utils.db import apply_migrations
 from telco_churn.utils.paths import get_project_root
 
 _PROJECT_ROOT = get_project_root()
@@ -38,8 +39,10 @@ zero-tenure,Female,0,No,No,0,No,No phone service,DSL,No,No,No,No,No,No,Month-to-
 
 @pytest.fixture(scope="module")
 def pg_engine() -> Iterator[Engine]:
-    """Spin up an ephemeral Postgres 16 container for the test module."""
+    """Spin up an ephemeral Postgres 16 container for the test module,
+    migrated to head — ingest() no longer creates customers_raw itself."""
     with PostgresContainer("postgres:16") as pg:
+        apply_migrations(pg.get_connection_url(driver=None))
         engine = create_engine(pg.get_connection_url())
         yield engine
         engine.dispose()
@@ -137,6 +140,72 @@ def test_primary_key_survives_second_ingest(
     ), "customers_raw must have a PRIMARY KEY constraint after ingest"
 
 
+def test_ingest_seeds_training_pool(pg_engine: Engine, sample_csv: Path) -> None:
+    """ingest() also seeds training_pool from the same validated dataframe, with
+    reserve_month NULL for every row (write path 1)."""
+    receipt = ingest(sample_csv, pg_engine)
+    assert receipt.training_pool_rows_seeded == 5
+    with pg_engine.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM training_pool")).scalar()
+        null_reserve_count = conn.execute(
+            text("SELECT COUNT(*) FROM training_pool WHERE reserve_month IS NULL")
+        ).scalar()
+    assert count == 5
+    assert null_reserve_count == 5
+
+
+def test_ingest_training_pool_seed_is_idempotent(
+    pg_engine: Engine, sample_csv: Path
+) -> None:
+    """Running ingest twice leaves exactly the original row count in
+    training_pool — the delete-and-reload scoped to reserve_month IS NULL
+    rows must never duplicate the seed."""
+    ingest(sample_csv, pg_engine)
+    ingest(sample_csv, pg_engine)
+    with pg_engine.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM training_pool")).scalar()
+    assert count == 5
+
+
+def test_ingest_training_pool_seed_preserves_reserved_rows(
+    pg_engine: Engine, sample_csv: Path
+) -> None:
+    """A rerun of ingest() must never touch rows write path 2 (the cyclical
+    reshape, Phase 10b) already appended with a non-null reserve_month —
+    seed_training_pool only ever deletes/reloads the reserve_month IS NULL
+    subset it owns."""
+    ingest(engine=pg_engine, path=sample_csv)
+    with pg_engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO training_pool (customerid, gender, seniorcitizen, "
+                "has_partner, dependents, tenure, phoneservice, multiplelines, "
+                "internetservice, onlinesecurity, onlinebackup, deviceprotection, "
+                "techsupport, streamingtv, streamingmovies, contract_type, "
+                "paperlessbilling, paymentmethod, monthlycharges, totalcharges, "
+                "churn, reserve_month) VALUES ('7590-VHVEG', 'Female', 0, 'Yes', "
+                "'No', 1, 'No', 'No phone service', 'DSL', 'No', 'Yes', 'No', "
+                "'No', 'No', 'No', 'Month-to-month', 'Yes', 'Electronic check', "
+                "29.85, 29.85, 0, 1)"
+            )
+        )
+
+    ingest(engine=pg_engine, path=sample_csv)
+
+    with pg_engine.connect() as conn:
+        reserved_count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM training_pool WHERE reserve_month = 1 "
+                "AND customerid = '7590-VHVEG'"
+            )
+        ).scalar()
+        null_count = conn.execute(
+            text("SELECT COUNT(*) FROM training_pool WHERE reserve_month IS NULL")
+        ).scalar()
+    assert reserved_count == 1
+    assert null_count == 5
+
+
 def test_ingest_validates_before_writing(pg_engine: Engine, tmp_path: Path) -> None:
     """ingest() raises ValidationError and leaves the DB unchanged when the CSV fails gate checks.
 
@@ -196,12 +265,23 @@ def test_ingest_main_cli_exits_zero(
     ), f"ingest CLI exited non-zero:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     with pg_engine.connect() as conn:
         count = conn.execute(text("SELECT COUNT(*) FROM customers_raw")).scalar()
+        # Filtered to the NULL-reserve_month seed this run owns — the module-scoped
+        # pg_engine fixture is shared across tests, and an earlier test in this
+        # module deliberately leaves a non-null reserve_month row behind to prove
+        # seed_training_pool() never touches it (test_ingest_training_pool_seed_
+        # preserves_reserved_rows), so a bare table-wide COUNT(*) here would be
+        # coupled to test execution order.
+        training_pool_count = conn.execute(
+            text("SELECT COUNT(*) FROM training_pool WHERE reserve_month IS NULL")
+        ).scalar()
     assert count == 5
+    assert training_pool_count == 5
     receipt_path = _PROJECT_ROOT / "reports" / "ingest_receipt.json"
     assert receipt_path.exists()
     receipt = json.loads(receipt_path.read_text())
     assert receipt["rows_loaded"] == 5
     assert receipt["csv_rows"] == 5
+    assert receipt["training_pool_rows_seeded"] == 5
 
 
 def test_ingest_main_cli_exits_one_on_missing_csv(pg_url: str, tmp_path: Path) -> None:

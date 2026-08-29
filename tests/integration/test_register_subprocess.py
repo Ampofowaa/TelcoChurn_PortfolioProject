@@ -57,7 +57,16 @@ import telco_churn.models.gate as gate
 import telco_churn.models.register as register_module
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
-from telco_churn.data.split import load_split, make_split, partition, write_split
+from telco_churn.data.split import (
+    SPLIT_COL,
+    TEST,
+    load_split,
+    make_reserve,
+    make_split,
+    partition,
+    write_reserve,
+    write_split,
+)
 from telco_churn.features.accessor import FEATURES_FILENAME
 from telco_churn.models.policy_config import costs_config_hash
 from telco_churn.utils.paths import (
@@ -77,13 +86,14 @@ _FAST_CALIBRATION_OVERRIDES = [
     "calibration.inner_cv_folds=3",
 ]
 _FAST_EVALUATE_OVERRIDES = ["evaluate.n_bootstrap=30"]
-# v3_top_k_features=3 (not the production 8): _make_synthetic_processed_frame's
+# direction_sanity_top_k_features=3 (not the production 8): _make_synthetic_processed_frame's
 # docstring plants exactly three real signal columns (contract_type, tenure,
 # monthlycharges) — the only ones with a real, learnable relationship to
-# churn — so cutting the V3 pre-seal veto's top-k at 3 keeps it checking real
-# signal instead of noise from one of this fixture's many uninformative
-# columns. Mirrors tests/unit/test_error_analysis.py's identical override.
-_FAST_THRESHOLD_OVERRIDES = ["threshold.v3_top_k_features=3"]
+# churn — so cutting the direction-sanity pre-seal veto's top-k at 3 keeps it
+# checking real signal instead of noise from one of this fixture's many
+# uninformative columns. Mirrors tests/unit/test_error_analysis.py's
+# identical override.
+_FAST_THRESHOLD_OVERRIDES = ["threshold.direction_sanity_top_k_features=3"]
 
 
 def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame:
@@ -147,13 +157,37 @@ def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame
 def _seed_processed_data(
     out_dir: Path, n: int = 300, seed: int = 0
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Write a processed features file + matching canonical split manifest into out_dir."""
+    """Write a processed features file + matching canonical split manifest into out_dir.
+
+    Also writes reserve_manifest.parquet alongside split_manifest.parquet,
+    mirroring data/split.py's own __main__ — models/sealed_test.py's
+    _load_sealed_test_partition() now joins down to
+    sealed_test_ids(), which reads both manifests unconditionally, so a fixture
+    that seeds only split_manifest.parquet leaves that read with no file to
+    find. Pre-existing gap, not a regression this test introduced: found while
+    verifying §E6's extraction against this fixture, the same class of gap
+    §E2/§E3 already found and fixed in test_split_postgres.py/
+    test_ingest_postgres.py/test_sql_features_postgres.py's own fixtures.
+    """
     df = _make_synthetic_processed_frame(n=n, seed=seed)
     df.to_parquet(out_dir / FEATURES_FILENAME, index=False)
     manifest = make_split(
         ids=df["customerid"], labels=df["churn"], test_size=0.2, random_state=42
     )
     write_split(manifest, out_dir / "split_manifest.parquet")
+
+    test_customerids = manifest.loc[manifest[SPLIT_COL] == TEST, "customerid"]
+    test_labels = (
+        df.set_index("customerid").loc[test_customerids, "churn"].reset_index(drop=True)
+    )
+    reserve_manifest = make_reserve(
+        ids=test_customerids.reset_index(drop=True),
+        labels=test_labels,
+        n_months=2,
+        fraction=0.3,
+        random_state=42,
+    )
+    write_reserve(reserve_manifest, out_dir / "reserve_manifest.parquet")
     return df, manifest
 
 
@@ -950,5 +984,104 @@ def test_register_cli_exits_one_when_refresh_reference_version_ambiguous(
     assert result.returncode == 1, (
         "register CLI should exit 1 when both register.model_version and "
         "register.refresh_reference_version are given:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+def test_register_cli_threshold_rerun_version_tags_a_fresh_run(
+    reviewed_model: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    """The costs.yaml-only re-run path, end to end via real subprocess
+    boundaries for all three steps: promote the champion, re-run
+    models.threshold's rerun mode against it, then register.py's
+    threshold_rerun_version CLI mode points the version's threshold_run_id
+    tag at that fresh run — never minting a new model version and never
+    moving the champion alias."""
+    tracking_uri = str(reviewed_model["tracking_uri"])
+    registered_model_name = str(reviewed_model["registered_model_name"])
+    champion_version = str(reviewed_model["model_version"])
+
+    promote_result = _run_register_cli(champion_version, reviewed_model)
+    assert promote_result.returncode == 0, (
+        "register CLI failed to promote the champion fixture:\n"
+        f"stdout: {promote_result.stdout}\nstderr: {promote_result.stderr}"
+    )
+
+    rerun_reports_dir = tmp_path / "rerun_reports"
+    rerun_reports_dir.mkdir()
+    policy_dir = tmp_path / "rerun_policy"
+    env = {**os.environ, "MLFLOW_TRACKING_URI": tracking_uri}
+
+    threshold_overrides = [
+        f"mlflow.tracking_uri={tracking_uri}",
+        f"mlflow.registered_model_name={registered_model_name}",
+        f"paths.costs_config={reviewed_model['costs_path']}",
+        f"paths.policy={policy_dir}",
+        f"paths.reports={rerun_reports_dir}",
+        f"paths.processed_data={reviewed_model['data_dir']}",
+        f"threshold.rerun_model_version={champion_version}",
+    ]
+    threshold_result = subprocess.run(
+        [sys.executable, "-m", "telco_churn.models.threshold", *threshold_overrides],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=str(_PROJECT_ROOT),
+        timeout=120,
+    )
+    assert threshold_result.returncode == 0, (
+        "threshold CLI (rerun mode) exited non-zero:\n"
+        f"stdout: {threshold_result.stdout}\nstderr: {threshold_result.stderr}"
+    )
+    fresh_threshold_run_id = json.loads(
+        (rerun_reports_dir / "threshold_rerun_receipt.json").read_text(encoding="utf-8")
+    )["threshold_run_id"]
+
+    tag_result = _run_register_cli(
+        None,
+        reviewed_model,
+        extra_overrides=[
+            f"paths.reports={rerun_reports_dir}",
+            f"register.threshold_rerun_version={champion_version}",
+        ],
+    )
+    assert tag_result.returncode == 0, (
+        "register CLI (threshold_rerun_version) exited non-zero:\n"
+        f"stdout: {tag_result.stdout}\nstderr: {tag_result.stderr}"
+    )
+
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+    tags = client.get_model_version(registered_model_name, champion_version).tags
+    assert tags["threshold_run_id"] == fresh_threshold_run_id
+    assert tags["promotion_status"] == "promoted"
+    assert (
+        str(
+            client.get_model_version_by_alias(registered_model_name, "champion").version
+        )
+        == champion_version
+    )
+
+
+def test_register_cli_exits_one_when_threshold_rerun_version_ambiguous(
+    reviewed_model: dict[str, object],
+) -> None:
+    """register.py __main__ exits 1 when threshold_rerun_version is given
+    alongside model_version — the same ambiguity guard
+    test_register_main_cli_exits_one_when_both_model_version_and_run_id_given
+    already covers for model_version/run_id."""
+    result = _run_register_cli(
+        str(reviewed_model["model_version"]),
+        reviewed_model,
+        extra_overrides=[
+            f"register.threshold_rerun_version={reviewed_model['model_version']}"
+        ],
+        timeout=60,
+    )
+
+    assert result.returncode == 1, (
+        "register CLI should exit 1 when both register.model_version and "
+        "register.threshold_rerun_version are given:\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )

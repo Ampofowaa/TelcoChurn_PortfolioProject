@@ -69,6 +69,8 @@ __all__ = [
     "read_eval_receipt",
     "write_error_analysis_receipt",
     "read_error_analysis_receipt",
+    "write_threshold_rerun_receipt",
+    "read_threshold_rerun_receipt",
     "find_dangling_receipts",
     "TRAINING_CYCLE_RUN_DESCRIPTION",
 ]
@@ -520,6 +522,48 @@ def read_error_analysis_receipt(cfg: DictConfig) -> dict[str, Any]:
         raise FileNotFoundError(
             f"{path} does not exist — run `python -m telco_churn.models.error_analysis` "
             "first for this model version."
+        )
+    with open(path, encoding="utf-8") as f:
+        receipt: dict[str, Any] = json.load(f)
+    return receipt
+
+
+def write_threshold_rerun_receipt(
+    model_version: str, threshold_run_id: str, cfg: DictConfig
+) -> None:
+    """Write reports/threshold_rerun_receipt.json — register.py's bootstrap pointer to a costs.yaml-only re-run's fresh MLflow run.
+
+    Same first-invocation-bootstrap role as write_eval_receipt/
+    write_error_analysis_receipt above, for register.py's
+    tag_threshold_rerun. Unlike those two, rewritten fresh on every re-run
+    rather than trusted once and never
+    read again: threshold_run_id is a pointer expected to move over an
+    already-promoted version's tenure (a second costs.yaml edit supersedes
+    the first), not a one-time decision to protect from re-computation.
+    """
+    reports_dir = _reports_dir(cfg)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(
+        reports_dir / "threshold_rerun_receipt.json",
+        "w",
+        encoding="utf-8",
+        newline="\n",
+    ) as f:
+        json.dump(
+            {"model_version": model_version, "threshold_run_id": threshold_run_id},
+            f,
+            indent=2,
+        )
+        f.write("\n")
+
+
+def read_threshold_rerun_receipt(cfg: DictConfig) -> dict[str, Any]:
+    """Read reports/threshold_rerun_receipt.json, raising a clear error naming the producing command."""
+    path = _reports_dir(cfg) / "threshold_rerun_receipt.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} does not exist — run `python -m telco_churn.models.threshold "
+            "threshold.rerun_model_version=<version>` first for this model version."
         )
     with open(path, encoding="utf-8") as f:
         receipt: dict[str, Any] = json.load(f)

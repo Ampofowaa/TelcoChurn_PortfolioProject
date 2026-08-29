@@ -212,6 +212,37 @@ def test_resolve_champion_model_cold_start_loads_the_aliased_version(
     assert bundle.explainer is not None
 
 
+def test_build_model_bundle_resolves_threshold_through_threshold_run_id_tag(
+    predict_cfg: DictConfig,
+) -> None:
+    """A costs.yaml-only re-run's threshold_run_id tag (register.py's
+    tag_threshold_rerun) supersedes the training run's own threshold.json,
+    without a new model version."""
+    name = str(predict_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_model(name, seed=1, threshold=0.4)
+    with mlflow.start_run() as rerun_run:
+        mlflow.log_dict(
+            {
+                "threshold": 0.55,
+                "scenario": "base",
+                "scenarios": {
+                    "base": {
+                        "threshold": 0.55,
+                        "costs": {"c": 60.0, "r": 0.3, "ltv": 500.0, "arpu": 70.0},
+                    },
+                },
+            },
+            "threshold/threshold.json",
+        )
+        rerun_run_id = rerun_run.info.run_id
+    client = mlflow.tracking.MlflowClient()
+    client.set_model_version_tag(name, version, "threshold_run_id", rerun_run_id)
+
+    bundle = predict.build_model_bundle(version, predict_cfg)
+
+    assert bundle.thresholds["base"] == pytest.approx(0.55)
+
+
 def test_resolve_champion_model_refresh_is_a_noop_on_unchanged_alias(
     predict_cfg: DictConfig,
 ) -> None:
@@ -748,12 +779,14 @@ def test_predict_single_probability_matches_direct_model_call(
     golden_predictions.json check (Task 4, through the HTTP layer) extends.
     """
     request = _predict_request()
-    response = predict.predict_single(
+    response, _scored = predict.predict_single(
         request, champion_only_runtime_raw_fields, predict_cfg
     )
 
     bundle = champion_only_runtime_raw_fields.champion
-    row = request.model_dump(exclude={"customerid", "include_explanation"})
+    row = request.model_dump(
+        exclude={"customerid", "include_explanation", "resolution_kind"}
+    )
     X = predict._assemble_model_input(pd.DataFrame([row]), bundle.committed_features)
     expected = float(bundle.model.predict_proba(X)[:, 1][0])
 
@@ -769,7 +802,7 @@ def test_predict_single_with_explanation(
     request = _predict_request()
     request.include_explanation = True
 
-    response = predict.predict_single(
+    response, _scored = predict.predict_single(
         request, champion_only_runtime_raw_fields, predict_cfg
     )
 
@@ -780,7 +813,7 @@ def test_predict_single_with_explanation(
 def test_predict_single_without_explanation_omits_it(
     predict_cfg: DictConfig, champion_only_runtime_raw_fields: predict.ServingRuntime
 ) -> None:
-    response = predict.predict_single(
+    response, _scored = predict.predict_single(
         _predict_request(), champion_only_runtime_raw_fields, predict_cfg
     )
     assert response.explanation is None
@@ -870,7 +903,7 @@ def test_predict_single_matches_golden_predictions_json(
     )
 
     for request, expected in zip(golden_requests, golden["p_hat"], strict=True):
-        response = predict.predict_single(request, runtime, predict_cfg)
+        response, _scored = predict.predict_single(request, runtime, predict_cfg)
         assert response.probability == pytest.approx(expected, abs=1e-9)
 
 

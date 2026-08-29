@@ -32,7 +32,8 @@ YES_NO_NO_INTERNET: Final[frozenset[str]] = frozenset(
 
 
 class RawSchema(DataFrameModel):  # type: ignore[misc]
-    """Schema for the raw customers_raw table (sql/schema/001_create_raw.sql).
+    """Schema for the raw customers_raw table
+    (alembic/versions/2a3418a6f529_create_customers_raw.py).
 
     totalcharges is nullable — the 11 zero-tenure customers in the IBM Telco
     dataset have whitespace in the source CSV, coerced to NaN by ingest.py.

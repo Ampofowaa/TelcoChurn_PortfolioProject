@@ -9,9 +9,14 @@ guard checks for, gated on this extraction). The development-partition loaders
 (`load_dev_features`, `load_dev_customer_ids`, `load_dev_partition`) live in the
 sibling `models/dev_features.py` instead, imported only by calibrate.py/
 threshold.py/register.py — never by error_analysis.py. `load_test_*`/
-`_load_test_partition` stay in evaluate.py exclusively (CLAUDE.md's "test set
-touched once" invariant: X_test/y_test are imported and used in exactly one
-place); a copy here would be a second route to the test partition.
+`_load_sealed_test_partition` live in the sibling `models/sealed_test.py`
+(Phase 10a-ii — extracted out of evaluate.py's own `__main__`-bearing module
+so performance_check.py can share them) — never by error_analysis.py, same
+reason: sealed_test.py imports
+data.split, and error_analysis.py must never become transitively reachable to
+it (CLAUDE.md's "test set touched once" invariant: X_test/y_test are imported
+and used only there and in evaluate.py's own thin `__main__` wrapper over it).
+A copy here would be a second route to the test partition.
 """
 
 from __future__ import annotations

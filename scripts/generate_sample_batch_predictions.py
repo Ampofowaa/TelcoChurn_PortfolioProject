@@ -13,8 +13,7 @@ invariant actually governs.
 
 The remaining 3 rows (one full-inline prospect, two partial-override
 what-ifs) are fixed, hand-picked examples demonstrating /predict/batch's
-other two item shapes — see prediction_logging_plan.md Part A for why these
-three shapes matter. They are not derived from customers_crm and don't
+other two item shapes. They are not derived from customers_crm and don't
 change between runs.
 
 Requires customers_crm to already be populated (`make crm-data`).

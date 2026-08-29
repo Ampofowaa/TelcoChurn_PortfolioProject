@@ -22,7 +22,15 @@ import telco_churn.models.evaluate as evaluate
 import telco_churn.models.register as register
 import telco_churn.models.threshold as threshold
 import telco_churn.models.train.log_model as log_model
-from telco_churn.data.split import make_split, partition, write_split
+from telco_churn.data.split import (
+    SPLIT_COL,
+    TEST,
+    make_reserve,
+    make_split,
+    partition,
+    write_reserve,
+    write_split,
+)
 from telco_churn.features.accessor import FEATURES_FILENAME
 from telco_churn.features.schema import FEATURE_SCHEMA
 from telco_churn.models.error_analysis import (
@@ -495,6 +503,66 @@ def test_sanitize_metric_name_leaves_allowed_characters_untouched() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _features_by_customer_id
+# ---------------------------------------------------------------------------
+
+
+def test_features_by_customer_id_uses_override_when_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """raw_partition_override sources the join instead of load_features(),
+    and load_features() is never even called — the same "stubbed to raise if
+    called" proof test_calibrate.py's own override tests use to demonstrate
+    no silent dev-only fallback."""
+
+    def _raise() -> pd.DataFrame:
+        raise AssertionError(
+            "load_features() must not be called when an override is given"
+        )
+
+    monkeypatch.setattr(error_analysis, "load_features", _raise)
+
+    override = pd.DataFrame(
+        {
+            "customerid": ["cust-A", "cust-B"],
+            "tenure": [99, 5],
+            "monthlycharges": [1.0, 2.0],
+        }
+    )
+    result = error_analysis._features_by_customer_id(
+        pd.Series(["cust-A"]), raw_partition_override=override
+    )
+
+    assert result["tenure"].tolist() == [99]
+
+
+def test_features_by_customer_id_defaults_to_load_features_when_no_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default (no override) path is unaffected — still reads load_features(),
+    the same behaviour the rare/cold-start and sealed-test lookups depend on."""
+    stub = pd.DataFrame(
+        {"customerid": ["cust-A"], "tenure": [12], "monthlycharges": [50.0]}
+    )
+    monkeypatch.setattr(error_analysis, "load_features", lambda: stub)
+
+    result = error_analysis._features_by_customer_id(pd.Series(["cust-A"]))
+
+    assert result["tenure"].tolist() == [12]
+
+
+def test_features_by_customer_id_override_missing_id_raises() -> None:
+    """A customer_id absent from the override fails the same missing-id
+    assertion as the default load_features() path — no silent NaN row."""
+    override = pd.DataFrame({"customerid": ["cust-A"], "tenure": [12]})
+
+    with pytest.raises(AssertionError, match="raw_partition_override"):
+        error_analysis._features_by_customer_id(
+            pd.Series(["cust-A", "cust-missing"]), raw_partition_override=override
+        )
+
+
+# ---------------------------------------------------------------------------
 # display_feature_name
 # ---------------------------------------------------------------------------
 
@@ -700,15 +768,16 @@ _FAST_EVALUATE_OVERRIDES = ["evaluate.n_bootstrap=30"]
 # V2b calibration-collapse check (sliced_calibration -> calibration_slope's
 # LogisticRegression bootstrap) -- ~8k unreduced refits. test_threshold.py's
 # own fixture already reduces this to 200; mirrored here since this fixture
-# nests the same call inside a larger chain. v3_top_k_features=3 (not the
-# production 8): _make_synthetic_processed_frame's docstring plants exactly
-# three real signal columns (contract_type, tenure, monthlycharges) — the
-# only ones with a real, learnable relationship to churn — so cutting the V3
-# pre-seal veto's top-k at 3 keeps it checking real signal instead of noise
-# from one of this fixture's many uninformative columns.
+# nests the same call inside a larger chain. direction_sanity_top_k_features=3
+# (not the production 8): _make_synthetic_processed_frame's docstring plants
+# exactly three real signal columns (contract_type, tenure, monthlycharges) —
+# the only ones with a real, learnable relationship to churn — so cutting
+# the direction-sanity pre-seal veto's top-k at 3 keeps it checking real
+# signal instead of noise from one of this fixture's many uninformative
+# columns.
 _FAST_THRESHOLD_OVERRIDES = [
     "threshold.n_bootstrap=50",
-    "threshold.v3_top_k_features=3",
+    "threshold.direction_sanity_top_k_features=3",
 ]
 
 
@@ -776,13 +845,37 @@ def _make_synthetic_processed_frame(n: int = 300, seed: int = 0) -> pd.DataFrame
 def _seed_processed_data(
     out_dir: Path, n: int = 300, seed: int = 0
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Write a processed features file + matching canonical split manifest into out_dir."""
+    """Write a processed features file + matching canonical split manifest into out_dir.
+
+    Also writes reserve_manifest.parquet alongside split_manifest.parquet,
+    mirroring data/split.py's own __main__ — models/sealed_test.py's
+    _load_sealed_test_partition() now joins down to
+    sealed_test_ids(), which reads both manifests unconditionally, so a fixture
+    that seeds only split_manifest.parquet leaves that read with no file to
+    find. Pre-existing gap, not a regression this test introduced: found while
+    verifying §E6's extraction against this fixture, the same class of gap
+    §E2/§E3 already found and fixed in test_split_postgres.py/
+    test_ingest_postgres.py/test_sql_features_postgres.py's own fixtures.
+    """
     df = _make_synthetic_processed_frame(n=n, seed=seed)
     df.to_parquet(out_dir / FEATURES_FILENAME, index=False)
     manifest = make_split(
         ids=df["customerid"], labels=df["churn"], test_size=0.2, random_state=42
     )
     write_split(manifest, out_dir / "split_manifest.parquet")
+
+    test_customerids = manifest.loc[manifest[SPLIT_COL] == TEST, "customerid"]
+    test_labels = (
+        df.set_index("customerid").loc[test_customerids, "churn"].reset_index(drop=True)
+    )
+    reserve_manifest = make_reserve(
+        ids=test_customerids.reset_index(drop=True),
+        labels=test_labels,
+        n_months=2,
+        fraction=0.3,
+        random_state=42,
+    )
+    write_reserve(reserve_manifest, out_dir / "reserve_manifest.parquet")
     return df, manifest
 
 

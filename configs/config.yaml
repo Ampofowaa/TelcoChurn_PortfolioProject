@@ -11,6 +11,7 @@ defaults:
   - register: default     # registry promotion knobs → cfg.register
   # - data: telco          # pending
   - serving: api          # cfg.serving — serving/predict.py, serving/app.py
+  - outcomes: default     # manual outcome-recording CLI knobs → cfg.outcomes
   - _self_
 
 # The dev/test split seed (data/split.py) and the CV-fold seed for models/train/.
@@ -29,6 +30,13 @@ random_seed: 42
 
 training_setup:
   test_size: 0.2                        # stratified dev/test split fraction
+  reserve_months: 6                     # Phase 10a-ii reserve: monthly cohorts carved from `test`
+  reserve_fraction: 0.4                 # fraction of `test` carved into the reserve (rest stays sealed test)
+  # Own key, deliberately not `random_seed` — same reasoning as random_seed's own
+  # comment above: reserve_ids() must draw from an independent stream, never the
+  # (dev, test) split's, so a shared key would make the reserve draw reachable from
+  # a routine dev/test-split seed edit.
+  reserve_random_state: 42
   # cv_folds/cv_repeats/bootstrap_n_samples/segment_bootstrap_n_samples retired:
   # they drove Steps 1-2 (candidates.py/comparison.py), which are notebook-only
   # (notebooks/03a-model-selection.ipynb) as of the model-family freeze —

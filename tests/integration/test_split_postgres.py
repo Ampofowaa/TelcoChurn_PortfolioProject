@@ -15,7 +15,8 @@ from sqlalchemy.engine import Engine
 from testcontainers.postgres import PostgresContainer
 
 from telco_churn.data.ingest import ingest
-from telco_churn.data.split import DEV, SPLIT_COL, TEST
+from telco_churn.data.split import DEV, RESERVE_COL, SPLIT_COL, TEST
+from telco_churn.utils.db import apply_migrations
 from telco_churn.utils.paths import get_project_root
 
 pytestmark = pytest.mark.integration
@@ -54,8 +55,10 @@ _SEED_CSV = (
 
 @pytest.fixture(scope="module")
 def pg_engine() -> Iterator[Engine]:
-    """Ephemeral Postgres 16 container for the test module."""
+    """Ephemeral Postgres 16 container for the test module, migrated to head —
+    ingest() no longer creates customers_raw itself."""
     with PostgresContainer("postgres:16") as pg:
+        apply_migrations(pg.get_connection_url(driver=None))
         engine = create_engine(pg.get_connection_url())
         yield engine
         engine.dispose()
@@ -81,11 +84,13 @@ def seeded_engine(
 def test_split_main_cli_exits_zero(
     seeded_engine: Engine, pg_url: str, tmp_path: Path
 ) -> None:
-    """split.py __main__ reads customers_raw, writes a valid manifest, and exits 0.
+    """split.py __main__ reads customers_raw, writes a valid split manifest plus a
+    valid reserve manifest, and exits 0.
 
     CLAUDE.md: every __main__ entry point requires a subprocess integration test
     covering the full composition path — here that's get_engine() -> POSTGRES_URL
-    -> pd.read_sql_table(customers_raw) -> make_split -> write_split.
+    -> pd.read_sql_table(customers_raw) -> make_split -> write_split, then
+    make_reserve -> write_reserve on the resulting test partition.
     """
     out_dir = tmp_path
     env = {**os.environ, "POSTGRES_URL": pg_url}
@@ -114,6 +119,14 @@ def test_split_main_cli_exits_zero(
     assert manifest["customerid"].is_unique
     n_test = int((manifest[SPLIT_COL] == TEST).sum())
     assert n_test == 6  # 30 rows * 0.2 test_size
+
+    reserve_path = out_dir / "reserve_manifest.parquet"
+    assert reserve_path.exists()
+    reserve = pd.read_parquet(reserve_path)
+    test_customerids = set(manifest.loc[manifest[SPLIT_COL] == TEST, "customerid"])
+    assert set(reserve["customerid"]) == test_customerids
+    assert reserve["customerid"].is_unique
+    assert reserve[RESERVE_COL].dropna().between(1, 6).all()
 
 
 def test_split_main_cli_exits_one_when_customers_raw_missing(tmp_path: Path) -> None:

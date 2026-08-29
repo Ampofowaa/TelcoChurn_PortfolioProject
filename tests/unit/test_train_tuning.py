@@ -773,6 +773,255 @@ def test_run_tuning_step_skips_enqueue_without_warm_start_params(
     enqueue_mock.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# run_tuning_step — warm_start_params argument (E4): the caller-supplied
+# value overrides cfg.tuning.warm_start_params so training_cycle.py (Phase
+# 10b) can seed the search from the champion's own tuned_hyperparameters
+# model-version tag (§E9) instead of this project's one-time, hand-set
+# config prior.
+# ---------------------------------------------------------------------------
+
+
+def test_run_tuning_step_warm_start_argument_overrides_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """A warm_start_params function argument is enqueued instead of
+    cfg.tuning.warm_start_params when both are set, and never via
+    study.add_trials — enqueue_trial re-fits and re-scores every enqueued
+    trial on the current data; add_trials would import the prior trials'
+    stale scores and reintroduce the mixed-dataset risk _study_name's
+    data_content_hash fix exists to prevent.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    tuning_cfg.tuning.warm_start_params = {
+        "num_leaves": 99,
+        "learning_rate": 0.01,
+        "min_child_samples": 10,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.1,
+        "reg_lambda": 0.1,
+    }
+    argument_warm_start = {
+        "num_leaves": 15,
+        "learning_rate": 0.05,
+        "min_child_samples": 12,
+        "subsample": 0.85,
+        "colsample_bytree": 0.85,
+        "reg_alpha": 0.2,
+        "reg_lambda": 0.2,
+    }
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    captured: dict[str, Any] = {}
+    original_enqueue = optuna.study.Study.enqueue_trial
+
+    def spy_enqueue(self: optuna.Study, params: Any, *args: Any, **kwargs: Any) -> Any:
+        captured["params"] = dict(params)
+        return original_enqueue(self, params, *args, **kwargs)
+
+    monkeypatch.setattr(optuna.study.Study, "enqueue_trial", spy_enqueue)
+    add_trials_mock = Mock(wraps=optuna.study.Study.add_trials)
+    monkeypatch.setattr(optuna.study.Study, "add_trials", add_trials_mock)
+
+    tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        storage=optuna.storages.InMemoryStorage(),
+        warm_start_params=argument_warm_start,
+    )
+
+    assert captured["params"] == argument_warm_start
+    add_trials_mock.assert_not_called()
+
+
+def test_run_tuning_step_warm_start_argument_ignored_in_pinned_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """warm_start_params is meaningless once pinned_params skips study
+    construction altogether — no enqueue_trial call happens either way."""
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    enqueue_mock = Mock(wraps=optuna.study.Study.enqueue_trial)
+    monkeypatch.setattr(optuna.study.Study, "enqueue_trial", enqueue_mock)
+
+    tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        pinned_params={"num_leaves": 12, "n_estimators": 100},
+        warm_start_params={"num_leaves": 5},
+    )
+
+    enqueue_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# run_tuning_step — pinned_params mode (E4): skip the Optuna search entirely,
+# ship the champion's own tuned hyperparameters unchanged. Reserved for the
+# two reserve-driven routine retrain cycles.
+# ---------------------------------------------------------------------------
+
+
+def test_run_tuning_step_pinned_mode_skips_the_search(
+    monkeypatch: pytest.MonkeyPatch,
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """pinned_params given: no Optuna study is built at all, and the returned
+    dict is shaped identically to the search path's own output, so
+    run_model_logging_step needs no changes to consume either.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+    pinned_params = {
+        "num_leaves": 12,
+        "learning_rate": 0.05,
+        "min_child_samples": 15,
+        "subsample": 0.9,
+        "colsample_bytree": 0.9,
+        "reg_alpha": 0.2,
+        "reg_lambda": 0.2,
+        "max_depth": 5,
+        "n_estimators": 150,
+    }
+
+    build_study_mock = Mock()
+    monkeypatch.setattr(tuning, "_build_optuna_study", build_study_mock)
+
+    result = tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        storage=optuna.storages.InMemoryStorage(),
+        pinned_params=pinned_params,
+    )
+
+    build_study_mock.assert_not_called()
+    assert set(result) == {
+        "best_params",
+        "best_n_estimators_median",
+        "best_cv_pr_auc_mean",
+        "boundary_hits",
+        "n_completed_trials",
+        "parent_run_id",
+        "committed_features",
+        "tuning_summary",
+    }
+    assert result["n_completed_trials"] == 0
+    assert result["best_cv_pr_auc_mean"] is None
+    assert result["best_n_estimators_median"] == 150
+    assert "n_estimators" not in result["best_params"]
+    assert result["best_params"] == {
+        k: v for k, v in pinned_params.items() if k != "n_estimators"
+    }
+    assert result["tuning_summary"]["mode"] == "pinned"
+    assert result["tuning_summary"]["n_trials_requested"] == 0
+    assert result["tuning_summary"]["n_completed_trials"] == 0
+    assert result["tuning_summary"]["boundary_hits"] == result["boundary_hits"]
+
+
+def test_run_tuning_step_pinned_mode_requires_n_estimators(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """A pinned_params dict missing n_estimators raises loudly rather than
+    silently shipping without a tree count — it is expected to be the
+    tuned_hyperparameters model-version tag payload, which always carries one.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+
+    with pytest.raises(ValueError, match="n_estimators"):
+        tuning.run_tuning_step(
+            X_dev,
+            y_dev,
+            committed_features,
+            tuning_cfg,
+            pinned_params={"num_leaves": 12},
+        )
+
+
+def test_run_tuning_step_pinned_mode_logs_tuning_study_run(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+) -> None:
+    """A tuning_study run is still opened and tagged in pinned mode —
+    log_model.py reopens this run's id to log the model onto it on either
+    path.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+    pinned_params = {"num_leaves": 12, "n_estimators": 100}
+
+    result = tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        pinned_params=pinned_params,
+    )
+
+    run = mlflow.get_run(result["parent_run_id"])
+    assert run.data.tags.get("stage") == "tuning"
+    assert run.data.params.get("mode") == "pinned"
+
+
+def test_run_tuning_step_pinned_mode_warns_on_boundary_hit(
+    tuning_mlflow_uri: str,
+    dev_split: tuple[pd.DataFrame, pd.Series],
+    tuning_cfg: DictConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pinned param sitting on the configured search range's edge still
+    warns — the range may have moved since the champion's own cycle pinned
+    it, so this is worth flagging even though nothing here re-searches it.
+    """
+    tuning_cfg.mlflow.tracking_uri = tuning_mlflow_uri
+    X_dev, y_dev = dev_split
+    committed_features = list(X_dev.columns)
+    # num_leaves' configured range in tuning_cfg is [10, 30] — 30 sits on the edge.
+    pinned_params = {"num_leaves": 30, "n_estimators": 100}
+
+    warning_mock = Mock()
+    monkeypatch.setattr(tuning.logger, "warning", warning_mock)
+
+    tuning.run_tuning_step(
+        X_dev,
+        y_dev,
+        committed_features,
+        tuning_cfg,
+        pinned_params=pinned_params,
+    )
+
+    boundary_calls = [
+        call
+        for call in warning_mock.call_args_list
+        if call.args[0] == "tuning_boundary_hit"
+    ]
+    assert len(boundary_calls) == 1
+    assert boundary_calls[0].kwargs["hit_params"] == ["num_leaves"]
+
+
 def test_run_tuning_step_warns_on_boundary_hit(
     monkeypatch: pytest.MonkeyPatch,
     tuning_mlflow_uri: str,

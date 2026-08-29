@@ -6,7 +6,9 @@ stages:
       - src/telco_churn/data/schema.py
       - src/telco_churn/data/checks.py
       - src/telco_churn/data/validate.py
-      - sql/schema/001_create_raw.sql
+      - src/telco_churn/data/tables.py
+      - alembic/
+      - alembic.ini
       - datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv
     params:
       - configs/config.yaml:
@@ -38,8 +40,12 @@ stages:
       - configs/config.yaml:
           - random_seed
           - training_setup.test_size
+          - training_setup.reserve_months
+          - training_setup.reserve_fraction
+          - training_setup.reserve_random_state
     outs:
       - datasets/processed/split_manifest.parquet
+      - datasets/processed/reserve_manifest.parquet
 
   features:
     cmd: uv run python -m telco_churn.features.build
@@ -146,8 +152,8 @@ stages:
       - configs/threshold/default.yaml:
           - random_state
           - n_bootstrap
-          - v3_top_k_features
-          - v3_min_direction_magnitude
+          - direction_sanity_top_k_features
+          - direction_sanity_min_magnitude
       - configs/calibration/default.yaml:
           - ece_n_bins
           - ece_strategy
@@ -164,6 +170,7 @@ stages:
     cmd: uv run python -m telco_churn.models.evaluate
     deps:
       - src/telco_churn/models/evaluate.py
+      - src/telco_churn/models/sealed_test.py
       - src/telco_churn/models/gate.py
       - src/telco_churn/models/diagnostics.py
       - src/telco_churn/models/economics.py
@@ -179,6 +186,7 @@ stages:
       - src/telco_churn/features/accessor.py
       - src/telco_churn/utils/stats.py
       - datasets/processed/split_manifest.parquet
+      - datasets/processed/reserve_manifest.parquet
       - datasets/processed/telco_churn_features.parquet
       - reports/calibrate_receipt.json
       - reports/policy/threshold.yaml

@@ -27,10 +27,16 @@ from omegaconf import DictConfig
 from sklearn.base import clone
 from sklearn.metrics import PrecisionRecallDisplay, average_precision_score
 from sklearn.model_selection import RepeatedStratifiedKFold
+from sqlalchemy.engine import Engine
 
 from telco_churn.data.split import partition
 from telco_churn.features.accessor import features_path, load_features
-from telco_churn.features.build import FEATURE_SCHEMA, TARGET_COL
+from telco_churn.features.build import (
+    FEATURE_SCHEMA,
+    TARGET_COL,
+    build_feature_df,
+    load_customer_features,
+)
 from telco_churn.utils.logging import get_logger
 
 __all__ = [
@@ -38,6 +44,7 @@ __all__ = [
     "COMMITTED_MODEL_FAMILY_DECISION_RUN_ID",
     "cv_score_candidate",
     "lgbm_default_params",
+    "load_training_pool_bundle",
     "logreg_default_params",
 ]
 
@@ -49,7 +56,7 @@ logger = get_logger(__name__)
 # ANALYSIS.md §4a. LightGBM wins on the evidence (paired-bootstrap Δ = 0.007,
 # CI [0.002, 0.012], p = 0.0020, run `c405f6fe31454c3a9899423680644411`) and on
 # build-specific rationale (SHAP speed, calibration continuity, training
-# speed for Optuna/weekly retrain). Edit this constant — never hand-fit a
+# speed for Optuna/monthly retrain). Edit this constant — never hand-fit a
 # LogReg pipeline into Steps 3-5 — if a re-run of 03a's on-demand review
 # concludes a different family should ship; same "explicit code changes,
 # never accidental side-effects" discipline features/schema.py's
@@ -87,40 +94,92 @@ def _git_sha() -> str:
 
 
 def _load_dev_features() -> tuple[pd.DataFrame, pd.Series]:
-    """Load the processed feature frame and return only its dev-partition rows."""
+    """Load the processed feature frame and return only its dev-partition rows.
+
+    The v1/cold-start path's only loader — train/__main__.py calls this
+    directly and unconditionally. load_training_pool_bundle() (below) is the
+    retrain-cycle equivalent, sourced from training_pool rather than the
+    static processed-features parquet; it never replaces this function, only
+    supplements it for a caller that needs dev ∪ matured reserve instead of
+    dev alone.
+    """
     df = load_features()
     dev_df, _test_df = partition(df)
     return dev_df[_FEATURE_COLS], dev_df[TARGET_COL]
 
 
-def _build_dev_dataset(X_dev: pd.DataFrame, y_dev: pd.Series) -> PandasDataset:
-    """Build the dev-partition MLflow dataset object, not yet logged to any run.
+def load_training_pool_bundle(
+    engine: Engine, reserve_months: list[int] | None = None
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
+    """Query training_pool for the fold-forward-eligible population; return the
+    4-field bundle a retrain cycle's train/calibrate/threshold steps all draw
+    from.
 
-    source resolves through features/accessor.py's canonical path, the same
-    single-owner rule candidates.py already follows, so this can't go stale
-    at Phase 8's CSV->parquet rename. The dataset's digest is content-based
-    (from_pandas), so this is purely lineage metadata — it records what data
-    a run touched, never something a computed number depends on.
+    reserve_months is the same fold-forward filter features/build.py::
+    build_feature_query already applies — None selects only the original
+    CSV-seeded population (reserve_month IS NULL), the same rows
+    _load_dev_features() reads for cold start; a non-empty list additionally
+    folds in those matured reserve cohorts.
+
+    Intended to be called exactly once per cycle, at flow start, by
+    training_cycle.py (Phase 10b) — nothing in this repo calls it yet, the
+    same "no live caller until its orchestrator lands" state
+    data/training_pool.py's write-path-2 functions are already in. The
+    returned (X_train, y_train, customer_ids) feed run_feature_audit_step/
+    run_tuning_step/run_model_logging_step directly; all four fields feed
+    calibrate.py's/threshold.py's own override parameters — one query, never
+    a second independent assembly, so no stage of a cycle can silently see a
+    different training_pool snapshot than its siblings.
+
+    raw_partition is the full customer_features frame (customerid + every
+    FEATURE_SCHEMA column + churn) — the same shape
+    models/dev_features.py::load_dev_partition() returns for the cold-start
+    path. threshold.py's V1/V2/V2b fairness diagnostics need it for
+    segment/protected columns (gender, seniorcitizen, ...); X_train/y_train
+    alone don't carry customerid or churn.
     """
-    dev_df = X_dev.copy()
-    dev_df[TARGET_COL] = y_dev.values
+    raw_partition = build_feature_df(load_customer_features(engine, reserve_months))
+    return (
+        raw_partition[_FEATURE_COLS],
+        raw_partition[TARGET_COL],
+        raw_partition["customerid"].reset_index(drop=True),
+        raw_partition,
+    )
+
+
+def _build_dev_dataset(X_train: pd.DataFrame, y_train: pd.Series) -> PandasDataset:
+    """Build the training-population MLflow dataset object, not yet logged to any run.
+
+    X_train/y_train is dev-only at cold start, dev ∪ matured reserve on a
+    retrain cycle — named to match
+    load_training_pool_bundle()'s own output fields so the value passes
+    through unchanged in both name and meaning from assembly to logging, on
+    either path. source resolves through features/accessor.py's canonical
+    path, the same single-owner rule candidates.py already follows, so this
+    can't go stale at Phase 8's CSV->parquet rename. The dataset's digest is
+    content-based (from_pandas), so this is purely lineage metadata — it
+    records what data a run touched, never something a computed number
+    depends on.
+    """
+    dataset_df = X_train.copy()
+    dataset_df[TARGET_COL] = y_train.values
     return mlflow_from_pandas(
-        dev_df,
+        dataset_df,
         source=str(features_path()),
         name="telco_churn_dev",
         targets=TARGET_COL,
     )
 
 
-def _log_dev_input(X_dev: pd.DataFrame, y_dev: pd.Series, context: str) -> None:
-    """Log the dev-partition dataset as an MLflow run input — call from inside an active run.
+def _log_dev_input(X_train: pd.DataFrame, y_train: pd.Series, context: str) -> None:
+    """Log the training-population dataset as an MLflow run input — call from inside an active run.
 
     Shared by comparison.py, feature_audit.py, and tuning.py (candidates.py
     calls _build_dev_dataset directly instead, since each of its three
     candidate runs needs its own log_input call against one shared dataset
     object, not a fresh build-and-log per run).
     """
-    mlflow.log_input(_build_dev_dataset(X_dev, y_dev), context=context)
+    mlflow.log_input(_build_dev_dataset(X_train, y_train), context=context)
 
 
 def _plot_bootstrap_delta(

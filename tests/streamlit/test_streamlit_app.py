@@ -60,8 +60,8 @@ _CRM_SNAPSHOT_AT = "2026-08-15T00:00:00+00:00"
 _CRM_SNAPSHOT_AT_DISPLAY = "2026-08-15 00:00:00 UTC"
 # GET /customer/{id}'s actual response shape: CustomerLookupResponse{features,
 # crm_snapshot_at} — never the bare CustomerFeatures dict _CUSTOMER_ROW is,
-# since customers_crm (prediction_logging_plan.md Part A) always carries a
-# provenance timestamp alongside the feature values.
+# since customers_crm always carries a provenance timestamp alongside the
+# feature values.
 _CUSTOMER_LOOKUP_RESPONSE: dict[str, Any] = {
     "features": _CUSTOMER_ROW,
     "crm_snapshot_at": _CRM_SNAPSHOT_AT,

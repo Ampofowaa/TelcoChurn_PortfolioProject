@@ -32,7 +32,7 @@ top_k_cohorts: 15
 # How many top-|SHAP| (sealed-test) features feed the dependence plots and
 # error_analysis.py's own reported-only direction_sanity_check_test re-audit
 # — decoupled from V3 (threshold.py's binding pre-seal veto, config key
-# threshold.v3_top_k_features, derived from the dev-SHAP ranking instead).
+# threshold.direction_sanity_top_k_features, derived from the dev-SHAP ranking instead).
 # 8, not a round number: mean-|SHAP| forms a tight plateau across ranks 4-8
 # (0.1949-0.1747, deltas <=0.03) before a real elbow at rank 8->9 (delta
 # 0.046) — cutting at 5 excluded two checkable, EDA-keyed features (Online

@@ -26,8 +26,8 @@ from telco_churn.serving.crm_data import (
     CrmGenerationParams,
     generate_crm_rows,
     load_crm,
-    setup_crm_schema,
 )
+from telco_churn.utils.db import apply_migrations
 from telco_churn.utils.paths import compose_config, reset_active_config
 
 # fastapi.testclient.TestClient imports the third-party `httpx` module by
@@ -127,13 +127,13 @@ def serving_postgres_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[s
     """
     with PostgresContainer("postgres:16") as pg:
         url = pg.get_connection_url(driver=None)
+        apply_migrations(url)
         engine = create_engine(url)
         csv_path = tmp_path_factory.mktemp("serving_csv") / "serving_customers.csv"
         csv_path.write_text(_serving_csv_text(), encoding="utf-8")
         ingest(csv_path, engine)
         raw_df = pd.read_sql_table("customers_raw", engine)
         crm_rows = generate_crm_rows(raw_df, _CRM_PARAMS)
-        setup_crm_schema(engine)
         load_crm(crm_rows, engine)
         engine.dispose()
         yield url
@@ -322,6 +322,32 @@ def compose_config_with_auth_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
         return cfg
 
     monkeypatch.setattr(app_module, "compose_config", _compose_with_auth_enabled)
+
+
+@pytest.fixture
+def compose_config_with_prediction_log_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Force serving.prediction_log.enabled=false for one test — same
+    monkeypatch-the-imported-name trick compose_config_with_auth_enabled
+    above uses, for the same reason (a plain literal, not an
+    ${oc.env:...} resolver, and app.py's lifespan calls compose_config()
+    with no overrides).
+    """
+    import telco_churn.serving.app as app_module
+
+    real_compose_config = app_module.compose_config
+
+    def _compose_with_prediction_log_disabled(
+        overrides: list[str] | None = None,
+    ) -> Any:
+        cfg = real_compose_config(overrides)
+        cfg.serving.prediction_log.enabled = False
+        return cfg
+
+    monkeypatch.setattr(
+        app_module, "compose_config", _compose_with_prediction_log_disabled
+    )
 
 
 @pytest.fixture

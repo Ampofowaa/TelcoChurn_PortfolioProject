@@ -50,7 +50,7 @@ _MODEL_DESCRIPTION = (
 def _cv_pr_auc_at_n_estimators(
     n_estimators: int,
     X_committed: pd.DataFrame,
-    y_dev: pd.Series,
+    y_train: pd.Series,
     lgbm_params: dict[str, Any],
     binary: list[str],
     multi_cat: list[str],
@@ -64,7 +64,7 @@ def _cv_pr_auc_at_n_estimators(
     random_state=cfg.tuning.random_state) split by construction alone: a
     StratifiedKFold's partition depends only on n_samples, the y labels, and
     (shuffle, random_state) — never on X's column content — so passing the
-    same y_dev with the same three parameters reproduces tuning.py's exact
+    same y_train with the same three parameters reproduces tuning.py's exact
     fold indices without threading them through tuning_result. This is the
     two-count diagnostic: a confirmation that the a-priori scaling rule holds
     on this project's own data, never a selection — it fits plain estimators
@@ -82,9 +82,9 @@ def _cv_pr_auc_at_n_estimators(
     """
     skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
     scores: list[float] = []
-    for train_idx, val_idx in skf.split(X_committed, y_dev):
+    for train_idx, val_idx in skf.split(X_committed, y_train):
         X_tr, X_val = X_committed.iloc[train_idx], X_committed.iloc[val_idx]
-        y_tr, y_val = y_dev.iloc[train_idx], y_dev.iloc[val_idx]
+        y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
 
         preprocessor = build_preprocessor(binary, multi_cat, numeric)
         X_tr_t = preprocessor.fit_transform(X_tr)
@@ -98,7 +98,7 @@ def _cv_pr_auc_at_n_estimators(
 
 
 def _scale_n_estimators(
-    tuning_result: dict[str, Any], cfg: DictConfig, y_dev: pd.Series
+    tuning_result: dict[str, Any], cfg: DictConfig, y_train: pd.Series
 ) -> dict[str, Any]:
     """Scale the raw early-stopped n_estimators median to the final-fit row count.
 
@@ -110,7 +110,7 @@ def _scale_n_estimators(
     n_estimators_es_median = int(tuning_result["best_n_estimators_median"])
     cv_folds = int(cfg.tuning.cv_folds)
     es_validation_size = float(cfg.tuning.es_validation_size)
-    n_final_fit = len(y_dev)
+    n_final_fit = len(y_train)
     n_fold_fit = round(
         n_final_fit * (cv_folds - 1) / cv_folds * (1 - es_validation_size)
     )
@@ -129,7 +129,7 @@ def _scale_n_estimators(
 def _run_two_count_diagnostic(
     scaling: dict[str, Any],
     X_committed: pd.DataFrame,
-    y_dev: pd.Series,
+    y_train: pd.Series,
     diagnostic_lgbm_params: dict[str, Any],
     binary: list[str],
     multi_cat: list[str],
@@ -149,7 +149,7 @@ def _run_two_count_diagnostic(
         label: _cv_pr_auc_at_n_estimators(
             n_estimators,
             X_committed,
-            y_dev,
+            y_train,
             diagnostic_lgbm_params,
             binary,
             multi_cat,
@@ -181,7 +181,7 @@ def _run_two_count_diagnostic(
 
 def _fit_committed_pipeline(
     X_committed: pd.DataFrame,
-    y_dev: pd.Series,
+    y_train: pd.Series,
     binary: list[str],
     multi_cat: list[str],
     numeric: list[str],
@@ -195,7 +195,7 @@ def _fit_committed_pipeline(
             ("model", LGBMClassifier(**model_params)),
         ]
     )
-    pipeline.fit(X_committed, y_dev)
+    pipeline.fit(X_committed, y_train)
 
     input_example = X_committed.head(5)
     in_memory_preds = pipeline.predict_proba(input_example)
@@ -313,15 +313,17 @@ def _log_model_run(
 
 
 def run_model_logging_step(
-    X_dev: pd.DataFrame,
-    y_dev: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
     tuning_result: dict[str, Any],
     cfg: DictConfig,
 ) -> dict[str, Any]:
     """Log the tuned pipeline to the tuning_study MLflow run — do not register it.
 
-    Refits [tree_preprocessor -> LightGBM] on all of development with the Step 4
-    hyperparameters. n_estimators is not used at its raw early-stopped median —
+    Refits [tree_preprocessor -> LightGBM] on all of X_train/y_train — dev-only
+    at cold start, dev ∪ matured reserve on a retrain cycle — with the Step 4
+    hyperparameters.
+    n_estimators is not used at its raw early-stopped median —
     that count was derived on each fold's *training* partition, smaller than
     this final fit by construction (tuning.py carves an es_validation_size
     slice out of every fold's training rows), so it is scaled by
@@ -373,14 +375,14 @@ def run_model_logging_step(
 
     fixed_hyperparameters = _lgbm_fixed_knobs(cfg, random_state)
     best_params = dict(tuning_result["best_params"])
-    X_committed = X_dev[committed_features]
+    X_committed = X_train[committed_features]
 
-    scaling = _scale_n_estimators(tuning_result, cfg, y_dev)
+    scaling = _scale_n_estimators(tuning_result, cfg, y_train)
     diagnostic_lgbm_params = {**best_params, **fixed_hyperparameters}
     diagnostic_scores = _run_two_count_diagnostic(
         scaling,
         X_committed,
-        y_dev,
+        y_train,
         diagnostic_lgbm_params,
         binary,
         multi_cat,
@@ -404,7 +406,7 @@ def run_model_logging_step(
     model_params = {**selected_hyperparameters, **fixed_hyperparameters}
 
     fitted = _fit_committed_pipeline(
-        X_committed, y_dev, binary, multi_cat, numeric, model_params
+        X_committed, y_train, binary, multi_cat, numeric, model_params
     )
 
     full_feature_space = (

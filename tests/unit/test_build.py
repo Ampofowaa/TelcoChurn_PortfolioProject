@@ -20,7 +20,7 @@ from telco_churn.features import (
     FeatureOutputSchema,
     build_feature_df,
 )
-from telco_churn.features.build import _reject_if_empty
+from telco_churn.features.build import _reject_if_empty, build_feature_query
 from telco_churn.utils.paths import get_project_root
 
 # ---------------------------------------------------------------------------
@@ -157,6 +157,46 @@ def test_build_feature_df_empty_dataframe_raises() -> None:
     """build_feature_df raises SchemaError when the input has no columns."""
     with pytest.raises(SchemaError):
         build_feature_df(pd.DataFrame())
+
+
+# ---------------------------------------------------------------------------
+# build_feature_query — the fold-forward cycle-scoped filter
+# ---------------------------------------------------------------------------
+
+
+def test_build_feature_query_default_selects_null_reserve_month_only() -> None:
+    """reserve_months=None (today's v1/cold-start default) filters to the
+    original CSV-seeded population only."""
+    query = build_feature_query()
+    assert "WHERE reserve_month IS NULL" in query
+    assert "IN (" not in query
+
+
+def test_build_feature_query_empty_list_behaves_like_none() -> None:
+    """An empty list is falsy — same NULL-only filter as the default, not an
+    always-false IN () clause."""
+    assert build_feature_query([]) == build_feature_query(None)
+
+
+def test_build_feature_query_folds_in_given_months() -> None:
+    """A non-empty reserve_months list ORs the seed population with the
+    given cohort numbers — the seed is always included, never replaced."""
+    query = build_feature_query([1, 2, 4])
+    assert "WHERE reserve_month IS NULL OR reserve_month IN (1, 2, 4)" in query
+
+
+def test_build_feature_query_casts_reserve_months_to_int() -> None:
+    """reserve_months values are cast through int() before interpolation —
+    rejects a non-numeric value rather than building an unintended query."""
+    with pytest.raises(ValueError, match="not-a-month"):
+        build_feature_query(["not-a-month"])  # type: ignore[list-item]
+
+
+def test_build_feature_query_selects_sql_feature_cols() -> None:
+    """The SELECT list is exactly SQL_FEATURE_COLS, comma-joined."""
+    query = build_feature_query()
+    for col in SQL_FEATURE_COLS:
+        assert col in query
 
 
 # ---------------------------------------------------------------------------

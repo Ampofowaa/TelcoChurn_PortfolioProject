@@ -23,7 +23,9 @@ from telco_churn.features import (
     build_feature_df,
     build_sql_features,
 )
+from telco_churn.features.build import load_customer_features
 from telco_churn.features.generate import compute_charge_per_service
+from telco_churn.utils.db import apply_migrations
 from telco_churn.utils.paths import get_project_root
 
 pytestmark = pytest.mark.integration
@@ -47,8 +49,11 @@ def sql_dir() -> Path:
 
 @pytest.fixture(scope="module")
 def pg_engine() -> Iterator[Engine]:
-    """Ephemeral Postgres 16 container seeded with sample data and feature views."""
+    """Ephemeral Postgres 16 container seeded with sample data and feature views,
+    migrated to head — ingest() no longer creates customers_raw/training_pool
+    itself."""
     with PostgresContainer("postgres:16") as pg:
+        apply_migrations(pg.get_connection_url(driver=None))
         engine = create_engine(pg.get_connection_url())
         yield engine
         engine.dispose()
@@ -430,3 +435,48 @@ def test_sql_features_main_cli_exits_one_on_connection_failure() -> None:
         f"sql_features CLI should exit 1 on an unreachable DB:\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Fold-forward: a matured reserve cohort becomes training-eligible via a
+# query-time filter, without the seed rows ever being rewritten.
+#
+# Placed last in this module deliberately — it inserts a permanent row into
+# the shared, module-scoped seeded_engine, which would otherwise inflate
+# every earlier test's _RAW_COUNT-based row-count assertion.
+# ---------------------------------------------------------------------------
+
+
+def test_load_customer_features_fold_forward_filter(seeded_engine: Engine) -> None:
+    """A matured reserve cohort becomes training-eligible via a query-time
+    filter alone, never a rewrite of the seed rows.
+
+    reserve_months=None (the default v1/cold-start path) selects only the
+    original CSV-seeded population — the inserted reserve row must not
+    silently appear. Once reserve_months includes its cohort, the same row
+    is picked up unchanged (never rewritten) alongside the seed.
+    """
+    with seeded_engine.begin() as conn:
+        conn.execute(text("""
+                INSERT INTO training_pool
+                    (customerid, gender, seniorcitizen, has_partner, dependents,
+                     tenure, phoneservice, multiplelines, internetservice,
+                     onlinesecurity, onlinebackup, deviceprotection, techsupport,
+                     streamingtv, streamingmovies, contract_type, paperlessbilling,
+                     paymentmethod, monthlycharges, totalcharges, churn, reserve_month)
+                VALUES
+                    ('reserve-cust-1', 'Female', 0, 'Yes', 'No', 5, 'Yes', 'No',
+                     'DSL', 'No', 'No', 'No', 'No', 'No', 'No', 'Month-to-month',
+                     'Yes', 'Mailed check', 40.0, 200.0, 0, 1)
+                """))
+
+    default_df = load_customer_features(seeded_engine)
+    assert "reserve-cust-1" not in set(default_df["customerid"])
+    assert len(default_df) == _RAW_COUNT
+
+    folded_df = load_customer_features(seeded_engine, reserve_months=[1])
+    assert "reserve-cust-1" in set(folded_df["customerid"])
+    assert len(folded_df) == _RAW_COUNT + 1
+    row = folded_df.loc[folded_df["customerid"] == "reserve-cust-1"].iloc[0]
+    assert row["tenure"] == 5
+    assert row["monthlycharges"] == pytest.approx(40.0)

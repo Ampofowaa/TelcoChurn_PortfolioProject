@@ -14,6 +14,7 @@ from sqlalchemy.engine import Engine
 from testcontainers.postgres import PostgresContainer
 
 from telco_churn.data.ingest import ingest
+from telco_churn.utils.db import apply_migrations
 from telco_churn.utils.paths import get_project_root
 
 pytestmark = pytest.mark.integration
@@ -32,8 +33,10 @@ zero-tenure,Female,0,No,No,0,No,No phone service,DSL,No,No,No,No,No,No,Month-to-
 
 @pytest.fixture(scope="module")
 def pg_engine() -> Iterator[Engine]:
-    """Ephemeral Postgres 16 container for the test module."""
+    """Ephemeral Postgres 16 container for the test module, migrated to
+    head — ingest() no longer creates customers_raw itself."""
     with PostgresContainer("postgres:16") as pg:
+        apply_migrations(pg.get_connection_url(driver=None))
         engine = create_engine(pg.get_connection_url())
         yield engine
         engine.dispose()
@@ -104,25 +107,27 @@ def test_validate_main_exits_one_on_blocking_error(
     value triggers both the schema gate (ERROR) and the churn_labels gate (ERROR),
     making can_proceed False and causing sys.exit(1).
 
-    The table's own `customers_raw_churn_check` CHECK constraint (sql/schema/
-    001_create_raw.sql) already rejects churn=9 at the database level, so it is
-    dropped here first — this test is deliberately reaching past that layer to
-    prove validate.py's own gates are a real second line of defense, not dead
-    code shadowed by the DB constraint. CLAUDE.md's "a hand-edited customers_raw
-    is invisible to dvc repro" scenario is exactly a case where corrupt data can
-    land in the table outside the constraint's reach (e.g. the constraint being
-    added after older rows existed, or a direct COPY that bypassed it).
+    The table's own `ck_customers_raw_churn_binary` CHECK constraint
+    (alembic/versions/2a3418a6f529_create_customers_raw.py) already rejects
+    churn=9 at the database level, so it is dropped here first — this test is
+    deliberately reaching past that layer to prove validate.py's own gates
+    are a real second line of defense, not dead code shadowed by the DB
+    constraint. CLAUDE.md's "a hand-edited customers_raw is invisible to dvc
+    repro" scenario is exactly a case where corrupt data can land in the
+    table outside the constraint's reach (e.g. the constraint being added
+    after older rows existed, or a direct COPY that bypassed it).
     """
     csv_path = tmp_path_factory.mktemp("bad_validate_csv") / "sample.csv"
     csv_path.write_text(_SAMPLE_CSV)
 
     with PostgresContainer("postgres:16") as pg:
+        apply_migrations(pg.get_connection_url(driver=None))
         engine = create_engine(pg.get_connection_url())
         ingest(csv_path, engine)
         with engine.connect() as conn:
             conn.execute(
                 text(
-                    "ALTER TABLE customers_raw DROP CONSTRAINT customers_raw_churn_check"
+                    "ALTER TABLE customers_raw DROP CONSTRAINT ck_customers_raw_churn_binary"
                 )
             )
             conn.execute(

@@ -4246,6 +4246,7 @@ name = "telcochurn-portfolioproject"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "alembic" },
     { name = "hydra-core" },
     { name = "lightgbm" },
     { name = "mlflow" },
@@ -4304,6 +4305,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "alembic", specifier = ">=1.18.4" },
     { name = "altair", marker = "extra == 'ui'", specifier = ">=5.0" },
     { name = "asyncpg", marker = "extra == 'serving'", specifier = ">=0.31.0" },
     { name = "fastapi", marker = "extra == 'serving'", specifier = ">=0.138.1" },
@@ -4330,7 +4332,7 @@ requires-dist = [
     { name = "structlog", specifier = ">=25.5.0" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'serving'", specifier = ">=0.49.0" },
 ]
-provides-extras = ["serving", "ui", "training"]
+provides-extras = ["serving", "training", "ui"]
 
 [package.metadata.requires-dev]
 dev = [

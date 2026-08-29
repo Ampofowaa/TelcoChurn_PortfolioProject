@@ -156,11 +156,18 @@ class CustomerLookupResponse(BaseModel):
 
 
 class PredictRequest(CustomerFeatures):
-    """POST /predict's request body: CustomerFeatures plus the one field that
-    is a request option, not a customer attribute.
+    """POST /predict's request body: CustomerFeatures plus two fields that
+    are request options, not customer attributes — neither is ever fed into
+    predict_proba.
     """
 
     include_explanation: bool = True
+    # /predict/batch reports a third value, "partial_override" — Score a
+    # Customer never does: detecting "fetched, then edited" here would need
+    # client-side diff logic purely to populate a label, for a distinction
+    # not worth the cost. A bare API caller
+    # that never sets this leaves it None rather than defaulting to a guess.
+    resolution_kind: Literal["id_only", "full_inline"] | None = None
 
 
 class FeatureContribution(BaseModel):
