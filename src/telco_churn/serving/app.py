@@ -468,6 +468,11 @@ async def get_customer(customerid: str) -> CustomerLookupResponse:
 async def health() -> dict[str, str]:
     """Liveness only — no dependency checks. A Postgres/MLflow outage must
     never restart-loop a process that was never actually broken."""
+    # DRILL — deliberate breakage to exercise cd.yml's rollback. Fires only
+    # where DOMAIN is set (the prod box's .env), so CI and local runs are
+    # unaffected. Revert this branch's PR immediately after the drill.
+    if os.environ.get("DOMAIN"):
+        raise HTTPException(status_code=500, detail="rollback drill")
     return {"status": "ok"}
 
 
