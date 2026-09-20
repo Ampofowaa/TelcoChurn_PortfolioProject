@@ -45,7 +45,6 @@ from telco_churn.models.artifacts import (
     load_dev_oof_predictions,
     load_threshold_validation,
     load_training_manifest,
-    resolve_champion_version,
 )
 from telco_churn.models.dev_features import load_dev_features
 from telco_churn.models.diagnostics import FAIRNESS_AXES, ROBUSTNESS_AXES
@@ -55,6 +54,7 @@ from telco_churn.models.environment_parity import (
     diff_environment,
 )
 from telco_churn.models.gate import check_threshold_screen_passed
+from telco_churn.models.registry_alias import resolve_champion_version
 from telco_churn.utils.hashing import content_hash
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (

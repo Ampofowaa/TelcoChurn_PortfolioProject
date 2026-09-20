@@ -577,6 +577,21 @@ def ensure_experiment_metadata(cfg: DictConfig) -> Experiment:
     first MLflow-touching call in a fresh process — it replaces the bare
     mlflow.set_experiment(...) call every training-cycle module makes.
 
+    First-creation-only artifact_location: an experiment's artifact_location
+    is fixed the moment it is created and cannot be changed afterward, so a
+    bare mlflow.set_experiment(name) — which silently creates the experiment
+    with whatever default the tracking backend happens to fall back to when
+    missing — is only safe when something else (a real `mlflow server`
+    process, e.g. local Docker Compose's --default-artifact-root) already
+    owns that default. Against a bare database URI with no server in front
+    of it (Phase 12a's RDS, direct-Postgres-URI mode), that default is a
+    local ./mlruns folder on whatever machine happens to create the
+    experiment first — wrong for a shared backend. If cfg.mlflow's
+    artifact_location is set, this creates the experiment explicitly with it
+    on first use; already-existing experiments are never touched, since
+    create_experiment would raise on a name collision and the location is
+    immutable anyway.
+
     The description is experiment-level, not run-level: MLflow renders
     exactly one 'mlflow.note.content' tag per experiment in the UI, and every
     module in this training cycle (candidates.py, calibrate.py, evaluate.py,
@@ -590,8 +605,13 @@ def ensure_experiment_metadata(cfg: DictConfig) -> Experiment:
     behind a single module that stopped being the first one to run.
     """
     mlflow.set_tracking_uri(resolve_tracking_uri(str(cfg.mlflow.tracking_uri)))
-    exp = mlflow.set_experiment(str(cfg.mlflow.experiment_name))
     client = mlflow.tracking.MlflowClient()
+    experiment_name = str(cfg.mlflow.experiment_name)
+    artifact_location = str(cfg.mlflow.artifact_location)
+    existing = client.get_experiment_by_name(experiment_name)
+    if existing is None and artifact_location:
+        client.create_experiment(experiment_name, artifact_location=artifact_location)
+    exp = mlflow.set_experiment(experiment_name)
     client.set_experiment_tag(
         exp.experiment_id, "mlflow.note.content", _EXPERIMENT_DESCRIPTION
     )

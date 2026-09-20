@@ -81,6 +81,7 @@ def selection_cfg() -> OmegaConf:
             "mlflow": {
                 "tracking_uri": "placeholder",
                 "experiment_name": "test_run_feature_audit_step",
+                "artifact_location": "",
             },
         }
     )

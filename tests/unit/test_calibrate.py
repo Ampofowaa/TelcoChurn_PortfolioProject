@@ -694,10 +694,14 @@ def registration_cfg(calibration_mlflow_uri: str, tmp_path: Path) -> DictConfig:
             # the real two-step CLI flow (models.calibrate then
             # models.register) sharing one composed cfg.
             "register": {"golden_atol": 1.0e-9},
+            "database": {
+                "url": "postgresql://user:pass@localhost:5432/telco_churn"  # pragma: allowlist secret
+            },
             "mlflow": {
                 "tracking_uri": calibration_mlflow_uri,
                 "experiment_name": "test_run_calibration_step",
                 "registered_model_name": "test-telco-churn-pipeline",
+                "artifact_location": "",
             },
             "paths": {
                 "figures": str(tmp_path / "figures"),
@@ -852,10 +856,14 @@ def _shared_registration_cfg(
                 "golden_n_rows": 5,
             },
             "register": {"golden_atol": 1.0e-9},
+            "database": {
+                "url": "postgresql://user:pass@localhost:5432/telco_churn"  # pragma: allowlist secret
+            },
             "mlflow": {
                 "tracking_uri": _shared_calibration_mlflow_uri,
                 "experiment_name": "test_run_calibration_step_shared",
                 "registered_model_name": "test-telco-churn-pipeline",
+                "artifact_location": "",
             },
             "paths": {"figures": str(figures_dir), "reports": str(reports_dir)},
         }

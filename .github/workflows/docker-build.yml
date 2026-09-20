@@ -1,0 +1,85 @@
+name: Docker build
+
+# Build-only regression guard (no push, no run): catches a broken COPY path,
+# a uv.lock/pyproject mismatch, or a missing system lib before cd.yml ships
+# these images. A separate workflow from ci.yml because `paths:` filters a
+# whole workflow, not one job — ci.yml's unit tests must keep running on every
+# push regardless of what changed.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "configs/**"
+      - "alembic.ini"
+      - "alembic/**"
+      - "docker/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/docker-build.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "configs/**"
+      - "alembic.ini"
+      - "alembic/**"
+      - "docker/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/docker-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: api
+            port: 8000
+            health_path: /health
+          - image: ui
+            port: 8501
+            health_path: /_stcore/health
+          # mlflow needs a backend store to be meaningful past boot: build only.
+          - image: mlflow
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Build ${{ matrix.image }} image
+        run: docker build -f docker/${{ matrix.image }}/Dockerfile -t telco-${{ matrix.image }}:ci .
+
+      # Catches failures a build cannot: a missing system lib (libgomp1) or a
+      # missing project-root marker only fail at import/startup. /health is
+      # liveness-only, so no Postgres/MLflow/champion is needed. The tracking
+      # URI points at a writable /tmp file: without any URI, MLflow falls back
+      # to a relative sqlite path in /app, which the non-root user can't
+      # create, and its synchronous retry backoff leaves /health unanswered
+      # for minutes. Production always sets this env var.
+      - name: Smoke test ${{ matrix.image }} container
+        if: matrix.port
+        run: |
+          docker run -d --name smoke -p ${{ matrix.port }}:${{ matrix.port }} \
+            -e MLFLOW_TRACKING_URI=sqlite:////tmp/mlflow.db \
+            telco-${{ matrix.image }}:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:${{ matrix.port }}${{ matrix.health_path }}; then
+              echo && echo "healthy after ~$((i * 2))s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "container never became healthy" >&2
+          docker logs smoke
+          exit 1
+
+      - name: Remove smoke container
+        if: always() && matrix.port
+        run: docker rm -f smoke

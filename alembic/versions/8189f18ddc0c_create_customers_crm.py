@@ -13,7 +13,6 @@ lands (PROJECT_PLAN.md's Phase 10a-i).
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-
 from alembic import op
 
 # revision identifiers, used by Alembic.

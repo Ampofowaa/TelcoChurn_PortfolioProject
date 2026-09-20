@@ -2,13 +2,18 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
     branches: [main]
   schedule:
-    # Runs once daily, 06:13 UTC — offset from :00 to avoid the top-of-hour
-    # scheduling queue GitHub Actions cron jobs pile up in.
-    - cron: "13 6 * * *"
+    # Weekly (Mondays) 06:13 UTC canary for upstream drift (postgres image,
+    # runner image, actions) — deps are lockfile-pinned, so daily adds nothing.
+    # Offset from :00 to avoid the top-of-hour scheduling queue.
+    - cron: "13 6 * * 1"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   unit:
@@ -16,20 +21,32 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python 3.13
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.13"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           cache-suffix: "unit"
 
       - name: Install dependencies
         run: uv sync --frozen --all-extras
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-py3.13-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Pre-commit hooks
+        # mypy is skipped here: the dedicated "Type check" step below already runs it.
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+        env:
+          SKIP: mypy
 
       - name: Lint
         run: uv run ruff check src/
@@ -45,15 +62,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python 3.13
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.13"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           cache-suffix: "integration"
 

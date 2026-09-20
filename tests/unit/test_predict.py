@@ -116,6 +116,7 @@ def predict_cfg(predict_mlflow_uri: str, request: pytest.FixtureRequest) -> Dict
                 "tracking_uri": predict_mlflow_uri,
                 "experiment_name": "test_predict",
                 "registered_model_name": registered_model_name,
+                "artifact_location": "",
             },
             "register": {"environment_packages": []},
             "serving": {

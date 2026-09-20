@@ -27,6 +27,7 @@ from telco_churn.models.train.common import (
     _git_sha,
     _lgbm_fixed_knobs,
 )
+from telco_churn.utils.db import host_from_url
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.mlflow import (
     TRAINING_CYCLE_RUN_DESCRIPTION,
@@ -226,6 +227,15 @@ def _build_training_manifest(
         "model_family": COMMITTED_MODEL_FAMILY,
         "git_sha": _git_sha(),
         "data_content_hash": features_sha256(),
+        # Host only, never the raw connection string — a Postgres URL carries
+        # a password, and this manifest is a reviewer-facing MLflow artifact.
+        # 'local' for either host means no real infra was configured for this
+        # run; a real hostname here is corroborated by ingest_receipt.json's
+        # stronger is_rds/rds_markers proof, computed against a live connection.
+        "data_backend": {
+            "postgres_host": host_from_url(str(cfg.database.url)),
+            "mlflow_tracking_host": host_from_url(str(cfg.mlflow.tracking_uri)),
+        },
         "model_family_committed": {
             "model_family": COMMITTED_MODEL_FAMILY,
             "decision_reference": "ANALYSIS.md §4a",
@@ -269,6 +279,11 @@ def _log_model_run(
 
     with mlflow.start_run(run_id=run_id):
         set_run_description(TRAINING_CYCLE_RUN_DESCRIPTION)
+        # Surfaced as a run tag (not just buried in training_manifest.json) so
+        # it's visible in the MLflow UI's run list without opening an artifact.
+        mlflow.set_tag(
+            "postgres_host", training_manifest["data_backend"]["postgres_host"]
+        )
         mlflow.log_param("target_column", TARGET_COL)
         mlflow.log_text("\n".join(full_feature_space), "feature_space.txt")
         mlflow.log_text("\n".join(committed_features), "feature_columns.txt")

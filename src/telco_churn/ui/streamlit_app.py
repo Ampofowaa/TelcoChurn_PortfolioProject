@@ -50,7 +50,7 @@ import streamlit as st
 
 from telco_churn.data.schema import YES_NO, YES_NO_NO_INTERNET, YES_NO_NO_PHONE
 from telco_churn.features.schema import CustomerFeaturesSchema
-from telco_churn.models.artifacts import resolve_champion_version
+from telco_churn.models.registry_alias import resolve_champion_version
 from telco_churn.serving.schemas import CustomerFeatures
 from telco_churn.utils.mlflow import resolve_model_run_id, resolve_tracking_uri
 from telco_churn.utils.paths import activate_config, compose_config
@@ -155,9 +155,21 @@ def _api_request(method: str, path: str, **kwargs: Any) -> requests.Response | N
     rather than raising, so every caller has one uniform "did this work"
     check instead of a try/except at each of the four call sites.
     """
+    headers = kwargs.pop("headers", {})
+    # serving/app.py's require_api_key reads this exact header name.
+    # API_KEY is unset for a bare `streamlit run` outside Compose (no auth
+    # configured locally) — compose.prod.yml's env_file wires it from the
+    # same SSM param the api container itself checks requests against.
+    api_key = os.environ.get("API_KEY")
+    if api_key:
+        headers = {**headers, "X-API-Key": api_key}
     try:
         return requests.request(
-            method, f"{API_BASE_URL}{path}", timeout=_REQUEST_TIMEOUT_SECONDS, **kwargs
+            method,
+            f"{API_BASE_URL}{path}",
+            timeout=_REQUEST_TIMEOUT_SECONDS,
+            headers=headers,
+            **kwargs,
         )
     except requests.RequestException as exc:
         st.error(f"Could not reach the API at {API_BASE_URL}: {exc}")

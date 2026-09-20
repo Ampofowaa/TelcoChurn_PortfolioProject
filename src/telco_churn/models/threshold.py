@@ -35,9 +35,15 @@ logging, if any of the three binding checks fails.
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, cast
+
+import matplotlib
+
+if "ipykernel" not in sys.modules:
+    matplotlib.use("Agg")  # non-interactive backend for CLI/DVC — skip in notebooks
 
 import matplotlib.pyplot as plt
 import mlflow

@@ -40,6 +40,7 @@ stages:
       - configs/config.yaml:
           - random_seed
           - training_setup.test_size
+          - training_setup.reserve_enabled
           - training_setup.reserve_months
           - training_setup.reserve_fraction
           - training_setup.reserve_random_state
@@ -178,6 +179,7 @@ stages:
       - src/telco_churn/models/calibration_metrics.py
       - src/telco_churn/models/artifacts.py
       - src/telco_churn/models/policy_config.py
+      - src/telco_churn/models/registry_alias.py
       - src/telco_churn/utils/hashing.py
       - src/telco_churn/data/split.py
       - src/telco_churn/data/schema.py

@@ -29,9 +29,15 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, cast
+
+import matplotlib
+
+if "ipykernel" not in sys.modules:
+    matplotlib.use("Agg")  # non-interactive backend for CLI/DVC — skip in notebooks
 
 import matplotlib.pyplot as plt
 import mlflow
@@ -50,7 +56,6 @@ from telco_churn.models.artifacts import (
     load_fitted_model,
     load_threshold_validation,
     load_training_manifest,
-    resolve_champion_version,
 )
 from telco_churn.models.diagnostics import (
     FAIRNESS_AXES,
@@ -75,6 +80,7 @@ from telco_churn.models.policy_config import (
     resolve_policy_scenarios,
     resolve_policy_thresholds_by_scenario,
 )
+from telco_churn.models.registry_alias import resolve_champion_version
 from telco_churn.models.sealed_test import (
     load_test_customer_ids,
     load_test_features,

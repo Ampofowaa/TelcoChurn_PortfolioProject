@@ -3,7 +3,7 @@
 import pytest
 
 import telco_churn.utils.db as db_module
-from telco_churn.utils.db import get_engine
+from telco_churn.utils.db import get_engine, host_from_url
 
 
 @pytest.fixture(autouse=True)
@@ -28,3 +28,26 @@ def test_get_engine_returns_singleton(monkeypatch: pytest.MonkeyPatch) -> None:
     engine_one = get_engine()
     engine_two = get_engine()
     assert engine_one is engine_two
+
+
+def test_host_from_url_extracts_rds_hostname() -> None:
+    """A real RDS endpoint's hostname is returned, password stripped."""
+    url = "postgresql://telco_admin:s3cr3t@telco-churn-db.cct88is8iujn.us-east-1.rds.amazonaws.com:5432/mlflow"  # pragma: allowlist secret
+    assert (
+        host_from_url(url) == "telco-churn-db.cct88is8iujn.us-east-1.rds.amazonaws.com"
+    )
+
+
+def test_host_from_url_extracts_localhost() -> None:
+    """A local Postgres URL's host is returned as-is."""
+    url = (
+        "postgresql://user:pass@localhost:5432/telco_churn"  # pragma: allowlist secret
+    )
+    assert host_from_url(url) == "localhost"
+
+
+def test_host_from_url_sqlite_returns_local() -> None:
+    """A file-based backend (sqlite, MLFLOW_TRACKING_URI's fallback) has no
+    host — resolved as 'local' rather than None, so callers never have to
+    special-case a missing value."""
+    assert host_from_url("sqlite:///mlflow.db") == "local"

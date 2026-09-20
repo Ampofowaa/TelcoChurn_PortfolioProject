@@ -89,8 +89,13 @@ class _FakeResponse:
 
 @pytest.fixture(autouse=True)
 def _stub_champion_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Patched on streamlit_app's own name binding, not the source module's -
+    # `from telco_churn.models.registry_alias import resolve_champion_version`
+    # binds a separate reference in streamlit_app's namespace, so patching
+    # the source module's attribute wouldn't reach the bare-name call in
+    # _resolve_champion_version_cached.
     monkeypatch.setattr(
-        "telco_churn.models.artifacts.resolve_champion_version", lambda cfg: None
+        "telco_churn.ui.streamlit_app.resolve_champion_version", lambda cfg: None
     )
 
 

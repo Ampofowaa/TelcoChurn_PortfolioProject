@@ -69,6 +69,17 @@ def test_ingest_row_count(pg_engine: Engine, sample_csv: Path) -> None:
     assert receipt.csv_rows == 5
 
 
+def test_ingest_backend_provenance_against_vanilla_postgres(
+    pg_engine: Engine, sample_csv: Path
+) -> None:
+    """A plain testcontainers Postgres image carries no rds_* roles — the
+    negative case that proves is_rds isn't hardcoded true."""
+    receipt = ingest(sample_csv, pg_engine)
+    assert receipt.is_rds is False
+    assert receipt.rds_markers == []
+    assert receipt.database_host is not None
+
+
 def test_ingest_persists_to_db(pg_engine: Engine, sample_csv: Path) -> None:
     """Rows are queryable from Postgres after ingest."""
     ingest(sample_csv, pg_engine)

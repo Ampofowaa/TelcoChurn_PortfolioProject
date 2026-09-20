@@ -44,10 +44,16 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal, cast
+
+import matplotlib
+
+if "ipykernel" not in sys.modules:
+    matplotlib.use("Agg")  # non-interactive backend for CLI/DVC — skip in notebooks
 
 import matplotlib.pyplot as plt
 import mlflow

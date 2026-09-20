@@ -27,9 +27,8 @@ degrade to a full sequential scan once the table has any real row count.
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql
-
 from alembic import op
+from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "2d9550dc429f"

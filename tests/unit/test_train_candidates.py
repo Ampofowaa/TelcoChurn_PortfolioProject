@@ -131,7 +131,11 @@ def test_run_candidate_step_logs_metric_contract(
                     "verbose": -1,
                 },
             },
-            "mlflow": {"tracking_uri": "placeholder", "experiment_name": "test"},
+            "mlflow": {
+                "tracking_uri": "placeholder",
+                "experiment_name": "test",
+                "artifact_location": "",
+            },
             "paths": {"processed_data": "."},
         }
     )
@@ -237,7 +241,11 @@ def test_run_candidate_step_dataset_source_uses_accessor_canonical_path(
                     "verbose": -1,
                 },
             },
-            "mlflow": {"tracking_uri": "placeholder", "experiment_name": "test"},
+            "mlflow": {
+                "tracking_uri": "placeholder",
+                "experiment_name": "test",
+                "artifact_location": "",
+            },
             "paths": {"processed_data": "."},
         }
     )

@@ -30,6 +30,7 @@ __all__ = [
     "test_ids",
     "partition",
     "make_reserve",
+    "make_disabled_reserve",
     "write_reserve",
     "load_reserve",
     "reserve_ids",
@@ -254,6 +255,26 @@ def make_reserve(
     )
 
 
+def make_disabled_reserve(ids: pd.Series) -> pd.DataFrame:
+    """Return a reserve manifest with every id unreserved (`reserve_month = NULL`).
+
+    The cold-start/first-promotion counterpart to make_reserve(): while
+    training_setup.reserve_enabled is False, nobody has been carved into a
+    reserve cohort yet, so sealed_test_ids() must see the full, untouched test
+    partition rather than treating an empty reserve as a broken manifest (see
+    its own reserve_enabled-gated assertion). Same manifest shape as
+    make_reserve()'s output — customerid, nullable Int16 reserve_month — so
+    every downstream reader works unchanged regardless of which one produced
+    the file on disk.
+    """
+    return pd.DataFrame(
+        {
+            "customerid": ids.reset_index(drop=True),
+            RESERVE_COL: pd.array([pd.NA] * len(ids), dtype="Int16"),
+        }
+    )
+
+
 def write_reserve(df: pd.DataFrame, path: Path) -> None:
     """Write the reserve manifest to a Parquet file, creating parent dirs as needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -291,26 +312,41 @@ def reserve_ids(manifest: pd.DataFrame | None = None) -> pd.DataFrame:
 def sealed_test_ids(
     split_manifest: pd.DataFrame | None = None,
     reserve_manifest: pd.DataFrame | None = None,
+    reserve_enabled: bool | None = None,
 ) -> pd.Series:
     """Return test_ids() minus every customerid the reserve manifest marks reserved.
 
     Both manifests default to their canonical on-disk location; pass in-memory
-    manifests in tests. Carries a defensive assertion —
-    `len(sealed_test_ids()) < len(test_ids())` — unconditionally true from the
-    moment a reserve manifest exists (fraction > 0 by construction), so a silent
-    no-op in reserve_ids() (a join miss, a swallowed missing-manifest error) fails
-    loudly here rather than quietly serving the full test set mislabeled as the
-    shrunk one.
+    manifests in tests. `reserve_enabled` defaults to
+    cfg.training_setup.reserve_enabled — pass an explicit bool in tests to avoid
+    depending on an active composed config.
+
+    While reserve carving is disabled (the cold-start/first-promotion state,
+    make_disabled_reserve()'s output on disk), nobody is reserved and the full
+    test set is legitimately returned unchanged — no assertion. Once enabled,
+    carries a defensive assertion — `len(sealed_test_ids()) < len(test_ids())`
+    — unconditionally true from the moment reserve carving is switched on
+    (fraction > 0 by construction), so a silent no-op in reserve_ids() (a join
+    miss, a swallowed missing-manifest error, reserve_enabled flipped back to
+    true against a stale disabled manifest) fails loudly here rather than
+    quietly serving the full test set mislabeled as the shrunk one.
     """
     test = test_ids(split_manifest)
     reserved = reserve_ids(reserve_manifest)
     reserved_ids = set(reserved.loc[reserved[RESERVE_COL].notna(), "customerid"])
     sealed = test[~test.isin(reserved_ids)].reset_index(drop=True)
-    assert len(sealed) < len(test), (
-        "sealed_test_ids() returned the full test set unchanged — reserve_ids() "
-        "produced no reserved customerids. This indicates a broken reserve "
-        "manifest, not a legitimate zero-reserve state."
+    resolved_enabled = (
+        reserve_enabled
+        if reserve_enabled is not None
+        else bool(load_config().training_setup.reserve_enabled)
     )
+    if resolved_enabled:
+        assert len(sealed) < len(test), (
+            "sealed_test_ids() returned the full test set unchanged even though "
+            "training_setup.reserve_enabled is true — reserve_ids() produced no "
+            "reserved customerids. This indicates a broken reserve manifest, not "
+            "a legitimate zero-reserve state."
+        )
     return sealed
 
 
@@ -360,13 +396,23 @@ if __name__ == "__main__":
             .loc[test_customerids, "churn"]
             .reset_index(drop=True)
         )
-        reserve_manifest = make_reserve(
-            ids=test_customerids.reset_index(drop=True),
-            labels=test_labels,
-            n_months=int(cfg.training_setup.reserve_months),
-            fraction=float(cfg.training_setup.reserve_fraction),
-            random_state=int(cfg.training_setup.reserve_random_state),
-        )
+        reserve_enabled = bool(cfg.training_setup.reserve_enabled)
+        if reserve_enabled:
+            reserve_manifest = make_reserve(
+                ids=test_customerids.reset_index(drop=True),
+                labels=test_labels,
+                n_months=int(cfg.training_setup.reserve_months),
+                fraction=float(cfg.training_setup.reserve_fraction),
+                random_state=int(cfg.training_setup.reserve_random_state),
+            )
+        else:
+            # Cold-start/first-promotion state: nobody is reserved yet, so
+            # evaluate.py's sealed_test_ids() sees the full, untouched test
+            # partition. Flip training_setup.reserve_enabled once Phase 10b's
+            # routine retraining actually begins, then re-run this stage.
+            reserve_manifest = make_disabled_reserve(
+                test_customerids.reset_index(drop=True)
+            )
         reserve_out_path = _default_reserve_manifest_path()
         write_reserve(reserve_manifest, reserve_out_path)
         n_reserved = int(reserve_manifest[RESERVE_COL].notna().sum())
@@ -376,6 +422,7 @@ if __name__ == "__main__":
             path=str(reserve_out_path),
             n_reserved=n_reserved,
             n_sealed=n_sealed,
+            reserve_enabled=reserve_enabled,
         )
     except OSError as e:
         logger.error("split_engine_config_error", error=str(e), exc_info=True)

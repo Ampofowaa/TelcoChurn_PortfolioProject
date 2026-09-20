@@ -14,7 +14,7 @@
 # champion's logged deps against.
 FROM python:3.13-slim AS builder
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.16@sha256:440fd6477af86a2f1b38080c539f1672cd22acb1b1a47e321dba5158ab08864d /uv /uvx /bin/
 
 WORKDIR /app
 
@@ -27,6 +27,8 @@ RUN uv sync --frozen --no-install-project --no-dev --extra serving
 
 COPY src/ ./src/
 COPY configs/ ./configs/
+COPY alembic.ini ./alembic.ini
+COPY alembic/ ./alembic/
 RUN uv sync --frozen --no-dev --extra serving
 
 FROM python:3.13-slim AS runtime
@@ -49,6 +51,11 @@ COPY --from=builder --chown=app:app /app/configs /app/configs
 # which resolves a sql/schema/*.sql Path at module level and needs this to
 # succeed even though nothing at runtime reads that file.
 COPY --from=builder --chown=app:app /app/pyproject.toml /app/pyproject.toml
+# cd.yml's deploy sequence runs `docker compose run --rm api alembic upgrade
+# head` against this same image - without these two, that step has no
+# migration files to apply.
+COPY --from=builder --chown=app:app /app/alembic.ini /app/alembic.ini
+COPY --from=builder --chown=app:app /app/alembic /app/alembic
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1

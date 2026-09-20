@@ -30,6 +30,14 @@ random_seed: 42
 
 training_setup:
   test_size: 0.2                        # stratified dev/test split fraction
+  # False until a champion has actually been promoted once: split.py always ran
+  # make_reserve() unconditionally, which meant even the very first, cold-start
+  # evaluate.py cycle already saw a reserve-depleted test set (846 of 1,409 rows)
+  # instead of the full sealed partition ANALYSIS.md §7 documents. Reserve carving
+  # exists to serve Phase 10b's *routine retraining* comparison surface, not the
+  # first promotion — flip this to true, deliberately, once Phase 10b's rolling
+  # retraining actually begins, then re-run `dvc repro split`.
+  reserve_enabled: false
   reserve_months: 6                     # Phase 10a-ii reserve: monthly cohorts carved from `test`
   reserve_fraction: 0.4                 # fraction of `test` carved into the reserve (rest stays sealed test)
   # Own key, deliberately not `random_seed` — same reasoning as random_seed's own
@@ -56,6 +64,15 @@ mlflow:
   tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,sqlite:///mlflow.db}
   experiment_name: telco-churn-training
   registered_model_name: telco-churn-pipeline
+  # Only consulted the moment the experiment is first created in a given
+  # backend (utils/mlflow.py::ensure_experiment_metadata) - an experiment's
+  # artifact_location is permanent thereafter, so this must be correct
+  # before the first run, not fixable after. Empty/unset everywhere the
+  # tracking_uri is a real `mlflow server` (local Docker Compose, which
+  # already proxies artifacts to its own configured destination) - only
+  # needed where training talks directly to a bare Postgres URI with no
+  # server in front of it (Phase 12a's RDS+S3, no MLflow server container).
+  artifact_location: ${oc.env:MLFLOW_ARTIFACT_LOCATION,''}
 
 paths:
   raw_data: datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv

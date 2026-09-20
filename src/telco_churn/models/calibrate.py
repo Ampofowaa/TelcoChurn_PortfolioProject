@@ -21,9 +21,15 @@ whether calibration itself succeeded.
 
 from __future__ import annotations
 
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+import matplotlib
+
+if "ipykernel" not in sys.modules:
+    matplotlib.use("Agg")  # non-interactive backend for CLI/DVC — skip in notebooks
 
 import matplotlib.pyplot as plt
 import mlflow

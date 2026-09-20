@@ -1,0 +1,140 @@
+name: CD
+
+# Builds api/ui, points the box at the new SHA, deploys over SSM, smoke-tests,
+# and rolls back to the previous SHA if anything from the flip onward fails.
+#
+# Path-filtered to what actually changes the built images: both Dockerfiles
+# COPY src/, configs/ (and, for api, alembic*) and `uv sync --frozen`, so any
+# other commit yields a bit-identical image and a rebuild would only burn one
+# of ECR's five retained tags. ci.yml still runs on every push regardless.
+#
+# infra/deploy/** and docker/mlflow/Dockerfile are in the filter because CD
+# itself syncs them to S3 (below) — a compose/Caddyfile-only commit still
+# rebuilds api/ui, an accepted cost: it spends one of ECR's five retained tags.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "configs/**"
+      - "alembic.ini"
+      - "alembic/**"
+      - "docker/api/Dockerfile"
+      - "docker/ui/Dockerfile"
+      - "docker/mlflow/Dockerfile"
+      - "infra/deploy/**"
+      - "pyproject.toml"
+      - "uv.lock"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/telco-churn-ci-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Captured before anything is overwritten: this is the rollback target.
+      # ":unset" is Terraform's placeholder, so a first-ever deploy has none.
+      - name: Record previous images
+        id: prev
+        run: |
+          api=$(aws ssm get-parameter --name /telco-churn/api-image --query Parameter.Value --output text)
+          ui=$(aws ssm get-parameter --name /telco-churn/ui-image --query Parameter.Value --output text)
+          echo "api=${api}" >> "$GITHUB_OUTPUT"
+          echo "ui=${ui}" >> "$GITHUB_OUTPUT"
+          if [[ "${api}" == *:unset || "${ui}" == *:unset ]]; then
+            echo "rollback_possible=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No previous deploy recorded — a failed smoke test cannot be rolled back this run."
+          else
+            echo "rollback_possible=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push images
+        id: build
+        run: |
+          registry="${{ steps.ecr.outputs.registry }}"
+          for image in api ui; do
+            uri="${registry}/telco-churn/${image}:${{ github.sha }}"
+            docker build -f "docker/${image}/Dockerfile" -t "${uri}" .
+            docker push "${uri}"
+            echo "${image}=${uri}" >> "$GITHUB_OUTPUT"
+          done
+
+      # Deploy files reach the box only through S3 — this is the step that
+      # used to be a manual `terraform apply` (which now only seeds them).
+      - name: Sync deploy files to S3
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+        run: scripts/sync_deploy_files.sh
+
+      # From here on, a failure leaves the box's target state changed, so it
+      # is what arms the rollback step below.
+      - name: Point SSM params at the new images
+        id: set_params
+        run: |
+          aws ssm put-parameter --name /telco-churn/api-image --type String --overwrite --value "${{ steps.build.outputs.api }}"
+          aws ssm put-parameter --name /telco-churn/ui-image --type String --overwrite --value "${{ steps.build.outputs.ui }}"
+
+      - name: Deploy on the box
+        run: scripts/ssm_run.sh scripts/deploy_on_box.sh
+
+      - name: Smoke test
+        run: scripts/ssm_run.sh scripts/smoke_test_deployed.sh
+
+      - name: Prune images
+        run: scripts/ssm_run.sh scripts/prune_on_box.sh
+
+      # Restores the previous SHA in SSM and the previous commit's deploy
+      # files in S3, then re-runs the same deploy sequence. Restoring the
+      # files matters: the deploy re-syncs S3 -> box, so a broken
+      # compose.prod.yml would otherwise survive an image-only rollback and
+      # sink the rollback too. The old image is pulled from ECR (IMMUTABLE tags, last five
+      # kept), so it does not matter that the box may have dropped its layers.
+      # The job stays red either way — a rollback is a recovery, not a success.
+      - name: Roll back to the previous images
+        if: >-
+          failure()
+          && steps.prev.outputs.rollback_possible == 'true'
+          && contains(fromJSON('["success","failure"]'), steps.set_params.outcome)
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          echo "::error::Deploy of ${{ github.sha }} failed — rolling back to the previous images."
+          # `before` is absent on workflow_dispatch and all-zeros on a new
+          # branch; there is no earlier commit to restore from then.
+          if [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            git fetch --depth=1 origin "${BEFORE_SHA}"
+            git checkout "${BEFORE_SHA}" -- infra/deploy docker/mlflow/Dockerfile
+            scripts/sync_deploy_files.sh
+          else
+            echo "::warning::No previous commit to restore deploy files from — rolling back images only."
+          fi
+          aws ssm put-parameter --name /telco-churn/api-image --type String --overwrite --value "${{ steps.prev.outputs.api }}"
+          aws ssm put-parameter --name /telco-churn/ui-image --type String --overwrite --value "${{ steps.prev.outputs.ui }}"
+          scripts/ssm_run.sh scripts/deploy_on_box.sh
+          scripts/ssm_run.sh scripts/smoke_test_deployed.sh \
+            || { echo "::error::ROLLBACK ALSO FAILED — the box is unhealthy, intervene by hand (see RUNBOOK)."; exit 1; }
+          echo "::warning::Rolled back to ${{ steps.prev.outputs.api }} — the box is healthy on the previous release."

@@ -13,13 +13,26 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "alembic>=1.18.4",
+    # MLflow's S3 artifact repository needs boto3 to actually be installed -
+    # it is not a hard mlflow dependency. Needed everywhere an MLflow
+    # artifact_location can be s3:// (Phase 12a+): training writes artifacts
+    # there, api reads the model, ui reads model_card.json via
+    # mlflow.artifacts.load_dict. Base dependency, not extras-gated, since
+    # all three of serving/ui/training need it.
+    "boto3>=1.35",
     "hydra-core>=1.3.2",
     "lightgbm>=4.0",
-    "mlflow>=3.12.0",
     "numpy>=2.4.6",
     "pandas>=3.0.3",
     "pandera>=0.18",
-    "pyarrow>=24.0.0",
+    # MLflow's tracking client resolves a plain postgresql:// URI (this
+    # project's rds-url-mlflow SSM param) to SQLAlchemy's default sync
+    # driver - psycopg2, not asyncpg. utils/db.py's own async engine
+    # (serving/app.py's customer-lookup routes) is a separate connection
+    # entirely and doesn't cover this. Base dependency (not extras-gated):
+    # training's DVC stages already needed a sync driver via utils/db.py's
+    # get_engine(), api/ui now need it too for the MLflow client itself.
+    "psycopg2-binary>=2.9",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
     "scikit-learn>=1.8.0",
@@ -32,6 +45,20 @@ dependencies = [
 serving = [
     "asyncpg>=0.31.0",
     "fastapi>=0.138.1",
+    # mlflow-skinny, not full mlflow: api never runs `mlflow server`/`mlflow
+    # ui` (that's docker/mlflow/Dockerfile's own image, built from the
+    # official upstream image, not this project's dependency tree) - it only
+    # ever loads a model and reads artifacts as a tracking *client*. Skinny
+    # drops Flask/gunicorn/docker/matplotlib/skops and the other
+    # server/UI-only weight (confirmed via a local SqlAlchemyStore-against-
+    # Postgres probe: tracking, mlflow.sklearn.log_model/load_model with
+    # this project's own cloudpickle serialization_format, mlflow.pyfunc
+    # .load_model/.get_model_dependencies, and mlflow.artifacts.load_dict
+    # all work under skinny + this extra's own sqlalchemy/alembic/psycopg2
+    # base deps, no extra packages needed). training keeps full `mlflow`
+    # below for `mlflow ui`/notebook use - both packages resolve together
+    # fine since full mlflow itself depends on a matching mlflow-skinny.
+    "mlflow-skinny>=3.12.0",
     "prometheus-client>=0.26.0",
     "prometheus-fastapi-instrumentator>=8.1.0",
     "shap>=0.44",
@@ -39,11 +66,24 @@ serving = [
 ]
 training = [
     "matplotlib>=3.10.9",
+    # Full mlflow, not skinny: `mlflow ui`/`mlflow server` (local dev,
+    # Makefile's `mlflow ui` target) need the Flask/gunicorn server code
+    # skinny excludes. See serving extra's mlflow-skinny comment.
+    "mlflow>=3.12.0",
     "optuna>=3.0",
+    # Read by features/accessor.py, data/split.py, and the models/ stage
+    # modules' own parquet I/O (dev_oof_predictions.parquet,
+    # shap_values.parquet, split_manifest.parquet, ...) - never imported by
+    # serving/ or ui/, so it doesn't belong in those extras' image footprint.
+    "pyarrow>=24.0.0",
     "shap>=0.44",
 ]
 ui = [
     "altair>=5.0",
+    # See serving extra's mlflow-skinny comment - same reasoning, ui is a
+    # tracking client only (resolve_champion_version, model_card.json via
+    # mlflow.artifacts.load_dict), never a server.
+    "mlflow-skinny>=3.12.0",
     "requests>=2.32",
     "streamlit>=1.40",
 ]
@@ -60,7 +100,6 @@ dev = [
     "nbconvert>=7.17.1",
     "nbstripout>=0.9.1",
     "pre-commit>=4.6.0",
-    "psycopg2-binary>=2.9",
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
     "pytest-xdist>=3.8.0",
