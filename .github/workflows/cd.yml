@@ -77,8 +77,17 @@ jobs:
           registry="${{ steps.ecr.outputs.registry }}"
           for image in api ui; do
             uri="${registry}/telco-churn/${image}:${{ github.sha }}"
-            docker build -f "docker/${image}/Dockerfile" -t "${uri}" .
-            docker push "${uri}"
+            # ECR tags are IMMUTABLE and a tag is a commit SHA, so a re-run of
+            # a partly failed deploy would otherwise die on the push. The image
+            # for a given SHA is identical, so reuse it. batch-get-image is
+            # already in the role's EcrPush grant (describe-images is not).
+            existing=$(aws ecr batch-get-image --repository-name "telco-churn/${image}"               --image-ids imageTag="${{ github.sha }}"               --query 'images[0].imageId.imageTag' --output text)
+            if [ "${existing}" = "${{ github.sha }}" ]; then
+              echo "${image}:${{ github.sha }} already in ECR — skipping build and push"
+            else
+              docker build -f "docker/${image}/Dockerfile" -t "${uri}" .
+              docker push "${uri}"
+            fi
             echo "${image}=${uri}" >> "$GITHUB_OUTPUT"
           done
 
