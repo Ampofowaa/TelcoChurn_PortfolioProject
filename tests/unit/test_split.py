@@ -16,6 +16,7 @@ from telco_churn.data.split import (
     dev_ids,
     load_reserve,
     load_split,
+    make_disabled_reserve,
     make_reserve,
     make_split,
     partition,
@@ -365,7 +366,7 @@ def test_sealed_test_ids_is_a_strict_subset_of_test_ids(
     ids, _labels = test_ids_labels
     split_manifest = pd.DataFrame({"customerid": ids, SPLIT_COL: TEST})
     full_test = get_test_ids(split_manifest)
-    sealed = sealed_test_ids(split_manifest, reserve_manifest)
+    sealed = sealed_test_ids(split_manifest, reserve_manifest, reserve_enabled=True)
 
     assert set(sealed) <= set(full_test)
     assert len(sealed) < len(full_test)
@@ -379,14 +380,43 @@ def test_sealed_test_ids_no_op_reserve_trips_the_assertion(
     test_ids_labels: tuple[pd.Series, pd.Series],
 ) -> None:
     """A reserve manifest with every reserve_month NULL (a silent no-op) must
-    trip the defensive assertion, not silently return the full test set."""
+    trip the defensive assertion when reserve carving is enabled, not silently
+    return the full test set."""
     ids, _labels = test_ids_labels
     split_manifest = pd.DataFrame({"customerid": ids, SPLIT_COL: TEST})
     broken_reserve = pd.DataFrame(
         {"customerid": ids, RESERVE_COL: pd.array([pd.NA] * len(ids), dtype="Int16")}
     )
     with pytest.raises(AssertionError):
-        sealed_test_ids(split_manifest, broken_reserve)
+        sealed_test_ids(split_manifest, broken_reserve, reserve_enabled=True)
+
+
+def test_make_disabled_reserve_reserves_nobody(
+    test_ids_labels: tuple[pd.Series, pd.Series],
+) -> None:
+    """The cold-start reserve manifest carries every id with reserve_month NULL."""
+    ids, _labels = test_ids_labels
+    result = make_disabled_reserve(ids)
+
+    assert list(result["customerid"]) == list(ids)
+    assert result[RESERVE_COL].isna().all()
+    assert result[RESERVE_COL].dtype == "Int16"
+
+
+def test_sealed_test_ids_disabled_reserve_returns_full_test_set(
+    test_ids_labels: tuple[pd.Series, pd.Series],
+) -> None:
+    """While reserve carving is disabled, sealed_test_ids() == test_ids() —
+    the cold-start/first-promotion state — and does not trip the assertion."""
+    ids, _labels = test_ids_labels
+    split_manifest = pd.DataFrame({"customerid": ids, SPLIT_COL: TEST})
+    disabled_reserve = make_disabled_reserve(ids)
+
+    full_test = get_test_ids(split_manifest)
+    sealed = sealed_test_ids(split_manifest, disabled_reserve, reserve_enabled=False)
+
+    assert set(sealed) == set(full_test)
+    assert len(sealed) == len(full_test)
 
 
 # ---------------------------------------------------------------------------
