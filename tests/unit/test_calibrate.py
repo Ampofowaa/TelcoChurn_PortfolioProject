@@ -698,6 +698,7 @@ def registration_cfg(calibration_mlflow_uri: str, tmp_path: Path) -> DictConfig:
                 "tracking_uri": calibration_mlflow_uri,
                 "experiment_name": "test_run_calibration_step",
                 "registered_model_name": "test-telco-churn-pipeline",
+                "artifact_location": "",
             },
             "paths": {
                 "figures": str(tmp_path / "figures"),
@@ -856,6 +857,7 @@ def _shared_registration_cfg(
                 "tracking_uri": _shared_calibration_mlflow_uri,
                 "experiment_name": "test_run_calibration_step_shared",
                 "registered_model_name": "test-telco-churn-pipeline",
+                "artifact_location": "",
             },
             "paths": {"figures": str(figures_dir), "reports": str(reports_dir)},
         }

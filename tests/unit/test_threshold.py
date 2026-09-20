@@ -548,6 +548,7 @@ def full_cfg(
                 "tracking_uri": threshold_mlflow_uri,
                 "experiment_name": "test_run_threshold_step",
                 "registered_model_name": "test-telco-churn-pipeline",
+                "artifact_location": "",
             },
             "paths": {
                 "figures": str(tmp_path / "figures"),

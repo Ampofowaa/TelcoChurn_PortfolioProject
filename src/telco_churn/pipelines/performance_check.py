@@ -67,7 +67,6 @@ from telco_churn.models.artifacts import (
     load_fitted_model,
     load_threshold_validation,
     load_training_manifest,
-    resolve_champion_version,
 )
 from telco_churn.models.economics import capacity_budget_check, ev_by_k
 from telco_churn.models.gate import (
@@ -84,6 +83,7 @@ from telco_churn.models.policy_config import (
     resolve_policy_scenarios,
     resolve_policy_thresholds_by_scenario,
 )
+from telco_churn.models.registry_alias import resolve_champion_version
 from telco_churn.models.sealed_test import (
     build_gate_inputs,
     comparative_deltas,

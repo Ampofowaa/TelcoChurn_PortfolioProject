@@ -118,6 +118,7 @@ def registry_cfg(
                 "tracking_uri": tracking_uri,
                 "experiment_name": "test_utils_mlflow",
                 "registered_model_name": registered_model_name,
+                "artifact_location": "",
             }
         }
     )

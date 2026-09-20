@@ -867,6 +867,7 @@ def _build_evaluation_orchestration_inputs(
                 "tracking_uri": tracking_uri,
                 "experiment_name": experiment_name,
                 "registered_model_name": registered_model_name,
+                "artifact_location": "",
             },
             "paths": {"costs_config": "configs/costs.yaml"},
         }

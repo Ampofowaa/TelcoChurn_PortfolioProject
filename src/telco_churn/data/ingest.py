@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 from sqlalchemy import text
@@ -12,7 +13,7 @@ from sqlalchemy.engine import Engine
 from telco_churn.data.checks import MAX_NULL_RATE, MIN_ROWS, frame_checksum
 from telco_churn.data.schema import RawSchema
 from telco_churn.data.validate import ValidationError, validate_raw
-from telco_churn.utils.db import apply_migrations, get_engine
+from telco_churn.utils.db import apply_migrations, backend_provenance, get_engine
 from telco_churn.utils.logging import get_logger
 from telco_churn.utils.paths import get_project_root
 
@@ -31,6 +32,11 @@ class IngestReceipt:
     DVC outs must be files; the real result of ingest() is rows in Postgres,
     which cannot itself be a dep or an out. This receipt is the hashable
     artifact that stands in for that side effect.
+
+    database_host/is_rds/rds_markers are utils/db.py::backend_provenance()'s
+    proof of which backend this cycle actually loaded data into — is_rds is
+    true only when the connected instance carries AWS RDS's own rds_*
+    roles, which a local/Docker Postgres never has.
     """
 
     rows_loaded: int
@@ -38,6 +44,9 @@ class IngestReceipt:
     null_counts: dict[str, int]
     frame_checksum: str
     training_pool_rows_seeded: int
+    database_host: str | None
+    is_rds: bool
+    rds_markers: list[str]
 
 
 logger = get_logger(__name__)
@@ -230,12 +239,22 @@ def ingest(
     logger.info("merge_complete", db_rows=n, csv_rows=csv_rows, table="customers_raw")
     n_seeded = seed_training_pool(df, engine)
     logger.info("training_pool_seeded", rows_seeded=n_seeded)
+    provenance = backend_provenance(engine)
+    logger.info(
+        "backend_provenance",
+        host=provenance["host"],
+        is_rds=provenance["is_rds"],
+        rds_markers=provenance["rds_markers"],
+    )
     return IngestReceipt(
         rows_loaded=n,
         csv_rows=csv_rows,
         null_counts={col: int(df[col].isna().sum()) for col in df.columns},
         frame_checksum=frame_checksum(df),
         training_pool_rows_seeded=n_seeded,
+        database_host=cast(str | None, provenance["host"]),
+        is_rds=cast(bool, provenance["is_rds"]),
+        rds_markers=cast(list[str], provenance["rds_markers"]),
     )
 
 

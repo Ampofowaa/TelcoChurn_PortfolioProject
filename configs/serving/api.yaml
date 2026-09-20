@@ -28,7 +28,12 @@ explanation:
 # Task 4 (serving/app.py) reads these — defined here now so this file's full
 # surface lands in one place rather than being edited twice across tasks.
 auth:
-  enabled: false
+  # oc.decode is required, not just oc.env: oc.env always returns a string,
+  # and serving/app.py reads this as bool(cfg.serving.auth.enabled) - a bare
+  # ${oc.env:AUTH_ENABLED,false} would resolve the unset case to the string
+  # "false", and bool("false") is True in Python. oc.decode parses the
+  # string as a real YAML boolean first, so unset genuinely stays disabled.
+  enabled: ${oc.decode:${oc.env:AUTH_ENABLED,false}}
 batch:
   max_size: 500
 

@@ -64,6 +64,15 @@ mlflow:
   tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,sqlite:///mlflow.db}
   experiment_name: telco-churn-training
   registered_model_name: telco-churn-pipeline
+  # Only consulted the moment the experiment is first created in a given
+  # backend (utils/mlflow.py::ensure_experiment_metadata) - an experiment's
+  # artifact_location is permanent thereafter, so this must be correct
+  # before the first run, not fixable after. Empty/unset everywhere the
+  # tracking_uri is a real `mlflow server` (local Docker Compose, which
+  # already proxies artifacts to its own configured destination) - only
+  # needed where training talks directly to a bare Postgres URI with no
+  # server in front of it (Phase 12a's RDS+S3, no MLflow server container).
+  artifact_location: ${oc.env:MLFLOW_ARTIFACT_LOCATION,''}
 
 paths:
   raw_data: datasets/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv

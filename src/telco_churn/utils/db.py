@@ -6,8 +6,9 @@ runs at startup."""
 
 import os
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from telco_churn.utils.paths import get_project_root
@@ -17,6 +18,8 @@ __all__ = [
     "get_async_engine",
     "dispose_async_engine",
     "apply_migrations",
+    "backend_provenance",
+    "host_from_url",
 ]
 
 _engine: Engine | None = None
@@ -76,6 +79,44 @@ async def dispose_async_engine() -> None:
     if _async_engine is not None:
         await _async_engine.dispose()
         _async_engine = None
+
+
+def host_from_url(url: str) -> str:
+    """Return the resolved host from a SQLAlchemy connection URL.
+
+    'local' for a file-based backend (sqlite:///mlflow.db, the tracking-URI
+    fallback) — the same "no infra configured" case configs/config.yaml's own
+    ${oc.env:...} fallbacks describe. Never returns the raw URL: a Postgres
+    connection string carries a password, and this value gets logged into
+    training_manifest.json / MLflow tags, which are meant to be read by a
+    reviewer.
+    """
+    return make_url(url).host or "local"
+
+
+def backend_provenance(engine: Engine) -> dict[str, object]:
+    """Return evidence of which Postgres backend `engine` is actually connected to.
+
+    `rds_markers` — role names starting `rds_` (rds_superuser, rds_replication,
+    ...) — exist only on a genuine AWS RDS instance; a local/Docker Postgres
+    image never creates them. A non-empty list is unfakeable proof this ran
+    against real managed infrastructure, not just a connection string that
+    happens to say so.
+    """
+    with engine.connect() as conn:
+        markers = sorted(
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT rolname FROM pg_roles WHERE rolname LIKE 'rds\\_%' ESCAPE '\\'"
+                )
+            )
+        )
+    return {
+        "host": engine.url.host,
+        "is_rds": bool(markers),
+        "rds_markers": markers,
+    }
 
 
 def apply_migrations(database_url: str | None = None) -> None:

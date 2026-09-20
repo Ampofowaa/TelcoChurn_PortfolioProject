@@ -67,6 +67,13 @@ COMMITTED_MODEL_FAMILY: str = "lightgbm"
 # logged Δ/CI back the decision above — log_model.py stamps this into
 # training_manifest.json's model_family_committed section so the frozen
 # decision is a resolvable reference, not a number retyped from ANALYSIS.md.
+# Predates the Phase 12a AWS migration (logged against local dev's Postgres +
+# mlruns backend, not RDS+S3) — it will not resolve in the reviewer-facing
+# MLflow UI (Group 9) or any other RDS+S3-backed MLflow instance. Left frozen
+# regardless, per the "don't touch this on a routine reconfirming re-run"
+# discipline above; run `3fd5da5b1c674854bcab186ccd4fc7ac` (2026-09-18,
+# against RDS+S3) reconfirmed the same decision with the same evidence shape
+# and is the AWS-reachable run to click through instead.
 COMMITTED_MODEL_FAMILY_DECISION_RUN_ID: str = "c405f6fe31454c3a9899423680644411"
 
 _FEATURE_COLS: list[str] = (

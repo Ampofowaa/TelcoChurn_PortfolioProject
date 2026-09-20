@@ -91,6 +91,7 @@ def register_cfg(
                 "tracking_uri": register_mlflow_uri,
                 "experiment_name": "test_register",
                 "registered_model_name": registered_model_name,
+                "artifact_location": "",
             },
             "paths": {"reports": str(reports_dir)},
             "register": {

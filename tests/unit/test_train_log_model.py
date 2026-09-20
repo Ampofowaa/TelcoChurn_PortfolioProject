@@ -85,6 +85,10 @@ def registration_cfg(tmp_path: Path) -> OmegaConf:
                 "tracking_uri": "placeholder",
                 "experiment_name": "test_run_model_logging_step",
                 "registered_model_name": "test-telco-churn-pipeline",
+                "artifact_location": "",
+            },
+            "database": {
+                "url": "postgresql://user:pass@localhost:5432/telco_churn"  # pragma: allowlist secret
             },
             "paths": {"reports": str(tmp_path / "reports")},
         }
@@ -275,6 +279,10 @@ def test_run_model_logging_step_training_manifest_has_expected_fields(
 
     assert "git_sha" in manifest
     assert "data_content_hash" in manifest
+    # data_backend: proof of which Postgres/MLflow backend this run actually
+    # used — host only, never the raw connection string (it carries a password).
+    assert manifest["data_backend"]["postgres_host"] == "localhost"
+    assert manifest["data_backend"]["mlflow_tracking_host"] == "local"
     assert manifest["logged_model_uri"] == result["model_uri"]
     # LoggedModel.model_id — distinct from run_id and not auto-populated onto
     # ModelVersion in OSS MLflow 3.14; must be persisted here or the registry

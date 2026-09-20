@@ -591,6 +591,7 @@ def tuning_cfg() -> DictConfig:
             "mlflow": {
                 "tracking_uri": "placeholder",
                 "experiment_name": "test_run_tuning_step",
+                "artifact_location": "",
             },
         }
     )

@@ -1,4 +1,4 @@
-"""Unit tests for telco_churn.models.artifacts."""
+"""Unit tests for telco_churn.models.registry_alias."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INTERNAL_ERROR
 from omegaconf import OmegaConf
 
-from telco_churn.models.artifacts import resolve_champion_version
+from telco_churn.models.registry_alias import resolve_champion_version
 
 # ---------------------------------------------------------------------------
 # resolve_champion_version

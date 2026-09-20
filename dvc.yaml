@@ -179,6 +179,7 @@ stages:
       - src/telco_churn/models/calibration_metrics.py
       - src/telco_churn/models/artifacts.py
       - src/telco_churn/models/policy_config.py
+      - src/telco_churn/models/registry_alias.py
       - src/telco_churn/utils/hashing.py
       - src/telco_churn/data/split.py
       - src/telco_churn/data/schema.py

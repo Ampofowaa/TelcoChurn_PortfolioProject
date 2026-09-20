@@ -169,15 +169,22 @@ FEATURE_SCHEMA = FeatureSchema(
 # reduced_set_bootstrap_test), run only from notebooks/03b-feature-selection.ipynb
 # §2's on-demand review — never recomputed live. 'N/A' is the pre-decision
 # bootstrap value (no frozen decision exists yet); this project's decision is
-# already made (run `de4fac8e` found the full set wins: paired-bootstrap
-# Δ = 0.008, CI [0.005, 0.011], p < 0.001 — see ANALYSIS.md §4b), so it is not
-# 'N/A' here.
+# already made (run `b918a87ef6e3425f992ccd1f7c714a1b` found the full set
+# wins: paired-bootstrap Δ = 0.008, CI [0.005, 0.011], p < 0.001 — see
+# ANALYSIS.md §4b), so it is not 'N/A' here.
 COMMITTED_FEATURES_DECISION: str = "full"
 
 # The selection_review MLflow run (telco-churn-feature-selection-review
 # experiment) whose logged Δ/CI back the decision above — same "resolvable
 # reference, not a number retyped from ANALYSIS.md" discipline
 # models/train/common.py::COMMITTED_MODEL_FAMILY_DECISION_RUN_ID documents.
+# Predates the Phase 12a AWS migration (logged against local dev's Postgres +
+# mlruns backend, not RDS+S3) — it will not resolve in the reviewer-facing
+# MLflow UI (Group 9) or any other RDS+S3-backed MLflow instance. Left frozen
+# regardless, per that same discipline's "don't touch this on a routine
+# reconfirming re-run" rule; run `146379a23a4642aca7fc1692a13aa7bb`
+# (2026-09-18, against RDS+S3) reconfirmed the same decision with the same
+# evidence shape and is the AWS-reachable run to click through instead.
 COMMITTED_FEATURES_DECISION_RUN_ID: str = "b918a87ef6e3425f992ccd1f7c714a1b"
 
 # The model's actual input space — a subset of FEATURE_SCHEMA (FEATURE_SCHEMA is

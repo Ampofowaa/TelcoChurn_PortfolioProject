@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from telco_churn.ui.streamlit_app import (
+    _api_request,
     _bulk_drill_options,
     _bulk_results_display_df,
     _display_value,
@@ -38,6 +39,38 @@ def test_parse_transformed_name_splits_field_and_level(
     transformed_name: str, expected: tuple[str, str]
 ) -> None:
     assert _parse_transformed_name(transformed_name) == expected
+
+
+def test_api_request_adds_x_api_key_header_when_api_key_env_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("API_KEY", "secret-demo-key")
+    captured: dict[str, object] = {}
+
+    def fake_request(method: str, url: str, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr("requests.request", fake_request)
+    _api_request("GET", "/health")
+
+    assert captured["headers"] == {"X-API-Key": "secret-demo-key"}
+
+
+def test_api_request_omits_x_api_key_header_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("API_KEY", raising=False)
+    captured: dict[str, object] = {}
+
+    def fake_request(method: str, url: str, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr("requests.request", fake_request)
+    _api_request("GET", "/health")
+
+    assert captured["headers"] == {}
 
 
 def test_humanize_feature_name_translates_seniorcitizen_binary_level() -> None:

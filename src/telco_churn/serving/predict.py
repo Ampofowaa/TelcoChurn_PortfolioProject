@@ -69,8 +69,6 @@ from telco_churn.features.generate import compute_charge_per_service
 from telco_churn.models.artifacts import (
     committed_features_from_manifest,
     load_training_manifest,
-    resolve_challenger_version,
-    resolve_champion_version,
 )
 from telco_churn.models.environment_parity import diff_environment
 from telco_churn.models.explain import local_explanations
@@ -79,6 +77,10 @@ from telco_churn.models.policy_config import (
     load_threshold_payload,
     resolve_policy_scenarios,
     resolve_policy_thresholds_by_scenario,
+)
+from telco_churn.models.registry_alias import (
+    resolve_challenger_version,
+    resolve_champion_version,
 )
 from telco_churn.models.shap_values import (
     build_tree_explainer,

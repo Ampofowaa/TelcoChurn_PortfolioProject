@@ -392,6 +392,7 @@ def comparison_cfg() -> OmegaConf:
             "mlflow": {
                 "tracking_uri": "placeholder",
                 "experiment_name": "test_run_comparison_step",
+                "artifact_location": "",
             },
         }
     )
