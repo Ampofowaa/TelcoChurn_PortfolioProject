@@ -1,4 +1,4 @@
-FROM ghcr.io/mlflow/mlflow:v3.14.0
+FROM ghcr.io/mlflow/mlflow:v3.16.1
 # boto3: the official image doesn't bundle it, and MLflow's S3 artifact
 # repository needs it installed to serve artifacts from an s3:// root
 # (--artifacts-destination s3://... --serve-artifacts) - same gap Group 6.5
