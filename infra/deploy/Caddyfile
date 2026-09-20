@@ -1,0 +1,43 @@
+# One hostname, path-based routing — the single DuckDNS subdomain serves
+# both containers, no second DNS record or cert needed. {$DOMAIN} is
+# substituted from the container's own environment (env_file: .env,
+# rendered by refresh-env.sh from the /telco-churn/domain SSM param) —
+# Caddy's native {$VAR} syntax, not a Terraform template.
+#
+# Staging CA's global block (acme_ca https://acme-staging-v02...) is gone -
+# a real cert issued cleanly during Group 9 bring-up (2026-09-20), so Caddy
+# now falls back to its default production ACME directory. Not expected to
+# need staging again unless this box starts hitting a real cert repeatedly
+# (Let's Encrypt production's low-volume rate limit is the reason staging
+# exists at all).
+
+{$DOMAIN} {
+	reverse_proxy /predict* api:8000
+	reverse_proxy /health api:8000
+	reverse_proxy /ready api:8000
+	reverse_proxy /metrics api:8000
+	reverse_proxy /customer/* api:8000
+
+	# Swagger/OpenAPI docs - left public (no X-API-Key) on purpose so a
+	# reviewer can see the schema and the auth requirement itself without
+	# needing a key. Without these three, /docs falls through to the
+	# catch-all `reverse_proxy ui:8501` below and silently serves the
+	# Streamlit UI instead of FastAPI's docs - caught 2026-09-20 writing up
+	# README.md's demo-access section, never actually wired up until now.
+	reverse_proxy /docs api:8000
+	reverse_proxy /redoc api:8000
+	reverse_proxy /openapi.json api:8000
+
+	# MLflow has no API-key concept like FastAPI's X-API-Key - basic_auth is
+	# the equivalent control here. Demo reviewer credentials, published in
+	# README.md (Group 13): same "demonstrate the control, not protect
+	# anything sensitive" justification as the API demo key, since the
+	# dataset is public/synthetic. Password is "telco-reviewer-2026"; only
+	# its bcrypt hash lives here.
+	basic_auth /mlflow* {
+		reviewer $2b$10$vJeb2Etz0nw8uuHphsighukcmJi/tq3sTLwg2onsXImiIsPPuvtHK
+	}
+	reverse_proxy /mlflow* mlflow:5000
+
+	reverse_proxy ui:8501
+}

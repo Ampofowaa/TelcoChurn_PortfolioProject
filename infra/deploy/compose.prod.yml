@@ -1,0 +1,143 @@
+services:
+  # Reviewer-facing MLflow UI, sharing the box's one hostname/cert under
+  # /mlflow (Caddyfile's static-prefix-matched route). Built, not pulled -
+  # this is the one exception to "no build: block for prod services": it's
+  # a viewer-only client of the same RDS+S3 backend api/ui already point at,
+  # with no CD pipeline of its own (no image to tag/push), so `docker
+  # compose up` building it in place on the box is the whole deploy path.
+  # docker/mlflow/Dockerfile is the same file local dev's docker-compose.yml
+  # builds - shipped here via the Group 8 aws_s3_object mechanism
+  # (infra/compute.tf), not baked into user-data or git-cloned.
+  mlflow:
+    build:
+      context: ./docker/mlflow
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      # MLflow 3.14's server-side DNS-rebinding guard only allowlists
+      # 'localhost' and private-IP literals by default. Caddy's
+      # reverse_proxy passes the original inbound Host header through
+      # unmodified (it doesn't rewrite it to the upstream's dial address),
+      # so MLflow sees Host: ${DOMAIN} here, not "mlflow:5000" - the
+      # compose-DNS-name case docker-compose.yml's own comment documents.
+      # Both entries are needed: DOMAIN for real traffic through Caddy,
+      # mlflow:*/localhost:* for anything hitting the container directly.
+      MLFLOW_SERVER_ALLOWED_HOSTS: "${DOMAIN},mlflow:*,mlflow,localhost:*,localhost"
+      # The actual OOM root cause (Group 9 bring-up, 2026-09-19/20): MLflow
+      # 3.14's server-side job-execution feature (huey-backed async job
+      # queue, for GenAI eval/deployment-job/webhook use cases this project
+      # has none of) spawns 7+ separate consumer processes at startup -
+      # confirmed via `ps aux` on the box, each an independent
+      # huey_consumer subprocess costing ~170-200MB RSS, ~1.3GB combined.
+      # That's the real memory hog, not the uvicorn/gunicorn worker count
+      # below - a known upstream issue (mlflow/mlflow#22792, "Slow memory
+      # creep ... when server-side GenAI jobs are enabled"). Disabling it
+      # is safe: this deployment never uses MLflow Jobs for anything.
+      MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"
+    # --workers 1 below: default is 4 - on this box's 2GiB t3.small, 4
+    # workers forking near-simultaneously at boot (~155-160MB RSS each,
+    # confirmed via `dmesg`'s oom-kill record) tipped the kernel OOM killer
+    # into repeatedly killing mlflow mid-startup (Group 9 bring-up,
+    # 2026-09-19/20). This is a low-traffic, reviewer-only admin UI - one
+    # worker is plenty. Kept alongside the job-execution fix above since it's
+    # still a real, if smaller, contributor to boot-time memory pressure.
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --workers 1
+      --backend-store-uri ${MLFLOW_TRACKING_URI}
+      --artifacts-destination s3://${S3_BUCKET}/telco-churn-training
+      --serve-artifacts
+      --static-prefix /mlflow
+    healthcheck:
+      # /mlflow/health, not /health - --static-prefix /mlflow below moves
+      # every route under that prefix, including the health endpoint itself
+      # (confirmed against a real container: bare /health 404s once
+      # static-prefix is set). docker-compose.yml's own mlflow service has
+      # no static-prefix, so its /health healthcheck doesn't need this.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/mlflow/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      # Mirrors docker-compose.yml's own mlflow healthcheck start_period -
+      # same documented cold-start race (uvicorn workers observably die and
+      # respawn once before a real, healthy startup lands ~60-70s in).
+      start_period: 90s
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /telco-churn/mlflow
+        awslogs-region: us-east-1
+        awslogs-create-group: "true"
+        awslogs-stream: mlflow
+
+  api:
+    image: ${API_IMAGE}
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      # Fixed deployment constant, not a secret and never CD-mutated - no
+      # SSM param for it. See configs/serving/api.yaml's auth.enabled.
+      AUTH_ENABLED: "true"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /telco-churn/api
+        awslogs-region: us-east-1
+        awslogs-create-group: "true"
+        awslogs-stream: api
+
+  ui:
+    image: ${UI_IMAGE}
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /telco-churn/ui
+        awslogs-region: us-east-1
+        awslogs-create-group: "true"
+        awslogs-stream: ui
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    env_file: [.env]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - ui
+      - mlflow
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /telco-churn/caddy
+        awslogs-region: us-east-1
+        awslogs-create-group: "true"
+        awslogs-stream: caddy
+
+volumes:
+  caddy_data:
+  caddy_config:

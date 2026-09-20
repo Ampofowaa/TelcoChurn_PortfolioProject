@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions in .github/workflows/ current: each PR bumps
+  # the commit SHA and the trailing version comment together.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Bumps the pinned uv tag+digest and base images in the three Dockerfiles.
+  - package-ecosystem: "docker"
+    directories:
+      - "/docker/api"
+      - "/docker/ui"
+      - "/docker/mlflow"
+    schedule:
+      interval: "weekly"
