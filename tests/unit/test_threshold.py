@@ -544,6 +544,9 @@ def full_cfg(
                 "direction_sanity_min_magnitude": 0.3,
             },
             "register": {"golden_atol": 1.0e-9},
+            "database": {
+                "url": "postgresql://user:pass@localhost:5432/telco_churn"  # pragma: allowlist secret
+            },
             "mlflow": {
                 "tracking_uri": threshold_mlflow_uri,
                 "experiment_name": "test_run_threshold_step",
