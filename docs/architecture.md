@@ -59,6 +59,38 @@ flowchart TD
 
 **Solid arrows** — main linear flow. **Dashed arrows** — feedback loops. Full rationale: the Error Analysis 1 loop in `ANALYSIS.md` §4a's "Generative diagnostic loop" subsection; the Business Review loops in §6 (cost-assumption uncertainty) and §8–§10 (drift-monitoring baseline, periodic recalibration).
 
+## Model Family & Feature Selection — Human-Reviewed, Frozen Into Code (Phase 5)
+
+Two decisions this system makes **exactly once, not every training cycle**: which model family to use, and which features to use. Both are made by a human reviewing evidence in a notebook, never computed automatically inside the routine pipeline — the ML Workflow diagram above glosses over this on purpose, since "Baseline Models" → "Hyperparameter Tuning" is the *routine* path, and this is the *periodic* one that occasionally updates what "Baseline Models" even means.
+
+```mermaid
+flowchart TD
+    subgraph Human["Human-reviewed, periodic — never routine, never per-retrain"]
+        T["Real trigger only:\nnew candidate family / drift signal /\nscheduled periodic review"] --> N1["notebooks/03a-model-selection.ipynb\nruns candidates.py + comparison.py"]
+        T --> N2["notebooks/03b-feature-selection.ipynb\nruns feature_selection.py's ablation"]
+        N1 --> D1{"today's family ==\nCOMMITTED_MODEL_FAMILY?"}
+        N2 --> D2{"today's features ==\nCOMMITTED_FEATURES?"}
+        D1 -->|"reconfirmed (expected)"| P1["No change —\ntoday's run is additional\nconfirming evidence only"]
+        D1 -->|"changed (rare)"| P2["Reviewed PR: update\nCOMMITTED_MODEL_FAMILY +\n_DECISION_RUN_ID, ANALYSIS.md §4a"]
+        D2 -->|"reconfirmed (expected)"| P3["No change"]
+        D2 -->|"changed (rare)"| P4["Reviewed PR: update\nCOMMITTED_FEATURES +\n_DECISION_RUN_ID, ANALYSIS.md §4b"]
+    end
+    P1 --> F["Frozen constants:\nmodels/train/common.py::COMMITTED_MODEL_FAMILY\nfeatures/schema.py::COMMITTED_FEATURES"]
+    P2 --> F
+    P3 --> F
+    P4 --> F
+    F --> Auto["Automated pipeline (train.py, Steps 1-5)\nevery dvc repro / future Phase 10 retrain:\ntrains COMMITTED_MODEL_FAMILY on\nCOMMITTED_FEATURES — never re-derives either"]
+    Auto --> Audit["feature_audit.py (Step 3)\naudits the already-frozen COMMITTED_FEATURES\nfor consistency, every cycle — never re-decides membership"]
+```
+
+**Neither notebook is wired into `models/train/__main__.py`.** `candidates.py`/`comparison.py` (Dummy vs. `LogisticRegressionCV` vs. LightGBM, paired-bootstrap comparison) and `feature_selection.py` (permutation-importance ablation) are explicitly notebook-only, on-demand tools — re-run "only on a real trigger... not on every retrain," per their own module docstrings. The routine automated pipeline never touches this decision at all; it just trains whichever family the frozen constant names, on whichever features the frozen constant lists.
+
+**The decision-check inside each notebook is deliberately self-contained.** It compares *today's fresh computation* against the hardcoded constant (`today_family == COMMITTED_MODEL_FAMILY`) — it never looks up or compares against the *original* decision run via MLflow. That makes it correct regardless of which MLflow backend/experiment the re-run happens to log into: running it against a different tracking store (a fresh environment, a different deployment target) doesn't confuse the check, since the original run is only ever cited as a string in the printed message, never dereferenced. The expected, normal outcome on a routine re-run is "Reconfirmed — no change needed"; only a genuine "DECISION CHANGED" result calls for updating the frozen constants, via a reviewed PR that also updates the `_DECISION_RUN_ID` citation and `ANALYSIS.md`'s rationale.
+
+**`feature_audit.py` is a different thing entirely, and easy to confuse with `feature_selection.py`.** It *is* part of the automated pipeline (Step 3 of `train.py`) and runs on every single cycle — but it only **audits** that the already-frozen `COMMITTED_FEATURES` still holds up (columns still exist, still behave consistently against the live feature space), producing a diagnostic. It never re-runs the importance ablation and never changes `COMMITTED_FEATURES` itself. Reading `feature_audit.py`'s presence in the automated pipeline as "feature selection happens every retrain" would be the wrong takeaway — selection is the rare, human-reviewed event above; auditing is the routine, automated check that the last selection decision hasn't silently gone stale.
+
+**The `_DECISION_RUN_ID` citations only ever resolve inside the tracking store they were created in — they are not globally resolvable links.** `COMMITTED_MODEL_FAMILY_DECISION_RUN_ID`/`COMMITTED_FEATURES_DECISION_RUN_ID` point at the specific run that was actually reviewed when the decision was made, which — for this project's decisions to date — lives in local development's MLflow instance. A re-run of these notebooks against a different backend (a fresh environment, a cloud-hosted MLflow) produces a *new*, independent run with its own, different run_id; it can never retroactively become the cited run, no matter how it's re-run. That's fine, because the citation was never meant to be a durable, infrastructure-independent link in the first place — the durable record is git: `ANALYSIS.md §4a`/`§4b`'s narrative and numbers, and the rendered `notebooks/03a-model-selection.ipynb`/`03b-feature-selection.ipynb` themselves (committed with output cells, per this project's Notebook Conventions), both of which survive regardless of whether any particular MLflow backend still exists. A reader who can't reach the cited tracking store isn't missing the evidence — it's already sitting in the repo.
+
 ## Data Flow — Ingestion to Training
 
 This shows *artifacts* — what each stage actually reads and writes, and which stages touch the database at all.

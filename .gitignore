@@ -265,3 +265,12 @@ project_thoughts.md
 prompts.txt
 summary.md
 prediction_logging_plan.md
+
+# Terraform (infra/) — .terraform.lock.hcl IS committed, state and secrets are not
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log

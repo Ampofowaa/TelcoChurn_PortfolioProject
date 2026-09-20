@@ -10,6 +10,8 @@ Predicts which telecom customers are likely to churn and quantifies the revenue 
 
 **0.670 PR-AUC · +$15,061 expected value per test cohort (95% CI [$11,215, $18,604]) · promotion gate: pass** — a one-time evaluation on the test set, held out since the original split and never touched until now. Full breakdown below.
 
+**Live demo:** **[telco-churn.duckdns.org](https://telco-churn.duckdns.org)** — the Streamlit UI, no install or login needed. Reviewer-only MLflow UI (same registry/runs cited throughout this README): [telco-churn.duckdns.org/mlflow](https://telco-churn.duckdns.org/mlflow) (`reviewer` / `telco-reviewer-2026`). Want to see the raw API's schema and auth requirement without a key? [telco-churn.duckdns.org/docs](https://telco-churn.duckdns.org/docs) (Swagger UI).
+
 Full modelling rationale, hyperparameter search, error analysis, SHAP explainability, and business impact → **[ANALYSIS.md](ANALYSIS.md)**
 Rendered notebooks — every figure, every phase, outputs included → **[notebooks/](notebooks/)**
 Engineering build plan (15 phases, current status) → **[PROJECT_PLAN.md](PROJECT_PLAN.md)**
@@ -115,13 +117,15 @@ Mechanism and rationale for each stage below → [Modelling](#modelling), [Pipel
 | Orchestration (Phase 10) | Prefect |
 | Infrastructure | Docker, Postgres |
 | CI/CD | GitHub Actions |
-| Cloud (Phase 12) | AWS ECR + App Runner + RDS + S3 |
+| Cloud (Phase 12a) | AWS EC2 + Docker Compose, RDS (Postgres), S3 (MLflow artifacts), ECR (image registry), Caddy (auto TLS) |
 
 ---
 
 ## Modelling
 
 Mechanism only — the reasoning behind each choice (why LightGBM over `LogisticRegressionCV`, why sigmoid calibration, why these guardrails) lives in `ANALYSIS.md`, linked per row rather than repeated here.
+
+**Family and feature selection are periodic, human-reviewed decisions frozen into code — not steps the routine pipeline re-runs.** Both are made in a notebook, on a real trigger (a new candidate family, a drift signal, a scheduled review), never on every retrain; the decision is then frozen as a literal constant the automated pipeline just trains against. Full mechanism, the human-review loop, and why this doesn't drift silently → [docs/architecture.md § Model Family & Feature Selection](docs/architecture.md#model-family--feature-selection--human-reviewed-frozen-into-code-phase-5).
 
 | Stage | Mechanism |
 |---|---|
@@ -160,7 +164,7 @@ Run it yourself → [Quick Start step 5](#quick-start). Full architecture → [d
 
 ## Serving
 
-The champion (`telco-churn-pipeline@champion` in the MLflow registry) is served behind a FastAPI app, with a Streamlit UI as a thin client — both run as their own Docker images and come up together with one `docker compose up`.
+The champion (`telco-churn-pipeline@champion` in the MLflow registry) is served behind a FastAPI app, with a Streamlit UI as a thin client — both run as their own Docker images. **Live on AWS** (Phase 12a) at **[telco-churn.duckdns.org](https://telco-churn.duckdns.org)**, no setup required; for local development, the same stack comes up with one `docker compose up` ([Quick Start step 9](#quick-start)).
 
 | Component | What it does |
 |---|---|
@@ -168,9 +172,10 @@ The champion (`telco-churn-pipeline@champion` in the MLflow registry) is served 
 | **Contact policy** | `POST /predict/batch` doesn't just score every row — it ranks them by expected value and caps who gets contacted at a configurable `contact_capacity`/`campaign_budget`, so the response reflects an operationally realistic campaign, not an unlimited-budget fantasy. |
 | **Shadow/canary rollout** | Config-gated, off by default: whenever a `challenger` model exists in the registry, it can be dual-scored against every request for comparison (**shadow**, zero routing risk) or actually serve a consistent-hash slice of live traffic (**canary**). Mechanism, Prometheus metrics, and a real evidence log → [docs/architecture.md § Shadow/Canary Serving](docs/architecture.md#shadowcanary-serving--servingpredictpy-phase-9). |
 | **Streamlit UI** (`ui/streamlit_app.py`) | **Score a Customer** tab: look up a real customer from `customers_crm` (a seeded "current state" derivation of the training data, never the frozen snapshot itself) or manually enter one for a what-if scenario. Mechanism, rationale, and what's/isn't durably recorded → [docs/architecture.md § Live Customer Lookup](docs/architecture.md#live-customer-lookup--customers_crm-phase-9). **Batch Prediction** tab: score a CSV upload — [`examples/sample_batch_predictions.csv`](examples/sample_batch_predictions.csv) demonstrates all three `/predict/batch` item shapes in one upload (ID-only, full inline, ID-plus-override). **Model Info** tab: read the champion's model card. All three drive the same FastAPI endpoints a real client would call. Runs from `docker/ui/Dockerfile`, same build pattern as the API image. |
-| **Docker Compose** | `docker-compose.yml` wires four services — `postgres`, `mlflow`, `fastapi`, `streamlit` — so `docker compose up -d --build` brings up the entire stack in one command, with `fastapi`/`streamlit` waiting on `postgres`/`mlflow` via `depends_on`. |
+| **Live deployment** (Phase 12a) | A single EC2 box (`t3.small`) behind Caddy — automatic TLS via Let's Encrypt, HTTPS-only, no laptop in the loop. Postgres runs on RDS and MLflow artifacts on S3 instead of local containers/volumes, but it's the same `docker compose` shape underneath (`infra/deploy/compose.prod.yml`), just pointed at managed backends. A fourth service, a persistent **reviewer-facing MLflow UI**, is reachable at [telco-churn.duckdns.org/mlflow](https://telco-churn.duckdns.org/mlflow) (login: `reviewer` / `telco-reviewer-2026`) — the actual registry and runs behind every number in this README, browsable without cloning the repo. |
+| **Docker Compose** (local dev) | `docker-compose.yml` wires four services — `postgres`, `mlflow`, `fastapi`, `streamlit` — so `docker compose up -d --build` brings up the entire stack in one command on your own machine, with `fastapi`/`streamlit` waiting on `postgres`/`mlflow` via `depends_on`. |
 
-Run it yourself → [Quick Start step 9](#quick-start).
+Try the live deployment above, or run it yourself locally → [Quick Start step 9](#quick-start). The raw API requires an `X-API-Key` on its three data routes (`/predict`, `/predict/batch`, `/customer/{id}`) — see the schema and try it interactively, no key needed, at [telco-churn.duckdns.org/docs](https://telco-churn.duckdns.org/docs).
 
 ---
 
@@ -203,6 +208,8 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full phase-by-phase roadmap and t
 ---
 
 ## Quick Start
+
+Want to try it without installing anything? **[telco-churn.duckdns.org](https://telco-churn.duckdns.org)** is live — skip straight to using it. Everything below is for running your own copy locally.
 
 **Prerequisites:** Python 3.13+, [uv](https://docs.astral.sh/uv/), [Docker Desktop](https://www.docker.com/products/docker-desktop/), and a [Kaggle API token](https://www.kaggle.com/settings/api).
 
