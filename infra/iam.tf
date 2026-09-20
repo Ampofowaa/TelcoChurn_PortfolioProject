@@ -223,6 +223,21 @@ resource "aws_iam_role_policy" "ci_deploy" {
         Resource = "*" # no resource-level permission support for these actions
       },
       {
+        # `aws s3 sync` lists the destination to work out what differs, so
+        # PutObject alone 403s on ListObjectsV2. Bucket-level action, scoped
+        # to the same prefix via s3:prefix so the rest of the bucket's keys
+        # stay unlistable.
+        Sid       = "DeployConfigList"
+        Effect    = "Allow"
+        Action    = "s3:ListBucket"
+        Resource  = local.mlflow_bucket_arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = ["deploy-config", "deploy-config/*"]
+          }
+        }
+      },
+      {
         # cd.yml syncs infra/deploy/ + docker/mlflow/Dockerfile here before
         # the SSM deploy command. This one prefix only — never model
         # artifacts or anything else in the bucket.
