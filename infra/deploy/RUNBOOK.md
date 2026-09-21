@@ -116,7 +116,8 @@ A push to `main` touching `src/`, `configs/`, `alembic*`, either Dockerfile,
 `pyproject.toml` or `uv.lock` (or a manual `workflow_dispatch`) builds `api`/`ui`
 tagged with the commit SHA, points `/telco-churn/{api,ui}-image` at them, and
 runs `scripts/deploy_on_box.sh` then `scripts/smoke_test_deployed.sh` on the box
-over SSM. `docker image prune` runs only after the smoke test passes. A model
+over SSM. `docker image prune -af` runs before the pull and again after a passing
+smoke test (see disk space, below). A model
 promotion is **not** a deploy — `champion` hot-reloads via the registry alias.
 
 ## One-time setup
@@ -153,6 +154,20 @@ Limits:
 - **Migrations are forward-only.** Rollback never runs `alembic downgrade`; the
   old image must tolerate the new schema, so write migrations backwards-compatibly.
 - **Rollback failing** logs `ROLLBACK ALSO FAILED`. Intervene by hand, below.
+
+## Disk space
+
+The root volume is 19 GB and each api+ui release is about 2.5 GB, so old
+releases must not accumulate. Both `deploy_on_box.sh` (before the pull) and
+`prune_on_box.sh` (after a green smoke test) run `docker image prune -af`,
+which removes every image no container is using — the release currently serving,
+which is also the rollback target, is in use and stays. An older release that a
+rollback needs is re-pulled from ECR, which keeps the last five tags.
+
+Symptom of a full disk: "Deploy on the box" fails with the SSM agent's
+`ipc messaging received timeout signal`, not a Docker error — the agent's own
+log (`/var/log/amazon/ssm/errors.log`) says `no space left on device`. Check
+`df -h /` and `docker system df` on the box, then `docker image prune -af`.
 
 ## Manual rollback (image)
 
