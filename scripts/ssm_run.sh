@@ -12,12 +12,16 @@ timeout="${2:-900}"
 REGION="us-east-1"
 
 # base64 sidesteps every quoting problem of embedding a script in JSON params.
+# The script is written to a temp file and run with stdin from /dev/null. It
+# used to be piped into `bash`, and any command in it that reads stdin
+# (`docker compose run`/`exec`) swallowed the rest of the script - later lines
+# never ran while SSM still reported Success.
 encoded=$(base64 -w0 "${script}")
 
 command_id=$(aws ssm send-command \
     --document-name AWS-RunShellScript \
     --targets "Key=tag:Project,Values=telco-churn" \
-    --parameters "commands=[\"echo ${encoded} | base64 -d | bash\"]" \
+    --parameters "commands=[\"f=\$(mktemp) && echo ${encoded} | base64 -d > \$f && bash \$f < /dev/null; rc=\$?; rm -f \$f; exit \$rc\"]" \
     --timeout-seconds "${timeout}" \
     --region "${REGION}" \
     --query Command.CommandId --output text)

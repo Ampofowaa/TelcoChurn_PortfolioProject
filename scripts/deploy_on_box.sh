@@ -21,6 +21,6 @@ chmod +x refresh-env.sh
 docker compose -f compose.prod.yml pull
 # Forward-only: a rollback re-runs this against the old image, and alembic
 # is already at head, so it is a no-op there — it never downgrades.
-docker compose -f compose.prod.yml run --rm api alembic upgrade head
+docker compose -f compose.prod.yml run --rm -T api alembic upgrade head < /dev/null
 # --build: mlflow is built on the box, not pulled from ECR.
 docker compose -f compose.prod.yml up -d --build
