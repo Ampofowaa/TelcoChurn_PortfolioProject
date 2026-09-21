@@ -27,11 +27,18 @@ fail() {
 
 status() { curl -s -o /dev/null -w '%{http_code}' "${RESOLVE[@]}" "$@"; }
 
-echo "==> /health"
-[ "$(status "${BASE_URL}/health")" = "200" ] || fail "/health did not return 200"
+# Both probes are polled, not asserted once: this runs seconds after
+# `docker compose up -d`, while the api and Caddy containers are still starting,
+# so the first request gets a connection error or a 502. /ready additionally goes
+# 503 -> 200 once the champion has loaded.
+echo "==> /health (timeout ${READY_TIMEOUT}s)"
+elapsed=0
+until [ "$(status "${BASE_URL}/health")" = "200" ]; do
+    elapsed=$((elapsed + 5))
+    [ "${elapsed}" -lt "${READY_TIMEOUT}" ] || fail "/health not 200 within ${READY_TIMEOUT}s"
+    sleep 5
+done
 
-# /ready goes 503 -> 200 once the champion has loaded, so poll instead of
-# asserting once.
 echo "==> /ready (timeout ${READY_TIMEOUT}s)"
 elapsed=0
 until [ "$(status "${BASE_URL}/ready")" = "200" ]; do
