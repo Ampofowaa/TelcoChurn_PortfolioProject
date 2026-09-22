@@ -171,7 +171,7 @@ Working checklist for implementation. Full rationale, corrections, and decision 
   - [x] Add `actions/cache` step for `~/.cache/pre-commit` (key: OS + Python version + `hashFiles('.pre-commit-config.yaml')`) before the `Pre-commit hooks` step, and SHA-pin it too
 - [x] **Gap 3:** add a `docker build` (no push) step for both Dockerfiles — done as a separate `.github/workflows/docker-build.yml` (api/ui/mlflow matrix, path-filtered, PRs into `main` + pushes to `main`); `uv:latest` pinned to `0.11.16@sha256:440fd64…` in both Dockerfiles; Dependabot `docker` ecosystem added. All three images built locally with the pin. Smoke-test step added for `api`/`ui` (`/health`, `/_stcore/health`), verified locally: `ui` healthy in ~6s, `api` in ~16s **only** with `MLFLOW_TRACKING_URI=sqlite:////tmp/mlflow.db` — with no URI the container's default relative sqlite path is unwritable for the non-root user and `/health` never answers (not a prod issue, prod always sets the URI)
 - [x] One-time: actually run `docker build` against both Dockerfiles locally right now — already covered: Group 9 built `api`/`ui`/`mlflow` for real (2026-09-18) and all three ran on the EC2 box (Phase F passed 2026-09-20). Current uncommitted Dockerfile diffs (`alembic` copies, `boto3`) are exactly those built-and-deployed changes; no rebuild needed
-- [ ] Verify: a lint error *and* a black-only formatting violation both go red
+- [x] Verify: a lint error *and* a black-only formatting violation both go red — confirmed 2026-09-22, PR from `test/ci-lint-and-format-check` (`src/telco_churn/_ci_lint_format_probe.py`, unwired scratch code, closed without merge). `unit`'s "Pre-commit hooks" step failed on both, independently, in one run: `ruff` caught `import os` unused (`F401`, auto-fixed to 0 remaining) — a real lint error; `black` separately reformatted a single-quoted string to double quotes — a case ruff's lint rules don't cover (quote style isn't in this project's `ruff.lint.select` list), so only the black hook caught it. Job exited 1.
 
 ## Group 11 — CD (`.github/workflows/cd.yml`, single-environment)
 
@@ -235,6 +235,6 @@ Working checklist for implementation. Full rationale, corrections, and decision 
 - [ ] `/ready` goes `503 → 200` on startup
 - [ ] **Reboot the EC2 instance** — stack comes back with no manual step
 - [ ] Close the laptop — service keeps serving
-- [ ] Deliberate lint error fails `ci.yml`; a real merge to `main` deploys via `cd.yml` and smoke-tests green
+- [x] Deliberate lint error fails `ci.yml`; a real merge to `main` deploys via `cd.yml` and smoke-tests green — two separately-proven halves, not one event: the lint/format half via Group 10's throwaway PR above (2026-09-22); the merge-deploys-and-smoke-tests-green half already proven 2026-09-21 by the drill-revert PR (#38) landing on `main` and running the full build/push/sync/deploy/smoke-test path unattended (see Group 9)
 - [ ] Grafana Cloud dashboard populates within minutes of driving traffic
 - [ ] Monthly AWS cost confirmed at ~$28–30, tracked against the shared credit balance
