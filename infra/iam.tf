@@ -21,9 +21,9 @@ locals {
   # own documented pattern for path-scoped access drops the slash so the
   # zero-width match covers the bare path too. GetParameter/GetParameters
   # still match fine since those check full parameter names ("telco-churn/api-key").
-  ssm_param_arn     = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/telco-churn*"
-  kms_ssm_key_arn   = "arn:aws:kms:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alias/aws/ssm"
-  log_group_arn     = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/telco-churn/*"
+  ssm_param_arn   = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/telco-churn*"
+  kms_ssm_key_arn = "arn:aws:kms:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alias/aws/ssm"
+  log_group_arn   = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/telco-churn/*"
 }
 
 # --- EC2 instance role -------------------------------------------------
@@ -227,10 +227,10 @@ resource "aws_iam_role_policy" "ci_deploy" {
         # PutObject alone 403s on ListObjectsV2. Bucket-level action, scoped
         # to the same prefix via s3:prefix so the rest of the bucket's keys
         # stay unlistable.
-        Sid       = "DeployConfigList"
-        Effect    = "Allow"
-        Action    = "s3:ListBucket"
-        Resource  = local.mlflow_bucket_arn
+        Sid      = "DeployConfigList"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = local.mlflow_bucket_arn
         Condition = {
           StringLike = {
             "s3:prefix" = ["deploy-config", "deploy-config/*"]
