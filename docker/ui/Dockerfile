@@ -39,6 +39,9 @@ COPY --from=builder --chown=app:app /app/configs /app/configs
 COPY --from=builder --chown=app:app /app/pyproject.toml /app/pyproject.toml
 # The Batch Prediction tab offers this as a one-click sample download.
 COPY --chown=app:app examples/sample_batch_predictions.csv /app/examples/sample_batch_predictions.csv
+# Theme only, never the whole .streamlit/ folder: a local secrets.toml there
+# is gitignored but still inside the build context.
+COPY --chown=app:app .streamlit/config.toml /app/.streamlit/config.toml
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \

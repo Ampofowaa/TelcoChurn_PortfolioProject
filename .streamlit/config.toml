@@ -1,0 +1,5 @@
+# Streamlit's default accent is red, which reads as "danger/delete" on the
+# primary action button. Teal stays clear of the SHAP chart's red/blue
+# increase/decrease colours so the accent never looks like a risk signal.
+[theme]
+primaryColor = "#0f766e"

@@ -553,8 +553,8 @@ def _render_lookup_tab() -> None:
     # Customer" — restating it would just push the actual instruction
     # further down the page for no added clarity.
     st.caption(
-        "Enter a Customer ID and click Fetch to load their current record, "
-        "or fill in the form yourself. Click Predict for a churn risk "
+        "Enter a Customer ID and click Fetch to load their current record "
+        "(or pick an example below), or fill in the form yourself. Click Predict for a churn risk "
         "score and explanation. This never changes the customer's "
         "account details."
     )
@@ -578,9 +578,10 @@ def _render_lookup_tab() -> None:
     customerid_key = (
         "lookup_customerid" if id_nonce == 0 else f"lookup_customerid_{id_nonce}"
     )
-    customerid = st.text_input("Customer ID (optional)", key=customerid_key)
-    col_fetch, col_clear = st.columns([1, 1])
-    with col_fetch:
+    # One row so Fetch sits beside the field it acts on; bottom-aligned so
+    # the buttons line up with the input box, not with its label.
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        customerid = st.text_input("Customer ID (optional)", key=customerid_key)
         # Never `disabled=not customerid`: that disables the button using
         # this run's value, before the browser has sent up what was just
         # typed — Streamlit only applies that keystroke on the next rerun,
@@ -588,15 +589,12 @@ def _render_lookup_tab() -> None:
         # triggered it, and the user has to hit Enter/Tab first to "unstick"
         # it. Validating after the click removes that dead click entirely.
         fetch_clicked = st.button("Fetch customer", key="lookup_fetch")
-    with col_clear:
         clear_clicked = st.button("Clear", key="lookup_clear")
 
-    st.caption("Don't have an ID? Try one of these:")
     example_clicked: str | None = None
-    for col, example_id in zip(
-        st.columns(len(_EXAMPLE_CUSTOMER_IDS)), _EXAMPLE_CUSTOMER_IDS, strict=True
-    ):
-        with col:
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.caption("Don't have an ID? Try one:", width="content")
+        for example_id in _EXAMPLE_CUSTOMER_IDS:
             if st.button(example_id, key=f"lookup_example_{example_id}"):
                 example_clicked = example_id
 
@@ -815,39 +813,40 @@ def _load_sample_batch_csv() -> bytes | None:
 
 
 def _render_bulk_tab() -> None:
-    st.subheader("Bulk CSV upload")
+    # No st.subheader: the tab bar already labels this "Batch Prediction",
+    # same reasoning as _render_lookup_tab.
     st.caption(
-        "Score the sample in one click, or upload your own CSV of customers "
-        "to score in one call. Each row can be: "
-        "just a `customerid` (their current details are looked up "
-        "automatically), a fully filled-in profile (no `customerid` "
-        "needed), or a `customerid` plus a few fields to override — useful "
-        "for testing what happens if a specific real customer's plan "
-        "changed. Rows of different types can be mixed in the same file. "
-        "Capped at the API's configured batch size."
+        "Score many customers in one call: try the sample in one click, or "
+        "upload your own CSV."
     )
     sample_csv = _load_sample_batch_csv()
     sample_clicked = False
     if sample_csv is not None:
-        col_sample, col_download = st.columns([1, 1])
-        with col_sample:
+        with st.container(horizontal=True):
             sample_clicked = st.button(
                 "Score the sample (50 customers)",
                 key="bulk_score_sample",
                 type="primary",
             )
-        with col_download:
             st.download_button(
                 "Download the sample CSV",
                 data=sample_csv,
                 file_name=_SAMPLE_BATCH_CSV_FILENAME,
                 mime="text/csv",
                 key="bulk_sample_download",
-                help=(
-                    "See the expected format, covering all three row "
-                    "types — or edit it and upload your own version below."
-                ),
+                help="Use it as a template for your own file.",
             )
+    with st.expander("What can each row contain?"):
+        st.markdown(
+            "- **Just a `customerid`** — their current details are looked "
+            "up automatically.\n"
+            "- **A fully filled-in profile** — no `customerid` needed.\n"
+            "- **A `customerid` plus a few fields to override** — useful for "
+            "testing what happens if a specific real customer's plan "
+            "changed.\n\n"
+            "Rows of different types can be mixed in the same file. Capped "
+            "at the API's configured batch size."
+        )
     uploaded = st.file_uploader("Or upload your own CSV", type=["csv"], key="bulk_csv")
 
     if sample_clicked:

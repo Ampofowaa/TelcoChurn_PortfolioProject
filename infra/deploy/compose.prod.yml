@@ -100,6 +100,10 @@ services:
     env_file: [.env]
     environment:
       API_BASE_URL: http://api:8000
+      # Browser-facing link for the UI's "Serving API" caption. Without it
+      # the UI falls back to API_BASE_URL, Docker's internal address, which
+      # no visitor's browser can reach. Caddy routes /docs to the API.
+      API_DISPLAY_URL: https://${DOMAIN}
     depends_on:
       - api
     healthcheck:
