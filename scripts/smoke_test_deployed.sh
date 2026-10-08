@@ -25,6 +25,12 @@ fail() {
     exit 1
 }
 
+fail_mlflow() {
+    echo "FAIL: $*"
+    docker compose -f /opt/telco-churn/compose.prod.yml logs --tail 100 mlflow || true
+    exit 1
+}
+
 status() { curl -s -o /dev/null -w '%{http_code}' "${RESOLVE[@]}" "$@"; }
 
 # Both probes are polled, not asserted once: this runs seconds after
@@ -62,5 +68,41 @@ echo "${body}" | jq -e '.probability | (type == "number" and . >= 0 and . <= 1)'
 
 echo "==> UI root"
 [ "$(status "${BASE_URL}/")" = "200" ] || fail "UI root did not return 200"
+
+# The reviewer-facing MLflow UI must be view-only: logged-out requests are
+# refused, the published reviewer account can read, and it can neither move an
+# alias nor create anything. Skipped when compose.prod.yml predates MLflow's
+# login: cd.yml's rollback runs this checkout's scripts against the previous
+# commit's deploy files.
+if grep -q -- '--app-name basic-auth' /opt/telco-churn/compose.prod.yml; then
+    MLFLOW_URL="${BASE_URL}/mlflow"
+    REVIEWER=(-u "reviewer:telco-reviewer-2026")
+    MODEL="telco-churn-pipeline"
+
+    echo "==> MLflow without a login must be rejected"
+    code=$(status "${MLFLOW_URL}/")
+    [ "${code}" = "401" ] || fail_mlflow "MLflow without a login returned ${code}, expected 401"
+
+    echo "==> MLflow reviewer can read the champion alias"
+    version=$(curl -fsS "${RESOLVE[@]}" "${REVIEWER[@]}" \
+        "${MLFLOW_URL}/api/2.0/mlflow/registered-models/alias?name=${MODEL}&alias=champion" \
+        | jq -er '.model_version.version') \
+        || fail_mlflow "reviewer could not read the champion alias"
+
+    echo "==> MLflow reviewer cannot move the champion alias"
+    # Re-points champion at the version it already holds, so even a wrongly
+    # allowed request would change nothing.
+    code=$(status "${REVIEWER[@]}" -X POST "${MLFLOW_URL}/api/2.0/mlflow/registered-models/alias" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"${MODEL}\",\"alias\":\"champion\",\"version\":\"${version}\"}")
+    [ "${code}" = "403" ] || fail_mlflow "reviewer setting the champion alias returned ${code}, expected 403"
+
+    echo "==> MLflow reviewer cannot create experiments"
+    # Empty body: if Caddy ever stopped blocking this, MLflow would answer 400
+    # (name missing) rather than create anything.
+    code=$(status "${REVIEWER[@]}" -X POST "${MLFLOW_URL}/api/2.0/mlflow/experiments/create" \
+        -H "Content-Type: application/json" -d '{}')
+    [ "${code}" = "403" ] || fail_mlflow "reviewer creating an experiment returned ${code}, expected 403"
+fi
 
 echo "==> smoke test passed"

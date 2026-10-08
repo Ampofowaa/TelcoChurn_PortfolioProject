@@ -113,6 +113,9 @@ jobs:
       - name: Deploy on the box
         run: scripts/ssm_run.sh scripts/deploy_on_box.sh
 
+      - name: Ensure the MLflow reviewer account
+        run: scripts/ssm_run.sh scripts/seed_mlflow_reviewer.sh
+
       - name: Smoke test
         run: scripts/ssm_run.sh scripts/smoke_test_deployed.sh
 
@@ -148,6 +151,7 @@ jobs:
           aws ssm put-parameter --name /telco-churn/api-image --type String --overwrite --value "${{ steps.prev.outputs.api }}"
           aws ssm put-parameter --name /telco-churn/ui-image --type String --overwrite --value "${{ steps.prev.outputs.ui }}"
           scripts/ssm_run.sh scripts/deploy_on_box.sh
+          scripts/ssm_run.sh scripts/seed_mlflow_reviewer.sh
           scripts/ssm_run.sh scripts/smoke_test_deployed.sh \
             || { echo "::error::ROLLBACK ALSO FAILED — the box is unhealthy, intervene by hand (see RUNBOOK)."; exit 1; }
           echo "::warning::Rolled back to ${{ steps.prev.outputs.api }} — the box is healthy on the previous release."

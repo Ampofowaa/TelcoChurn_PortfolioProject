@@ -456,6 +456,8 @@ def test_score_the_sample_scores_the_bundled_csv_in_one_click(
     assert len(batch_payloads[0]) == 50
     assert len(at.dataframe) == 1
     assert len(at.dataframe[0].value) == 50
+    assert "bulk_score" not in [b.key for b in at.button]
+    assert "row(s) parsed" not in " ".join(m.value for m in at.markdown)
 
 
 def test_uploading_a_file_replaces_the_sample_and_clears_its_results(

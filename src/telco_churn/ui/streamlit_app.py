@@ -885,12 +885,15 @@ def _render_bulk_tab() -> None:
             f"{len(rows)} row(s) parsed — exceeds the API's batch limit of "
             f"{max_size}. Split the file and upload in smaller batches."
         )
-    else:
-        st.write(f"{len(rows)} row(s) parsed (limit: {max_size}).")
-
-    score_clicked = st.button(
-        "Score batch", key="bulk_score", disabled=not rows or over_limit
-    )
+    # The sample is scored by its own button the moment it's chosen, so the
+    # row count and a second "Score batch" would only invite a pointless rerun.
+    score_clicked = False
+    if source_id != "sample":
+        if not over_limit:
+            st.write(f"{len(rows)} row(s) parsed (limit: {max_size}).")
+        score_clicked = st.button(
+            "Score batch", key="bulk_score", disabled=not rows or over_limit
+        )
     if (score_clicked or sample_clicked) and rows and not over_limit:
         resp = _api_request("POST", "/predict/batch", json=rows)
         if resp is None:

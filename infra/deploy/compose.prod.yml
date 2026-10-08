@@ -35,6 +35,7 @@ services:
       # creep ... when server-side GenAI jobs are enabled"). Disabling it
       # is safe: this deployment never uses MLflow Jobs for anything.
       MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"
+      MLFLOW_AUTH_CONFIG_PATH: /tmp/basic_auth.ini
     # --workers 1 below: default is 4 - on this box's 2GiB t3.small, 4
     # workers forking near-simultaneously at boot (~155-160MB RSS each,
     # confirmed via `dmesg`'s oom-kill record) tipped the kernel OOM killer
@@ -42,15 +43,44 @@ services:
     # 2026-09-19/20). This is a low-traffic, reviewer-only admin UI - one
     # worker is plenty. Kept alongside the job-execution fix above since it's
     # still a real, if smaller, contributor to boot-time memory pressure.
-    command: >
-      mlflow server
-      --host 0.0.0.0
-      --port 5000
-      --workers 1
-      --backend-store-uri ${MLFLOW_TRACKING_URI}
-      --artifacts-destination s3://${S3_BUCKET}/telco-churn-training
-      --serve-artifacts
-      --static-prefix /mlflow
+    #
+    # --app-name basic-auth: MLflow's own login, default_permission READ, so
+    # the published `reviewer` account can browse but never edit or delete
+    # (scripts/seed_mlflow_reviewer.sh creates it). The auth app reads its
+    # admin password and database URI only from an ini file, never the
+    # environment, so the ini is rendered here from .env at container start
+    # - kept off the host disk and out of git. Refuses to start on an empty
+    # or placeholder secret: the first start against an empty mlflow_auth
+    # database creates the admin account with whatever password is in the
+    # ini, so a REPLACE_ME there would mint a guessable admin. Failing here
+    # takes down only /mlflow; the smoke test catches it and CD rolls back.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        for value in "$${MLFLOW_ADMIN_PASSWORD:-}" "$${MLFLOW_FLASK_SERVER_SECRET_KEY:-}" "$${MLFLOW_AUTH_DATABASE_URI:-}"; do
+          case "$$value" in
+            ""|REPLACE_ME) echo "mlflow: an auth secret is unset or still REPLACE_ME in SSM - refusing to start" >&2; exit 1 ;;
+          esac
+        done
+        umask 077
+        cat > "$$MLFLOW_AUTH_CONFIG_PATH" <<EOF
+        [mlflow]
+        default_permission = READ
+        database_uri = $$MLFLOW_AUTH_DATABASE_URI
+        admin_username = admin
+        admin_password = $$MLFLOW_ADMIN_PASSWORD
+        authorization_function = mlflow.server.auth:authenticate_request_basic_auth
+        EOF
+        exec mlflow server \
+          --app-name basic-auth \
+          --host 0.0.0.0 \
+          --port 5000 \
+          --workers 1 \
+          --backend-store-uri "$$MLFLOW_TRACKING_URI" \
+          --artifacts-destination "s3://$$S3_BUCKET/telco-churn-training" \
+          --serve-artifacts \
+          --static-prefix /mlflow
     healthcheck:
       # /mlflow/health, not /health - --static-prefix /mlflow below moves
       # every route under that prefix, including the health endpoint itself
