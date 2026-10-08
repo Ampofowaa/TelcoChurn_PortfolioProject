@@ -37,6 +37,25 @@
 	basic_auth /mlflow* {
 		reviewer $2b$10$vJeb2Etz0nw8uuHphsighukcmJi/tq3sTLwg2onsXImiIsPPuvtHK
 	}
+
+	# MLflow's own basic-auth app (compose.prod.yml) gives the reviewer
+	# account READ on everything that exists, but two gaps remain that only a
+	# proxy can close, so both are refused here for every caller:
+	#   - Creating experiments/registered models is allowed for any logged-in
+	#     user (no MLflow workspaces here). Nothing legitimately creates
+	#     through this server - training writes to RDS/S3 directly.
+	#   - Any user may change their own password, and reviewer's is public, so
+	#     a stranger could lock every other reviewer out. User management
+	#     happens on the box instead (scripts/seed_mlflow_reviewer.sh talks to
+	#     the container directly, never through Caddy).
+	@mlflow_create path_regexp ^/mlflow/(ajax-)?api/[0-9.]+/mlflow/(experiments|registered-models)/create$
+	respond @mlflow_create "Creating experiments or models is disabled on this read-only MLflow UI." 403
+	@mlflow_user_writes {
+		path_regexp ^/mlflow/(ajax-)?api/[0-9.]+/mlflow/users/
+		not method GET HEAD
+	}
+	respond @mlflow_user_writes "User management is disabled on this read-only MLflow UI." 403
+
 	reverse_proxy /mlflow* mlflow:5000
 
 	reverse_proxy ui:8501

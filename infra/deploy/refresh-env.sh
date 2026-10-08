@@ -42,6 +42,9 @@ POSTGRES_URL=$(get_param "rds-url-app")
 MLFLOW_TRACKING_URI=$(get_param "rds-url-mlflow")
 S3_BUCKET=$(get_param "s3-bucket")
 DOMAIN=$(get_param "domain")
+MLFLOW_ADMIN_PASSWORD=$(get_param "mlflow-admin-password")
+MLFLOW_FLASK_SERVER_SECRET_KEY=$(get_param "mlflow-flask-secret-key")
+MLFLOW_AUTH_DATABASE_URI=$(get_param "rds-url-mlflow-auth")
 EOF
 
 chmod 600 "$ENV_FILE"

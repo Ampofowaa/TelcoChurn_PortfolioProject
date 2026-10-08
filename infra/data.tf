@@ -121,13 +121,15 @@ resource "aws_s3_bucket_policy" "mlflow" {
 
 # --- Group 6: RDS Postgres ----------------------------------------------
 #
-# One instance, two logical databases: the default database ("telco_churn",
+# One instance, three logical databases: the default database ("telco_churn",
 # matching docker-compose.yml/configs/config.yaml's local-dev naming) holds
 # the app tables (customers_raw, customers_crm, prediction_log, Optuna's own
-# "optuna" schema); "mlflow" is created manually post-apply (Group 6's
-# `CREATE DATABASE mlflow;` step) since aws_db_instance only provisions one
-# database per instance. Group 7 renders these into two separate SSM params
-# (rds-url-app / rds-url-mlflow) rather than one shared URL.
+# "optuna" schema); "mlflow" (tracking/registry) and "mlflow_auth" (the MLflow
+# UI's basic-auth users and permissions) are created manually post-apply
+# (`CREATE DATABASE mlflow;` / `CREATE DATABASE mlflow_auth;`) since
+# aws_db_instance only provisions one database per instance. Each gets its
+# own SSM param (rds-url-app / rds-url-mlflow / rds-url-mlflow-auth) rather
+# than one shared URL.
 
 resource "aws_db_subnet_group" "main" {
   name       = "${var.project_name}-rds"
