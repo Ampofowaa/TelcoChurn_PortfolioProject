@@ -886,6 +886,16 @@ def _render_bulk_tab() -> None:
         return
 
     normalized = _normalize_bulk_csv_columns(raw_df)
+    # _rows_from_bulk_csv keeps only known columns, so a file whose header
+    # line is missing (pandas then reads the first customer row as the
+    # header) would otherwise parse to zero rows with no reason given.
+    if not set(normalized.columns) & set(CustomerFeatures.model_fields):
+        st.error(
+            "None of this file's column headers are recognised. The first "
+            "line must be a header row (e.g. `customerid`, or the feature "
+            "columns). Download the sample CSV for the exact format."
+        )
+        return
     rows = _rows_from_bulk_csv(normalized)
     max_size = int(_get_cfg().serving.batch.max_size)
     over_limit = len(rows) > max_size
