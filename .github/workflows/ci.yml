@@ -77,5 +77,23 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --all-extras
 
+      # testcontainers would otherwise pull these from inside the tests, from
+      # every xdist worker at once; a transient Docker Hub refusal then fails
+      # one test's setup ("unauthorized: authentication required" on an
+      # anonymous pull). One retried pull up front leaves them cached for
+      # every test. Ryuk is testcontainers' own cleanup container; its tag is
+      # read from the installed package so a library bump can't leave it stale.
+      - name: Pre-pull test images
+        run: |
+          ryuk=$(uv run python -c "from testcontainers.core.config import testcontainers_config as c; print(c.ryuk_image)")
+          for image in postgres:16 "${ryuk}"; do
+            for attempt in 1 2 3; do
+              docker pull "${image}" && break
+              [ "${attempt}" -lt 3 ] || exit 1
+              echo "pull of ${image} failed (attempt ${attempt}), retrying in 15s"
+              sleep 15
+            done
+          done
+
       - name: Integration tests
         run: uv run pytest -m integration --run-integration --no-cov -n auto
