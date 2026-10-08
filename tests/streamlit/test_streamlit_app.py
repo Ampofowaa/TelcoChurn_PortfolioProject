@@ -355,7 +355,7 @@ def test_bulk_drill_into_customer_sends_a_flat_predict_payload(
     at.run(timeout=_RUN_TIMEOUT_SECONDS)
 
     csv_bytes = f"customerid\n{_CUSTOMER_ROW['customerid']}\n".encode()
-    at.file_uploader(key="bulk_csv").set_value(("customers.csv", csv_bytes, "text/csv"))
+    _bulk_uploader(at).set_value(("customers.csv", csv_bytes, "text/csv"))
     at.run(timeout=_RUN_TIMEOUT_SECONDS)
 
     at.button(key="bulk_score").click().run(timeout=_RUN_TIMEOUT_SECONDS)
@@ -410,6 +410,11 @@ def test_example_id_button_fills_the_id_field_and_fetches(
     assert at.success[0].value.startswith(f"Loaded customer {example_id} ")
     id_field = next(w for w in at.text_input if w.key.startswith("lookup_customerid"))
     assert id_field.value == example_id
+
+
+def _bulk_uploader(at: AppTest) -> Any:
+    """The Batch Prediction tab's CSV uploader, whatever its current key nonce."""
+    return next(w for w in at.file_uploader if w.key.startswith("bulk_csv"))
 
 
 def _batch_response(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -474,9 +479,34 @@ def test_uploading_a_file_replaces_the_sample_and_clears_its_results(
     assert len(at.dataframe) == 1
 
     csv_bytes = f"customerid\n{_CUSTOMER_ROW['customerid']}\n".encode()
-    at.file_uploader(key="bulk_csv").set_value(("customers.csv", csv_bytes, "text/csv"))
+    _bulk_uploader(at).set_value(("customers.csv", csv_bytes, "text/csv"))
     at.run(timeout=_RUN_TIMEOUT_SECONDS)
 
     assert not at.exception
     assert len(at.dataframe) == 0
     assert "1 row(s) parsed" in " ".join(m.value for m in at.markdown)
+
+
+def test_score_the_sample_scores_the_sample_even_with_a_file_uploaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch_payloads: list[list[dict[str, Any]]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        batch_payloads.append(kwargs["json"])
+        return _FakeResponse(200, _batch_response(kwargs["json"]))
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+    csv_bytes = f"customerid\n{_CUSTOMER_ROW['customerid']}\n".encode()
+    _bulk_uploader(at).set_value(("customers.csv", csv_bytes, "text/csv"))
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    at.button(key="bulk_score_sample").click().run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    assert [len(p) for p in batch_payloads] == [50]
+    assert len(at.dataframe[0].value) == 50
+    assert _bulk_uploader(at).value is None

@@ -847,10 +847,19 @@ def _render_bulk_tab() -> None:
             "Rows of different types can be mixed in the same file. Capped "
             "at the API's configured batch size."
         )
-    uploaded = st.file_uploader("Or upload your own CSV", type=["csv"], key="bulk_csv")
-
+    # An uploaded file would otherwise win over the sample below, so "Score
+    # the sample" would silently re-score the upload. A file_uploader's value
+    # can't be set programmatically; rotating its key is the only way to
+    # empty it, so the screen never shows a file that isn't the one scored.
+    upload_nonce = st.session_state.get("bulk_upload_nonce", 0)
     if sample_clicked:
         st.session_state["bulk_use_sample"] = True
+        upload_nonce += 1
+        st.session_state["bulk_upload_nonce"] = upload_nonce
+    uploaded = st.file_uploader(
+        "Or upload your own CSV", type=["csv"], key=f"bulk_csv_{upload_nonce}"
+    )
+
     if uploaded is not None:
         st.session_state["bulk_use_sample"] = False
         source_id = f"upload:{uploaded.file_id}"
@@ -866,7 +875,7 @@ def _render_bulk_tab() -> None:
     # different file must not leave the previous file's scores on screen
     # under the new file's row count.
     if st.session_state.get("bulk_source_id") != source_id:
-        for key in ("bulk_result", "bulk_rows", "bulk_scored_at"):
+        for key in ("bulk_result", "bulk_rows", "bulk_scored_at", "bulk_drill_choice"):
             st.session_state.pop(key, None)
         st.session_state["bulk_source_id"] = source_id
 
