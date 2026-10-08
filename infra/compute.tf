@@ -43,9 +43,12 @@ resource "aws_s3_object" "deploy_config" {
   # it `aws s3 sync`s infra/deploy/ + docker/mlflow/Dockerfile here on every
   # deploy. Without ignore_changes, the next `terraform plan` would see
   # CD's newer content as drift and try to revert it. The bucket is
-  # versioned, so an overwrite is always recoverable.
+  # versioned, so an overwrite is always recoverable. Tags too: `aws s3 sync`
+  # re-uploads each object without tags, so every plan after a deploy would
+  # otherwise want to re-add the provider's default_tags, only for the next
+  # deploy to strip them again.
   lifecycle {
-    ignore_changes = [etag, source]
+    ignore_changes = [etag, source, tags, tags_all]
   }
 }
 
