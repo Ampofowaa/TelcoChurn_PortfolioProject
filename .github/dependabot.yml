@@ -15,3 +15,9 @@ updates:
       - "/docker/mlflow"
     schedule:
       interval: "weekly"
+    # The MLflow server image must move in lockstep with uv.lock's mlflow (see
+    # docker/mlflow/Dockerfile): a server-only bump migrates the shared
+    # tracking database out from under the 3.x clients. Upgraded by hand,
+    # both sides in one PR.
+    ignore:
+      - dependency-name: "mlflow/mlflow"
