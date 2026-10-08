@@ -4,7 +4,8 @@ name: CD
 # and rolls back to the previous SHA if anything from the flip onward fails.
 #
 # Path-filtered to what actually changes the built images: both Dockerfiles
-# COPY src/, configs/ (and, for api, alembic*) and `uv sync --frozen`, so any
+# COPY src/, configs/ (and, for api, alembic*; for ui, the sample batch CSV
+# its download button serves) and `uv sync --frozen`, so any
 # other commit yields a bit-identical image and a rebuild would only burn one
 # of ECR's five retained tags. ci.yml still runs on every push regardless.
 #
@@ -22,6 +23,7 @@ on:
       - "alembic/**"
       - "docker/api/Dockerfile"
       - "docker/ui/Dockerfile"
+      - "examples/sample_batch_predictions.csv"
       - "docker/mlflow/Dockerfile"
       - "infra/deploy/**"
       - "pyproject.toml"

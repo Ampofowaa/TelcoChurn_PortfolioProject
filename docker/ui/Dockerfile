@@ -37,6 +37,8 @@ COPY --from=builder --chown=app:app /app/configs /app/configs
 # compose_config()/activate_config() call (for the "About this model" tab)
 # needs this to resolve, same reason docker/api/Dockerfile carries it.
 COPY --from=builder --chown=app:app /app/pyproject.toml /app/pyproject.toml
+# The Batch Prediction tab offers this as a one-click sample download.
+COPY --chown=app:app examples/sample_batch_predictions.csv /app/examples/sample_batch_predictions.csv
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
