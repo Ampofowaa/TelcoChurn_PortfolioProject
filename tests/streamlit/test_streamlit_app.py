@@ -510,3 +510,20 @@ def test_score_the_sample_scores_the_sample_even_with_a_file_uploaded(
     assert [len(p) for p in batch_payloads] == [50]
     assert len(at.dataframe[0].value) == 50
     assert _bulk_uploader(at).value is None
+
+
+def test_a_csv_without_a_header_row_explains_why_nothing_parsed() -> None:
+    # The header line deleted along with the rows a user trimmed out, so
+    # pandas takes the first customer row as the column names.
+    csv_bytes = (
+        b"ID-only,0042-RLHYP,,,\n" b"ID-only,0048-LUMLS,,,\n" b"ID-only,0048-PIHNL,,,\n"
+    )
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+    _bulk_uploader(at).set_value(("check.csv", csv_bytes, "text/csv"))
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    assert any("column headers are recognised" in e.value for e in at.error)
+    assert "bulk_score" not in [b.key for b in at.button]
