@@ -369,3 +369,112 @@ def test_bulk_drill_into_customer_sends_a_flat_predict_payload(
     assert "features" not in sent, f"payload must be flattened, not wrapped: {sent}"
     assert sent["gender"] == _CUSTOMER_ROW["gender"]
     assert sent["tenure"] == _CUSTOMER_ROW["tenure"]
+
+
+def test_bulk_tab_offers_the_sample_csv_as_a_download() -> None:
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    buttons = at.get("download_button")
+    assert [b.proto.label for b in buttons] == ["Download the sample CSV"]
+
+
+def test_example_id_button_fills_the_id_field_and_fetches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    example_id = "0094-OIFMO"
+    requested: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        requested.append(url)
+        return _FakeResponse(
+            200,
+            {
+                "features": {**_CUSTOMER_ROW, "customerid": example_id},
+                "crm_snapshot_at": _CRM_SNAPSHOT_AT,
+            },
+        )
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+    at.button(key=f"lookup_example_{example_id}").click().run(
+        timeout=_RUN_TIMEOUT_SECONDS
+    )
+
+    assert not at.exception
+    assert len(requested) == 1
+    assert requested[0].endswith(f"/customer/{example_id}")
+    assert at.success[0].value.startswith(f"Loaded customer {example_id} ")
+    id_field = next(w for w in at.text_input if w.key.startswith("lookup_customerid"))
+    assert id_field.value == example_id
+
+
+def _batch_response(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """A POST /predict/batch response scoring every submitted row."""
+    return {
+        "capacity_limit": 10,
+        "results": [
+            {
+                "index": i,
+                "customerid": row.get("customerid"),
+                "probability": 0.3,
+                "threshold": 0.4,
+                "decision_threshold": 0.4,
+                "decision": False,
+                "contact": False,
+                "model_version": "1",
+                "served_source": "champion",
+            }
+            for i, row in enumerate(rows)
+        ],
+        "errors": [],
+    }
+
+
+def test_score_the_sample_scores_the_bundled_csv_in_one_click(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch_payloads: list[list[dict[str, Any]]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        assert method == "POST"
+        assert url.endswith("/predict/batch")
+        batch_payloads.append(kwargs["json"])
+        return _FakeResponse(200, _batch_response(kwargs["json"]))
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+    at.button(key="bulk_score_sample").click().run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    assert len(batch_payloads) == 1
+    assert len(batch_payloads[0]) == 50
+    assert len(at.dataframe) == 1
+    assert len(at.dataframe[0].value) == 50
+
+
+def test_uploading_a_file_replaces_the_sample_and_clears_its_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_request(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        return _FakeResponse(200, _batch_response(kwargs["json"]))
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+    at.button(key="bulk_score_sample").click().run(timeout=_RUN_TIMEOUT_SECONDS)
+    assert len(at.dataframe) == 1
+
+    csv_bytes = f"customerid\n{_CUSTOMER_ROW['customerid']}\n".encode()
+    at.file_uploader(key="bulk_csv").set_value(("customers.csv", csv_bytes, "text/csv"))
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    assert len(at.dataframe) == 0
+    assert "1 row(s) parsed" in " ".join(m.value for m in at.markdown)

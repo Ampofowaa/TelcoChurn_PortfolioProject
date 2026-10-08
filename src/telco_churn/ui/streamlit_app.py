@@ -35,6 +35,7 @@ discipline `serving/schemas.py` already applies to the wire contract.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -53,7 +54,7 @@ from telco_churn.features.schema import CustomerFeaturesSchema
 from telco_churn.models.registry_alias import resolve_champion_version
 from telco_churn.serving.schemas import CustomerFeatures
 from telco_churn.utils.mlflow import resolve_model_run_id, resolve_tracking_uri
-from telco_churn.utils.paths import activate_config, compose_config
+from telco_churn.utils.paths import activate_config, compose_config, get_project_root
 
 __all__ = ["API_BASE_URL", "main"]
 
@@ -68,6 +69,16 @@ API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000")
 # bare `streamlit run` against a bare `uvicorn` run, both on localhost).
 _API_DISPLAY_URL = os.environ.get("API_DISPLAY_URL", API_BASE_URL)
 _REQUEST_TIMEOUT_SECONDS = 30.0
+_SAMPLE_BATCH_CSV_FILENAME = "sample_batch_predictions.csv"
+# Real IDs present in customers_crm (it covers every customers_raw row), so
+# a first-time visitor who has no ID of their own can still see a lookup.
+_EXAMPLE_CUSTOMER_IDS = (
+    "0094-OIFMO",
+    "0096-BXERS",
+    "0096-FCPUF",
+    "0098-BOWSO",
+    "0100-DUVFC",
+)
 # Mirrors configs/serving/api.yaml's poll_interval_seconds default — the
 # champion this tab reads about hot-reloads on roughly that cadence, so this
 # poll shouldn't lag it by much. Only gates the cheap "which version is
@@ -580,6 +591,15 @@ def _render_lookup_tab() -> None:
     with col_clear:
         clear_clicked = st.button("Clear", key="lookup_clear")
 
+    st.caption("Don't have an ID? Try one of these:")
+    example_clicked: str | None = None
+    for col, example_id in zip(
+        st.columns(len(_EXAMPLE_CUSTOMER_IDS)), _EXAMPLE_CUSTOMER_IDS, strict=True
+    ):
+        with col:
+            if st.button(example_id, key=f"lookup_example_{example_id}"):
+                example_clicked = example_id
+
     form_nonce = st.session_state.get("lookup_form_nonce", 0)
     form_key_prefix = "lookup" if form_nonce == 0 else f"lookup_{form_nonce}"
 
@@ -588,6 +608,15 @@ def _render_lookup_tab() -> None:
         st.session_state["lookup_id_nonce"] = id_nonce + 1
         st.session_state["lookup_form_nonce"] = form_nonce + 1
         st.rerun()
+
+    if example_clicked is not None:
+        # The ID field is remounted under a fresh key seeded with the example,
+        # same reason as the form-wide nonce above: a programmatic overwrite
+        # of an already-rendered widget doesn't reliably reach the browser.
+        customerid = example_clicked
+        fetch_clicked = True
+        st.session_state["lookup_id_nonce"] = id_nonce + 1
+        st.session_state[f"lookup_customerid_{id_nonce + 1}"] = example_clicked
 
     if fetch_clicked:
         if not customerid:
@@ -771,10 +800,25 @@ def _bulk_drill_options(
     return options
 
 
+@st.cache_data
+def _load_sample_batch_csv() -> bytes | None:
+    """Return examples/sample_batch_predictions.csv's bytes, or None if absent.
+
+    None rather than raising: a missing sample only costs the convenience
+    download, never the upload path itself.
+    """
+    path = get_project_root() / "examples" / _SAMPLE_BATCH_CSV_FILENAME
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
 def _render_bulk_tab() -> None:
     st.subheader("Bulk CSV upload")
     st.caption(
-        "Upload a CSV of customers to score in one call. Each row can be: "
+        "Score the sample in one click, or upload your own CSV of customers "
+        "to score in one call. Each row can be: "
         "just a `customerid` (their current details are looked up "
         "automatically), a fully filled-in profile (no `customerid` "
         "needed), or a `customerid` plus a few fields to override — useful "
@@ -782,12 +826,53 @@ def _render_bulk_tab() -> None:
         "changed. Rows of different types can be mixed in the same file. "
         "Capped at the API's configured batch size."
     )
-    uploaded = st.file_uploader("CSV file", type=["csv"], key="bulk_csv")
-    if uploaded is None:
+    sample_csv = _load_sample_batch_csv()
+    sample_clicked = False
+    if sample_csv is not None:
+        col_sample, col_download = st.columns([1, 1])
+        with col_sample:
+            sample_clicked = st.button(
+                "Score the sample (50 customers)",
+                key="bulk_score_sample",
+                type="primary",
+            )
+        with col_download:
+            st.download_button(
+                "Download the sample CSV",
+                data=sample_csv,
+                file_name=_SAMPLE_BATCH_CSV_FILENAME,
+                mime="text/csv",
+                key="bulk_sample_download",
+                help=(
+                    "See the expected format, covering all three row "
+                    "types — or edit it and upload your own version below."
+                ),
+            )
+    uploaded = st.file_uploader("Or upload your own CSV", type=["csv"], key="bulk_csv")
+
+    if sample_clicked:
+        st.session_state["bulk_use_sample"] = True
+    if uploaded is not None:
+        st.session_state["bulk_use_sample"] = False
+        source_id = f"upload:{uploaded.file_id}"
+        csv_source: Any = uploaded
+    elif st.session_state.get("bulk_use_sample") and sample_csv is not None:
+        source_id = "sample"
+        csv_source = io.BytesIO(sample_csv)
+        st.caption(f"Using the sample CSV (`{_SAMPLE_BATCH_CSV_FILENAME}`).")
+    else:
         return
 
+    # Results belong to the file that produced them: switching to a
+    # different file must not leave the previous file's scores on screen
+    # under the new file's row count.
+    if st.session_state.get("bulk_source_id") != source_id:
+        for key in ("bulk_result", "bulk_rows", "bulk_scored_at"):
+            st.session_state.pop(key, None)
+        st.session_state["bulk_source_id"] = source_id
+
     try:
-        raw_df = pd.read_csv(uploaded)
+        raw_df = pd.read_csv(csv_source)
     except (pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
         st.error(f"Could not parse the uploaded CSV: {exc}")
         return
@@ -804,7 +889,10 @@ def _render_bulk_tab() -> None:
     else:
         st.write(f"{len(rows)} row(s) parsed (limit: {max_size}).")
 
-    if st.button("Score batch", key="bulk_score", disabled=not rows or over_limit):
+    score_clicked = st.button(
+        "Score batch", key="bulk_score", disabled=not rows or over_limit
+    )
+    if (score_clicked or sample_clicked) and rows and not over_limit:
         resp = _api_request("POST", "/predict/batch", json=rows)
         if resp is None:
             pass
