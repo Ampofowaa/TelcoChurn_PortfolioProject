@@ -82,6 +82,15 @@ if grep -q -- '--app-name basic-auth' /opt/telco-churn/compose.prod.yml; then
     echo "==> MLflow without a login must be rejected"
     code=$(status "${MLFLOW_URL}/")
     [ "${code}" = "401" ] || fail_mlflow "MLflow without a login returned ${code}, expected 401"
+    # Once Caddy stops gating /mlflow, MLflow's own login is the only thing in
+    # front of it - make sure the 401 really came from MLflow. Skipped while
+    # the deployed Caddyfile still has basic_auth (a rollback to a commit
+    # from before the gate was removed), whose 401 is Caddy's.
+    if ! grep -qE '^[[:space:]]*basic_auth' /opt/telco-churn/Caddyfile; then
+        curl -s -o /dev/null -D - "${RESOLVE[@]}" "${MLFLOW_URL}/" \
+            | grep -qi '^www-authenticate: Basic realm="mlflow"' \
+            || fail_mlflow "MLflow's 401 did not come from its own basic-auth app"
+    fi
 
     echo "==> MLflow reviewer can read the champion alias"
     version=$(curl -fsS "${RESOLVE[@]}" "${REVIEWER[@]}" \

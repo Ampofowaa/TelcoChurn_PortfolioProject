@@ -81,6 +81,13 @@ curl -sk -u "reviewer:telco-reviewer-2026" -o /dev/null -w "mlflow (expect 200):
 curl -sk -o /dev/null -w "mlflow no auth (expect 401): %{http_code}\n" "https://$DOMAIN/mlflow/"
 ```
 
+The `/mlflow` login comes from MLflow's own basic-auth app
+(`compose.prod.yml`, `--app-name basic-auth`), not from Caddy. The `reviewer`
+account is view-only: `default_permission = READ`, and the Caddyfile refuses
+experiment/model creation and every user-management write for all callers.
+`scripts/seed_mlflow_reviewer.sh` (run by `cd.yml` after each deploy) creates
+the account, or resets its password if someone changed it.
+
 **One thing this hasn't been live-tested against real traffic**: whether
 Caddy's `reverse_proxy` really does pass the original `Host: $DOMAIN` header
 through to the `mlflow` container unmodified (the design `compose.prod.yml`'s
