@@ -77,5 +77,19 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --all-extras
 
+      # testcontainers would otherwise pull postgres:16 from inside the tests,
+      # from every xdist worker at once; a transient Docker Hub refusal then
+      # fails one test's setup ("unauthorized: authentication required" on an
+      # anonymous pull). One retried pull up front leaves the image cached for
+      # every test.
+      - name: Pre-pull test images
+        run: |
+          for attempt in 1 2 3; do
+            docker pull postgres:16 && exit 0
+            echo "pull attempt ${attempt} failed, retrying in 15s"
+            sleep 15
+          done
+          exit 1
+
       - name: Integration tests
         run: uv run pytest -m integration --run-integration --no-cov -n auto
