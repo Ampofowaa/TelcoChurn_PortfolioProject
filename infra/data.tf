@@ -140,14 +140,17 @@ resource "aws_db_subnet_group" "main" {
   }
 }
 
-# rds.force_ssl is dynamic (no reboot required) on the postgres16 family.
+# rds.force_ssl is dynamic (no reboot required) on the postgres16 family,
+# but AWS reports it back with apply_method "pending-reboot". Declared to
+# match, or every plan shows a no-op remove/re-add of the same value.
 resource "aws_db_parameter_group" "main" {
   name   = "${var.project_name}-postgres16"
   family = "postgres16"
 
   parameter {
-    name  = "rds.force_ssl"
-    value = "1"
+    name         = "rds.force_ssl"
+    value        = "1"
+    apply_method = "pending-reboot"
   }
 
   tags = {
