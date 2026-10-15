@@ -13,6 +13,8 @@ name: CD
 # infra/deploy/** and docker/mlflow/Dockerfile are in the filter because CD
 # itself syncs them to S3 (below) — a compose/Caddyfile-only commit still
 # rebuilds api/ui, an accepted cost: it spends one of ECR's five retained tags.
+# The scripts CD runs on the box are in it for the same reason: a fix to
+# deploy_on_box.sh does nothing until a deploy actually runs it.
 
 on:
   push:
@@ -28,6 +30,12 @@ on:
       - ".streamlit/config.toml"
       - "docker/mlflow/Dockerfile"
       - "infra/deploy/**"
+      - "scripts/deploy_on_box.sh"
+      - "scripts/prune_on_box.sh"
+      - "scripts/seed_mlflow_reviewer.sh"
+      - "scripts/smoke_test_deployed.sh"
+      - "scripts/ssm_run.sh"
+      - "scripts/sync_deploy_files.sh"
       - "pyproject.toml"
       - "uv.lock"
   workflow_dispatch:
