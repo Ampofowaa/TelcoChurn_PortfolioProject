@@ -6,7 +6,7 @@
 # out-of-date database schema"). A Dependabot bump to v3.16.1 against 3.14
 # clients took live predictions down on 2026-10-08. Upgrade both sides in one
 # change, never this image alone.
-FROM ghcr.io/mlflow/mlflow:v3.14.0
+FROM ghcr.io/mlflow/mlflow:v3.16.1
 # boto3: the official image doesn't bundle it, and MLflow's S3 artifact
 # repository needs it installed to serve artifacts from an s3:// root
 # (--artifacts-destination s3://... --serve-artifacts) - same gap Group 6.5
@@ -15,4 +15,4 @@ FROM ghcr.io/mlflow/mlflow:v3.14.0
 # (infra/deploy/compose.prod.yml) needs for CSRF - without it the server dies
 # on import. Pinned to the base image's own version so pip resolves only the
 # extra's dependencies and never swaps mlflow itself.
-RUN pip install --no-cache-dir psycopg2-binary boto3 "mlflow[auth]==3.14.0"
+RUN pip install --no-cache-dir psycopg2-binary boto3 "mlflow[auth]==3.16.1"
