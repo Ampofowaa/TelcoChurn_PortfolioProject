@@ -13,7 +13,11 @@ cd /opt/telco-churn
 
 bucket=$(aws ssm get-parameter --name /telco-churn/s3-bucket \
     --query Parameter.Value --output text --region "${REGION}")
-aws s3 sync "s3://${bucket}/deploy-config/" /opt/telco-churn/ --region "${REGION}"
+# --exact-timestamps: by default an S3-to-local sync skips any file whose size
+# matches the local copy, so a same-length edit never reaches the box. The
+# v3.14.0 -> v3.16.1 bump in docker/mlflow/Dockerfile was skipped this way,
+# and the box rebuilt the old MLflow server while CD reported green.
+aws s3 sync "s3://${bucket}/deploy-config/" /opt/telco-churn/ --exact-timestamps --region "${REGION}"
 chmod +x refresh-env.sh
 ./refresh-env.sh
 
