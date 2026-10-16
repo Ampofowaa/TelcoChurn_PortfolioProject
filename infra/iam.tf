@@ -154,17 +154,13 @@ resource "aws_iam_role" "ci_deploy" {
         Principal = { Federated = aws_iam_openid_connect_provider.github.arn }
         Action    = "sts:AssumeRoleWithWebIdentity"
         Condition = {
+          # GitHub issues this repo the immutable subject format, which embeds the
+          # owner and repo IDs next to their names: a deleted-and-recreated repo of
+          # the same name gets a new ID and cannot assume this role. A repo rename
+          # still changes the claim, so update it here when renaming.
           StringEquals = {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          }
-          # Both names during the repo rename: GitHub redirects old URLs, but the
-          # OIDC sub claim carries the new name, so drop the old entry once the
-          # rename has landed and CD has deployed under it.
-          StringLike = {
-            "token.actions.githubusercontent.com:sub" = [
-              "repo:Ampofowaa/churn-retention-mlops:ref:refs/heads/main",
-              "repo:Ampofowaa/TelcoChurn_PortfolioProject:ref:refs/heads/main",
-            ]
+            "token.actions.githubusercontent.com:sub" = "repo:Ampofowaa@45298539/churn-retention-mlops@1250249500:ref:refs/heads/main"
           }
         }
       }
