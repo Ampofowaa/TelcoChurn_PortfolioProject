@@ -70,6 +70,17 @@ API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000")
 _API_DISPLAY_URL = os.environ.get("API_DISPLAY_URL", API_BASE_URL)
 _REQUEST_TIMEOUT_SECONDS = 30.0
 _SAMPLE_BATCH_CSV_FILENAME = "sample_batch_predictions.csv"
+# Everything derived from one scored batch. Cleared together whenever a new
+# batch is scored or the source file changes, so neither the table, the
+# dropdown nor a shown explanation can outlive the batch it came from.
+_BULK_RESULT_STATE_KEYS = (
+    "bulk_result",
+    "bulk_rows",
+    "bulk_scored_at",
+    "bulk_drill_choice",
+    "bulk_drill_explained",
+    "bulk_table_selection_seen",
+)
 # Real IDs present in customers_crm (it covers every customers_raw row), so
 # a first-time visitor who has no ID of their own can still see a lookup.
 _EXAMPLE_CUSTOMER_IDS = (
@@ -440,14 +451,12 @@ def _render_shap_chart(explanation: dict[str, Any], raw_values: dict[str, Any]) 
     # truncating labels like "Contract type: Month-to-month" mid-word ("Mo…"),
     # which also silently ate the impact badge whenever it had been appended
     # to the same string (always the last part to fit, so always the first
-    # cut). The domain is padded 30% past the longest bar so the impact
-    # label — now its own text mark, not string-concatenated — has room to
-    # render past the bar's tip instead of being clipped at the plot edge.
+    # cut).
     base = alt.Chart(chart_df).encode(
         x=alt.X(
             "shap_value:Q",
             axis=None,
-            scale=alt.Scale(domain=[-max_abs * 1.3, max_abs * 1.3]),
+            scale=alt.Scale(domain=[-max_abs * 1.05, max_abs * 1.05]),
         ),
         y=alt.Y("feature:N", sort=None, title=None, axis=alt.Axis(labelLimit=0)),
     )
@@ -471,15 +480,19 @@ def _render_shap_chart(explanation: dict[str, Any], raw_values: dict[str, Any]) 
     # `.encode(align=...)` now raises `TypeError: unexpected keyword
     # argument 'align'`), so the two label directions are split into two
     # sign-filtered layers instead of one conditionally-aligned one.
+    # Each impact label sits at zero on the side opposite its bar — always
+    # empty, since a row has one bar. Placed past the bar's tip instead, a
+    # full-length bar pushed it off the plot and into the axis labels on a
+    # narrow window, however much the domain was padded.
     labels_positive = (
         base.transform_filter("datum.shap_value >= 0")
-        .mark_text(color="#c9ced6", align="left", dx=5)
-        .encode(text="impact:N")
+        .mark_text(color="#c9ced6", align="right", dx=-5)
+        .encode(x=alt.datum(0), text="impact:N")
     )
     labels_negative = (
         base.transform_filter("datum.shap_value < 0")
-        .mark_text(color="#c9ced6", align="right", dx=-5)
-        .encode(text="impact:N")
+        .mark_text(color="#c9ced6", align="left", dx=5)
+        .encode(x=alt.datum(0), text="impact:N")
     )
     st.altair_chart(bars + labels_positive + labels_negative, use_container_width=True)
     st.caption(
@@ -507,18 +520,27 @@ def _render_prediction_response(
         _render_shap_chart(explanation, raw_values)
 
 
+def _request_prediction(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """POST /predict and return its JSON body, or None after surfacing the
+    failure — the shared fetch half of every single-row prediction view."""
+    resp = _api_request("POST", "/predict", json=payload)
+    if resp is None:
+        return None
+    if not resp.ok:
+        st.error(f"API error {resp.status_code}: {resp.text}")
+        return None
+    data: dict[str, Any] = resp.json()
+    return data
+
+
 def _run_single_prediction(payload: dict[str, Any]) -> None:
     """`payload` doubles as the raw-value source for `_render_shap_chart`'s
     per-attribute labels (e.g. "Contract type: Month-to-month") — it already
     carries every raw field the form submitted, so no second lookup is needed.
     """
-    resp = _api_request("POST", "/predict", json=payload)
-    if resp is None:
-        return
-    if not resp.ok:
-        st.error(f"API error {resp.status_code}: {resp.text}")
-        return
-    _render_prediction_response(resp.json(), payload)
+    data = _request_prediction(payload)
+    if data is not None:
+        _render_prediction_response(data, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -708,22 +730,40 @@ def _rows_from_bulk_csv(df: pd.DataFrame) -> list[dict[str, Any]]:
     return records
 
 
-def _drill_into_prediction(
+def _explain_scored_row(
     customerid: str | None, submitted_row: dict[str, Any]
-) -> None:
-    """Re-score one row from a scored batch via single /predict — reusing
-    Lookup's exact rendering path rather than a second, batch-shaped
-    explanation feature (/predict/batch never computes SHAP).
+) -> dict[str, Any] | None:
+    """Re-score one row from a scored batch via single /predict, returning
+    the response and the raw values its chart labels read — /predict/batch
+    never computes SHAP, so the explanation needs this second call.
+
+    Returned rather than rendered so the caller can keep it in session state:
+    the explanation then survives unrelated reruns (a diagnostics toggle, a
+    dropdown change) instead of vanishing until the button is clicked again.
     """
+    payload = {**submitted_row, "customerid": customerid, "include_explanation": True}
     if customerid:
         resp = _api_request("GET", f"/customer/{customerid}")
         if resp is not None and resp.ok:
             features = resp.json().get("features", {})
             payload = {**features, "include_explanation": True}
-            _run_single_prediction(payload)
-            return
-    payload = {**submitted_row, "customerid": customerid, "include_explanation": True}
-    _run_single_prediction(payload)
+    data = _request_prediction(payload)
+    if data is None:
+        return None
+    return {"data": data, "raw_values": payload}
+
+
+def _drill_label_for_table_row(labels: list[str], rows: list[int]) -> str | None:
+    """Drill-down label for the row selected in the results table, or None.
+
+    `rows` holds positional indices into the displayed table, which is built
+    from `results` in order, as is `_bulk_drill_options` — so a position
+    maps straight to a label. Sorting the table in the browser does not
+    change these positions.
+    """
+    if not rows or not 0 <= rows[0] < len(labels):
+        return None
+    return labels[rows[0]]
 
 
 def _risk_label(probability: float, threshold: float) -> str:
@@ -763,7 +803,9 @@ def _bulk_results_display_df(
     return pd.DataFrame(
         {
             "Customer ID": [r["customerid"] or f"Row {r['index']}" for r in results],
-            "Churn Probability": [f"{r['probability']:.0%}" for r in results],
+            # One decimal, matching the drill-down's own metric — a whole
+            # percent here (10%) next to 9.6% there reads as a different row.
+            "Churn Probability": [f"{r['probability']:.1%}" for r in results],
             "Risk Level": [
                 _risk_label(r["probability"], r["threshold"]) for r in results
             ],
@@ -875,7 +917,7 @@ def _render_bulk_tab() -> None:
     # different file must not leave the previous file's scores on screen
     # under the new file's row count.
     if st.session_state.get("bulk_source_id") != source_id:
-        for key in ("bulk_result", "bulk_rows", "bulk_scored_at", "bulk_drill_choice"):
+        for key in _BULK_RESULT_STATE_KEYS:
             st.session_state.pop(key, None)
         st.session_state["bulk_source_id"] = source_id
 
@@ -920,6 +962,8 @@ def _render_bulk_tab() -> None:
         elif not resp.ok:
             st.error(f"API error {resp.status_code}: {resp.text}")
         else:
+            for key in _BULK_RESULT_STATE_KEYS:
+                st.session_state.pop(key, None)
             st.session_state["bulk_result"] = resp.json()
             st.session_state["bulk_rows"] = rows
             st.session_state["bulk_scored_at"] = date.today().isoformat()
@@ -932,6 +976,7 @@ def _render_bulk_tab() -> None:
 
     st.metric("Capacity limit this cycle", data["capacity_limit"])
     results = data.get("results", [])
+    selected_rows: list[int] = []
     if results:
         st.markdown("##### Results")
         show_diagnostics = st.checkbox(
@@ -940,7 +985,15 @@ def _render_bulk_tab() -> None:
             key="bulk_show_diagnostics",
         )
         results_df = _bulk_results_display_df(results, show_diagnostics)
-        st.dataframe(results_df, hide_index=True, use_container_width=True)
+        table_event = st.dataframe(
+            results_df,
+            hide_index=True,
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="bulk_results_table",
+        )
+        selected_rows = list(table_event["selection"]["rows"])
         download_df = results_df.drop(columns=["index"], errors="ignore")
         st.download_button(
             "Download results (CSV)",
@@ -978,15 +1031,42 @@ def _render_bulk_tab() -> None:
     if not results:
         return
     st.markdown("##### Drill into one customer")
+    st.caption("Click a row in the table above, or pick one here.")
     submitted_rows: list[dict[str, Any]] = st.session_state.get("bulk_rows", [])
     options = _bulk_drill_options(results)
-    choice = st.selectbox(
-        "Select a scored row", list(options.keys()), key="bulk_drill_choice"
-    )
+    labels = list(options.keys())
+
+    # Act on a table click only when the selection changes: the selection
+    # persists across reruns, so without this every later rerun would
+    # re-explain the clicked row over whatever the dropdown picked since.
+    explain_label: str | None = None
+    table_label = _drill_label_for_table_row(labels, selected_rows)
+    if table_label != st.session_state.get("bulk_table_selection_seen"):
+        st.session_state["bulk_table_selection_seen"] = table_label
+        if table_label is not None:
+            # Must be set before the selectbox below is created this run.
+            st.session_state["bulk_drill_choice"] = table_label
+            explain_label = table_label
+
+    choice = st.selectbox("Select a scored row", labels, key="bulk_drill_choice")
     if st.button("View explanation", key="bulk_drill_button"):
-        chosen = options[choice]
-        submitted_row = submitted_rows[chosen["index"]]
-        _drill_into_prediction(chosen["customerid"], submitted_row)
+        explain_label = choice
+
+    if explain_label is not None:
+        chosen = options[explain_label]
+        explained = _explain_scored_row(
+            chosen["customerid"], submitted_rows[chosen["index"]]
+        )
+        if explained is not None:
+            st.session_state["bulk_drill_explained"] = {
+                "label": explain_label,
+                **explained,
+            }
+
+    shown = st.session_state.get("bulk_drill_explained")
+    if shown:
+        st.markdown(f"**Explanation for {shown['label']}**")
+        _render_prediction_response(shown["data"], shown["raw_values"])
 
 
 # ---------------------------------------------------------------------------

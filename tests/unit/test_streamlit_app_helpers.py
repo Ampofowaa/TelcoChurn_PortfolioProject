@@ -12,6 +12,7 @@ from telco_churn.ui.streamlit_app import (
     _bulk_drill_options,
     _bulk_results_display_df,
     _display_value,
+    _drill_label_for_table_row,
     _humanize_feature_name,
     _impact_label,
     _parse_transformed_name,
@@ -166,7 +167,7 @@ def test_bulk_results_display_df_default_view_is_analyst_facing() -> None:
         "Contact This Cycle",
     ]
     assert df["Customer ID"].tolist() == ["CUST-1", "Row 1"]
-    assert df["Churn Probability"].tolist() == ["82%", "10%"]
+    assert df["Churn Probability"].tolist() == ["82.0%", "10.0%"]
     assert df["Risk Level"].tolist() == ["High", "Low"]
     assert df["Contact This Cycle"].tolist() == ["Yes", "No"]
 
@@ -202,3 +203,19 @@ def test_bulk_drill_options_disambiguates_repeated_customerid_with_row_number() 
     assert set(options.keys()) == {"CUST-9 (row 0)", "CUST-9 (row 1)"}
     assert options["CUST-9 (row 0)"]["index"] == 0
     assert options["CUST-9 (row 1)"]["index"] == 1
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        ([0], "CUST-1"),
+        ([1], "(no id) (row 1)"),
+        ([], None),
+        ([2], None),
+    ],
+)
+def test_drill_label_for_table_row_maps_position_to_label(
+    rows: list[int], expected: str | None
+) -> None:
+    labels = list(_bulk_drill_options(_BULK_RESULTS).keys())
+    assert _drill_label_for_table_row(labels, rows) == expected
