@@ -14,6 +14,7 @@ See [PROJECT_PLAN.md](docs/PROJECT_PLAN.md) for the full roadmap.
 - **`utils/db.py::get_async_engine`** — a pooled asyncpg connection silently dropped by RDS hung the first `/predict/batch` after a long idle until kernel TCP retransmits gave up; the pool now recycles connections after 30 min and bounds connect/query time at 10 s.
 - **`serving/app.py`** — `customers_crm` lookups (`GET /customer/{id}`, `/predict/batch` ID resolution) are capped at `serving.database.lookup_timeout_seconds` (20 s, under the UI's 30 s client timeout) and answer 503 on a stall; new `customer_lookup_timeouts_total` counter.
 - **`serving/app.py`, `serving/predict.py`** — the champion hot-reload poll and the cold-start load ran blocking MLflow I/O on the event loop, freezing every route while MLflow answered; both now run in a worker thread (`asyncio.to_thread`).
+- **`infra/deploy/Caddyfile`** — the bare `/mlflow` link answered "Permission denied" after login, because MLflow 3.16's basic-auth fails closed on routes with no permission rule; Caddy now redirects it to `/mlflow/`, and `scripts/smoke_test_deployed.sh` asserts the reviewer can open it.
 - Tests: `tests/unit/test_app_resilience.py` (new, 4 tests — lookup 503s on both routes, poll off the event loop, `/health` answers during a blocked refresh), 2 new `get_async_engine` tests in `test_db.py`.
 
 ---

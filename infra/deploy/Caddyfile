@@ -54,6 +54,13 @@
 	}
 	respond @mlflow_user_writes "User management is disabled on this read-only MLflow UI." 403
 
+	# The bare /mlflow (the link README.md publishes) has to be redirected here.
+	# Since 3.16 MLflow's auth app fails closed: a route with no permission rule
+	# is refused for non-admins, and only /mlflow/ has one. Its own redirect to
+	# the trailing slash runs after that check, so the reviewer signed in and
+	# then got "Permission denied".
+	redir /mlflow /mlflow/ 308
+
 	reverse_proxy /mlflow* mlflow:5000
 
 	reverse_proxy ui:8501
