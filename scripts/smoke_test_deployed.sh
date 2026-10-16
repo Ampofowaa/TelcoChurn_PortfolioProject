@@ -92,6 +92,12 @@ if grep -q -- '--app-name basic-auth' /opt/telco-churn/compose.prod.yml; then
             || fail_mlflow "MLflow's 401 did not come from its own basic-auth app"
     fi
 
+    echo "==> MLflow reviewer can open the bare /mlflow link"
+    # README.md links /mlflow without the trailing slash, which MLflow's
+    # fail-closed auth refuses; Caddy must redirect it to /mlflow/.
+    code=$(status "${REVIEWER[@]}" -L "${MLFLOW_URL}")
+    [ "${code}" = "200" ] || fail_mlflow "reviewer opening ${MLFLOW_URL} returned ${code}, expected 200"
+
     echo "==> MLflow reviewer can read the champion alias"
     version=$(curl -fsS "${RESOLVE[@]}" "${REVIEWER[@]}" \
         "${MLFLOW_URL}/api/2.0/mlflow/registered-models/alias?name=${MODEL}&alias=champion" \
