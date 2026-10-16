@@ -414,7 +414,9 @@ async def load_serving_state_with_retry(cfg: DictConfig) -> ServingRuntime:
     backoff_max = float(cfg.serving.initial_load.backoff_max_seconds)
     while True:
         try:
-            return resolve_serving_model(cfg, None)
+            # Threaded for the same reason as app.py's poll loop: a load is
+            # blocking MLflow I/O that would otherwise freeze /health too.
+            return await asyncio.to_thread(resolve_serving_model, cfg, None)
         except Exception:
             logger.warning(
                 "initial_model_load_failed_retrying",

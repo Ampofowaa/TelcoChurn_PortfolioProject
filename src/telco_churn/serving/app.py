@@ -78,6 +78,12 @@ _PREDICTION_LOG_WRITE_FAILURES_TOTAL = Counter(
     "response itself was still served; this counts only the logging side effect.",
     labelnames=("route",),
 )
+_CUSTOMER_LOOKUP_TIMEOUTS_TOTAL = Counter(
+    "customer_lookup_timeouts",
+    "customers_crm lookups abandoned after serving.database.lookup_timeout_seconds "
+    "and answered 503 — a stalled-Postgres signal, independent of request volume.",
+    labelnames=("route",),
+)
 
 
 @contextlib.asynccontextmanager
@@ -160,7 +166,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         while True:
             await asyncio.sleep(interval)
-            app.state.runtime = predict.resolve_serving_model(cfg, app.state.runtime)
+            # Off the event loop: a refresh is blocking MLflow/registry I/O,
+            # and run inline it would stall every in-flight request for as
+            # long as MLflow takes to answer, every poll interval.
+            app.state.runtime = await asyncio.to_thread(
+                predict.resolve_serving_model, cfg, app.state.runtime
+            )
 
     poll_task = asyncio.create_task(_load_and_poll_loop())
 
@@ -192,6 +203,38 @@ def require_api_key(
     expected = os.environ.get("API_KEY")
     if not expected or not x_api_key or not secrets.compare_digest(x_api_key, expected):
         raise HTTPException(status_code=401, detail="missing or invalid API key")
+
+
+async def _lookup_customers_or_503(
+    customerids: list[str],
+    cfg: DictConfig,
+    route: Literal["customer", "batch"],
+) -> dict[str, dict[str, Any]]:
+    """customer_lookup.lookup_customers, bounded by serving.database.lookup_timeout_seconds.
+
+    A stalled Postgres connection otherwise holds the request open until the
+    kernel gives up on the socket, long after any client has stopped waiting.
+    Timing out here turns that into an explicit, retryable 503.
+    """
+    timeout_seconds = float(cfg.serving.database.lookup_timeout_seconds)
+    try:
+        return await asyncio.wait_for(
+            customer_lookup.lookup_customers(customerids, get_async_engine()),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        _CUSTOMER_LOOKUP_TIMEOUTS_TOTAL.labels(route=route).inc()
+        logger.error(
+            "customer_lookup_timed_out",
+            route=route,
+            n_ids=len(customerids),
+            timeout_seconds=timeout_seconds,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="customer lookup timed out; the database did not respond — retry",
+        ) from None
 
 
 def get_runtime(request: Request) -> predict.ServingRuntime:
@@ -354,9 +397,7 @@ async def predict_batch_endpoint(
         }
     )
     looked_up = (
-        await customer_lookup.lookup_customers(lookup_ids, get_async_engine())
-        if lookup_ids
-        else {}
+        await _lookup_customers_or_503(lookup_ids, cfg, "batch") if lookup_ids else {}
     )
     rows, row_indices, row_customer_ids, resolution_errors, resolution_kinds = (
         customer_lookup.resolve_batch_rows(validated, looked_up)
@@ -443,7 +484,7 @@ async def predict_batch_endpoint(
     response_model=CustomerLookupResponse,
     dependencies=[Depends(require_api_key)],
 )
-async def get_customer(customerid: str) -> CustomerLookupResponse:
+async def get_customer(customerid: str, request: Request) -> CustomerLookupResponse:
     """Read-only lookup of an existing customer's simulated-current state.
 
     Reads customers_crm, not customers_raw — a live lookup must hit a
@@ -453,7 +494,9 @@ async def get_customer(customerid: str) -> CustomerLookupResponse:
     a live-monitored result, and surfacing it next to a freshly computed
     probability invites reading it as live validation.
     """
-    found = await customer_lookup.lookup_customers([customerid], get_async_engine())
+    found = await _lookup_customers_or_503(
+        [customerid], request.app.state.cfg, "customer"
+    )
     row = found.get(customerid)
     if row is None:
         raise HTTPException(

@@ -24,18 +24,18 @@ chain silently dropped or altered a value in transit.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
-
-from telco_churn.serving.app import app
 
 pytestmark = pytest.mark.integration
 
 
 def test_predict_batch_id_only_matches_inline_prediction_of_the_same_crm_row(
-    serving_env: dict[str, Any], serving_champion: dict[str, Any]
+    ready_serving_client: Callable[[], Any],
+    serving_env: dict[str, Any],
+    serving_champion: dict[str, Any],
 ) -> None:
     """ID-only /predict/batch resolution must score identically to
     submitting that same customer's current customers_crm row (as returned
@@ -44,7 +44,7 @@ def test_predict_batch_id_only_matches_inline_prediction_of_the_same_crm_row(
     value in transit, even though customers_crm's values themselves
     (deliberately) no longer match calibrate.py's frozen golden reference.
     """
-    with TestClient(app) as client:
+    with ready_serving_client() as client:
         id_only_payload = [
             {"customerid": cid} for cid in serving_champion["golden_customerids"]
         ]
@@ -73,7 +73,9 @@ def test_predict_batch_id_only_matches_inline_prediction_of_the_same_crm_row(
 
 
 def test_predict_batch_id_only_decision_matches_served_threshold(
-    serving_env: dict[str, Any], serving_champion: dict[str, Any]
+    ready_serving_client: Callable[[], Any],
+    serving_env: dict[str, Any],
+    serving_champion: dict[str, Any],
 ) -> None:
     """decision/decision_threshold must agree with the served
     probability/threshold pair for every ID-resolved row — the invariant
@@ -83,7 +85,7 @@ def test_predict_batch_id_only_decision_matches_served_threshold(
     """
     payload = [{"customerid": cid} for cid in serving_champion["golden_customerids"]]
 
-    with TestClient(app) as client:
+    with ready_serving_client() as client:
         response = client.post("/predict/batch", json=payload)
 
     assert response.status_code == 200

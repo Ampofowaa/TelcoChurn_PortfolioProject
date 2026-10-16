@@ -25,6 +25,20 @@ __all__ = [
 _engine: Engine | None = None
 _async_engine: AsyncEngine | None = None
 
+# A pooled asyncpg connection left idle for hours can be silently dropped by
+# the far side (RDS restart/failover, a stateful network hop expiring it)
+# without the client ever seeing a FIN — the socket still reads ESTABLISHED,
+# and the next query on it hangs in kernel TCP retransmits (~15-30 min)
+# rather than failing. pool_pre_ping alone can't catch this: the ping itself
+# is a query on that same dead socket. Recycling by age replaces such a
+# connection at checkout with no network round trip at all.
+_ASYNC_POOL_RECYCLE_SECONDS = 1800
+# Bound every asyncpg connect attempt and query (pool_pre_ping's ping
+# included), so a dead connection the recycle window hasn't reached yet
+# fails in seconds instead of hanging a request indefinitely.
+_ASYNC_CONNECT_TIMEOUT_SECONDS = 10.0
+_ASYNC_COMMAND_TIMEOUT_SECONDS = 10.0
+
 
 def get_engine() -> Engine:
     """Return the shared SQLAlchemy engine, creating it on first call."""
@@ -63,7 +77,15 @@ def get_async_engine() -> AsyncEngine:
         url = os.environ.get("POSTGRES_URL")
         if not url:
             raise OSError("POSTGRES_URL environment variable is not set")
-        _async_engine = create_async_engine(_to_asyncpg_url(url), pool_pre_ping=True)
+        _async_engine = create_async_engine(
+            _to_asyncpg_url(url),
+            pool_pre_ping=True,
+            pool_recycle=_ASYNC_POOL_RECYCLE_SECONDS,
+            connect_args={
+                "timeout": _ASYNC_CONNECT_TIMEOUT_SECONDS,
+                "command_timeout": _ASYNC_COMMAND_TIMEOUT_SECONDS,
+            },
+        )
     return _async_engine
 
 
