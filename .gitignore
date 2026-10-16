@@ -265,6 +265,7 @@ project_thoughts.md
 prompts.txt
 summary.md
 prediction_logging_plan.md
+docs/PHASE_12A_TODO.md
 
 # Terraform (infra/) — .terraform.lock.hcl IS committed, state and secrets are not
 **/.terraform/
