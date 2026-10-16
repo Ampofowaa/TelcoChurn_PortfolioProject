@@ -265,6 +265,7 @@ project_thoughts.md
 prompts.txt
 summary.md
 prediction_logging_plan.md
+docs/PHASE_12A_TODO.md
 
 # Terraform (infra/) — .terraform.lock.hcl IS committed, state and secrets are not
 **/.terraform/
@@ -274,3 +275,9 @@ prediction_logging_plan.md
 !*.tfvars.example
 crash.log
 crash.*.log
+
+# Editor and local Claude Code state (the shared .claude/CLAUDE.md stays tracked)
+.vscode/
+.claude/*
+!.claude/CLAUDE.md
+*.tfplan

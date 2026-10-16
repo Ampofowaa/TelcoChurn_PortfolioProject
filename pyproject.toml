@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [project]
-name = "telcochurn-portfolioproject"
+name = "churn-retention-mlops"
 version = "0.1.0"
 description = "Production-grade churn prediction system: Pandera validation, LightGBM + Optuna, MLflow registry, FastAPI serving, Prefect orchestration, AWS deployment"
 readme = "README.md"

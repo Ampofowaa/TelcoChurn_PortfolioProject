@@ -190,10 +190,9 @@ resource "aws_db_instance" "main" {
 
   # Without this, a password/instance-class change queues silently until the
   # next maintenance window instead of applying — which is how the live RDS
-  # password drifted from Terraform state/SSM on 2026-09-18 (see
-  # PHASE_12A_TODO.md's Group 6.5 incident note). No production traffic on
-  # this single-instance portfolio DB to protect from apply-time blips, so
-  # there's no reason to defer.
+  # password drifted from Terraform state/SSM on 2026-09-18. No production
+  # traffic on this single-instance portfolio DB to protect from apply-time
+  # blips, so there's no reason to defer.
   apply_immediately = true
 
   # 7 (the plan's original value) is rejected outright by this account's

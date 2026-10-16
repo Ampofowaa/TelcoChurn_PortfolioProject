@@ -60,7 +60,7 @@ resource "aws_instance" "main" {
   # Alloy (~30-100MB) + OS (~150MB), which already sits at ~730-950MB
   # before adding it. t3.small is 2GB. Real recurring cost impact: ~+$7.59/mo
   # (t3.micro ~$7.59 -> t3.small ~$15.18/mo), bringing this phase's total
-  # from ~$28-30/mo to ~$36-38/mo (PHASE_12A_TODO.md Group 9).
+  # from ~$28-30/mo to ~$36-38/mo.
   instance_type = "t3.small"
 
   subnet_id              = aws_subnet.public[0].id

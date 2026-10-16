@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-End-to-end ML portfolio project on the IBM Telco Customer Churn dataset. The goal is a production-grade system covering data ingestion → validation → feature engineering → model training → serving → monitoring. The full build plan is in `PROJECT_PLAN.md` (15 phases, 0–14, ordered as a natural data-science lifecycle). Always consult it before starting work on a new phase or feature.
+End-to-end ML portfolio project on the IBM Telco Customer Churn dataset. The goal is a production-grade system covering data ingestion → validation → feature engineering → model training → serving → monitoring. The full build plan is in `docs/PROJECT_PLAN.md` (15 phases, 0–14, ordered as a natural data-science lifecycle). Always consult it before starting work on a new phase or feature.
 
 ## Source of Truth
 
@@ -10,7 +10,7 @@ End-to-end ML portfolio project on the IBM Telco Customer Churn dataset. The goa
 - **Modelling rationale:** `ANALYSIS.md` documents every modelling decision, analytical results and findings, and known limitations — the full narrative from data insights through to model results. **§0 (Problem Framing & Cost Definition)** is the entry point — it defines the prediction unit, label definition, cost structure, success criteria, and the two modelling invariants (test set touched once; one metric drives selection) that govern all phases. Do not contradict it.
 - **System & workflow diagrams:** `docs/architecture.md` — system architecture diagram (infrastructure flow) and ML workflow diagram (modelling lifecycle with the two feedback loops).
 - **Project landing page:** `README.md` is the recruiter-facing overview (headline metrics, pipeline diagram, quick start, project status). It does not contain modelling rationale.
-- **Build roadmap:** `PROJECT_PLAN.md` defines the 15-phase lifecycle-ordered execution plan. Do not implement features that belong to a later phase.
+- **Build roadmap:** `docs/PROJECT_PLAN.md` defines the 15-phase lifecycle-ordered execution plan. Do not implement features that belong to a later phase.
 
 ## Key Commands
 
@@ -46,7 +46,7 @@ The full rules, with their reasoning, live in `docs/conventions/`. This file kee
 
 ## MLflow Model Registry
 
-Full rules: [`docs/conventions/mlflow-registry.md`](docs/conventions/mlflow-registry.md). Read it before touching `models/` registration, evaluation logging, `drift_reference.json` or `model_card.json`.
+Full rules: [`docs/conventions/mlflow-registry.md`](../docs/conventions/mlflow-registry.md). Read it before touching `models/` registration, evaluation logging, `drift_reference.json` or `model_card.json`.
 
 - Tracking backend is Postgres via the MLflow server; `mlruns/` is the artifact store only. The `tracking_uri` fallback must stay `sqlite:///mlflow.db`, never a bare `mlruns` path.
 - Registered model `telco-churn-pipeline`; aliases `champion` (served) and `challenger`.
@@ -61,7 +61,7 @@ Full rules: [`docs/conventions/mlflow-registry.md`](docs/conventions/mlflow-regi
 
 ## Data Handling and DVC Pipeline
 
-Full rules: [`docs/conventions/data-and-pipeline.md`](docs/conventions/data-and-pipeline.md). Read it before touching `data/`, `features/`, `dvc.yaml`, receipts or `customers_crm`.
+Full rules: [`docs/conventions/data-and-pipeline.md`](../docs/conventions/data-and-pipeline.md). Read it before touching `data/`, `features/`, `dvc.yaml`, receipts or `customers_crm`.
 
 - `datasets/raw/` is read-only. The raw CSV is committed to git and is a DVC dep, not an out.
 - Postgres is a materialised cache of the CSV, never a source of truth. A hand-edited `customers_raw` needs `dvc repro --force`. Per-cycle receipts are `cache: false` and gitignored.
@@ -74,7 +74,7 @@ Full rules: [`docs/conventions/data-and-pipeline.md`](docs/conventions/data-and-
 
 ## Modelling Invariants and Serving
 
-Full rules: [`docs/conventions/modelling-and-serving.md`](docs/conventions/modelling-and-serving.md). Read it before touching evaluation, the gate, or anything under `serving/`.
+Full rules: [`docs/conventions/modelling-and-serving.md`](../docs/conventions/modelling-and-serving.md). Read it before touching evaluation, the gate, or anything under `serving/`.
 
 - Test set touched once: only `models/evaluate.py` binds the test partition. Routine retrain cycles gate on the `reserve` cohort, not the sealed set.
 - `evaluate.py` resolves its model by explicit run_id/version, never by alias.
@@ -107,7 +107,7 @@ monitoring/             # Prometheus config + Grafana dashboard JSON
 
 ## Changelog, Code Style, Notebooks and Testing
 
-Full rules: [`docs/conventions/engineering.md`](docs/conventions/engineering.md). Read it before editing `CHANGELOG.md`, a notebook, or adding a module, CLI entry point or test.
+Full rules: [`docs/conventions/engineering.md`](../docs/conventions/engineering.md). Read it before editing `CHANGELOG.md`, a notebook, or adding a module, CLI entry point or test.
 
 - **Changelog:** Keep a Changelog; update at the end of every phase or significant fix. Bullets 1–2 lines with file paths; keep test counts; no data statistics or deep rationale.
 - **Formatting:** always `make format` (ruff format, then black — black has final say). `mypy --strict` on `src/`.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-off manual bring-up of Group 9's serving stack (PHASE_12A_TODO.md's
-# last unchecked Group 9 item), run BEFORE Group 11's CD pipeline exists.
+# One-off manual bring-up of the Phase 12a serving stack, run BEFORE the CD
+# pipeline (cd.yml) existed.
 # Run this from your own terminal with real AWS access — never via a Claude
 # Code `!`-prefixed command (sandboxed, no AWS creds/SSM access).
 #
