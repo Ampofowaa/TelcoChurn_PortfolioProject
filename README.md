@@ -78,7 +78,7 @@ Detail: [docs/architecture.md](docs/architecture.md) (diagrams, modelling stages
 
 ## Status
 
-Phases 0–9 (data through serving), retraining foundations, and the AWS deployment are done. **Next:** Prefect orchestration of monthly retraining and daily drift checks, then ML monitoring. Roadmap → [PROJECT_PLAN.md](PROJECT_PLAN.md) · history → [CHANGELOG.md](CHANGELOG.md)
+Phases 0–9 (data through serving), retraining foundations, and the AWS deployment are done. **Next:** Prefect orchestration of monthly retraining and daily drift checks, then ML monitoring. Roadmap → [PROJECT_PLAN.md](docs/PROJECT_PLAN.md) · history → [CHANGELOG.md](CHANGELOG.md)
 
 ## Run it locally
 

@@ -1,6 +1,6 @@
 # Contributing
 
-See [README.md](README.md) for the project overview and pipeline, and [CLAUDE.md](CLAUDE.md) for the governing conventions (Git branch/commit rules, code style, testing philosophy) — this file covers setup and day-to-day commands only, and defers to `CLAUDE.md` rather than duplicating its rules, to avoid the two drifting apart.
+See [README.md](README.md) for the project overview and pipeline, and [CLAUDE.md](.claude/CLAUDE.md) for the governing conventions (Git branch/commit rules, code style, testing philosophy) — this file covers setup and day-to-day commands only, and defers to `CLAUDE.md` rather than duplicating its rules, to avoid the two drifting apart.
 
 ## Setup
 

@@ -275,3 +275,8 @@ docs/PHASE_12A_TODO.md
 !*.tfvars.example
 crash.log
 crash.*.log
+
+# Editor and local Claude Code state (the shared .claude/CLAUDE.md stays tracked)
+.vscode/
+.claude/*
+!.claude/CLAUDE.md

@@ -4,7 +4,7 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions map to project phases, not strict Semantic Versioning: a new phase bumps MINOR
 (e.g. Phase 5 starts at `0.5.0`); QA passes and sub-steps within a phase bump PATCH.
-See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
+See [PROJECT_PLAN.md](docs/PROJECT_PLAN.md) for the full roadmap.
 
 ---
 
