@@ -297,7 +297,7 @@ def test_score_tab_renders_every_raw_field() -> None:
 def test_bulk_drill_into_customer_sends_a_flat_predict_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression test: _drill_into_prediction's GET /customer/{id} call
+    """Regression test: _explain_scored_row's GET /customer/{id} call
     returns CustomerLookupResponse{features, crm_snapshot_at} (Part A), not
     bare CustomerFeatures — the payload it builds for POST /predict must
     unwrap ["features"] first. Previously it spread the whole response in
@@ -369,6 +369,91 @@ def test_bulk_drill_into_customer_sends_a_flat_predict_payload(
     assert "features" not in sent, f"payload must be flattened, not wrapped: {sent}"
     assert sent["gender"] == _CUSTOMER_ROW["gender"]
     assert sent["tenure"] == _CUSTOMER_ROW["tenure"]
+
+
+def _markdown_text(at: AppTest) -> list[str]:
+    return [m.value for m in at.markdown]
+
+
+def test_bulk_drill_explanation_names_its_customer_and_survives_a_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The explanation is titled with the customer it explains, and stays on
+    screen through an unrelated rerun without re-calling /predict."""
+    ids = ["0001-AAAAA", "0002-BBBBB"]
+    probabilities = {"0001-AAAAA": 0.096, "0002-BBBBB": 0.6}
+    predict_calls: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        if method == "POST" and url.endswith("/predict/batch"):
+            return _FakeResponse(
+                200,
+                {
+                    "capacity_limit": 10,
+                    "results": [
+                        {
+                            "index": i,
+                            "customerid": cid,
+                            "probability": probabilities[cid],
+                            "threshold": 0.4,
+                            "decision_threshold": 0.4,
+                            "decision": probabilities[cid] >= 0.4,
+                            "contact": probabilities[cid] >= 0.4,
+                            "model_version": "1",
+                            "served_source": "champion",
+                        }
+                        for i, cid in enumerate(ids)
+                    ],
+                    "errors": [],
+                },
+            )
+        if method == "GET" and "/customer/" in url:
+            cid = url.rsplit("/", 1)[-1]
+            return _FakeResponse(
+                200,
+                {
+                    "features": {**_CUSTOMER_ROW, "customerid": cid},
+                    "crm_snapshot_at": _CRM_SNAPSHOT_AT,
+                },
+            )
+        if method == "POST" and url.endswith("/predict"):
+            cid = kwargs["json"]["customerid"]
+            predict_calls.append(cid)
+            return _FakeResponse(
+                200,
+                {
+                    "customerid": cid,
+                    "probability": probabilities[cid],
+                    "threshold": 0.4,
+                    "decision": probabilities[cid] >= 0.4,
+                    "model_version": "1",
+                    "explanation": None,
+                },
+            )
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+    csv_bytes = ("customerid\n" + "\n".join(ids) + "\n").encode()
+    _bulk_uploader(at).set_value(("customers.csv", csv_bytes, "text/csv"))
+    at.run(timeout=_RUN_TIMEOUT_SECONDS)
+    at.button(key="bulk_score").click().run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    at.selectbox(key="bulk_drill_choice").set_value("0002-BBBBB")
+    at.button(key="bulk_drill_button").click().run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    assert predict_calls == ["0002-BBBBB"]
+    assert "**Explanation for 0002-BBBBB**" in _markdown_text(at)
+    assert [m.value for m in at.metric if m.label == "Churn probability"] == ["60.0%"]
+
+    at.checkbox(key="bulk_show_diagnostics").check().run(timeout=_RUN_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    assert predict_calls == ["0002-BBBBB"]
+    assert "**Explanation for 0002-BBBBB**" in _markdown_text(at)
 
 
 def test_bulk_tab_offers_the_sample_csv_as_a_download() -> None:
