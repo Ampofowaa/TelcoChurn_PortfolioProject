@@ -3,8 +3,8 @@
 [![CI](https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/actions/workflows/ci.yml/badge.svg)](https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/actions/workflows/ci.yml)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-1085%20passing-brightgreen)](CONTRIBUTING.md#testing)
-[![Coverage](https://img.shields.io/badge/coverage-96.8%25-brightgreen)](CONTRIBUTING.md#testing)
+[![Tests](https://img.shields.io/badge/tests-1314%20passing-brightgreen)](CONTRIBUTING.md#testing)
+[![Coverage](https://img.shields.io/badge/coverage-92%25-brightgreen)](CONTRIBUTING.md#testing)
 
 Tells a telecom retention team **which customers are worth contacting, and what the campaign earns**. Trained, calibrated, gated by a human review, and live on AWS.
 
