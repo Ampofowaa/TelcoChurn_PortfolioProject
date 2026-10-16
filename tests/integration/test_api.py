@@ -17,7 +17,7 @@ model name can't be redirected per-test.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -30,13 +30,15 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-def api_client(serving_env: dict[str, Any]) -> Iterator[TestClient]:
+def api_client(
+    ready_serving_client: Callable[[], Any], serving_env: dict[str, Any]
+) -> Iterator[TestClient]:
     """A TestClient whose lifespan startup has already loaded the seeded
     champion — the context-manager form is required for FastAPI to actually
     run the `lifespan` startup/shutdown hooks (a bare TestClient(app) without
     `with` never triggers them).
     """
-    with TestClient(app) as client:
+    with ready_serving_client() as client:
         yield client
 
 
@@ -263,6 +265,7 @@ def test_predict_batch_writes_rows_to_prediction_log(
 
 
 def test_prediction_log_disabled_skips_the_write(
+    ready_serving_client: Callable[[], Any],
     api_client: TestClient,
     serving_env: dict[str, Any],
     compose_config_with_prediction_log_disabled: None,
@@ -272,7 +275,7 @@ def test_prediction_log_disabled_skips_the_write(
         "pl-disabled-0001", tenure=5, monthlycharges=30.0
     )
 
-    with TestClient(app) as client:
+    with ready_serving_client() as client:
         response = client.post("/predict", json=payload)
     assert response.status_code == 200
 
@@ -300,6 +303,7 @@ def test_prediction_log_disabled_skips_the_write(
 
 
 def test_predict_401s_with_no_api_key_when_auth_enabled(
+    ready_serving_client: Callable[[], Any],
     monkeypatch: pytest.MonkeyPatch,
     serving_env: dict[str, Any],
     compose_config_with_auth_enabled: None,
@@ -310,13 +314,14 @@ def test_predict_401s_with_no_api_key_when_auth_enabled(
         "prospect-auth-0001", tenure=5, monthlycharges=30.0
     )
 
-    with TestClient(app) as client:
+    with ready_serving_client() as client:
         response = client.post("/predict", json=payload)
 
     assert response.status_code == 401
 
 
 def test_predict_401s_with_wrong_api_key_when_auth_enabled(
+    ready_serving_client: Callable[[], Any],
     monkeypatch: pytest.MonkeyPatch,
     serving_env: dict[str, Any],
     compose_config_with_auth_enabled: None,
@@ -327,7 +332,7 @@ def test_predict_401s_with_wrong_api_key_when_auth_enabled(
         "prospect-auth-0002", tenure=5, monthlycharges=30.0
     )
 
-    with TestClient(app) as client:
+    with ready_serving_client() as client:
         response = client.post(
             "/predict", json=payload, headers={"X-API-Key": "wrong-key"}
         )
@@ -336,6 +341,7 @@ def test_predict_401s_with_wrong_api_key_when_auth_enabled(
 
 
 def test_predict_succeeds_with_correct_api_key_when_auth_enabled(
+    ready_serving_client: Callable[[], Any],
     monkeypatch: pytest.MonkeyPatch,
     serving_env: dict[str, Any],
     compose_config_with_auth_enabled: None,
@@ -346,7 +352,7 @@ def test_predict_succeeds_with_correct_api_key_when_auth_enabled(
         "prospect-auth-0003", tenure=5, monthlycharges=30.0
     )
 
-    with TestClient(app) as client:
+    with ready_serving_client() as client:
         response = client.post(
             "/predict", json=payload, headers={"X-API-Key": "test-secret-key"}
         )
@@ -355,13 +361,14 @@ def test_predict_succeeds_with_correct_api_key_when_auth_enabled(
 
 
 def test_health_and_ready_stay_unauthenticated_when_auth_enabled(
+    ready_serving_client: Callable[[], Any],
     monkeypatch: pytest.MonkeyPatch,
     serving_env: dict[str, Any],
     compose_config_with_auth_enabled: None,
 ) -> None:
     monkeypatch.setenv("API_KEY", "test-secret-key")
 
-    with TestClient(app) as client:
+    with ready_serving_client() as client:
         assert client.get("/health").status_code == 200
         assert client.get("/ready").status_code == 200
         assert client.get("/metrics").status_code == 200

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import contextlib
+import time
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import httpx2
@@ -385,3 +387,30 @@ def serving_customer_payload() -> Any:
         }
 
     return _make
+
+
+@pytest.fixture
+def ready_serving_client() -> Callable[[], contextlib.AbstractContextManager[Any]]:
+    """Factory for a TestClient that has finished loading the champion.
+
+    The lifespan loads the model in a worker thread, so the event loop (and
+    so the app) is answering before the load completes, with 503 "model not
+    loaded yet" from every model-backed route. Entering this waits on
+    /ready the way a real readiness probe does, so a test's first request
+    never races the load.
+    """
+    from fastapi.testclient import TestClient
+
+    from telco_churn.serving.app import app
+
+    @contextlib.contextmanager
+    def _open() -> Iterator[TestClient]:
+        with TestClient(app) as client:
+            deadline = time.monotonic() + 120.0
+            while client.get("/ready").status_code != 200:
+                if time.monotonic() > deadline:
+                    raise AssertionError("champion never became ready within 120s")
+                time.sleep(0.05)
+            yield client
+
+    return _open

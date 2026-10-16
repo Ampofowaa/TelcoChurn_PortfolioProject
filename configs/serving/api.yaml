@@ -37,6 +37,14 @@ auth:
 batch:
   max_size: 500
 
+# Upper bound on one customers_crm lookup (GET /customer/{id} and
+# /predict/batch's ID resolution). A stalled lookup returns 503 instead of
+# holding the request open — kept under the Streamlit UI's own 30s client
+# timeout so the caller sees the API's explicit error, not a bare read
+# timeout.
+database:
+  lookup_timeout_seconds: 20.0
+
 # Off-switch so the FastAPI TestClient suite doesn't need a live Postgres
 # just to exercise /predict — flip false per-test the same way auth.enabled/
 # shadow.enabled already are.

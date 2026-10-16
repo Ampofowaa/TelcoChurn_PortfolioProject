@@ -10,6 +10,12 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
 ## [Unreleased]
 
+### Fixed
+- **`utils/db.py::get_async_engine`** — a pooled asyncpg connection silently dropped by RDS hung the first `/predict/batch` after a long idle until kernel TCP retransmits gave up; the pool now recycles connections after 30 min and bounds connect/query time at 10 s.
+- **`serving/app.py`** — `customers_crm` lookups (`GET /customer/{id}`, `/predict/batch` ID resolution) are capped at `serving.database.lookup_timeout_seconds` (20 s, under the UI's 30 s client timeout) and answer 503 on a stall; new `customer_lookup_timeouts_total` counter.
+- **`serving/app.py`, `serving/predict.py`** — the champion hot-reload poll and the cold-start load ran blocking MLflow I/O on the event loop, freezing every route while MLflow answered; both now run in a worker thread (`asyncio.to_thread`).
+- Tests: `tests/unit/test_app_resilience.py` (new, 4 tests — lookup 503s on both routes, poll off the event loop, `/health` answers during a blocked refresh), 2 new `get_async_engine` tests in `test_db.py`.
+
 ---
 
 ## [0.10.1] - 2026-08-26 — Phase 10a-ii: Training Pipeline Refactor for Retraining
