@@ -11,7 +11,7 @@ Tells a telecom retention team **which customers are worth contacting, and what 
 **▶ Live demo: [telco-churn.duckdns.org](https://telco-churn.duckdns.org)** — no login. In **Batch Prediction**, click **Score the sample**.
 Also live: [API docs](https://telco-churn.duckdns.org/docs) · [MLflow runs](https://telco-churn.duckdns.org/mlflow) (`reviewer` / `telco-reviewer-2026`)
 
-<!-- TODO: add a screenshot of the Streamlit Batch Prediction tab here, e.g. ![Batch Prediction tab](docs/img/batch_prediction.png) -->
+![Scoring 50 customers in the Batch Prediction tab, then explaining one prediction](docs/img/batch_scoring.gif)
 
 ## Problem
 
