@@ -317,3 +317,57 @@ flowchart TD
 ```
 
 **Never version arithmetic (`N-1`).** A rejected or crashed evaluation cycle can leave a higher-numbered version in the registry with no `champion` alias and no `promoted` tag — indistinguishable from a legitimate former champion by version number alone. Selecting on the `promotion_status` tag is the one query that can't land on that version by accident. `champion_history()` reads the same `promotion_log` tag back as an ordered list, so "what was champion two promotions ago" is `history[-3]`, not a re-derivation.
+
+---
+
+## Modelling Stages
+
+Mechanism only — the reasoning behind each choice (why LightGBM over `LogisticRegressionCV`, why sigmoid calibration, why these guardrails) lives in `ANALYSIS.md`, linked per row rather than repeated here.
+
+**Family and feature selection are periodic, human-reviewed decisions frozen into code — not steps the routine pipeline re-runs.** Both are made in a notebook, on a real trigger (a new candidate family, a drift signal, a scheduled review), never on every retrain; the decision is then frozen as a literal constant the automated pipeline just trains against. Full mechanism, the human-review loop, and why this doesn't drift silently → [docs/architecture.md § Model Family & Feature Selection](#model-family--feature-selection--human-reviewed-frozen-into-code-phase-5).
+
+| Stage | Mechanism |
+|---|---|
+| **Family selection** | Three candidates cross-validated on the dev partition — `DummyClassifier(strategy='prior')` (leakage safeguard + BSS floor), `LogisticRegressionCV` baseline, LightGBM challenger. PR-AUC is the sole selection criterion. → [ANALYSIS.md §4a](../ANALYSIS.md#4a-model-selection) |
+| **Feature selection** | Permutation-importance ablation over 100 CV folds, stability-voted rather than decided from a single all-dev fit. → [ANALYSIS.md §4b](../ANALYSIS.md#4b-feature-selection-concluded-ablation--importance-diagnostic) |
+| **Hyperparameter tuning** | Optuna, TPE sampler, 50 trials; final pick is the 1-SE-rule value, not the raw-best trial. → [ANALYSIS.md §4c](../ANALYSIS.md#4c-hyperparameter-tuning-optuna) |
+| **Calibration** | `CalibratedClassifierCV` (sigmoid) — fit and logged only; `calibrate.py` never registers a model on its own. → [ANALYSIS.md §5](../ANALYSIS.md#5-probability-calibration) |
+| **Threshold** | Closed-form `t* = c / (r × LTV)` from `configs/costs.yaml`, derived out-of-fold with no leakage into the sealed test set. → [ANALYSIS.md §6](../ANALYSIS.md#6-business-impact--threshold-selection) |
+| **Promotion gate** | PR-AUC drives selection; three veto-only guardrails (recall at `t*`, Brier, calibration slope) can reject a candidate but never promote one. → [ANALYSIS.md §0](../ANALYSIS.md#success-criterion--the-promotion-gate) |
+| **Registration** | `register.py` is the sole registry-write entry point — mints the challenger, tags it `pending`, and flips (or rejects) the `champion` alias only after both the automated gate and a human review pass. → [ANALYSIS.md §8](../ANALYSIS.md#8-model-registration--promotion) |
+
+Full modelling narrative, every number, every deviation from the archived exploratory pass → [ANALYSIS.md](../ANALYSIS.md).
+
+## Pipeline Versioning (DVC)
+
+`dvc.yaml` wraps the file-producing half of the pipeline as a reproducible, content-hashed DAG — the registry-mutating half (minting/tagging/flipping a model version) structurally cannot live in it, since a registry alias isn't a file DVC can hash.
+
+| Component | What it does |
+|---|---|
+| **9-stage DAG** (`dvc.yaml`) | `ingest → validate → split → features → train → calibrate → threshold → evaluate → error_analysis`, each stage's `deps`/`params`/`outs` explicitly declared. `dvc repro <stage>` only re-runs that stage and its upstream chain when something it actually depends on changed — never the whole DAG unconditionally. |
+| **Registry writes stay outside the DAG** | `register.py` (mint challenger, tag, flip/reject champion) runs as its own step, never a `dvc.yaml` stage. A full training cycle is therefore two `dvc repro` calls bracketing one registration step, not one — [CONTRIBUTING.md § Running the full stack locally](../CONTRIBUTING.md#running-the-full-stack-locally) run through it. |
+| **Receipts bridge the two worlds** | Six small JSON receipts (`reports/*_receipt.json`) stand in for side effects DVC can't hash directly — a Postgres load, an MLflow run — giving `validate`/`train`/`calibrate`/`eval`/`error_analysis` a real dependency edge on "did the step before me actually succeed," not just "did its script exit 0." |
+| **Local cache only** | No DVC remote yet — `.dvc/cache` is local-only through Phase 11; Phase 12 adds an S3 remote for shared caching, not a migration off the current setup. |
+
+```bash
+dvc repro <stage>   # re-run one stage and its upstream chain
+dvc dag             # print the pipeline DAG
+dvc metrics show    # diff metrics.json / params across commits
+```
+
+Run it yourself → [CONTRIBUTING.md § Running the full stack locally](../CONTRIBUTING.md#running-the-full-stack-locally). Full architecture → [docs/architecture.md](architecture.md).
+
+## Serving Components
+
+The champion (`telco-churn-pipeline@champion` in the MLflow registry) is served behind a FastAPI app, with a Streamlit UI as a thin client — both run as their own Docker images. **Live on AWS** (Phase 12a) at **[telco-churn.duckdns.org](https://telco-churn.duckdns.org)**, no setup required; for local development, the same stack comes up with one `docker compose up` ([CONTRIBUTING.md](../CONTRIBUTING.md#running-the-full-stack-locally)).
+
+| Component | What it does |
+|---|---|
+| **FastAPI** (`serving/app.py`, `serving/predict.py`) | Loads the champion at startup and hot-reloads it on a TTL poll — a promotion is just an MLflow alias flip, so a new champion goes live without a redeploy. Exposes `POST /predict`, `POST /predict/batch`, `GET /customer/{id}`, `GET /health`/`GET /ready` (liveness vs. readiness), and `GET /metrics` (Prometheus). Runs on `uvicorn` inside `docker/api/Dockerfile`, a multi-stage build from the project's own `uv.lock`. |
+| **Contact policy** | `POST /predict/batch` doesn't just score every row — it ranks them by expected value and caps who gets contacted at a configurable `contact_capacity`/`campaign_budget`, so the response reflects an operationally realistic campaign, not an unlimited-budget fantasy. |
+| **Shadow/canary rollout** | Config-gated, off by default: whenever a `challenger` model exists in the registry, it can be dual-scored against every request for comparison (**shadow**, zero routing risk) or actually serve a consistent-hash slice of live traffic (**canary**). Mechanism, Prometheus metrics, and a real evidence log → [docs/architecture.md § Shadow/Canary Serving](#shadowcanary-serving--servingpredictpy-phase-9). |
+| **Streamlit UI** (`ui/streamlit_app.py`) | **Score a Customer** tab: look up a real customer from `customers_crm` (a seeded "current state" derivation of the training data, never the frozen snapshot itself) or manually enter one for a what-if scenario. Mechanism, rationale, and what's/isn't durably recorded → [docs/architecture.md § Live Customer Lookup](#live-customer-lookup--customers_crm-phase-9). **Batch Prediction** tab: score a CSV upload, or the bundled sample in one click — [`examples/sample_batch_predictions.csv`](../examples/sample_batch_predictions.csv) demonstrates all three `/predict/batch` item shapes in one upload (ID-only, full inline, ID-plus-override). **Model Info** tab: read the champion's model card. All three drive the same FastAPI endpoints a real client would call. Runs from `docker/ui/Dockerfile`, same build pattern as the API image. |
+| **Live deployment** (Phase 12a) | A single EC2 box (`t3.small`) behind Caddy — automatic TLS via Let's Encrypt, HTTPS-only, no laptop in the loop. Postgres runs on RDS and MLflow artifacts on S3 instead of local containers/volumes, but it's the same `docker compose` shape underneath (`infra/deploy/compose.prod.yml`), just pointed at managed backends. A fourth service, a persistent **reviewer-facing MLflow UI**, is reachable at [telco-churn.duckdns.org/mlflow](https://telco-churn.duckdns.org/mlflow) (login: `reviewer` / `telco-reviewer-2026`) — the actual registry and runs behind every number in the README, browsable without cloning the repo. |
+| **Docker Compose** (local dev) | `docker-compose.yml` wires four services — `postgres`, `mlflow`, `fastapi`, `streamlit` — so `docker compose up -d --build` brings up the entire stack in one command on your own machine, with `fastapi`/`streamlit` waiting on `postgres`/`mlflow` via `depends_on`. |
+
+Try the live deployment above — the Batch Prediction tab's **Score the sample** button needs no file; to prepare your own, **[download the sample CSV](https://raw.githubusercontent.com/Ampofowaa/TelcoChurn_PortfolioProject/main/examples/sample_batch_predictions.csv)** as a template — or run it yourself locally → [CONTRIBUTING.md](../CONTRIBUTING.md#running-the-full-stack-locally). The raw API requires an `X-API-Key` on its three data routes (`/predict`, `/predict/batch`, `/customer/{id}`) — see the schema and try it interactively, no key needed, at [telco-churn.duckdns.org/docs](https://telco-churn.duckdns.org/docs).
