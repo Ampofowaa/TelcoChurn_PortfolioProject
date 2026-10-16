@@ -1,6 +1,6 @@
 # Telco Customer Churn — Who to Call, and Whether It Pays
 
-[![CI](https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/actions/workflows/ci.yml/badge.svg)](https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/actions/workflows/ci.yml)
+[![CI](https://github.com/Ampofowaa/churn-retention-mlops/actions/workflows/ci.yml/badge.svg)](https://github.com/Ampofowaa/churn-retention-mlops/actions/workflows/ci.yml)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-1314%20passing-brightgreen)](CONTRIBUTING.md#testing)
@@ -85,8 +85,8 @@ Phases 0–9 (data through serving), retraining foundations, and the AWS deploym
 Requires Python 3.13+, [uv](https://docs.astral.sh/uv/), and Docker. The raw CSV is committed, so there's nothing to download.
 
 ```bash
-git clone https://github.com/Ampofowaa/TelcoChurn_PortfolioProject.git
-cd TelcoChurn_PortfolioProject
+git clone https://github.com/Ampofowaa/churn-retention-mlops.git
+cd churn-retention-mlops
 uv sync --all-extras
 uv run pytest                  # unit tests, no Docker needed
 ```

@@ -44,8 +44,8 @@ The complete first-time training cycle plus serving, step by step. (Nothing to i
 **1 — Clone and install**
 
 ```bash
-git clone https://github.com/Ampofowaa/TelcoChurn_PortfolioProject.git
-cd TelcoChurn_PortfolioProject
+git clone https://github.com/Ampofowaa/churn-retention-mlops.git
+cd churn-retention-mlops
 uv sync --all-extras
 pre-commit install
 ```

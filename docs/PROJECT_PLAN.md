@@ -84,7 +84,7 @@ This plan describes how to build that wrapper, phase by phase, without re-doing 
 ## Repository Layout (target)
 
 ```
-TelcoChurn_PortfolioProject/
+churn-retention-mlops/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml              # lint, type-check, unit tests on every push/PR

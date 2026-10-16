@@ -280,3 +280,4 @@ crash.*.log
 .vscode/
 .claude/*
 !.claude/CLAUDE.md
+*.tfplan

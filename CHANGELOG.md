@@ -899,35 +899,35 @@ phases build on.*
 
 ---
 
-<!-- Version comparison links: the `origin` remote (github.com/Ampofowaa/TelcoChurn_PortfolioProject)
+<!-- Version comparison links: the `origin` remote (github.com/Ampofowaa/churn-retention-mlops)
 already exists, but no `vX.Y.Z` tags have been pushed yet, so these links would 404 if uncommented
 now. Un-comment once tags are pushed for each released version below.
-[Unreleased]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.8.0...HEAD
-[0.8.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.6...v0.8.0
-[0.7.6]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.5...v0.7.6
-[0.7.5]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.4...v0.7.5
-[0.7.4]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.3...v0.7.4
-[0.7.3]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.2...v0.7.3
-[0.7.2]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.1...v0.7.2
-[0.7.1]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.7.0...v0.7.1
-[0.7.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.6.3...v0.7.0
-[0.6.3]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.6.2...v0.6.3
-[0.6.2]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.6.1...v0.6.2
-[0.6.1]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.6.0...v0.6.1
-[0.6.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.4...v0.6.0
-[0.5.4]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.3...v0.5.4
-[0.5.3]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.2...v0.5.3
-[0.5.2]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.1...v0.5.2
-[0.5.1]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.5.0...v0.5.1
-[0.5.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.4.3...v0.5.0
-[0.4.3]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.4.2...v0.4.3
-[0.4.2]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.4.1...v0.4.2
-[0.4.1]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.2.2...v0.3.0
-[0.2.2]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.2.1...v0.2.2
-[0.2.1]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/compare/v0.0.1...v0.1.0
-[0.0.1]: https://github.com/Ampofowaa/TelcoChurn_PortfolioProject/releases/tag/v0.0.1
+[Unreleased]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.7.6...v0.8.0
+[0.7.6]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.7.5...v0.7.6
+[0.7.5]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.7.4...v0.7.5
+[0.7.4]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.7.3...v0.7.4
+[0.7.3]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.7.2...v0.7.3
+[0.7.2]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.6.3...v0.7.0
+[0.6.3]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.6.2...v0.6.3
+[0.6.2]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.5.4...v0.6.0
+[0.5.4]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.5.3...v0.5.4
+[0.5.3]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.5.2...v0.5.3
+[0.5.2]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.4.3...v0.5.0
+[0.4.3]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.2.2...v0.3.0
+[0.2.2]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Ampofowaa/churn-retention-mlops/compare/v0.0.1...v0.1.0
+[0.0.1]: https://github.com/Ampofowaa/churn-retention-mlops/releases/tag/v0.0.1
 -->

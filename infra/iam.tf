@@ -157,8 +157,14 @@ resource "aws_iam_role" "ci_deploy" {
           StringEquals = {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
           }
+          # Both names during the repo rename: GitHub redirects old URLs, but the
+          # OIDC sub claim carries the new name, so drop the old entry once the
+          # rename has landed and CD has deployed under it.
           StringLike = {
-            "token.actions.githubusercontent.com:sub" = "repo:Ampofowaa/TelcoChurn_PortfolioProject:ref:refs/heads/main"
+            "token.actions.githubusercontent.com:sub" = [
+              "repo:Ampofowaa/churn-retention-mlops:ref:refs/heads/main",
+              "repo:Ampofowaa/TelcoChurn_PortfolioProject:ref:refs/heads/main",
+            ]
           }
         }
       }
