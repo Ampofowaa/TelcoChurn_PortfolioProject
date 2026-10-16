@@ -10,3 +10,9 @@
 *.pkl binary
 *.parquet binary
 *.csv binary
+
+# Language bar: count the code, not notebook outputs (mostly embedded plot images),
+# and count the SQL feature views, which GitHub ignores by default
+*.ipynb linguist-detectable=false
+*.sql linguist-detectable=true
+*.mako linguist-generated
